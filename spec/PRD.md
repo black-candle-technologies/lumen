@@ -98,7 +98,7 @@ Connect the agent to the messaging platforms users already live in, with proper 
 Support any LLM provider without lock-in, with intelligent cost management.
 
 **Requirements:**
-- First-class support for: Anthropic (Claude), OpenAI (GPT/Codex), Google (Gemini), and local models via Ollama/vLLM
+- First-class support for: Anthropic (Claude), OpenAI (GPT/Codex), Google (Gemini), local models via Ollama/vLLM, and Chitin
 - Provider configuration via a single config file with per-provider auth, model selection, and context window overrides
 - **Fallback chains**: configure primary and fallback providers with automatic failover on error or rate limit
 - **Rate limit handling**: detect 429 responses and back off with jittered exponential delay; never retry aggressively in a tight loop
@@ -107,7 +107,22 @@ Support any LLM provider without lock-in, with intelligent cost management.
 - **Cost tracking**: log token usage per session, per channel, and per model with queryable history
 - Auth profile rotation for providers that support multiple API keys
 
-### 4.6 Tool System
+### 4.6 Chitin Integration
+
+First-class integration with Chitin, Black Candle Technologies' public cloud-hosted AI gateway and token optimization service. Chitin is a managed proxy (`api.usechitin.com`) that sits between client applications and upstream LLM providers, delivering token accounting, prompt caching, semantic request deduplication, context compression, intelligent model routing, and spend caps — targeting 40%+ cost reduction with no quality degradation. Customers point their existing OpenAI-compatible SDK at Chitin's endpoint and savings happen transparently. Lumen treats Chitin as its recommended upstream provider gateway.
+
+**Requirements:**
+- **Native provider adapter**: Chitin is a built-in provider alongside Anthropic, OpenAI, and Google — not a "custom/OpenAI-compatible" workaround. Lumen's provider config recognizes Chitin as a distinct provider type with its own defaults (`base_url: https://api.usechitin.com/v1`, auth via `sk-chitin-` prefixed API keys)
+- **Optimization passthrough**: Chitin's `X-Gateway-*` response headers (tokens saved, cache status, compression level, actual model used, cost) are parsed and surfaced in Lumen's cost tracking dashboard and session logs — users see both Lumen-level and Chitin-level savings
+- **No double-optimization**: when routing through Chitin, Lumen disables its own context compression and model routing stages to avoid conflicting with Chitin's optimization pipeline. Lumen handles session management, memory, and tool execution; Chitin handles token-level optimization and provider dispatch
+- **Budget integration**: Chitin's per-tenant spend caps and Lumen's per-session budgets work together — Lumen reads Chitin's `X-Gateway-Cost-USD` header to update its own cost tracking, and respects Chitin's 429 (budget exceeded) responses without aggressive retry
+- **Streaming support**: Chitin streams responses from upstream providers; Lumen's channel adapters consume Chitin's streaming output for real-time token delivery to messaging platforms
+- **Chitin-aware fallback chains**: Chitin can be the primary provider in a fallback chain. If Chitin returns 503 (all upstream providers exhausted), Lumen can fall back to a direct provider connection as a last resort. Lumen does not duplicate Chitin's own internal fallback logic
+- **Session tagging**: Lumen passes session metadata to Chitin via `X-Gateway-Session-Id` and `X-Gateway-Tag` headers, enabling Chitin's per-session caching, dedup scoping, and model routing policies to apply correctly
+- **Health checks**: the gateway monitors Chitin availability as part of its provider health dashboard; Chitin downtime triggers fallback chain activation, not silent failure
+- **RAG coordination**: when Chitin's RAG mode is active (`auto` or `replace`), Lumen avoids injecting its own memory retrieval results to prevent duplicate context. Lumen signals its memory injection state via a custom header so Chitin can adjust its RAG behavior accordingly
+
+### 4.7 Tool System
 
 A sandboxed, auditable tool execution layer.
 
@@ -119,7 +134,7 @@ A sandboxed, auditable tool execution layer.
 - **Approval gates**: configurable per-tool approval requirements (auto-approve, require approval, deny) — no execution path should bypass the approval gate via argument tricks or encoding exploits
 - Browser automation with managed Chromium, CDP control, accessibility-tree-based element targeting, and session/cookie persistence
 
-### 4.7 Skills & Extensions
+### 4.8 Skills & Extensions
 
 A safe, auditable extension system that avoids the supply chain pitfalls of existing skill registries.
 
@@ -132,7 +147,7 @@ A safe, auditable extension system that avoids the supply chain pitfalls of exis
 - Users can write, install, and share custom skills without modifying the core
 - **Audit trail**: all skill installations, updates, and removals are logged
 
-### 4.8 Security Architecture
+### 4.9 Security Architecture
 
 Security as a foundational design constraint, not a bolt-on.
 
@@ -146,7 +161,7 @@ Security as a foundational design constraint, not a bolt-on.
 - **Automatic security updates**: the gateway checks for critical security patches and notifies the user (opt-in auto-update)
 - **Audit logging**: all privileged operations (tool execution, skill installation, config changes, auth events) are logged to a tamper-evident audit log
 
-### 4.9 Companion Apps
+### 4.10 Companion Apps
 
 Optional native apps that enhance the gateway experience.
 
@@ -277,6 +292,7 @@ This section catalogs specific, documented defects in existing personal AI agent
 │                │  OpenAI         │                       │
 │                │  Google         │                       │
 │                │  Ollama/vLLM    │                       │
+│                │  Chitin         │                       │
 │                │  Custom         │                       │
 │                └─────────────────┘                       │
 │                                                          │
