@@ -1,0 +1,13 @@
+{
+  "name": "lumen",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:web": "pnpm --dir apps/web dev",
+    "build:web": "pnpm --dir apps/web build",
+    "check:web": "pnpm --dir apps/web check",
+    "dev:desktop": "pnpm --dir apps/desktop tauri dev",
+    "build:desktop": "pnpm --dir apps/desktop tauri build",
+    "check:rust": "cargo check --workspace"
+  }
+}
