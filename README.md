@@ -1,7 +1,5 @@
 # Lumen
 
-**Status:** on hold until Chitin is complete.
-
 Lumen is a local-first AI agent runtime for user-owned infrastructure. It is meant to run close to the user's data, models, tools, projects, and automation logic instead of becoming a large hosted SaaS dashboard.
 
 The core idea is simple: users own the infrastructure, Lumen coordinates it.
