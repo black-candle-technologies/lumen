@@ -1,0 +1,25 @@
+- name: Runtime
+  fields:
+    - Workspace root
+    - Local API port
+    - Startup mode
+- name: Local Model Runner
+  fields:
+    - Provider path
+    - Default model
+    - Context window
+- name: Security & Approvals
+  fields:
+    - Risk threshold
+    - Approval timeout
+    - Deny by default
+- name: User & Channel Allowlist
+  fields:
+    - Local user
+    - Trusted channels
+    - Blocked channels
+- name: Secrets
+  fields:
+    - Vault path
+    - Key source
+    - Rotation policy

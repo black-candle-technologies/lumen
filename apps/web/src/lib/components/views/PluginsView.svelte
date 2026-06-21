@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { plugins } from '$lib/mockData';
+	import { plugins } from '$lib/mock';
 </script>
 
 <div class="stack">
 	<div class="notice">
 		<strong>Permissioned plugins.</strong>
-		<span> Every plugin declares scope and permissions. This screen is mock-only and performs no installs.</span>
+		<span> Every plugin declares scope and permissions before touching local systems.</span>
 	</div>
 
 	<div class="cards">
@@ -23,7 +23,7 @@
 					<dt>Hash</dt><dd>{plugin.hash}</dd>
 					<dt>Scope</dt><dd>{plugin.scope}</dd>
 				</dl>
-				<button type="button" disabled>{plugin.enabled ? 'Disable mock' : 'Install mock'}</button>
+				<button type="button" disabled>{plugin.enabled ? 'Disable' : 'Install'}</button>
 			</article>
 		{:else}
 			<p class="empty">No plugins installed.</p>

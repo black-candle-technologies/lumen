@@ -1,0 +1,118 @@
+- id: evt_58291
+  timestamp: 2026-06-20 12:14:33
+  actor: shell-agent
+  action: command.requested
+  target: C:\Users\laneb\lumen
+  tool: shell.local
+  risk: high
+  status: pending
+  approval: appr_1042 pending
+  source: chat
+  permission: shell.exec.workspace
+  version: core@0.1.0 hash:ae72...441a
+  systems:
+    - filesystem
+    - shell
+  result: Waiting for human approval
+  raw:
+    command: pnpm install
+    cwd: C:\Users\laneb\lumen
+    approval: required
+- id: evt_58284
+  timestamp: 2026-06-20 12:09:18
+  actor: plugin-manager
+  action: plugin.install.requested
+  target: github.triage
+  tool: plugins.registry
+  risk: medium
+  status: pending
+  approval: appr_1041 pending
+  source: settings
+  permission: plugin.install
+  version: github.triage@0.1.0 hash:4bc1...18ad
+  systems:
+    - plugin registry
+    - workspace metadata
+  result: Install paused for permission review
+  raw:
+    plugin: github.triage
+    permissions:
+      - repo.read
+      - issues.read
+    approval: required
+- id: evt_58277
+  timestamp: 2026-06-20 12:02:10
+  actor: maintenance-agent
+  action: job.completed
+  target: nightly repo scan
+  tool: jobs.scheduler
+  risk: low
+  status: allowed
+  approval: not required
+  source: scheduler
+  permission: workspace.read
+  version: core@0.1.0 hash:2c21...a9fd
+  systems:
+    - filesystem
+  result: Completed with warnings
+  raw:
+    warnings: 2
+    duration_ms: 1824
+- id: evt_58266
+  timestamp: 2026-06-20 11:58:02
+  actor: mail-agent
+  action: external.message.requested
+  target: gmail
+  tool: gmail.draft-only
+  risk: medium
+  status: pending
+  approval: appr_1040 pending
+  source: chat
+  permission: mail.send.external
+  version: gmail.draft-only@0.4.0 hash:772b...a933
+  systems:
+    - gmail
+  result: Send paused for human review
+  raw:
+    recipient_domain: external.example
+    mode: send
+    approval: required
+- id: evt_58240
+  timestamp: 2026-06-20 11:47:55
+  actor: cleanup-agent
+  action: data.delete.requested
+  target: local vault
+  tool: storage.vault
+  risk: critical
+  status: denied
+  approval: appr_1039 denied by policy
+  source: job
+  permission: vault.delete
+  version: storage@0.3.2 hash:9f42...77ba
+  systems:
+    - vault
+    - filesystem
+  result: Denied by policy
+  raw:
+    retention_days: 90
+    policy: manual approval required
+    backup_verified: false
+- id: evt_58192
+  timestamp: 2026-06-20 11:25:41
+  actor: model-router
+  action: model.selected
+  target: llama-3.1-8b-local
+  tool: model.local-runner
+  risk: low
+  status: allowed
+  approval: not required
+  source: chat
+  permission: model.local.invoke
+  version: local-runner@0.1.0 hash:190a...ce22
+  systems:
+    - local model runner
+  result: Local model selected for mock session
+  raw:
+    provider: local
+    model: llama-3.1-8b-local
+    streaming: true

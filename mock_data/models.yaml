@@ -1,0 +1,18 @@
+- provider: Local runner
+  status: ok
+  model: llama-3.1-8b-local
+  endpoint: http://127.0.0.1:11434
+  streaming: true
+  role: default chat and jobs
+- provider: OpenAI-compatible
+  status: pending
+  model: gpt-compatible-placeholder
+  endpoint: https://api.example.local/v1
+  streaming: true
+  role: optional remote fallback
+- provider: Experimental vision
+  status: disabled
+  model: vision-disabled
+  endpoint: not configured
+  streaming: false
+  role: disabled example

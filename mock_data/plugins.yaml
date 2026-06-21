@@ -1,0 +1,23 @@
+- name: filesystem.safe-read
+  enabled: true
+  permissions:
+    - workspace.read
+    - path.allowlist
+  version: 0.2.1
+  hash: sha256:8b4a...19cd
+  scope: workspace
+- name: shell.local
+  enabled: true
+  permissions:
+    - shell.exec.workspace
+  version: 0.1.0
+  hash: sha256:ae72...441a
+  scope: approval-gated
+- name: gmail.draft-only
+  enabled: false
+  permissions:
+    - mail.read
+    - mail.draft
+  version: 0.4.0
+  hash: sha256:772b...a933
+  scope: user

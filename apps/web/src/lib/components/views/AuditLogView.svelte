@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { AuditEvent, AuditFilter } from '$lib/mockData';
+	import type { AuditEvent, AuditFilter } from '$lib/mock';
 
 	let { auditFilter, filteredAudit, selectedAudit, onFilter, onSelect } = $props<{
 		auditFilter: AuditFilter;
@@ -19,7 +19,7 @@
 		<div class="panel-head">
 			<div>
 				<h2>Events</h2>
-				<p class="muted compact">Risk filter keeps selection inside the visible event set.</p>
+				<p class="muted compact">Review runtime actions, permissions, and approval outcomes.</p>
 			</div>
 			<label class="select-label">
 				<span>Risk</span>

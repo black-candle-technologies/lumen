@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Approval } from '$lib/mockData';
+	import type { Approval } from '$lib/mock';
 
 	let { approvals, onDecision } = $props<{
 		approvals: Approval[];
@@ -16,7 +16,7 @@
 		<div>
 			<h2>Safe by default</h2>
 			<p class="muted compact">
-				These buttons only change local mock state. They do not approve real runtime actions.
+				Risky actions pause here for human review before they touch local systems.
 			</p>
 		</div>
 		<span class="badge neutral">{pendingCount} pending</span>
@@ -41,13 +41,13 @@
 				<div class="actions">
 					{#if approval.state === 'pending'}
 						<button type="button" onclick={() => onDecision(approval.id, 'approved')}>
-							Approve locally
+							Approve
 						</button>
 						<button type="button" class="ghost" onclick={() => onDecision(approval.id, 'denied')}>
-							Deny locally
+							Deny
 						</button>
 					{:else}
-						<span class="muted">Decision recorded in mock state.</span>
+						<span class="muted">Decision recorded.</span>
 					{/if}
 				</div>
 			</article>

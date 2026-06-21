@@ -1,0 +1,6 @@
+- role: system
+  body: Runtime policy loaded. High-risk actions require approval.
+- role: user
+  body: Scan this repo and summarize risky changes.
+- role: agent
+  body: I can inspect the workspace with read-only permissions. Shell commands will pause for approval.

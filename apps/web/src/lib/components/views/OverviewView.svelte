@@ -1,12 +1,12 @@
 <script lang="ts">
-	import { activity, auditEvents, jobs, models, plugins, runtime } from '$lib/mockData';
+	import { activity, auditEvents, jobs, models, plugins, runtime } from '$lib/mock';
 
 	let { pendingCount } = $props<{ pendingCount: number }>();
 
 	const metrics = $derived([
 		{ label: 'Runtime', value: runtime.status, detail: `${runtime.host} / ${runtime.mode}` },
 		{ label: 'Pending approvals', value: pendingCount, detail: 'human review required' },
-		{ label: 'Audit events', value: auditEvents.length, detail: 'mock event stream' },
+		{ label: 'Audit events', value: auditEvents.length, detail: 'event stream' },
 		{
 			label: 'Active jobs',
 			value: jobs.filter((job) => job.status === 'enabled').length,
@@ -22,9 +22,8 @@
 		<span class="eyebrow">Local-first agent runtime</span>
 		<h2>Agents, tools, model providers, approvals, and audit trails in one local control plane.</h2>
 		<p>
-			This is a frontend shell with mock state. It is designed to show Lumen's operating model:
-			local execution first, explicit permissions, approval gates for risky actions, and readable
-			audit history.
+			Lumen runs local execution first, with explicit permissions, approval gates for risky
+			actions, and readable audit history.
 		</p>
 	</section>
 
@@ -39,7 +38,6 @@
 	<section class="panel activity-panel">
 		<div class="panel-head">
 			<h2>Recent activity</h2>
-			<span class="badge neutral">mock</span>
 		</div>
 		{#if activity.length}
 			<ul class="activity-list">

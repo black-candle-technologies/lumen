@@ -1,14 +1,14 @@
 <script lang="ts">
-	import { jobs } from '$lib/mockData';
+	import { jobs } from '$lib/mock';
 </script>
 
 <section class="panel">
 	<div class="panel-head">
 		<div>
 			<h2>Scheduled jobs</h2>
-			<p class="muted compact">Mock schedules only. No jobs are created or executed.</p>
+			<p class="muted compact">Create and monitor recurring local agent work.</p>
 		</div>
-		<button type="button" disabled>Create job mock</button>
+		<button type="button" disabled>Create job</button>
 	</div>
 
 	<div class="job-table" role="table" aria-label="Scheduled jobs">

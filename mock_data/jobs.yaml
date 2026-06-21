@@ -1,0 +1,18 @@
+- name: Nightly repo scan
+  schedule: 0 2 * * *
+  owner: maintenance-agent
+  status: enabled
+  lastRun: Today 02:00
+  nextRun: Tomorrow 02:00
+- name: Inbox action draft
+  schedule: */30 9-17 * * Mon-Fri
+  owner: assistant
+  status: enabled
+  lastRun: 11:30
+  nextRun: 12:00
+- name: Monthly archive cleanup
+  schedule: 0 5 1 * *
+  owner: storage-agent
+  status: disabled
+  lastRun: Never
+  nextRun: Not scheduled

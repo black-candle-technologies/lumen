@@ -12,9 +12,8 @@
 		auditEvents,
 		runtime,
 		type Approval,
-		type AuditFilter,
-		type Risk
-	} from '$lib/mockData';
+		type AuditFilter
+	} from '$lib/mock';
 
 	type View = 'overview' | 'chat' | 'jobs' | 'approvals' | 'audit' | 'plugins' | 'models' | 'settings';
 
@@ -43,6 +42,7 @@
 		filteredAudit.find((event) => event.id === selectedAuditId) ?? filteredAudit[0]
 	);
 
+	// keep selected audit event valid after filters change
 	$effect(() => {
 		if (filteredAudit.length && !filteredAudit.some((event) => event.id === selectedAuditId)) {
 			selectedAuditId = filteredAudit[0].id;
@@ -92,7 +92,7 @@
 		</nav>
 
 		<div class="runtime-card">
-			<span class="eyebrow">Mock runtime</span>
+			<span class="eyebrow">Runtime</span>
 			<strong>{runtime.status}</strong>
 			<small>{runtime.host}</small>
 			<small>{runtime.mode} / uptime {runtime.uptime}</small>
@@ -102,9 +102,10 @@
 	<main class="main">
 		<header class="topbar">
 			<div>
-				<span class="eyebrow">Control surface / mock data</span>
+				<span class="eyebrow">Control surface</span>
 				<h1>{activeTitle}</h1>
 			</div>
+			<div class="mock-banner" role="status">Mock UI, no functionality</div>
 			<div class="status-strip" aria-label="Runtime status">
 				<span class="status-dot" aria-hidden="true"></span>
 				<span>Local only</span>

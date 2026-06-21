@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { models } from '$lib/mockData';
+	import { models } from '$lib/mock';
 </script>
 
 <div class="stack">
 	<div class="notice">
-		<strong>Provider visibility only.</strong>
-		<span> Model status and endpoints are placeholder values. No provider is called from this UI.</span>
+		<strong>Model providers.</strong>
+		<span> Configure local and OpenAI-compatible providers for chat, jobs, and tool planning.</span>
 	</div>
 
 	<div class="cards">

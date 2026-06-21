@@ -204,6 +204,19 @@ small,
 	padding: 0.85rem 1.25rem;
 }
 
+.mock-banner {
+	margin-left: auto;
+	border: 1px solid rgba(255, 199, 95, 0.35);
+	border-radius: 8px;
+	background: rgba(255, 199, 95, 0.12);
+	color: #ffd889;
+	padding: 0.45rem 0.65rem;
+	font-size: 0.78rem;
+	font-weight: 800;
+	text-transform: uppercase;
+	white-space: nowrap;
+}
+
 .status-strip {
 	display: flex;
 	align-items: center;
@@ -376,6 +389,11 @@ input {
 	padding: 0.75rem 0;
 }
 
+.job-row > span {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
 .table-head {
 	border-top: 0;
 	color: #a8b5c2;
@@ -407,7 +425,6 @@ input {
 	color: #d0dae5;
 }
 
-.neutral,
 .allowed,
 .enabled,
 .ok,
@@ -416,17 +433,18 @@ input {
 	color: #82efb1;
 }
 
-.pending,
-.running,
-.warning {
+.neutral {
+	background: #222b35;
+	color: #d0dae5;
+}
+
+.pending {
 	background: rgba(255, 199, 95, 0.15);
 	color: #ffd889;
 }
 
 .disabled,
-.denied,
-.failed,
-.blocked {
+.denied {
 	background: rgba(255, 108, 108, 0.14);
 	color: #ffaaaa;
 }
@@ -622,8 +640,7 @@ pre {
 
 @media (max-width: 640px) {
 	.topbar,
-	.panel-head,
-	.approval-row {
+	.panel-head {
 		align-items: stretch;
 		flex-direction: column;
 	}
@@ -634,6 +651,11 @@ pre {
 
 	.status-strip {
 		justify-content: flex-start;
+	}
+
+	.mock-banner {
+		margin-left: 0;
+		width: fit-content;
 	}
 
 	.nav {

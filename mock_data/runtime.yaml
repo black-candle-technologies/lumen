@@ -1,0 +1,5 @@
+status: running
+host: localhost:7410
+mode: local-only
+uptime: 02h 18m
+model: llama-3.1-8b-local

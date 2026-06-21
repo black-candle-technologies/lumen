@@ -1,0 +1,40 @@
+- id: appr_1042
+  risk: high
+  requester: shell-agent
+  action: Run command: pnpm install
+  target: local shell
+  timestamp: 2026-06-20 12:14:33
+  riskReason: Shell execution can mutate the workspace and install third-party code.
+  state: pending
+- id: appr_1041
+  risk: medium
+  requester: plugin-manager
+  action: Install plugin: github.triage
+  target: plugin registry
+  timestamp: 2026-06-20 12:09:18
+  riskReason: New plugins must declare permissions before they can access local context.
+  state: pending
+- id: appr_1040
+  risk: medium
+  requester: mail-agent
+  action: Send external message
+  target: gmail
+  timestamp: 2026-06-20 11:58:02
+  riskReason: External messages can transmit private local information outside the machine.
+  state: pending
+- id: appr_1039
+  risk: critical
+  requester: cleanup-agent
+  action: Delete data older than 90 days
+  target: local vault
+  timestamp: 2026-06-20 11:47:55
+  riskReason: Data deletion is irreversible without a verified backup.
+  state: pending
+- id: appr_1038
+  risk: high
+  requester: scheduler
+  action: Create recurring job
+  target: jobs
+  timestamp: 2026-06-20 11:31:09
+  riskReason: Recurring jobs can repeatedly execute future actions without fresh prompts.
+  state: pending
