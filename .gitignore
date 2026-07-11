@@ -39,6 +39,7 @@ src-tauri/target
 *.rpm
 
 # Local configuration and runtime state
+.worktrees/
 .env
 .env.*
 !.env.example
