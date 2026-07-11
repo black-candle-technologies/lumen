@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::identity::WorkspaceId;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum CapabilityName {
     #[serde(rename = "fs.read")]
     FsRead,
@@ -35,7 +35,7 @@ pub enum CapabilityName {
     PolicyModify,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WorkspacePath(String);
 
 impl WorkspacePath {
@@ -71,7 +71,7 @@ impl WorkspacePath {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResourceScope {
     Workspace {
@@ -137,7 +137,7 @@ impl ResourceScope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Capability {
     name: CapabilityName,
     scope: ResourceScope,
@@ -161,7 +161,7 @@ impl Capability {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct CapabilitySet(BTreeSet<Capability>);
 
@@ -175,7 +175,7 @@ impl CapabilitySet {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct EffectiveCapabilities(Vec<CapabilitySet>);
 

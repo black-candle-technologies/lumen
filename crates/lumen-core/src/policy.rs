@@ -1,11 +1,40 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use thiserror::Error;
 
 use crate::{
     action::ActionEnvelope,
     capability::{Capability, CapabilityName, EffectiveCapabilities},
 };
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct PolicyVersion(String);
+
+impl PolicyVersion {
+    pub fn new(value: impl Into<String>) -> Result<Self, PolicyVersionError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+        {
+            return Err(PolicyVersionError);
+        }
+
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("policy version must be a non-empty ASCII identifier")]
+pub struct PolicyVersionError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyDecision {
@@ -20,7 +49,7 @@ pub enum DenialReason {
     MissingCapability(Capability),
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Policy {
     approval_required: BTreeSet<CapabilityName>,
 }

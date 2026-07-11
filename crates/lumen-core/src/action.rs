@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -12,9 +12,7 @@ use crate::{
 
 macro_rules! uuid_id {
     ($name:ident) => {
-        #[derive(
-            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-        )]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
@@ -45,7 +43,7 @@ macro_rules! uuid_id {
 uuid_id!(ActionId);
 uuid_id!(RunId);
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ActionKind(String);
 
@@ -69,7 +67,7 @@ impl ActionKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum CanonicalValue {
     Null,
@@ -118,7 +116,7 @@ impl From<bool> for CanonicalValue {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActionEnvelope {
     schema_version: u16,
     action_id: ActionId,
@@ -170,7 +168,7 @@ impl ActionEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct ActionFingerprint(String);
 

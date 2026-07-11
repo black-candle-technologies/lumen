@@ -66,11 +66,11 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-core/src/approval.rs`, `crates/lumen-core/src/action.rs`
 
-- [ ] Write tests for one-shot consumption, expiry, fingerprint mutation, policy-version changes, rejection, and replay.
-- [ ] Run the focused tests and confirm they fail.
-- [ ] Implement the approval state machine and dispatch precondition checks.
-- [ ] Run `cargo test -p lumen-core` and confirm the tests pass.
-- [ ] Commit as `feat(core): bind approvals to immutable actions`.
+- [x] Write tests for one-shot consumption, expiry, fingerprint mutation, policy-version changes, rejection, and replay.
+- [x] Run the focused tests and confirm they fail.
+- [x] Implement the approval state machine and dispatch precondition checks.
+- [x] Run `cargo test -p lumen-core` and confirm the tests pass.
+- [x] Commit as `feat(core): bind approvals to immutable actions`.
 
 ## Task 3: Audit Domain And SQLite Foundation
 

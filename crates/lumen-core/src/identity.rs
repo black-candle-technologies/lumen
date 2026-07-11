@@ -1,14 +1,12 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
 macro_rules! uuid_id {
     ($name:ident) => {
-        #[derive(
-            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-        )]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
@@ -42,7 +40,7 @@ macro_rules! uuid_id {
 
 uuid_id!(WorkspaceId);
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct PrincipalId {
     provider: String,
     subject: String,
@@ -68,7 +66,7 @@ impl PrincipalId {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ComponentId(String);
 
