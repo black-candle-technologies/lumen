@@ -76,12 +76,12 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-core/src/audit.rs`, `crates/lumen-db/src/{lib,migrations,repositories,audit}.rs`, `crates/lumen-db/migrations/*`
 
-- [ ] Write database tests for empty migration, foreign keys, ordered append, hash continuity, and tamper detection.
-- [ ] Run `cargo test -p lumen-db` and confirm they fail.
-- [ ] Implement SQLite setup, the Milestone 1 schema, repository transactions, and audit hash chaining.
-- [ ] Add an atomic test proving one-shot approval consumption and execution reservation cannot race.
-- [ ] Run `cargo test -p lumen-db` and confirm all database tests pass.
-- [ ] Commit as `feat(db): add runtime state and chained audit log`.
+- [x] Write database tests for empty migration, foreign keys, ordered append, hash continuity, and tamper detection.
+- [x] Run `cargo test -p lumen-db` and confirm they fail.
+- [x] Implement SQLite setup, the Milestone 1 schema, repository transactions, and audit hash chaining.
+- [x] Add an atomic test proving one-shot approval consumption and execution reservation cannot race.
+- [x] Run `cargo test -p lumen-db` and confirm all database tests pass.
+- [x] Commit as `feat(db): add runtime state and chained audit log`.
 
 ## Task 4: Run Orchestrator With Fakes
 

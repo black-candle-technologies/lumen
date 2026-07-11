@@ -38,6 +38,32 @@ impl fmt::Display for ApprovalId {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+pub struct ExecutionAttemptId(Uuid);
+
+impl ExecutionAttemptId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl Default for ExecutionAttemptId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExecutionAttemptId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct TimestampMillis(u64);
 
 impl TimestampMillis {
@@ -59,6 +85,19 @@ pub enum ApprovalState {
     Expired,
     Consumed,
     Invalidated,
+}
+
+impl ApprovalState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Granted => "granted",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+            Self::Consumed => "consumed",
+            Self::Invalidated => "invalidated",
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -105,6 +144,34 @@ impl ApprovalRequest {
 
     pub const fn state(&self) -> ApprovalState {
         self.state
+    }
+
+    pub const fn action_fingerprint(&self) -> &ActionFingerprint {
+        &self.action_fingerprint
+    }
+
+    pub const fn policy_version(&self) -> &PolicyVersion {
+        &self.policy_version
+    }
+
+    pub const fn created_at(&self) -> TimestampMillis {
+        self.created_at
+    }
+
+    pub const fn expires_at(&self) -> TimestampMillis {
+        self.expires_at
+    }
+
+    pub const fn decided_by(&self) -> Option<&PrincipalId> {
+        self.decided_by.as_ref()
+    }
+
+    pub const fn decided_at(&self) -> Option<TimestampMillis> {
+        self.decided_at
+    }
+
+    pub const fn consumed_at(&self) -> Option<TimestampMillis> {
+        self.consumed_at
     }
 
     pub fn grant(

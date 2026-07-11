@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -67,7 +67,7 @@ impl ActionKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum CanonicalValue {
     Null,
@@ -159,6 +159,34 @@ impl ActionEnvelope {
 
     pub fn required_capabilities(&self) -> &[Capability] {
         &self.required_capabilities
+    }
+
+    pub const fn id(&self) -> ActionId {
+        self.action_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn requesting_component(&self) -> &ComponentId {
+        &self.requesting_component
+    }
+
+    pub const fn kind(&self) -> &ActionKind {
+        &self.kind
+    }
+
+    pub const fn arguments(&self) -> &CanonicalValue {
+        &self.arguments
     }
 
     pub fn fingerprint(&self) -> ActionFingerprint {
