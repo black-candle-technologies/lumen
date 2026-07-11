@@ -1,0 +1,96 @@
+# Runtime Execution
+
+This document defines the authoritative lifecycle for agent runs and sensitive actions.
+
+## Core Entities
+
+- **Request context:** authenticated actor, channel, workspace, request ID, and trust metadata.
+- **Agent run:** one bounded model-and-tool loop with model, token, action, time, and cost budgets.
+- **Action proposal:** untrusted structured output from a model, user, job, or plugin.
+- **Action envelope:** runtime-normalized immutable description of an intended effect.
+- **Policy decision:** allow, deny, or require approval, plus policy version and reasons.
+- **Approval:** an authorization bound to an action fingerprint and use constraints.
+- **Execution attempt:** one isolated dispatch of an approved action.
+- **Result:** bounded structured output with outcome and redaction metadata.
+
+## Action Envelope
+
+Every action envelope includes:
+
+- Unique action ID and schema version
+- Run, workspace, actor, and requesting component IDs
+- Canonical action kind
+- Normalized arguments and resource identifiers
+- Required capabilities
+- Plugin artifact and effective-configuration hashes when applicable
+- Referenced-content hashes when the content determines the effect
+- Deadline, resource budget, and idempotency classification
+- Creation timestamp and parent action where applicable
+
+Canonical serialization produces the action fingerprint. Secret values are excluded; stable secret reference IDs are included.
+
+## State Machine
+
+An action moves through these states:
+
+```text
+proposed -> normalized -> evaluating
+evaluating -> denied
+evaluating -> approved
+evaluating -> awaiting_approval
+awaiting_approval -> rejected
+awaiting_approval -> expired
+awaiting_approval -> approved
+approved -> dispatching -> running
+running -> succeeded
+running -> failed
+running -> cancelled
+running -> timed_out
+running -> unknown
+```
+
+`approved` means both policy and any required human approval are valid. The runtime re-evaluates policy and recomputes the fingerprint during `dispatching`.
+
+## Agent Loop
+
+1. Persist the authenticated request and create a run with explicit budgets.
+2. Select the model under the routing policy.
+3. Assemble context with source and sensitivity metadata.
+4. Stream text output or parse a structured action proposal.
+5. Reject malformed or unavailable actions without invoking an executor.
+6. Normalize the proposal and persist its action envelope.
+7. Evaluate effective capabilities and policy.
+8. Deny, approve, or create an approval request.
+9. Dispatch only after the final fingerprint and policy checks pass.
+10. Bound, redact, and persist the result.
+11. Return the result to the model as untrusted content if budgets allow another turn.
+12. Finish the run with a terminal reason.
+
+The loop cannot exceed configured limits for model turns, actions, wall time, tokens, remote cost, or captured bytes.
+
+## Approval Concurrency
+
+Approval uses an atomic compare-and-set transition. Only a pending, unexpired request with a matching fingerprint may be granted. Consumption and dispatch reservation occur transactionally so concurrent workers cannot reuse a one-shot approval.
+
+## Execution And Recovery
+
+Before starting a side effect, the runtime persists an execution attempt and dispatch reservation. On success or known failure it records the terminal outcome. If the runtime loses contact after dispatch, the outcome is `unknown`.
+
+Automatic retry is allowed only when:
+
+- The action kind is declared idempotent.
+- Policy permits retry.
+- The retry remains within the original envelope and approval.
+- The executor supplies an idempotency key where the target supports one.
+
+Unknown non-idempotent actions require user reconciliation rather than blind retry.
+
+## Cancellation
+
+Cancellation stops further model turns, revokes pending dispatch reservations, sends protocol cancellation, and terminates the isolated process tree after a grace period. Cancellation is an outcome, not deletion; all prior records remain auditable.
+
+## Result Handling
+
+Results are schema-validated, byte-bounded, and scanned for known secret values before persistence or model reuse. Binary or large artifacts are stored separately with content hashes and references. Diagnostic stderr remains distinct from user-facing structured output.
+
+Tool results never directly alter identity, policy, approvals, plugin state, or runtime configuration.

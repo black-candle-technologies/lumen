@@ -1,94 +1,121 @@
 # Plugin System
 
-Plugins are central to Lumen. They are how the runtime grows without turning the core into a bundle of one-off integrations.
+Plugins extend Lumen without becoming part of its security kernel. They can describe and request capabilities, but only the runtime can grant authority, obtain approval, resolve secrets, execute sensitive host operations, and write authoritative audit events.
 
-## What Plugins Can Add
+## Extension Categories
 
-Plugins may provide:
+A plugin package may provide one or more typed components:
 
-- Model routers
-- Model providers
-- External chat platform adapters
-- Local tools
-- Workflow integrations
-- Custom agent capabilities
-- Scheduled job handlers
-- Approval-aware actions
+- Model provider adapter
+- Inbound or outbound channel adapter
+- Tool provider
+- Workflow integration
+- Scheduled-job handler
+- Skill bundle
+- User-interface metadata
 
-## Requirements
+These categories share installation and provenance metadata but do not share implicit permissions. A model provider does not gain filesystem access because another component in the same package declares a file tool.
 
-Every plugin should be:
+## Execution Types
 
-- **Explicitly installed:** The runtime should know what plugin is present and where it came from.
-- **Enableable and disableable:** Installed does not always mean active.
-- **Permissioned:** Plugins should only access the capabilities they have been granted.
-- **Audited:** Meaningful plugin actions should appear in the audit log.
-- **Hashed:** Lumen should record cryptographic hashes for plugin code/config involved in an action.
-- **Configurable by scope:** Settings may vary globally, by user, by workspace, or by agent.
+Lumen supports two third-party execution types:
 
-## Plugin Identity
+### WASM component
 
-A plugin should have a stable identity independent of its local directory name. At minimum, plugin metadata should include:
+Preferred for portable tools and transformations. The runtime exposes a narrow versioned host interface. Filesystem, network, clock, randomness, secrets, and other resources are available only through explicitly granted host capabilities.
 
-- Plugin ID
-- Human-readable name
-- Version
-- Description
-- Entrypoint or runtime type
-- Declared permissions
-- Hash or hash set
+### Supervised subprocess
 
-The exact manifest format is still open.
+Used for MCP servers, native binaries, model runners, and integrations that cannot fit the WASM host interface. The runtime starts the process with a minimal environment, explicit resource limits, an authenticated local protocol channel, and a platform sandbox profile.
 
-## Scoped Settings
+Native dynamic libraries and arbitrary in-process Rust plugins are not supported. Built-in Rust functionality is compiled as part of Lumen and is reviewed and released with the runtime rather than installed as a plugin.
 
-Plugin settings should support scoped configuration. A likely table shape:
+## Manifest
 
-```sql
-CREATE TABLE plugin_settings (
-  plugin_id TEXT NOT NULL,
-  scope_type TEXT NOT NULL,
-  scope_id TEXT NOT NULL,
-  config TEXT NOT NULL,
-  config_version INTEGER NOT NULL DEFAULT 1,
-  updated_at TEXT NOT NULL,
-  UNIQUE (plugin_id, scope_type, scope_id)
-);
+Every package contains a canonical `lumen-plugin.toml`. The initial schema is:
+
+```toml
+manifest_version = 1
+id = "dev.example.git-tools"
+name = "Git Tools"
+version = "1.2.0"
+description = "Workspace-scoped Git operations"
+
+[runtime]
+type = "wasm-component" # or "subprocess"
+entrypoint = "plugin.wasm"
+protocol_version = 1
+
+[[components]]
+id = "status"
+kind = "tool"
+description = "Read repository status"
+
+[[components.capabilities]]
+name = "fs.read"
+scope = "workspace"
+
+[integrity]
+algorithm = "sha256"
+artifact = "<hex digest>"
 ```
 
-Expected `scope_type` values:
+Manifests are parsed as structured data with unknown security-relevant fields rejected. Plugin ID is stable across versions and independent of directory name. Component IDs are stable within a plugin.
 
-- `global`
-- `user`
-- `workspace`
-- `agent`
+## Installation Lifecycle
 
-This allows one plugin to behave differently for different users, workspaces, agents, or default system settings.
+Installation is a staged transaction:
 
-## Audit Events
+1. Acquire the package into a quarantine directory.
+2. Parse and validate the manifest without executing plugin code.
+3. Compute hashes for the canonical manifest and every executable artifact.
+4. Record source provenance and signature information when available.
+5. Present requested capabilities and version changes for approval.
+6. Atomically install an immutable version directory.
+7. Create a disabled plugin-version record.
+8. Enable components only after grants and settings pass validation.
 
-Plugin-related audit events should capture:
+Updates install side by side and never replace an executing artifact. A changed executable, manifest, or effective configuration produces a new action fingerprint and invalidates prior approvals that depend on it. Uninstall disables the version first and removes files only after active runs have ended.
 
-- Plugin ID
-- Plugin version
-- Plugin hash
-- Requesting user or channel
-- Agent or job that invoked the plugin
-- Permission checked
-- Action attempted
-- Result
-- Systems touched
-- Approval request ID, when relevant
+Hashes establish artifact identity, not trust. Signatures establish publisher continuity only when the signer is trusted. Neither replaces sandboxing or least privilege.
 
-The audit trail should make it possible to answer: "What code or configuration caused this action?"
+## Capability Grants
 
-## Runtime Boundary
+Manifest capabilities are requests. Administrators grant a subset at global or workspace scope, and users may further restrict them for an agent or run. The runtime computes the intersection before each action.
 
-The plugin execution boundary is still undefined. Options include:
+Plugin-defined permission names are not allowed for host authority. Plugins may define descriptive feature flags, but all sensitive effects map to runtime-owned capability namespaces from [Security Model](SECURITY.md).
 
-- In-process Rust plugins for maximum performance and tight integration
-- Subprocess plugins for a clearer fault and security boundary
-- WASM plugins for portable sandboxing
-- MCP servers as plugin-backed external tools
+## Settings And Secrets
 
-The early implementation should choose the smallest boundary that supports safe local automation without making future sandboxing impossible.
+Settings support `global`, `workspace`, `user`, and `agent` scopes. Effective configuration is a deterministic merge from broadest to narrowest scope and is hashed for each action. Unknown keys and type mismatches are rejected against the plugin's versioned settings schema.
+
+Secret values are never stored in plugin settings. A setting may contain a secret reference, and the runtime resolves it only for an approved action with `secret.use` authority.
+
+## Protocol Boundary
+
+Both runtime types use a versioned request/response contract built around typed components and structured action proposals. Protocol messages have request IDs, deadlines, size limits, and cancellation. A plugin cannot ask the runtime to execute an arbitrary undeclared operation.
+
+The runtime is responsible for:
+
+- Authentication of the plugin process or instance
+- Schema validation
+- Capability evaluation
+- Approval handling
+- Secret resolution
+- Deadlines and resource limits
+- Audit emission
+- Result-size enforcement and redaction
+
+Plugin logs are diagnostic input and are never treated as audit truth.
+
+## Failure And Health
+
+Plugin crashes fail the current action without crashing the runtime. Restart policy is bounded and uses backoff. Repeated failures quarantine the component until an authorized user re-enables it. Non-idempotent actions are not retried automatically.
+
+## Skills
+
+Skill bundles contain versioned instructions and supporting resources. Skill content is hashed, attributed, scoped, and audited when loaded. Skills cannot call host APIs directly and cannot expand the capability set of the agent using them. A workflow-derived skill is disabled until reviewed and explicitly enabled.
+
+## MVP Boundary
+
+The first vertical slice defines the plugin contracts and uses built-in executors. Third-party installation and execution remain disabled until the policy, approval, sandbox, secret, and audit paths have integration tests. This prevents the extension ecosystem from solidifying around a bypassable early boundary.

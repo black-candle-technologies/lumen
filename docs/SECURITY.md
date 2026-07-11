@@ -1,79 +1,171 @@
 # Security Model
 
-Lumen is safe by default. The runtime should assume that agent actions need accountability, approval boundaries, and clear ownership.
+Lumen assumes that useful agents routinely process hostile content and occasionally produce incorrect or unsafe actions. Safety therefore comes from runtime-enforced authority boundaries, not from asking a model or plugin to behave safely.
 
-## Goals
+## Security Goals
 
-- Only approved users and channels can interact with the agent.
-- Risky tasks require explicit approval.
-- Every meaningful action is traceable.
-- Plugins run with declared and enforced permissions.
-- Local-first operation keeps user data close to user-owned infrastructure.
+- Accept requests only from authenticated and allowed identities and channels.
+- Grant least authority by workspace, actor, agent, plugin, tool, and resource.
+- Require meaningful approval for risky actions.
+- Prevent models and extensions from bypassing policy enforcement.
+- Keep local data local unless an explicit egress policy permits disclosure.
+- Limit the impact of compromised or malicious extensions.
+- Produce an attributable and tamper-evident history of meaningful activity.
+- Fail closed when identity, policy, approval, sandbox, or audit prerequisites are unavailable.
 
-## Identity and Allowlisting
+## Threat Model
 
-Chats and external requests should only be accepted from explicitly approved identities.
+### In scope
 
-Examples of allowlisted identities:
+Lumen is designed to resist or contain:
 
-- Local web users
-- Chat platform users
-- Chat channels
-- Workspace members
-- Service accounts
+- Prompt injection in websites, files, messages, email, and retrieved context
+- Malicious or malformed model output
+- A model attempting to exceed the user's request
+- Malicious, compromised, or vulnerable third-party plugins and skills
+- Unauthorized inbound users, channels, or service identities
+- Authenticated users attempting actions outside their workspace authority
+- Cross-workspace data disclosure through runtime APIs or stored state
+- Plugin supply-chain substitution or unreviewed upgrades
+- Secret disclosure through prompts, logs, tool results, URLs, or process environments
+- Network access outside an action's declared destination scope
+- Filesystem access outside declared workspace paths
+- Approval replay, mutation after approval, and time-of-check/time-of-use mistakes
+- Runaway tools, process trees, output floods, and resource exhaustion within configured limits
 
-The runtime should reject unknown users and channels by default.
+### Out of scope
 
-## Approval Gates
+Lumen does not protect against:
 
-Risky actions should require explicit approval before execution.
+- A compromised operating-system kernel
+- A malicious or compromised operating-system administrator
+- An attacker with unrestricted access as the operating-system account running Lumen
+- Physical attacks on an unlocked machine
+- Hardware, firmware, hypervisor, or CPU compromise
+- Denial of service against dependencies outside Lumen's control
 
-Examples:
+Lumen still avoids unnecessary privilege and protects stored secrets at rest where the platform permits, but it does not claim a security boundary against the host that owns the process.
 
-- Writing to external systems
-- Sending messages to other people
-- Running shell commands
-- Installing or updating plugins
-- Changing permissions
-- Deleting or overwriting data
-- Scheduling recurring jobs
-- Touching production systems
+## Trust Assumptions
 
-Approval records should be connected to the final audit event.
+Trusted components are limited to:
 
-## Audit Trail
+- The Lumen runtime core and its compiled-in policy enforcement
+- The active policy and boot configuration selected by an authorized administrator
+- The configured local secret-store implementation
+- The operating system under the out-of-scope assumptions above
 
-The audit log should capture:
+Models, provider endpoints, plugins, skills, external content, channel payloads, browser content, and tool results are untrusted.
 
-- What happened
-- When it happened
-- Who requested it
-- Which agent, job, plugin, or tool acted
-- Which plugin hash or version was involved
-- What permission checks were performed
-- What systems were touched
-- Whether approval was requested and granted
-- Whether the action succeeded or failed
+## Identity And Workspaces
 
-The audit trail is a core product feature, not an afterthought.
+Every request has a structured identity containing provider, stable subject ID, channel identity where applicable, and authenticated attributes. Display names are never authorization identifiers.
 
-## Plugin Security
+Authorization is workspace-scoped:
 
-Plugins should declare required permissions. The runtime should enforce those permissions before plugin actions can touch sensitive resources.
+- Unknown identities and channels are denied by default.
+- Membership and role do not automatically grant tool capabilities.
+- Channel adapters must authenticate before constructing a core request.
+- Forwarded identity assertions require a configured trusted proxy.
+- Local desktop access does not imply administrator authority.
+- Service identities used by scheduled jobs have explicit grants and owners.
 
-Plugin records should include cryptographic hashes so Lumen can verify what plugin code/config was used when an action happened.
+The initial release supports a local identity and one or more workspaces, but not hostile multi-tenant isolation between operating-system accounts.
 
-## Local Secrets
+## Capability Model
 
-Secrets should not be stored in plain runtime settings unless there is no safer option. The first implementation should define a local secret storage approach before plugins need API keys or credentials.
+Permissions are structured capabilities, not free-form strings interpreted by plugins. A capability contains:
 
-Possible approaches:
+- Namespace and operation, such as `fs.read`, `process.spawn`, or `net.connect`
+- Resource scope, such as a canonical path, executable digest, or destination origin
+- Principal scope, such as user, workspace, agent, plugin, or job
+- Constraints, such as read-only access, argument patterns, byte limits, or expiry
+- Provenance identifying who granted it and under which policy version
 
-- OS keychain integration
-- Encrypted local secrets file
-- Environment variables for bootstrap-only secrets
-- External secret manager plugin
+The effective capability set is the intersection of actor, workspace, agent, plugin, tool, and run constraints. A plugin's manifest declaration is a request for authority, not a grant.
 
-## Non-Goals
+Initial capability namespaces are:
 
-Lumen should not assume that local-first means security is automatic. Local execution reduces exposure to hosted services, but it does not remove the need for permissions, approvals, isolation, and auditing.
+- `fs.read`, `fs.write`, and `fs.delete`
+- `process.spawn`
+- `net.connect`
+- `secret.use`
+- `message.send`
+- `schedule.create` and `schedule.modify`
+- `plugin.install`, `plugin.update`, and `plugin.enable`
+- `policy.modify`
+
+Capabilities are deny-by-default and must be checked again immediately before execution.
+
+## Approval Model
+
+Approvals supplement policy; they do not replace it. The approval screen must show the actual effect rather than a vague risk label.
+
+An approval binds:
+
+- The canonical action type and normalized arguments
+- Resource identifiers, paths, command, working directory, and destination as applicable
+- Relevant environment names, excluding secret values
+- Hashes of referenced scripts or files when their contents determine the action
+- Plugin ID, version, executable hash, and effective configuration hash
+- Requesting identity, workspace, run, and policy version
+- Creation time, expiry, and allowed use count
+
+The runtime recomputes this fingerprint immediately before execution. Any material change invalidates the approval. Approval is one-shot by default. Reusable grants require an explicit narrow scope and expiration.
+
+Approval is mandatory by default for writes outside a disposable workspace, process execution, external messages, plugin changes, permission changes, recurring jobs, destructive operations, and remote-system mutations.
+
+## Prompt Injection And Confused Deputies
+
+Lumen assumes that content can instruct the model to misuse legitimate capabilities. Content-origin labels are retained when context is assembled, but labels and prompt warnings are advisory rather than enforcement.
+
+Defenses are structural:
+
+- Retrieved content cannot grant capabilities.
+- A model cannot approve its own action.
+- Tool results cannot alter policy or approval state.
+- The runtime evaluates the authenticated principal and intended resource, not only the model's proposed tool name.
+- Sensitive actions require an exact action preview and, where policy requires, human confirmation.
+- Secrets are resolved after policy evaluation so they need not enter model context.
+- Results are bounded and treated as untrusted on re-entry into the agent loop.
+
+## Isolation And Resource Control
+
+Third-party execution occurs in WASM or a supervised subprocess. The sandbox backend applies the strongest supported platform restrictions and reports its effective guarantees. Policy can require a minimum sandbox strength; the runtime denies execution if that strength is unavailable.
+
+Each action receives explicit limits for:
+
+- Wall-clock deadline
+- CPU and memory where supported
+- Output bytes
+- Filesystem roots and access modes
+- Network destinations
+- Child-process creation
+- Environment variables
+- Cancellation and process-tree termination
+
+The Linux backend should combine process isolation with kernel-enforced restrictions such as namespaces, resource controls, seccomp, and Landlock where available. Other platforms use platform-specific backends without pretending their guarantees are identical.
+
+## Network Egress
+
+Network access is a capability. It is disabled for sandboxed actions unless granted for explicit destination origins. Policy evaluates normalized scheme, host, port, and resolved-address constraints and defends against redirects and DNS rebinding at connection time.
+
+Remote model requests are network egress and follow [Model Routing](MODEL_ROUTING.md). Loopback is not automatically trusted: local services still require an explicit endpoint configuration.
+
+## Secrets
+
+The first implementation uses the operating-system keychain through a `SecretStore` interface. SQL and configuration contain opaque secret references only. Environment variables are permitted only to bootstrap the secret store or for explicitly configured development use.
+
+Executors request a secret by reference after policy and approval checks. Secret values are scoped to the single action, omitted from audit payloads, and redacted from captured output using known-value fingerprints. Redaction is defense in depth, not permission to expose secrets broadly.
+
+## Policy Administration
+
+Policy changes are authenticated, authorized, approved when they expand authority, versioned, and audited. Runs retain the policy version and decision record used for every action. Revocation prevents new actions immediately; running actions are cancelled when the revoked capability is material to their execution.
+
+## Failure Behavior
+
+Lumen fails closed when it cannot authenticate a request, load policy, verify an approval, satisfy a required sandbox profile, access required audit persistence, or resolve a scoped secret. A crash after dispatch but before outcome recording is represented as an `unknown` outcome and is never automatically retried unless the action is declared idempotent.
+
+## Security Validation
+
+Security-sensitive code requires tests for deny-by-default behavior, scope intersection, approval mutation and replay, path canonicalization, redirect and destination enforcement, secret redaction, plugin hash changes, revocation, audit continuity, crash recovery, and resource-limit enforcement.
