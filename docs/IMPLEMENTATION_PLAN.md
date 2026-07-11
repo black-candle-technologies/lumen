@@ -56,11 +56,11 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-core/src/{identity,capability,action,policy}.rs`, `crates/lumen-core/src/lib.rs`
 
-- [ ] Write unit tests for canonical action fingerprints, resource scopes, capability intersection, and deny-by-default policy.
-- [ ] Run `cargo test -p lumen-core` and confirm the tests fail for missing behavior.
-- [ ] Implement typed identities, action envelopes, capability scopes, and policy decisions without infrastructure dependencies.
-- [ ] Run `cargo test -p lumen-core` and confirm the tests pass.
-- [ ] Commit as `feat(core): define action and capability model`.
+- [x] Write unit tests for canonical action fingerprints, resource scopes, capability intersection, and deny-by-default policy.
+- [x] Run `cargo test -p lumen-core` and confirm the tests fail for missing behavior.
+- [x] Implement typed identities, action envelopes, capability scopes, and policy decisions without infrastructure dependencies.
+- [x] Run `cargo test -p lumen-core` and confirm the tests pass.
+- [x] Commit as `feat(core): define action and capability model`.
 
 ## Task 2: Approval State Machine
 
