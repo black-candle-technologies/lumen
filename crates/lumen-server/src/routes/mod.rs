@@ -1,0 +1,264 @@
+use std::str::FromStr;
+
+use axum::{
+    Extension, Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response, Sse},
+    routing::{get, post},
+};
+use lumen_core::{
+    action::RunId,
+    approval::ApprovalId,
+    identity::{PrincipalId, WorkspaceId},
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{
+    ApiState, ApprovalDecision, ApprovalDecisionCommand, AuditQuery, CreateRunCommand, ServiceError,
+};
+
+pub fn router(state: ApiState) -> Router {
+    Router::new()
+        .route("/api/v1/workspaces/{workspace_id}/runs", post(create_run))
+        .route(
+            "/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/decision",
+            post(decide_approval),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/{run_id}/events",
+            get(run_events),
+        )
+        .route("/api/v1/workspaces/{workspace_id}/audit", get(list_audit))
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .with_state(state)
+}
+
+async fn authenticate(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let Some(principal) = state.authenticate(authorization) else {
+        return ApiError::Unauthorized.into_response();
+    };
+    request.extensions_mut().insert(principal);
+    next.run(request).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRunBody {
+    prompt: String,
+}
+
+async fn create_run(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    Json(body): Json<CreateRunBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    if body.prompt.trim().is_empty() || body.prompt.len() > 256 * 1024 {
+        return Err(ApiError::BadRequest("prompt is empty or too large".into()));
+    }
+    let result = state
+        .service
+        .create_run(CreateRunCommand::new(workspace_id, actor, body.prompt))
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(result)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalDecisionBody {
+    decision: ApprovalDecision,
+}
+
+async fn decide_approval(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path((workspace, approval)): Path<(String, String)>,
+    Json(body): Json<ApprovalDecisionBody>,
+) -> Result<Json<crate::ApprovalResult>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let approval_id = parse_approval(&approval)?;
+    let result = state
+        .service
+        .decide_approval(ApprovalDecisionCommand::new(
+            workspace_id,
+            approval_id,
+            actor,
+            body.decision,
+        ))
+        .await?;
+    Ok(Json(result))
+}
+
+async fn run_events(
+    State(state): State<ApiState>,
+    Path((workspace, run)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let run_id = parse_run(&run)?;
+    let after = headers
+        .get("last-event-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::BadRequest("invalid Last-Event-ID".into()))?
+                .parse::<u64>()
+                .map_err(|_| ApiError::BadRequest("invalid Last-Event-ID".into()))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(Sse::new(state.events.subscribe(
+        workspace_id,
+        run_id,
+        after,
+    )))
+}
+
+#[derive(Deserialize)]
+struct AuditParameters {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_audit_limit")]
+    limit: u16,
+}
+
+const fn default_audit_limit() -> u16 {
+    100
+}
+
+#[derive(Serialize)]
+struct AuditResponse {
+    events: Vec<crate::AuditEntry>,
+}
+
+async fn list_audit(
+    State(state): State<ApiState>,
+    Path(workspace): Path<String>,
+    Query(parameters): Query<AuditParameters>,
+) -> Result<Json<AuditResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    if parameters.after < 0 || parameters.limit == 0 || parameters.limit > 200 {
+        return Err(ApiError::BadRequest("invalid audit page bounds".into()));
+    }
+    let events = state
+        .service
+        .list_audit(AuditQuery::new(
+            workspace_id,
+            parameters.after,
+            parameters.limit,
+        ))
+        .await?;
+    Ok(Json(AuditResponse { events }))
+}
+
+fn ensure_workspace(state: &ApiState, workspace_id: WorkspaceId) -> Result<(), ApiError> {
+    if state.allows_workspace(workspace_id) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+fn parse_workspace(value: &str) -> Result<WorkspaceId, ApiError> {
+    parse_uuid(value).map(WorkspaceId::from_uuid)
+}
+
+fn parse_run(value: &str) -> Result<RunId, ApiError> {
+    parse_uuid(value).map(RunId::from_uuid)
+}
+
+fn parse_approval(value: &str) -> Result<ApprovalId, ApiError> {
+    parse_uuid(value).map(ApprovalId::from_uuid)
+}
+
+fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
+    Uuid::from_str(value).map_err(|_| ApiError::BadRequest("invalid resource identifier".into()))
+}
+
+#[derive(Debug)]
+enum ApiError {
+    Unauthorized,
+    Forbidden,
+    BadRequest(String),
+    Service(ServiceError),
+}
+
+impl From<ServiceError> for ApiError {
+    fn from(error: ServiceError) -> Self {
+        Self::Service(error)
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    code: &'static str,
+    message: String,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "local authentication failed".to_owned(),
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "workspace_forbidden",
+                "workspace is not allowlisted".to_owned(),
+            ),
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
+            Self::Service(ServiceError::NotFound) => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "resource was not found".to_owned(),
+            ),
+            Self::Service(ServiceError::Conflict(message)) => {
+                (StatusCode::CONFLICT, "conflict", message)
+            }
+            Self::Service(ServiceError::Unavailable(message)) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
+            }
+            Self::Service(ServiceError::Internal(_)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "runtime service failed".to_owned(),
+            ),
+        };
+        let mut response = (
+            status,
+            Json(ErrorEnvelope {
+                error: ErrorBody { code, message },
+            }),
+        )
+            .into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
+    }
+}

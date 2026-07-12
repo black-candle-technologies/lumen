@@ -121,12 +121,12 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-server/src/{lib,state,sse}.rs`, `crates/lumen-server/src/routes/*`
 
-- [ ] Write route tests for local authentication, workspace rejection, run creation, approval grant/reject, SSE replay, audit listing, and direct-dispatch rejection.
-- [ ] Confirm route tests fail before implementation.
-- [ ] Implement Axum handlers as adapters over the core application service.
-- [ ] Ensure no handler can construct an approved execution attempt directly.
-- [ ] Run `cargo test -p lumen-server` and confirm tests pass.
-- [ ] Commit as `feat(server): expose secured local runtime API`.
+- [x] Write route tests for local authentication, workspace rejection, run creation, approval grant/reject, SSE replay, audit listing, and direct-dispatch rejection.
+- [x] Confirm route tests fail before implementation.
+- [x] Implement Axum handlers as adapters over the core application service.
+- [x] Ensure no handler can construct an approved execution attempt directly.
+- [x] Run `cargo test -p lumen-server` and confirm tests pass.
+- [x] Commit as `feat(server): expose secured local runtime API`.
 
 ## Task 8: Configuration And Process Composition
 
