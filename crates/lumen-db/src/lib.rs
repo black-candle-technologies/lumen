@@ -9,7 +9,7 @@ use std::path::Path;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
-pub use repositories::DispatchReservation;
+pub use repositories::{DispatchReservation, PendingApprovalView};
 
 #[derive(Clone, Debug)]
 pub struct Database {

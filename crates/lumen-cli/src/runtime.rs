@@ -7,10 +7,10 @@ use std::{
 use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ApprovalState, ExecutionAttemptId, TimestampMillis},
-    audit::AuditEvent,
+    audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
     executor::ExecutorPort,
-    model::ModelPort,
+    model::{ModelError, ModelFuture, ModelInput, ModelPort},
     policy::{Policy, PolicyVersion},
     run::{
         ActionNormalizer, ApprovalFuture, ApprovalPort, ApprovalPortError, ApprovalResolution,
@@ -26,10 +26,12 @@ use lumen_integrations::{
     sandbox::SandboxBackend,
 };
 use lumen_server::{
-    ApprovalDecision, ApprovalDecisionCommand, ApprovalResult, AuditEntry, AuditQuery,
-    CreateRunCommand, EventBroker, RunCreated, RuntimeService, ServiceError, ServiceFuture,
+    ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
+    AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand, EventBroker, RunCancellation,
+    RunCreated, RuntimeService, ServiceError, ServiceFuture,
 };
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::{CliError, config::Config};
 
@@ -47,6 +49,8 @@ pub(crate) struct LocalRuntimeService {
     capabilities: EffectiveCapabilities,
     budget: RunBudget,
     runs: Arc<Mutex<BTreeMap<RunId, StoredRun>>>,
+    cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
+    run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -114,6 +118,8 @@ impl LocalRuntimeService {
             capabilities: EffectiveCapabilities::new([CapabilitySet::new(grants)]),
             budget: RunBudget::new(config.runtime.max_model_turns, config.runtime.max_actions),
             runs: Arc::new(Mutex::new(BTreeMap::new())),
+            cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+            run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -148,8 +154,19 @@ impl LocalRuntimeService {
             .database
             .update_run_state(run_id, "running", None)
             .await;
+        let cancellation = self
+            .cancellations
+            .lock()
+            .await
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
+        let model = CancellableModel {
+            inner: self.model.as_ref(),
+            cancellation: cancellation.clone(),
+        };
         let orchestrator = RunOrchestrator::new(
-            self.model.as_ref(),
+            &model,
             self.normalizer.as_ref(),
             self.executor.as_ref(),
             self.approvals.as_ref(),
@@ -187,21 +204,56 @@ impl LocalRuntimeService {
                 let _ = self
                     .events
                     .publish(stored.workspace_id, run_id, kind, payload);
+                self.finish_run(run_id).await;
             }
             Err(error) => {
                 let timestamp = now();
+                if cancellation.is_cancelled() {
+                    let _ = self
+                        .audit
+                        .record(AuditEvent::new(
+                            AuditEventId::new(),
+                            timestamp,
+                            AuditEventKind::RunCancelled,
+                            AuditOutcome::Failure,
+                            Some(stored.workspace_id),
+                            CanonicalValue::object([(
+                                "run_id",
+                                CanonicalValue::from(run_id.to_string()),
+                            )]),
+                        ))
+                        .await;
+                }
                 let _ = self
                     .database
-                    .update_run_state(run_id, "failed", Some(timestamp))
+                    .update_run_state(
+                        run_id,
+                        if cancellation.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        },
+                        Some(timestamp),
+                    )
                     .await;
                 let _ = self.events.publish(
                     stored.workspace_id,
                     run_id,
-                    "run.failed",
+                    if cancellation.is_cancelled() {
+                        "run.cancelled"
+                    } else {
+                        "run.failed"
+                    },
                     CanonicalValue::from(error.to_string()),
                 );
+                self.finish_run(run_id).await;
             }
         }
+    }
+
+    async fn finish_run(&self, run_id: RunId) {
+        self.cancellations.lock().await.remove(&run_id);
+        self.run_workspaces.lock().await.remove(&run_id);
     }
 }
 
@@ -227,6 +279,16 @@ impl RuntimeService for LocalRuntimeService {
                     state,
                 },
             );
+            service
+                .cancellations
+                .lock()
+                .await
+                .insert(run_id, CancellationToken::new());
+            service
+                .run_workspaces
+                .lock()
+                .await
+                .insert(run_id, command.workspace_id());
             service
                 .events
                 .publish(
@@ -293,6 +355,84 @@ impl RuntimeService for LocalRuntimeService {
                     ))
                 })
                 .collect()
+        })
+    }
+
+    fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>> {
+        Box::pin(async move {
+            self.database
+                .list_pending_approvals(query.workspace_id())
+                .await
+                .map_err(repository_service_error)
+                .map(|approvals| {
+                    approvals
+                        .into_iter()
+                        .map(|approval| {
+                            ApprovalPreview::new(
+                                approval.approval_id(),
+                                approval.run_id(),
+                                approval.kind(),
+                                approval.arguments().clone(),
+                                approval.capabilities().to_vec(),
+                                approval.fingerprint(),
+                                approval.created_at(),
+                                approval.expires_at(),
+                            )
+                        })
+                        .collect()
+                })
+        })
+    }
+
+    fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation> {
+        let service = self.clone();
+        Box::pin(async move {
+            let workspace = service
+                .run_workspaces
+                .lock()
+                .await
+                .get(&command.run_id())
+                .copied()
+                .ok_or(ServiceError::NotFound)?;
+            if workspace != command.workspace_id() {
+                return Err(ServiceError::NotFound);
+            }
+            let cancellation = service
+                .cancellations
+                .lock()
+                .await
+                .get(&command.run_id())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            cancellation.cancel();
+            let should_advance = {
+                let mut runs = service.runs.lock().await;
+                runs.get_mut(&command.run_id()).is_some_and(|stored| {
+                    stored.state.cancel();
+                    true
+                })
+            };
+            if should_advance {
+                service.spawn_advance(command.run_id()).await;
+            }
+            Ok(RunCancellation::new(command.run_id()))
+        })
+    }
+}
+
+struct CancellableModel<'a> {
+    inner: &'a dyn ModelPort,
+    cancellation: CancellationToken,
+}
+
+impl ModelPort for CancellableModel<'_> {
+    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => Err(ModelError::new("model request cancelled")),
+                result = self.inner.generate(input) => result,
+            }
         })
     }
 }

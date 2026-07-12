@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ApiState, ApprovalDecision, ApprovalDecisionCommand, AuditQuery, CreateRunCommand, ServiceError,
+    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
+    CancelRunCommand, CreateRunCommand, ServiceError,
 };
 
 pub fn router(state: ApiState) -> Router {
@@ -26,6 +27,14 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/decision",
             post(decide_approval),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/approvals",
+            get(list_approvals),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/{run_id}/cancel",
+            post(cancel_run),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/runs/{run_id}/events",
@@ -101,6 +110,40 @@ async fn decide_approval(
         ))
         .await?;
     Ok(Json(result))
+}
+
+#[derive(Serialize)]
+struct ApprovalListResponse {
+    approvals: Vec<crate::ApprovalPreview>,
+}
+
+async fn list_approvals(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<ApprovalListResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let approvals = state
+        .service
+        .list_approvals(ApprovalQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(ApprovalListResponse { approvals }))
+}
+
+async fn cancel_run(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path((workspace, run)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let run_id = parse_run(&run)?;
+    let result = state
+        .service
+        .cancel_run(CancelRunCommand::new(workspace_id, run_id, actor))
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(result)))
 }
 
 async fn run_events(

@@ -22,6 +22,8 @@ pub trait RuntimeService: Send + Sync {
         command: ApprovalDecisionCommand,
     ) -> ServiceFuture<'_, ApprovalResult>;
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>>;
+    fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>>;
+    fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation>;
 }
 
 #[derive(Clone)]
@@ -172,6 +174,110 @@ impl ApprovalDecisionCommand {
 pub struct ApprovalResult {
     approval_id: ApprovalId,
     decision: ApprovalDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl ApprovalQuery {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApprovalPreview {
+    approval_id: ApprovalId,
+    run_id: RunId,
+    kind: String,
+    arguments: CanonicalValue,
+    capabilities: Vec<CanonicalValue>,
+    fingerprint: String,
+    created_at: TimestampMillis,
+    expires_at: TimestampMillis,
+}
+
+impl ApprovalPreview {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        approval_id: ApprovalId,
+        run_id: RunId,
+        kind: impl Into<String>,
+        arguments: CanonicalValue,
+        capabilities: Vec<CanonicalValue>,
+        fingerprint: impl Into<String>,
+        created_at: TimestampMillis,
+        expires_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            approval_id,
+            run_id,
+            kind: kind.into(),
+            arguments,
+            capabilities,
+            fingerprint: fingerprint.into(),
+            created_at,
+            expires_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelRunCommand {
+    workspace_id: WorkspaceId,
+    run_id: RunId,
+    actor: PrincipalId,
+}
+
+impl CancelRunCommand {
+    pub(crate) const fn new(workspace_id: WorkspaceId, run_id: RunId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            run_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct RunCancellation {
+    run_id: RunId,
+    state: &'static str,
+}
+
+impl RunCancellation {
+    pub const fn new(run_id: RunId) -> Self {
+        Self {
+            run_id,
+            state: "cancellation_requested",
+        }
+    }
 }
 
 impl ApprovalResult {

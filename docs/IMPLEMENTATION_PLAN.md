@@ -143,11 +143,11 @@ apps/web/src/routes/
 
 **Files:** `apps/web/src/routes/+page.svelte`, `apps/web/src/routes/approvals/*`, `apps/web/src/routes/audit/*`
 
-- [ ] Write component and browser tests for chat streaming, exact approval preview, changed-action invalidation, cancellation, and audit inspection.
-- [ ] Confirm tests fail before implementation.
-- [ ] Implement the chat, approval, and audit workflows without adding unrelated dashboard features.
-- [ ] Run `pnpm check:web`, frontend tests, and Playwright at desktop and mobile viewports.
-- [ ] Commit as `feat(web): add chat approvals and audit views`.
+- [x] Write component and browser tests for chat streaming, exact approval preview, changed-action invalidation, cancellation, and audit inspection.
+- [x] Confirm tests fail before implementation.
+- [x] Implement the chat, approval, and audit workflows without adding unrelated dashboard features.
+- [x] Run `pnpm check:web`, frontend tests, and Playwright at desktop and mobile viewports.
+- [x] Commit as `feat(web): add chat approvals and audit views`.
 
 ## Task 10: End-To-End Security Verification
 

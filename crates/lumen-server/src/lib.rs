@@ -7,6 +7,7 @@ mod state;
 pub use routes::router;
 pub use sse::{EventBroker, EventBrokerError, RunEvent};
 pub use state::{
-    ApiState, ApiStateError, ApprovalDecision, ApprovalDecisionCommand, ApprovalResult, AuditEntry,
-    AuditQuery, CreateRunCommand, RunCreated, RuntimeService, ServiceError, ServiceFuture,
+    ApiState, ApiStateError, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview,
+    ApprovalQuery, ApprovalResult, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand,
+    RunCancellation, RunCreated, RuntimeService, ServiceError, ServiceFuture,
 };

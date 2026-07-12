@@ -16,8 +16,9 @@ use lumen_core::{
     identity::{PrincipalId, WorkspaceId},
 };
 use lumen_server::{
-    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalResult, AuditEntry, AuditQuery,
-    CreateRunCommand, EventBroker, RunCreated, RuntimeService, ServiceFuture, router,
+    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
+    ApprovalResult, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand, EventBroker,
+    RunCancellation, RunCreated, RuntimeService, ServiceFuture, router,
 };
 use tower::ServiceExt;
 
@@ -29,6 +30,9 @@ struct FakeService {
     approval_commands: Mutex<Vec<ApprovalDecisionCommand>>,
     audit_queries: Mutex<Vec<AuditQuery>>,
     audit_entries: Mutex<Vec<AuditEntry>>,
+    approval_queries: Mutex<Vec<ApprovalQuery>>,
+    approval_previews: Mutex<Vec<ApprovalPreview>>,
+    cancellation_commands: Mutex<Vec<CancelRunCommand>>,
 }
 
 impl RuntimeService for FakeService {
@@ -60,6 +64,28 @@ impl RuntimeService for FakeService {
             .push(query);
         let entries = self.audit_entries.lock().expect("audit entries").clone();
         Box::pin(async move { Ok(entries) })
+    }
+
+    fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>> {
+        self.approval_queries
+            .lock()
+            .expect("approval queries")
+            .push(query);
+        let approvals = self
+            .approval_previews
+            .lock()
+            .expect("approval previews")
+            .clone();
+        Box::pin(async move { Ok(approvals) })
+    }
+
+    fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation> {
+        let run_id = command.run_id();
+        self.cancellation_commands
+            .lock()
+            .expect("cancellation commands")
+            .push(command);
+        Box::pin(async move { Ok(RunCancellation::new(run_id)) })
     }
 }
 
@@ -326,6 +352,74 @@ async fn audit_listing_is_workspace_scoped_and_bounded() {
     assert_eq!(queries[0].workspace_id(), workspace_id);
     assert_eq!(queries[0].after(), 5);
     assert_eq!(queries[0].limit(), 10);
+}
+
+#[tokio::test]
+async fn approval_listing_returns_exact_action_previews() {
+    let workspace_id = WorkspaceId::new();
+    let approval_id = ApprovalId::new();
+    let run_id = RunId::new();
+    let (app, service, _) = test_app(workspace_id);
+    service
+        .approval_previews
+        .lock()
+        .expect("approval previews")
+        .push(ApprovalPreview::new(
+            approval_id,
+            run_id,
+            "process.spawn",
+            CanonicalValue::object([("program", CanonicalValue::from("/bin/echo"))]),
+            vec![CanonicalValue::object([(
+                "name",
+                CanonicalValue::from("process.spawn"),
+            )])],
+            "a".repeat(64),
+            TimestampMillis::new(10),
+            TimestampMillis::new(20),
+        ));
+
+    let response = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/approvals"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["approvals"][0]["kind"], "process.spawn");
+    assert_eq!(body["approvals"][0]["arguments"]["program"], "/bin/echo");
+    assert_eq!(body["approvals"][0]["fingerprint"], "a".repeat(64));
+    let queries = service.approval_queries.lock().expect("approval queries");
+    assert_eq!(queries[0].workspace_id(), workspace_id);
+    assert_eq!(queries[0].actor().subject(), "operator");
+}
+
+#[tokio::test]
+async fn run_cancellation_is_forwarded_to_the_runtime_service() {
+    let workspace_id = WorkspaceId::new();
+    let run_id = RunId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/runs/{run_id}/cancel"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let commands = service
+        .cancellation_commands
+        .lock()
+        .expect("cancellation commands");
+    assert_eq!(commands[0].workspace_id(), workspace_id);
+    assert_eq!(commands[0].run_id(), run_id);
+    assert_eq!(commands[0].actor().subject(), "operator");
 }
 
 #[tokio::test]

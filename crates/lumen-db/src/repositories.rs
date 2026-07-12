@@ -1,10 +1,12 @@
 use lumen_core::{
-    action::{ActionEnvelope, ActionFingerprint, ActionId},
+    action::{ActionEnvelope, ActionFingerprint, ActionId, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
     identity::PrincipalId,
     identity::WorkspaceId,
     policy::PolicyVersion,
 };
+use sqlx::Row;
+use uuid::Uuid;
 
 use crate::{Database, RepositoryError, timestamp_to_i64};
 
@@ -35,6 +37,52 @@ impl DispatchReservation {
             policy_version,
             reserved_at,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingApprovalView {
+    approval_id: ApprovalId,
+    run_id: RunId,
+    kind: String,
+    arguments: CanonicalValue,
+    capabilities: Vec<CanonicalValue>,
+    fingerprint: String,
+    created_at: TimestampMillis,
+    expires_at: TimestampMillis,
+}
+
+impl PendingApprovalView {
+    pub const fn approval_id(&self) -> ApprovalId {
+        self.approval_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub const fn arguments(&self) -> &CanonicalValue {
+        &self.arguments
+    }
+
+    pub fn capabilities(&self) -> &[CanonicalValue] {
+        &self.capabilities
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub const fn created_at(&self) -> TimestampMillis {
+        self.created_at
+    }
+
+    pub const fn expires_at(&self) -> TimestampMillis {
+        self.expires_at
     }
 }
 
@@ -296,6 +344,49 @@ impl Database {
         Ok(())
     }
 
+    pub async fn list_pending_approvals(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<PendingApprovalView>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT approvals.id AS approval_id, actions.run_id, actions.kind,
+                    actions.arguments_json, actions.capabilities_json,
+                    approvals.action_fingerprint, approvals.created_at, approvals.expires_at
+             FROM approval_requests AS approvals
+             JOIN actions ON actions.id = approvals.action_id
+             WHERE actions.workspace_id = ? AND approvals.state = 'pending'
+             ORDER BY approvals.created_at, approvals.id",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let approval_id = parse_uuid(
+                    row.try_get::<String, _>("approval_id")?,
+                    ApprovalId::from_uuid,
+                )?;
+                let run_id = parse_uuid(row.try_get::<String, _>("run_id")?, RunId::from_uuid)?;
+                let created_at = u64::try_from(row.try_get::<i64, _>("created_at")?)
+                    .map_err(|_| RepositoryError::TimestampOutOfRange)?;
+                let expires_at = u64::try_from(row.try_get::<i64, _>("expires_at")?)
+                    .map_err(|_| RepositoryError::TimestampOutOfRange)?;
+                Ok(PendingApprovalView {
+                    approval_id,
+                    run_id,
+                    kind: row.try_get("kind")?,
+                    arguments: serde_json::from_str(&row.try_get::<String, _>("arguments_json")?)?,
+                    capabilities: serde_json::from_str(
+                        &row.try_get::<String, _>("capabilities_json")?,
+                    )?,
+                    fingerprint: row.try_get("action_fingerprint")?,
+                    created_at: TimestampMillis::new(created_at),
+                    expires_at: TimestampMillis::new(expires_at),
+                })
+            })
+            .collect()
+    }
+
     pub async fn reserve_execution(
         &self,
         reservation: DispatchReservation,
@@ -340,4 +431,10 @@ impl Database {
         transaction.commit().await?;
         Ok(())
     }
+}
+
+fn parse_uuid<T>(value: String, constructor: impl FnOnce(Uuid) -> T) -> Result<T, RepositoryError> {
+    Uuid::parse_str(&value)
+        .map(constructor)
+        .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))
 }
