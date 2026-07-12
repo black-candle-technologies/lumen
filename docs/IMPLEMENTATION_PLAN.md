@@ -87,12 +87,12 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-core/src/{model,executor,run}.rs`
 
-- [ ] Write async tests using fake model, executor, approval, and audit ports.
-- [ ] Cover text completion, denied action, approval pause/resume, budget exhaustion, cancellation, executor failure, and unknown outcome.
-- [ ] Run the focused tests and confirm they fail.
-- [ ] Implement the bounded agent loop and non-bypassable dispatch sequence.
-- [ ] Run `cargo test -p lumen-core` and confirm all tests pass.
-- [ ] Commit as `feat(core): orchestrate policy-bound agent runs`.
+- [x] Write async tests using fake model, executor, approval, and audit ports.
+- [x] Cover text completion, denied action, approval pause/resume, budget exhaustion, cancellation, executor failure, and unknown outcome.
+- [x] Run the focused tests and confirm they fail.
+- [x] Implement the bounded agent loop and non-bypassable dispatch sequence.
+- [x] Run `cargo test -p lumen-core` and confirm all tests pass.
+- [x] Commit as `feat(core): orchestrate policy-bound agent runs`.
 
 ## Task 5: Local Model Integration
 

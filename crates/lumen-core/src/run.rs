@@ -1,0 +1,607 @@
+use std::{future::Future, pin::Pin};
+
+use thiserror::Error;
+
+use crate::{
+    action::{ActionEnvelope, CanonicalValue, RunId},
+    approval::{ApprovalId, ApprovalRequest, DispatchError, TimestampMillis, authorize_dispatch},
+    audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
+    capability::EffectiveCapabilities,
+    executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorPort},
+    identity::{PrincipalId, WorkspaceId},
+    model::{
+        ActionProposal, ModelError, ModelInput, ModelMessage, ModelOutput, ModelPort, ModelRole,
+    },
+    policy::{DenialReason, Policy, PolicyDecision, PolicyVersion},
+};
+
+pub type ApprovalFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ApprovalResolution, ApprovalPortError>> + Send + 'a>>;
+pub type AuditFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AuditPortError>> + Send + 'a>>;
+
+pub trait ActionNormalizer: Send + Sync {
+    fn normalize(
+        &self,
+        context: &RunContext,
+        proposal: ActionProposal,
+    ) -> Result<ActionEnvelope, NormalizationError>;
+}
+
+pub trait ApprovalPort: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        action: &'a ActionEnvelope,
+        policy_version: &'a PolicyVersion,
+        now: TimestampMillis,
+    ) -> ApprovalFuture<'a>;
+}
+
+pub trait AuditPort: Send + Sync {
+    fn record(&self, event: AuditEvent) -> AuditFuture<'_>;
+}
+
+#[derive(Debug)]
+pub enum ApprovalResolution {
+    Pending(ApprovalId),
+    Granted(ApprovalRequest),
+    Rejected(ApprovalId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunContext {
+    run_id: RunId,
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl RunContext {
+    pub const fn new(run_id: RunId, workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            run_id,
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunBudget {
+    max_model_turns: u32,
+    max_actions: u32,
+}
+
+impl RunBudget {
+    pub const fn new(max_model_turns: u32, max_actions: u32) -> Self {
+        Self {
+            max_model_turns,
+            max_actions,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RunState {
+    context: RunContext,
+    messages: Vec<ModelMessage>,
+    budget: RunBudget,
+    model_turns: u32,
+    actions: u32,
+    pending_action: Option<PendingAction>,
+    terminal_outcome: Option<RunOutcome>,
+    started: bool,
+    cancelled: bool,
+}
+
+impl RunState {
+    pub fn new(context: RunContext, prompt: impl Into<String>, budget: RunBudget) -> Self {
+        Self {
+            context,
+            messages: vec![ModelMessage::new(
+                ModelRole::User,
+                CanonicalValue::from(prompt.into()),
+            )],
+            budget,
+            model_turns: 0,
+            actions: 0,
+            pending_action: None,
+            terminal_outcome: None,
+            started: false,
+            cancelled: false,
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+
+    pub fn has_pending_action(&self) -> bool {
+        self.pending_action.is_some()
+    }
+
+    fn finish(&mut self, outcome: RunOutcome) -> RunOutcome {
+        self.terminal_outcome = Some(outcome.clone());
+        outcome
+    }
+}
+
+#[derive(Debug)]
+struct PendingAction {
+    action: ActionEnvelope,
+    approval_id: ApprovalId,
+}
+
+pub struct RunOrchestrator<'a> {
+    model: &'a dyn ModelPort,
+    normalizer: &'a dyn ActionNormalizer,
+    executor: &'a dyn ExecutorPort,
+    approvals: &'a dyn ApprovalPort,
+    audit: &'a dyn AuditPort,
+    policy: Policy,
+    policy_version: PolicyVersion,
+}
+
+impl<'a> RunOrchestrator<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        model: &'a dyn ModelPort,
+        normalizer: &'a dyn ActionNormalizer,
+        executor: &'a dyn ExecutorPort,
+        approvals: &'a dyn ApprovalPort,
+        audit: &'a dyn AuditPort,
+        policy: Policy,
+        policy_version: PolicyVersion,
+    ) -> Self {
+        Self {
+            model,
+            normalizer,
+            executor,
+            approvals,
+            audit,
+            policy,
+            policy_version,
+        }
+    }
+
+    pub async fn run_until_blocked(
+        &self,
+        state: &mut RunState,
+        capabilities: &EffectiveCapabilities,
+        now: TimestampMillis,
+    ) -> Result<RunOutcome, RunError> {
+        if let Some(outcome) = &state.terminal_outcome {
+            return Ok(outcome.clone());
+        }
+
+        if !state.started {
+            self.audit(
+                state,
+                AuditEventKind::RunCreated,
+                AuditOutcome::Success,
+                now,
+            )
+            .await?;
+            state.started = true;
+        }
+
+        loop {
+            if state.cancelled {
+                self.audit(
+                    state,
+                    AuditEventKind::RunCancelled,
+                    AuditOutcome::Failure,
+                    now,
+                )
+                .await?;
+                return Ok(state.finish(RunOutcome::Cancelled));
+            }
+
+            if let Some(pending) = state.pending_action.take() {
+                match self
+                    .resolve_approval(state, pending.action, pending.approval_id, now)
+                    .await?
+                {
+                    ActionProgress::Ready(action) => {
+                        if let Some(outcome) = self.execute(state, action, now).await? {
+                            return Ok(outcome);
+                        }
+                        continue;
+                    }
+                    ActionProgress::Blocked(outcome, pending) => {
+                        state.pending_action = Some(pending);
+                        return Ok(outcome);
+                    }
+                    ActionProgress::Terminal(outcome) => return Ok(state.finish(outcome)),
+                }
+            }
+
+            if state.model_turns >= state.budget.max_model_turns {
+                return Ok(state.finish(RunOutcome::BudgetExhausted(BudgetKind::ModelTurns)));
+            }
+            let output = self
+                .model
+                .generate(ModelInput::new(state.messages.clone()))
+                .await?;
+            state.model_turns += 1;
+
+            match output {
+                ModelOutput::FinalText(text) => {
+                    self.audit(
+                        state,
+                        AuditEventKind::RunCompleted,
+                        AuditOutcome::Success,
+                        now,
+                    )
+                    .await?;
+                    return Ok(state.finish(RunOutcome::Completed { text }));
+                }
+                ModelOutput::Action(proposal) => {
+                    if state.actions >= state.budget.max_actions {
+                        return Ok(state.finish(RunOutcome::BudgetExhausted(BudgetKind::Actions)));
+                    }
+                    self.audit(
+                        state,
+                        AuditEventKind::ActionProposed,
+                        AuditOutcome::Pending,
+                        now,
+                    )
+                    .await?;
+                    let action = self.normalizer.normalize(&state.context, proposal)?;
+                    state.actions += 1;
+                    self.audit(
+                        state,
+                        AuditEventKind::ActionNormalized,
+                        AuditOutcome::Success,
+                        now,
+                    )
+                    .await?;
+
+                    let decision = self.policy.evaluate(&action, capabilities);
+                    match &decision {
+                        PolicyDecision::Deny(reason) => {
+                            self.audit(
+                                state,
+                                AuditEventKind::PolicyDenied,
+                                AuditOutcome::Denied,
+                                now,
+                            )
+                            .await?;
+                            return Ok(state.finish(RunOutcome::Denied {
+                                reason: reason.clone(),
+                            }));
+                        }
+                        PolicyDecision::Allow => {
+                            self.audit(
+                                state,
+                                AuditEventKind::PolicyAllowed,
+                                AuditOutcome::Success,
+                                now,
+                            )
+                            .await?;
+                            let authorization = authorize_dispatch(
+                                &decision,
+                                &action,
+                                &self.policy_version,
+                                None,
+                                now,
+                            )?;
+                            if let Some(outcome) = self
+                                .execute(state, AuthorizedAction::new(action, authorization), now)
+                                .await?
+                            {
+                                return Ok(outcome);
+                            }
+                        }
+                        PolicyDecision::RequireApproval => {
+                            match self
+                                .approvals
+                                .resolve(&action, &self.policy_version, now)
+                                .await?
+                            {
+                                ApprovalResolution::Pending(approval_id) => {
+                                    self.audit(
+                                        state,
+                                        AuditEventKind::ApprovalCreated,
+                                        AuditOutcome::Pending,
+                                        now,
+                                    )
+                                    .await?;
+                                    state.pending_action = Some(PendingAction {
+                                        action,
+                                        approval_id,
+                                    });
+                                    return Ok(RunOutcome::AwaitingApproval { approval_id });
+                                }
+                                ApprovalResolution::Granted(mut approval) => {
+                                    let authorization = self
+                                        .consume_approval(state, &action, &mut approval, now)
+                                        .await?;
+                                    if let Some(outcome) = self
+                                        .execute(
+                                            state,
+                                            AuthorizedAction::new(action, authorization),
+                                            now,
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(outcome);
+                                    }
+                                }
+                                ApprovalResolution::Rejected(approval_id) => {
+                                    self.audit(
+                                        state,
+                                        AuditEventKind::ApprovalRejected,
+                                        AuditOutcome::Denied,
+                                        now,
+                                    )
+                                    .await?;
+                                    return Ok(
+                                        state.finish(RunOutcome::ApprovalRejected { approval_id })
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn resolve_approval(
+        &self,
+        state: &RunState,
+        action: ActionEnvelope,
+        expected_id: ApprovalId,
+        now: TimestampMillis,
+    ) -> Result<ActionProgress, RunError> {
+        match self
+            .approvals
+            .resolve(&action, &self.policy_version, now)
+            .await?
+        {
+            ApprovalResolution::Pending(approval_id) => {
+                if approval_id != expected_id {
+                    return Err(RunError::ApprovalIdentityMismatch);
+                }
+                Ok(ActionProgress::Blocked(
+                    RunOutcome::AwaitingApproval { approval_id },
+                    PendingAction {
+                        action,
+                        approval_id,
+                    },
+                ))
+            }
+            ApprovalResolution::Granted(mut approval) => {
+                if approval.id() != expected_id {
+                    return Err(RunError::ApprovalIdentityMismatch);
+                }
+                let authorization = self
+                    .consume_approval(state, &action, &mut approval, now)
+                    .await?;
+                Ok(ActionProgress::Ready(AuthorizedAction::new(
+                    action,
+                    authorization,
+                )))
+            }
+            ApprovalResolution::Rejected(approval_id) => {
+                if approval_id != expected_id {
+                    return Err(RunError::ApprovalIdentityMismatch);
+                }
+                self.audit(
+                    state,
+                    AuditEventKind::ApprovalRejected,
+                    AuditOutcome::Denied,
+                    now,
+                )
+                .await?;
+                Ok(ActionProgress::Terminal(RunOutcome::ApprovalRejected {
+                    approval_id,
+                }))
+            }
+        }
+    }
+
+    async fn consume_approval(
+        &self,
+        state: &RunState,
+        action: &ActionEnvelope,
+        approval: &mut ApprovalRequest,
+        now: TimestampMillis,
+    ) -> Result<crate::approval::DispatchAuthorization, RunError> {
+        self.audit(
+            state,
+            AuditEventKind::ApprovalGranted,
+            AuditOutcome::Success,
+            now,
+        )
+        .await?;
+        let authorization = authorize_dispatch(
+            &PolicyDecision::RequireApproval,
+            action,
+            &self.policy_version,
+            Some(approval),
+            now,
+        )?;
+        self.audit(
+            state,
+            AuditEventKind::ApprovalConsumed,
+            AuditOutcome::Success,
+            now,
+        )
+        .await?;
+        Ok(authorization)
+    }
+
+    async fn execute(
+        &self,
+        state: &mut RunState,
+        action: AuthorizedAction,
+        now: TimestampMillis,
+    ) -> Result<Option<RunOutcome>, RunError> {
+        self.audit(
+            state,
+            AuditEventKind::ExecutionStarted,
+            AuditOutcome::Pending,
+            now,
+        )
+        .await?;
+        match self.executor.execute(&action).await? {
+            ExecutionOutcome::Succeeded(result) => {
+                self.audit(
+                    state,
+                    AuditEventKind::ExecutionSucceeded,
+                    AuditOutcome::Success,
+                    now,
+                )
+                .await?;
+                state
+                    .messages
+                    .push(ModelMessage::new(ModelRole::Tool, result));
+                Ok(None)
+            }
+            ExecutionOutcome::Failed(message) => {
+                self.audit(
+                    state,
+                    AuditEventKind::ExecutionFailed,
+                    AuditOutcome::Failure,
+                    now,
+                )
+                .await?;
+                Ok(Some(state.finish(RunOutcome::ExecutionFailed { message })))
+            }
+            ExecutionOutcome::Unknown(message) => {
+                self.audit(
+                    state,
+                    AuditEventKind::ExecutionUnknown,
+                    AuditOutcome::Unknown,
+                    now,
+                )
+                .await?;
+                Ok(Some(state.finish(RunOutcome::ExecutionUnknown { message })))
+            }
+        }
+    }
+
+    async fn audit(
+        &self,
+        state: &RunState,
+        kind: AuditEventKind,
+        outcome: AuditOutcome,
+        now: TimestampMillis,
+    ) -> Result<(), AuditPortError> {
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                now,
+                kind,
+                outcome,
+                Some(state.context.workspace_id()),
+                CanonicalValue::object([
+                    (
+                        "run_id",
+                        CanonicalValue::from(state.context.run_id().to_string()),
+                    ),
+                    (
+                        "actor",
+                        CanonicalValue::from(state.context.actor().subject()),
+                    ),
+                ]),
+            ))
+            .await
+    }
+}
+
+enum ActionProgress {
+    Ready(AuthorizedAction),
+    Blocked(RunOutcome, PendingAction),
+    Terminal(RunOutcome),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunOutcome {
+    Completed { text: String },
+    AwaitingApproval { approval_id: ApprovalId },
+    ApprovalRejected { approval_id: ApprovalId },
+    Denied { reason: DenialReason },
+    BudgetExhausted(BudgetKind),
+    Cancelled,
+    ExecutionFailed { message: String },
+    ExecutionUnknown { message: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BudgetKind {
+    ModelTurns,
+    Actions,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("action normalization failed: {message}")]
+pub struct NormalizationError {
+    message: String,
+}
+
+impl NormalizationError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("approval port failed: {message}")]
+pub struct ApprovalPortError {
+    message: String,
+}
+
+impl ApprovalPortError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("audit port failed: {message}")]
+pub struct AuditPortError {
+    message: String,
+}
+
+impl AuditPortError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum RunError {
+    #[error(transparent)]
+    Model(#[from] ModelError),
+    #[error(transparent)]
+    Normalization(#[from] NormalizationError),
+    #[error(transparent)]
+    ApprovalPort(#[from] ApprovalPortError),
+    #[error(transparent)]
+    Audit(#[from] AuditPortError),
+    #[error(transparent)]
+    Dispatch(#[from] DispatchError),
+    #[error(transparent)]
+    Executor(#[from] ExecutorError),
+    #[error("approval response did not match the pending approval")]
+    ApprovalIdentityMismatch,
+}
