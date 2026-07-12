@@ -109,13 +109,13 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-integrations/src/{filesystem,process,sandbox}.rs`
 
-- [ ] Write tests for workspace path canonicalization, symlink escape, command allowlisting, environment filtering, output limits, timeout, cancellation, and process-tree termination.
-- [ ] Confirm the tests fail before implementation.
-- [ ] Implement read-only workspace access and the sandbox backend contract.
-- [ ] Implement process dispatch only through validated action envelopes.
-- [ ] Add platform capability reporting and deny when required enforcement is unavailable.
-- [ ] Run `cargo test -p lumen-integrations` and confirm tests pass.
-- [ ] Commit as `feat(integrations): add constrained local executors`.
+- [x] Write tests for workspace path canonicalization, symlink escape, command allowlisting, environment filtering, output limits, timeout, cancellation, and process-tree termination.
+- [x] Confirm the tests fail before implementation.
+- [x] Implement read-only workspace access and the sandbox backend contract.
+- [x] Implement process dispatch only through validated action envelopes.
+- [x] Add platform capability reporting and deny when required enforcement is unavailable.
+- [x] Run `cargo test -p lumen-integrations` and confirm tests pass.
+- [x] Commit as `feat(integrations): add constrained local executors`.
 
 ## Task 7: HTTP And SSE Surface
 
