@@ -98,12 +98,12 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-integrations/src/openai_compatible.rs`, `crates/lumen-integrations/src/lib.rs`
 
-- [ ] Write contract tests against a local mock HTTP server for streaming, structured actions, malformed output, deadlines, and cancellation.
-- [ ] Confirm tests fail before the client exists.
-- [ ] Implement the loopback-restricted OpenAI-compatible client and provider identity recording.
-- [ ] Verify that no remote fallback exists and non-loopback endpoints require explicit configuration.
-- [ ] Run `cargo test -p lumen-integrations` and confirm tests pass.
-- [ ] Commit as `feat(integrations): add local model provider`.
+- [x] Write contract tests against a local mock HTTP server for streaming, structured actions, malformed output, deadlines, and cancellation.
+- [x] Confirm tests fail before the client exists.
+- [x] Implement the loopback-restricted OpenAI-compatible client and provider identity recording.
+- [x] Verify that no remote fallback exists and non-loopback endpoints require explicit configuration.
+- [x] Run `cargo test -p lumen-integrations` and confirm tests pass.
+- [x] Commit as `feat(integrations): add local model provider`.
 
 ## Task 6: Built-In Filesystem And Process Executors
 
