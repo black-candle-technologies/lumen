@@ -100,7 +100,7 @@ impl ApprovalState {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ApprovalRequest {
     id: ApprovalId,
     action_fingerprint: ActionFingerprint,

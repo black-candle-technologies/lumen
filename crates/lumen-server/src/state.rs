@@ -85,7 +85,7 @@ pub struct CreateRunCommand {
 }
 
 impl CreateRunCommand {
-    pub(crate) fn new(workspace_id: WorkspaceId, actor: PrincipalId, prompt: String) -> Self {
+    pub fn new(workspace_id: WorkspaceId, actor: PrincipalId, prompt: String) -> Self {
         Self {
             workspace_id,
             actor,
@@ -137,7 +137,7 @@ pub struct ApprovalDecisionCommand {
 }
 
 impl ApprovalDecisionCommand {
-    pub(crate) const fn new(
+    pub const fn new(
         workspace_id: WorkspaceId,
         approval_id: ApprovalId,
         actor: PrincipalId,

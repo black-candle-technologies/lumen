@@ -9,7 +9,7 @@ use lumen_core::{
     },
     identity::WorkspaceId,
 };
-use sqlx::Row;
+use sqlx::{Row, sqlite::SqliteRow};
 use uuid::Uuid;
 
 use crate::{Database, RepositoryError, timestamp_to_i64};
@@ -68,7 +68,8 @@ impl Database {
 
         let mut expected_previous = AuditHash::genesis();
         for (expected_sequence, row) in (1_i64..).zip(rows) {
-            let sequence: i64 = row.try_get("sequence").map_err(storage_error)?;
+            let record = record_from_row(&row)?;
+            let sequence = record.sequence();
             if sequence != expected_sequence {
                 return Err(AuditIntegrityError::SequenceGap {
                     expected: expected_sequence,
@@ -76,63 +77,95 @@ impl Database {
                 });
             }
 
-            let event_id = Uuid::parse_str(
-                row.try_get::<String, _>("event_id")
-                    .map_err(storage_error)?
-                    .as_str(),
-            )
-            .map_err(|_| AuditValueError::InvalidUuid)?;
-            let timestamp =
-                u64::try_from(row.try_get::<i64, _>("timestamp").map_err(storage_error)?)
-                    .map_err(|_| AuditValueError::InvalidPayload)?;
-            let kind = AuditEventKind::from_str(
-                row.try_get::<String, _>("event_type")
-                    .map_err(storage_error)?
-                    .as_str(),
-            )?;
-            let outcome = AuditOutcome::from_str(
-                row.try_get::<String, _>("outcome")
-                    .map_err(storage_error)?
-                    .as_str(),
-            )?;
-            let workspace_id = row
-                .try_get::<Option<String>, _>("workspace_id")
-                .map_err(storage_error)?
-                .map(|value| {
-                    Uuid::parse_str(&value)
-                        .map(WorkspaceId::from_uuid)
-                        .map_err(|_| AuditValueError::InvalidUuid)
-                })
-                .transpose()?;
-            let payload = serde_json::from_str::<CanonicalValue>(
-                row.try_get::<String, _>("payload_json")
-                    .map_err(storage_error)?
-                    .as_str(),
-            )
-            .map_err(|_| AuditValueError::InvalidPayload)?;
-            let previous_hash = AuditHash::parse(
-                row.try_get::<String, _>("previous_hash")
-                    .map_err(storage_error)?,
-            )?;
-            let hash = AuditHash::parse(
-                row.try_get::<String, _>("event_hash")
-                    .map_err(storage_error)?,
-            )?;
-            let event = AuditEvent::new(
-                AuditEventId::from_uuid(event_id),
-                TimestampMillis::new(timestamp),
-                kind,
-                outcome,
-                workspace_id,
-                payload,
-            );
-            let record = AuditRecord::from_stored(sequence, event, previous_hash, hash);
             record.verify(&expected_previous)?;
             expected_previous = record.hash().clone();
         }
 
         Ok(())
     }
+
+    pub async fn list_audit_records(
+        &self,
+        workspace_id: WorkspaceId,
+        after: i64,
+        limit: u16,
+    ) -> Result<Vec<AuditRecord>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT sequence, event_id, timestamp, event_type, outcome, workspace_id,
+                    payload_json, previous_hash, event_hash
+             FROM audit_events
+             WHERE workspace_id = ? AND sequence > ?
+             ORDER BY sequence LIMIT ?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(record_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))
+    }
+}
+
+fn record_from_row(row: &SqliteRow) -> Result<AuditRecord, AuditIntegrityError> {
+    let sequence: i64 = row.try_get("sequence").map_err(storage_error)?;
+    let event_id = Uuid::parse_str(
+        row.try_get::<String, _>("event_id")
+            .map_err(storage_error)?
+            .as_str(),
+    )
+    .map_err(|_| AuditValueError::InvalidUuid)?;
+    let timestamp = u64::try_from(row.try_get::<i64, _>("timestamp").map_err(storage_error)?)
+        .map_err(|_| AuditValueError::InvalidPayload)?;
+    let kind = AuditEventKind::from_str(
+        row.try_get::<String, _>("event_type")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    let outcome = AuditOutcome::from_str(
+        row.try_get::<String, _>("outcome")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    let workspace_id = row
+        .try_get::<Option<String>, _>("workspace_id")
+        .map_err(storage_error)?
+        .map(|value| {
+            Uuid::parse_str(&value)
+                .map(WorkspaceId::from_uuid)
+                .map_err(|_| AuditValueError::InvalidUuid)
+        })
+        .transpose()?;
+    let payload = serde_json::from_str::<CanonicalValue>(
+        row.try_get::<String, _>("payload_json")
+            .map_err(storage_error)?
+            .as_str(),
+    )
+    .map_err(|_| AuditValueError::InvalidPayload)?;
+    let previous_hash = AuditHash::parse(
+        row.try_get::<String, _>("previous_hash")
+            .map_err(storage_error)?,
+    )?;
+    let hash = AuditHash::parse(
+        row.try_get::<String, _>("event_hash")
+            .map_err(storage_error)?,
+    )?;
+    let event = AuditEvent::new(
+        AuditEventId::from_uuid(event_id),
+        TimestampMillis::new(timestamp),
+        kind,
+        outcome,
+        workspace_id,
+        payload,
+    );
+    Ok(AuditRecord::from_stored(
+        sequence,
+        event,
+        previous_hash,
+        hash,
+    ))
 }
 
 fn audit_value_error(error: AuditValueError) -> RepositoryError {

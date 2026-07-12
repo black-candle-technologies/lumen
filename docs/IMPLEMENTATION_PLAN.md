@@ -132,12 +132,12 @@ apps/web/src/routes/
 
 **Files:** `crates/lumen-cli/src/{main,config}.rs`, workspace `Cargo.toml` files
 
-- [ ] Write tests for strict `lumen.toml` parsing, unknown fields, secure defaults, loopback binding, and missing sandbox guarantees.
-- [ ] Confirm tests fail before implementation.
-- [ ] Wire database, core services, integrations, server, graceful shutdown, and audit verification.
-- [ ] Add `lumen migrate`, `lumen serve`, and `lumen audit verify` commands.
-- [ ] Run `cargo test --workspace` and `cargo check --workspace`.
-- [ ] Commit as `feat(cli): compose the local runtime`.
+- [x] Write tests for strict `lumen.toml` parsing, unknown fields, secure defaults, loopback binding, and missing sandbox guarantees.
+- [x] Confirm tests fail before implementation.
+- [x] Wire database, core services, integrations, server, graceful shutdown, and audit verification.
+- [x] Add `lumen migrate`, `lumen serve`, and `lumen audit verify` commands.
+- [x] Run `cargo test --workspace` and `cargo check --workspace`.
+- [x] Commit as `feat(cli): compose the local runtime`.
 
 ## Task 9: Minimal Control Surface
 

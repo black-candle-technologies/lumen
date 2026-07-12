@@ -52,6 +52,10 @@ pub enum RepositoryError {
     ApprovalNotAvailable,
     #[error("approval does not reference a stored action")]
     MissingAction,
+    #[error("approval decision conflicts with its stored state or workspace")]
+    ApprovalDecisionConflict,
+    #[error("run state is invalid: {0}")]
+    InvalidRunState(String),
 }
 
 pub(crate) fn timestamp_to_i64(

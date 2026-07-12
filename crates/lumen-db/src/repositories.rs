@@ -1,6 +1,7 @@
 use lumen_core::{
     action::{ActionEnvelope, ActionFingerprint, ActionId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
+    identity::PrincipalId,
     identity::WorkspaceId,
     policy::PolicyVersion,
 };
@@ -38,6 +39,103 @@ impl DispatchReservation {
 }
 
 impl Database {
+    pub async fn bootstrap_workspace(
+        &self,
+        id: WorkspaceId,
+        name: &str,
+        administrator: &PrincipalId,
+        created_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let created_at = timestamp_to_i64(created_at)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?, ?, ?)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO identities (provider, subject, created_at) VALUES (?, ?, ?)
+             ON CONFLICT(provider, subject) DO NOTHING",
+        )
+        .bind(administrator.provider())
+        .bind(administrator.subject())
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO workspace_memberships (
+                workspace_id, identity_provider, identity_subject, role, created_at
+             ) VALUES (?, ?, ?, 'owner', ?)
+             ON CONFLICT(workspace_id, identity_provider, identity_subject) DO NOTHING",
+        )
+        .bind(id.to_string())
+        .bind(administrator.provider())
+        .bind(administrator.subject())
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn create_run(
+        &self,
+        run_id: lumen_core::action::RunId,
+        workspace_id: WorkspaceId,
+        actor: &PrincipalId,
+        created_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let created_at = timestamp_to_i64(created_at)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO identities (provider, subject, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(actor.provider())
+        .bind(actor.subject())
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_runs (
+                id, workspace_id, actor_provider, actor_subject, state, created_at
+             ) VALUES (?, ?, ?, ?, 'created', ?)",
+        )
+        .bind(run_id.to_string())
+        .bind(workspace_id.to_string())
+        .bind(actor.provider())
+        .bind(actor.subject())
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_run_state(
+        &self,
+        run_id: lumen_core::action::RunId,
+        state: &str,
+        completed_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(
+            state,
+            "running" | "awaiting_approval" | "completed" | "failed" | "cancelled"
+        ) {
+            return Err(RepositoryError::InvalidRunState(state.to_owned()));
+        }
+        sqlx::query("UPDATE agent_runs SET state = ?, completed_at = ? WHERE id = ?")
+            .bind(state)
+            .bind(completed_at.map(timestamp_to_i64).transpose()?)
+            .bind(run_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn insert_workspace(
         &self,
         id: WorkspaceId,
@@ -148,6 +246,51 @@ impl Database {
 
         if result.rows_affected() != 1 {
             return Err(RepositoryError::MissingAction);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_approval_decision(
+        &self,
+        workspace_id: WorkspaceId,
+        approval: &ApprovalRequest,
+    ) -> Result<(), RepositoryError> {
+        let approver = approval
+            .decided_by()
+            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
+        let decided_at = approval
+            .decided_at()
+            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO identities (provider, subject, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(approver.provider())
+        .bind(approver.subject())
+        .bind(timestamp_to_i64(decided_at)?)
+        .execute(&mut *transaction)
+        .await?;
+        let result = sqlx::query(
+            "UPDATE approval_requests
+             SET state = ?, decided_by_provider = ?, decided_by_subject = ?, decided_at = ?
+             WHERE id = ? AND state = 'pending'
+               AND EXISTS (
+                   SELECT 1 FROM actions
+                   WHERE actions.id = approval_requests.action_id
+                     AND actions.workspace_id = ?
+               )",
+        )
+        .bind(approval.state().as_str())
+        .bind(approver.provider())
+        .bind(approver.subject())
+        .bind(timestamp_to_i64(decided_at)?)
+        .bind(approval.id().to_string())
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::ApprovalDecisionConflict);
         }
         transaction.commit().await?;
         Ok(())
