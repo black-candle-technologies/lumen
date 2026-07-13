@@ -113,11 +113,11 @@ impl BuiltinExecutor {
                     .map_err(|error| ExecutorError::new(error.to_string()))?;
                 let path = WorkspacePath::parse(parsed.path)
                     .map_err(|error| ExecutorError::new(error.to_string()))?;
-                let contents = self
-                    .filesystem
-                    .read_text(&path)
-                    .await
-                    .map_err(|error| ExecutorError::new(error.to_string()))?;
+                let contents = self.filesystem.read_text(&path).await;
+                let contents = match contents {
+                    Ok(contents) => contents,
+                    Err(error) => return Ok(ExecutionOutcome::Failed(error.to_string())),
+                };
                 Ok(ExecutionOutcome::Succeeded(CanonicalValue::object([(
                     "contents",
                     CanonicalValue::from(contents),
@@ -126,13 +126,17 @@ impl BuiltinExecutor {
             "process.spawn" => {
                 let parsed: ProcessArguments = parse_arguments(action.arguments())
                     .map_err(|error| ExecutorError::new(error.to_string()))?;
-                self.process
+                match self
+                    .process
                     .execute(
                         ProcessRequest::new(parsed.program, parsed.arguments, parsed.environment),
                         CancellationToken::new(),
                     )
                     .await
-                    .map_err(|error| ExecutorError::new(error.to_string()))
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(error) => Ok(ExecutionOutcome::Failed(error.to_string())),
+                }
             }
             kind => Err(ExecutorError::new(format!(
                 "unsupported authorized action: {kind}"

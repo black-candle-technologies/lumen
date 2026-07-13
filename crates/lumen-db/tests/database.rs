@@ -344,6 +344,61 @@ async fn concurrent_audit_appends_form_one_contiguous_chain() {
     assert_eq!(sequences, (1_i64..=8).collect::<Vec<_>>());
 }
 
+#[tokio::test]
+async fn crash_recovery_marks_reserved_execution_unknown_without_retrying() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let action = action();
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let approval = granted_approval(&action);
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+    database
+        .reserve_execution(DispatchReservation::new(
+            ExecutionAttemptId::new(),
+            action.id(),
+            approval.id(),
+            action.fingerprint(),
+            policy_version(),
+            TimestampMillis::new(1_300),
+        ))
+        .await
+        .expect("execution reserved");
+
+    let recovered = database
+        .recover_incomplete_executions(TimestampMillis::new(1_500))
+        .await
+        .expect("recovery succeeds");
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].action_id(), action.id());
+    let attempt_state: String = sqlx::query_scalar("SELECT state FROM execution_attempts LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .expect("attempt state");
+    let action_state: String = sqlx::query_scalar("SELECT state FROM actions WHERE id = ?")
+        .bind(action.id().to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("action state");
+    let run_state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(action.run_id().to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("run state");
+    assert_eq!(attempt_state, "unknown");
+    assert_eq!(action_state, "unknown");
+    assert_eq!(run_state, "failed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_consumption_and_execution_reservation_are_atomic() {
     let directory = tempdir().expect("temporary directory created");

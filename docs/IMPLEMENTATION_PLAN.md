@@ -153,9 +153,9 @@ apps/web/src/routes/
 
 **Files:** new integration tests under the owning crates or a focused workspace test package if shared setup justifies it
 
-- [ ] Add an end-to-end test where hostile retrieved content proposes an out-of-scope command and receives a denial.
-- [ ] Add an approval mutation and replay test across the HTTP and database boundaries.
-- [ ] Add symlink escape, secret-redaction, cancellation, crash-recovery, and audit-tampering scenarios.
-- [ ] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `pnpm check:web`.
-- [ ] Update the roadmap only for behavior demonstrated by the verification suite.
-- [ ] Commit as `test: verify runtime security boundaries end to end`.
+- [x] Add an end-to-end test where hostile retrieved content proposes an out-of-scope command and receives a denial.
+- [x] Add an approval mutation and replay test across the HTTP and database boundaries.
+- [x] Add symlink escape, secret-redaction, cancellation, crash-recovery, and audit-tampering scenarios.
+- [x] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `pnpm check:web`.
+- [x] Update the roadmap only for behavior demonstrated by the verification suite.
+- [x] Commit as `test: verify runtime security boundaries end to end`.

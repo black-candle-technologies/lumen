@@ -4,21 +4,21 @@ Lumen will grow through security-complete vertical slices. A milestone is comple
 
 ## Milestone 0: Architecture Baseline
 
-- Define trust boundaries and out-of-scope host threats.
-- Fix crate ownership and dependency direction.
-- Select SQLite, local-first routing, WASM plus subprocess extensions, and OS-keychain secrets.
-- Define action, approval, capability, and audit invariants.
+- [x] Define trust boundaries and out-of-scope host threats.
+- [x] Fix crate ownership and dependency direction.
+- [x] Select SQLite, local-first routing, WASM plus subprocess extensions, and OS-keychain secrets.
+- [x] Define action, approval, capability, and audit invariants.
 
 ## Milestone 1: Local Runtime Kernel
 
-- Load one `lumen.toml` configuration.
-- Create and migrate SQLite runtime state.
-- Support local identity and workspace allowlisting.
-- Implement action envelopes, capability evaluation, approvals, and audit chaining.
-- Connect one loopback OpenAI-compatible local model endpoint.
-- Implement workspace-scoped file reads and sandboxed command execution.
-- Expose chat, approval, and audit APIs with SSE run events.
-- Add integration tests proving that API, model, and executor paths cannot bypass policy.
+- [x] Load one `lumen.toml` configuration.
+- [x] Create and migrate SQLite runtime state.
+- [x] Support local identity and workspace allowlisting.
+- [x] Implement action envelopes, capability evaluation, approvals, and audit chaining.
+- [x] Connect one loopback OpenAI-compatible local model endpoint.
+- [x] Implement workspace-scoped file reads and sandboxed command execution.
+- [x] Expose chat, approval, and audit APIs with SSE run events.
+- [x] Add integration tests proving that API, model, and executor paths cannot bypass policy.
 
 This milestone intentionally excludes remote providers, third-party plugin loading, external chat channels, scheduled jobs, browser automation, and learned skills.
 

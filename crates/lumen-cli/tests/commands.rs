@@ -1,4 +1,4 @@
-use lumen_cli::{AuditCommand, Cli, Command, CommandOutput, execute};
+use lumen_cli::{AuditCommand, Cli, CliError, Command, CommandOutput, execute};
 use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
@@ -83,4 +83,40 @@ async fn audit_verify_checks_the_persisted_chain() {
     .expect("audit verifies");
 
     assert_eq!(output, CommandOutput::AuditVerified);
+}
+
+#[tokio::test]
+async fn audit_verify_rejects_a_tampered_persisted_event() {
+    let directory = tempdir().expect("temporary directory");
+    let config_path = write_config(directory.path());
+    let database = Database::connect(directory.path().join("lumen.sqlite3"))
+        .await
+        .expect("database opens");
+    database
+        .append_audit_event(AuditEvent::new(
+            AuditEventId::new(),
+            TimestampMillis::new(1),
+            AuditEventKind::RunCreated,
+            AuditOutcome::Success,
+            None,
+            CanonicalValue::object([("run_id", CanonicalValue::from("original"))]),
+        ))
+        .await
+        .expect("audit event");
+    sqlx::query("UPDATE audit_events SET payload_json = '{\"run_id\":\"tampered\"}'")
+        .execute(database.pool())
+        .await
+        .expect("audit payload tampered");
+    database.close().await;
+
+    let error = execute(Cli {
+        config: config_path,
+        command: Command::Audit {
+            command: AuditCommand::Verify,
+        },
+    })
+    .await
+    .expect_err("tampered audit must fail verification");
+
+    assert!(matches!(error, CliError::AuditIntegrity(_)));
 }

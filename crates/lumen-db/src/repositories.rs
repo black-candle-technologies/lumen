@@ -52,6 +52,32 @@ pub struct PendingApprovalView {
     expires_at: TimestampMillis,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredExecution {
+    attempt_id: ExecutionAttemptId,
+    action_id: ActionId,
+    run_id: RunId,
+    workspace_id: WorkspaceId,
+}
+
+impl RecoveredExecution {
+    pub const fn attempt_id(&self) -> ExecutionAttemptId {
+        self.attempt_id
+    }
+
+    pub const fn action_id(&self) -> ActionId {
+        self.action_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+}
+
 impl PendingApprovalView {
     pub const fn approval_id(&self) -> ApprovalId {
         self.approval_id
@@ -87,6 +113,76 @@ impl PendingApprovalView {
 }
 
 impl Database {
+    pub async fn recover_incomplete_executions(
+        &self,
+        recovered_at: TimestampMillis,
+    ) -> Result<Vec<RecoveredExecution>, RepositoryError> {
+        let recovered_at = timestamp_to_i64(recovered_at)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows = sqlx::query(
+            "SELECT attempts.id AS attempt_id, actions.id AS action_id,
+                    actions.run_id, actions.workspace_id
+             FROM execution_attempts AS attempts
+             JOIN actions ON actions.id = attempts.action_id
+             WHERE attempts.state IN ('reserved', 'running')
+             ORDER BY attempts.reserved_at, attempts.id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        let recovered = rows
+            .into_iter()
+            .map(|row| {
+                Ok(RecoveredExecution {
+                    attempt_id: parse_uuid(
+                        row.try_get::<String, _>("attempt_id")?,
+                        ExecutionAttemptId::from_uuid,
+                    )?,
+                    action_id: parse_uuid(
+                        row.try_get::<String, _>("action_id")?,
+                        ActionId::from_uuid,
+                    )?,
+                    run_id: parse_uuid(row.try_get::<String, _>("run_id")?, RunId::from_uuid)?,
+                    workspace_id: parse_uuid(
+                        row.try_get::<String, _>("workspace_id")?,
+                        WorkspaceId::from_uuid,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, RepositoryError>>()?;
+        if !recovered.is_empty() {
+            sqlx::query(
+                "UPDATE agent_runs SET state = 'failed', completed_at = ?
+                 WHERE id IN (
+                     SELECT actions.run_id FROM actions
+                     JOIN execution_attempts ON execution_attempts.action_id = actions.id
+                     WHERE execution_attempts.state IN ('reserved', 'running')
+                 )",
+            )
+            .bind(recovered_at)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE actions SET state = 'unknown'
+                 WHERE id IN (
+                     SELECT action_id FROM execution_attempts
+                     WHERE state IN ('reserved', 'running')
+                 )",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE execution_attempts
+                 SET state = 'unknown', completed_at = ?
+                 WHERE state IN ('reserved', 'running')",
+            )
+            .bind(recovered_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(recovered)
+    }
+
     pub async fn bootstrap_workspace(
         &self,
         id: WorkspaceId,
@@ -428,6 +524,78 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
 
+        sqlx::query("UPDATE actions SET state = 'running' WHERE id = ?")
+            .bind(reservation.action_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn reserve_allowed_execution(
+        &self,
+        attempt_id: ExecutionAttemptId,
+        action_id: ActionId,
+        reserved_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let reserved_at = timestamp_to_i64(reserved_at)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            "INSERT INTO execution_attempts (
+                id, action_id, approval_id, state, reserved_at
+             ) SELECT ?, id, NULL, 'reserved', ? FROM actions
+               WHERE id = ? AND state = 'normalized'",
+        )
+        .bind(attempt_id.to_string())
+        .bind(reserved_at)
+        .bind(action_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        sqlx::query("UPDATE actions SET state = 'running' WHERE id = ?")
+            .bind(action_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn complete_execution(
+        &self,
+        attempt_id: ExecutionAttemptId,
+        action_id: ActionId,
+        state: &str,
+        completed_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(
+            state,
+            "succeeded" | "failed" | "cancelled" | "timed_out" | "unknown"
+        ) {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        let completed_at = timestamp_to_i64(completed_at)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            "UPDATE execution_attempts SET state = ?, completed_at = ?
+             WHERE id = ? AND action_id = ? AND state IN ('reserved', 'running')",
+        )
+        .bind(state)
+        .bind(completed_at)
+        .bind(attempt_id.to_string())
+        .bind(action_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        sqlx::query("UPDATE actions SET state = ? WHERE id = ?")
+            .bind(state)
+            .bind(action_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }

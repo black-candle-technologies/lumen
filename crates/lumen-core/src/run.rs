@@ -18,6 +18,7 @@ use crate::{
 pub type ApprovalFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ApprovalResolution, ApprovalPortError>> + Send + 'a>>;
 pub type AuditFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AuditPortError>> + Send + 'a>>;
+pub type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ActionPortError>> + Send + 'a>>;
 
 pub trait ActionNormalizer: Send + Sync {
     fn normalize(
@@ -38,6 +39,10 @@ pub trait ApprovalPort: Send + Sync {
 
 pub trait AuditPort: Send + Sync {
     fn record(&self, event: AuditEvent) -> AuditFuture<'_>;
+}
+
+pub trait ActionPort: Send + Sync {
+    fn persist<'a>(&'a self, action: &'a ActionEnvelope, now: TimestampMillis) -> ActionFuture<'a>;
 }
 
 #[derive(Debug)]
@@ -148,6 +153,7 @@ pub struct RunOrchestrator<'a> {
     executor: &'a dyn ExecutorPort,
     approvals: &'a dyn ApprovalPort,
     audit: &'a dyn AuditPort,
+    actions: &'a dyn ActionPort,
     policy: Policy,
     policy_version: PolicyVersion,
 }
@@ -160,6 +166,7 @@ impl<'a> RunOrchestrator<'a> {
         executor: &'a dyn ExecutorPort,
         approvals: &'a dyn ApprovalPort,
         audit: &'a dyn AuditPort,
+        actions: &'a dyn ActionPort,
         policy: Policy,
         policy_version: PolicyVersion,
     ) -> Self {
@@ -169,6 +176,7 @@ impl<'a> RunOrchestrator<'a> {
             executor,
             approvals,
             audit,
+            actions,
             policy,
             policy_version,
         }
@@ -259,6 +267,7 @@ impl<'a> RunOrchestrator<'a> {
                     .await?;
                     let action = self.normalizer.normalize(&state.context, proposal)?;
                     state.actions += 1;
+                    self.actions.persist(&action, now).await?;
                     self.audit(
                         state,
                         AuditEventKind::ActionNormalized,
@@ -580,6 +589,20 @@ pub struct AuditPortError {
     message: String,
 }
 
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("action persistence failed: {message}")]
+pub struct ActionPortError {
+    message: String,
+}
+
+impl ActionPortError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 impl AuditPortError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
@@ -598,6 +621,8 @@ pub enum RunError {
     ApprovalPort(#[from] ApprovalPortError),
     #[error(transparent)]
     Audit(#[from] AuditPortError),
+    #[error(transparent)]
+    ActionPort(#[from] ActionPortError),
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
     #[error(transparent)]

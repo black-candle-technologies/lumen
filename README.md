@@ -20,14 +20,13 @@ It is designed for people who want an AI agent that can do real work without giv
 - **Small web surface:** The web UI exists for control and visibility, not as a sprawling admin product.
 - **Skill-building:** Completed workflows can become reusable agent skills, allowing Lumen to improve at repeated work over time.
 
-## Planned Web Surface
+## Web Surface
 
 The web UI/API should stay intentionally narrow:
 
 - Chat
-- Scheduled jobs
+- Approvals
 - Audit log
-- Settings
 
 Lumen can expose web functionality, but the product should not depend on becoming a cloud-hosted automation platform.
 
@@ -50,11 +49,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for more detail.
 
 Lumen separates host boot configuration from mutable runtime state.
 
-Host-level boot config belongs in files:
-
-- `lumen.toml`
-- `config.yml`
-- `.env`
+Host-level boot config belongs in one `lumen.toml`. Environment variables are reserved for bootstrap secrets such as the local bearer token.
 
 Runtime product state belongs in SQL:
 
@@ -81,7 +76,7 @@ The reason is practical: runtime state needs to be queryable, auditable, mutable
 
 ## Repository Status
 
-This repository is currently in an early planning state. The README and docs describe the intended product direction rather than a finished implementation.
+Milestone 1, the local runtime kernel, is implemented. It includes strict local configuration, SQLite state and audit chaining, a loopback OpenAI-compatible model client, capability and approval enforcement, constrained file/process execution, authenticated HTTP/SSE APIs, and the chat/approval/audit control surface. Later roadmap milestones remain intentionally unavailable.
 
 ## License
 

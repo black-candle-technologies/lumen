@@ -19,9 +19,9 @@ use lumen_core::{
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelOutput, ModelPort},
     policy::{DenialReason, Policy, PolicyVersion},
     run::{
-        ActionNormalizer, ApprovalFuture, ApprovalPort, ApprovalResolution, AuditFuture, AuditPort,
-        AuditPortError, BudgetKind, NormalizationError, RunBudget, RunContext, RunError,
-        RunOrchestrator, RunOutcome, RunState,
+        ActionFuture, ActionNormalizer, ActionPort, ApprovalFuture, ApprovalPort,
+        ApprovalResolution, AuditFuture, AuditPort, AuditPortError, BudgetKind, NormalizationError,
+        RunBudget, RunContext, RunError, RunOrchestrator, RunOutcome, RunState,
     },
 };
 use uuid::Uuid;
@@ -253,6 +253,34 @@ impl AuditPort for FakeAudit {
     }
 }
 
+struct NoopActions;
+
+static ACTIONS: NoopActions = NoopActions;
+
+impl ActionPort for NoopActions {
+    fn persist<'a>(
+        &'a self,
+        _action: &'a ActionEnvelope,
+        _now: TimestampMillis,
+    ) -> ActionFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Default)]
+struct CountingActions(AtomicUsize);
+
+impl ActionPort for CountingActions {
+    fn persist<'a>(
+        &'a self,
+        _action: &'a ActionEnvelope,
+        _now: TimestampMillis,
+    ) -> ActionFuture<'a> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
 fn orchestrator<'a>(
     model: &'a dyn ModelPort,
     executor: &'a dyn ExecutorPort,
@@ -265,6 +293,7 @@ fn orchestrator<'a>(
         executor,
         approvals,
         audit,
+        &ACTIONS,
         Policy::default(),
         policy_version(),
     )
@@ -344,6 +373,35 @@ async fn denied_action_never_reaches_the_executor() {
     ));
     assert_eq!(executor.call_count(), 0);
     assert!(audit.events().contains(&AuditEventKind::PolicyDenied));
+}
+
+#[tokio::test]
+async fn normalized_action_is_persisted_before_policy_denial() {
+    let model = FakeModel::new([proposal("filesystem.read")]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let actions = CountingActions::default();
+    let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+    let orchestrator = RunOrchestrator::new(
+        &model,
+        &NORMALIZER,
+        &executor,
+        &approvals,
+        &audit,
+        &actions,
+        Policy::default(),
+        policy_version(),
+    );
+
+    let outcome = orchestrator
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .await
+        .expect("denial is recorded");
+
+    assert!(matches!(outcome, RunOutcome::Denied { .. }));
+    assert_eq!(actions.0.load(Ordering::SeqCst), 1);
+    assert_eq!(executor.call_count(), 0);
 }
 
 #[tokio::test]

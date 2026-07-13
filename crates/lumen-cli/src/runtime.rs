@@ -5,17 +5,20 @@ use std::{
 };
 
 use lumen_core::{
-    action::{CanonicalValue, RunId},
-    approval::{ApprovalId, ApprovalRequest, ApprovalState, ExecutionAttemptId, TimestampMillis},
+    action::{ActionEnvelope, CanonicalValue, RunId},
+    approval::{
+        ApprovalId, ApprovalRequest, ApprovalState, DispatchAuthorization, ExecutionAttemptId,
+        TimestampMillis,
+    },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
-    executor::ExecutorPort,
-    model::{ModelError, ModelFuture, ModelInput, ModelPort},
+    executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
+    model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort},
     policy::{Policy, PolicyVersion},
     run::{
-        ActionNormalizer, ApprovalFuture, ApprovalPort, ApprovalPortError, ApprovalResolution,
-        AuditFuture, AuditPort, AuditPortError, RunBudget, RunContext, RunOrchestrator, RunOutcome,
-        RunState,
+        ActionFuture, ActionNormalizer, ActionPort, ActionPortError, ApprovalFuture, ApprovalPort,
+        ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError,
+        NormalizationError, RunBudget, RunContext, RunOrchestrator, RunOutcome, RunState,
     },
 };
 use lumen_db::{Database, DispatchReservation};
@@ -42,6 +45,7 @@ pub(crate) struct LocalRuntimeService {
     executor: Arc<dyn ExecutorPort>,
     approvals: Arc<ApprovalRegistry>,
     audit: Arc<DatabaseAudit>,
+    actions: Arc<DatabaseActions>,
     database: Database,
     events: EventBroker,
     policy: Policy,
@@ -52,14 +56,16 @@ pub(crate) struct LocalRuntimeService {
     cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    redactor: Arc<SecretRedactor>,
 }
 
 impl LocalRuntimeService {
-    pub(crate) fn build(
+    pub(crate) fn build_with_secrets(
         config: &Config,
         database: Database,
         events: EventBroker,
         sandbox: Arc<dyn SandboxBackend>,
+        secrets: Vec<String>,
     ) -> Result<Self, CliError> {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
         let model_config = OpenAiCompatibleConfig::new(
@@ -85,10 +91,23 @@ impl LocalRuntimeService {
         .map_err(|error| CliError::Runtime(error.to_string()))?;
         let filesystem = WorkspaceReader::new(&workspace, config.runtime.file_read_limit_bytes)
             .map_err(|error| CliError::Runtime(error.to_string()))?;
-        let executor = BuiltinExecutor::new(filesystem, process);
-        let normalizer = BuiltinActionNormalizer::new(
-            lumen_core::identity::ComponentId::new("builtin.tools").expect("static component ID"),
-        );
+        let approvals = Arc::new(ApprovalRegistry::new(
+            database.clone(),
+            Duration::from_secs(config.runtime.approval_ttl_seconds),
+        ));
+        let redactor = Arc::new(SecretRedactor::new(secrets));
+        let executor = RedactingExecutor {
+            inner: BuiltinExecutor::new(filesystem, process),
+            redactor: Arc::clone(&redactor),
+            approvals: Arc::clone(&approvals),
+        };
+        let normalizer = SecretRejectingNormalizer {
+            inner: BuiltinActionNormalizer::new(
+                lumen_core::identity::ComponentId::new("builtin.tools")
+                    .expect("static component ID"),
+            ),
+            redactor: Arc::clone(&redactor),
+        };
         let mut grants = vec![Capability::new(
             CapabilityName::FsRead,
             ResourceScope::workspace(config.workspace_id()),
@@ -101,16 +120,13 @@ impl LocalRuntimeService {
                     .map_err(|error| CliError::Runtime(error.to_string()))?,
             ));
         }
-        let approvals = Arc::new(ApprovalRegistry::new(
-            database.clone(),
-            Duration::from_secs(config.runtime.approval_ttl_seconds),
-        ));
         Ok(Self {
             model: Arc::new(model),
             normalizer: Arc::new(normalizer),
             executor: Arc::new(executor),
             approvals,
             audit: Arc::new(DatabaseAudit(database.clone())),
+            actions: Arc::new(DatabaseActions(database.clone())),
             database,
             events,
             policy: Policy::default(),
@@ -121,6 +137,7 @@ impl LocalRuntimeService {
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            redactor,
         })
     }
 
@@ -171,6 +188,7 @@ impl LocalRuntimeService {
             self.executor.as_ref(),
             self.approvals.as_ref(),
             self.audit.as_ref(),
+            self.actions.as_ref(),
             self.policy.clone(),
             self.policy_version.clone(),
         );
@@ -195,7 +213,8 @@ impl LocalRuntimeService {
                 self.runs.lock().await.insert(run_id, stored);
             }
             Ok(outcome) => {
-                let (state, kind, payload) = terminal_event(&outcome);
+                let (state, kind, mut payload) = terminal_event(&outcome);
+                self.redactor.redact_value(&mut payload);
                 let timestamp = now();
                 let _ = self
                     .database
@@ -236,6 +255,8 @@ impl LocalRuntimeService {
                         Some(timestamp),
                     )
                     .await;
+                let mut message = error.to_string();
+                self.redactor.redact_string(&mut message);
                 let _ = self.events.publish(
                     stored.workspace_id,
                     run_id,
@@ -244,7 +265,7 @@ impl LocalRuntimeService {
                     } else {
                         "run.failed"
                     },
-                    CanonicalValue::from(error.to_string()),
+                    CanonicalValue::from(message),
                 );
                 self.finish_run(run_id).await;
             }
@@ -425,6 +446,126 @@ struct CancellableModel<'a> {
     cancellation: CancellationToken,
 }
 
+struct RedactingExecutor {
+    inner: BuiltinExecutor,
+    redactor: Arc<SecretRedactor>,
+    approvals: Arc<ApprovalRegistry>,
+}
+
+struct SecretRejectingNormalizer {
+    inner: BuiltinActionNormalizer,
+    redactor: Arc<SecretRedactor>,
+}
+
+impl ActionNormalizer for SecretRejectingNormalizer {
+    fn normalize(
+        &self,
+        context: &RunContext,
+        proposal: ActionProposal,
+    ) -> Result<ActionEnvelope, NormalizationError> {
+        let action = self.inner.normalize(context, proposal)?;
+        let encoded = serde_json::to_string(&action)
+            .map_err(|error| NormalizationError::new(error.to_string()))?;
+        if self.redactor.contains_secret(&encoded) {
+            return Err(NormalizationError::new(
+                "action contains known secret material",
+            ));
+        }
+        Ok(action)
+    }
+}
+
+impl ExecutorPort for RedactingExecutor {
+    fn execute<'a>(&'a self, action: &'a AuthorizedAction) -> ExecutorFuture<'a> {
+        Box::pin(async move {
+            let attempt_id = self.approvals.reserve(action, now()).await?;
+            let outcome = match self.inner.execute(action).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = self
+                        .approvals
+                        .database
+                        .complete_execution(attempt_id, action.action().id(), "unknown", now())
+                        .await;
+                    return Ok(ExecutionOutcome::Unknown(error.to_string()));
+                }
+            };
+            let outcome = match outcome {
+                ExecutionOutcome::Succeeded(mut value) => {
+                    self.redactor.redact_value(&mut value);
+                    ExecutionOutcome::Succeeded(value)
+                }
+                ExecutionOutcome::Failed(mut message) => {
+                    self.redactor.redact_string(&mut message);
+                    ExecutionOutcome::Failed(message)
+                }
+                ExecutionOutcome::Unknown(mut message) => {
+                    self.redactor.redact_string(&mut message);
+                    ExecutionOutcome::Unknown(message)
+                }
+            };
+            let state = match &outcome {
+                ExecutionOutcome::Succeeded(_) => "succeeded",
+                ExecutionOutcome::Failed(_) => "failed",
+                ExecutionOutcome::Unknown(_) => "unknown",
+            };
+            if let Err(error) = self
+                .approvals
+                .database
+                .complete_execution(attempt_id, action.action().id(), state, now())
+                .await
+            {
+                return Ok(ExecutionOutcome::Unknown(format!(
+                    "execution outcome could not be persisted: {error}"
+                )));
+            }
+            Ok(outcome)
+        })
+    }
+}
+
+struct SecretRedactor {
+    secrets: Vec<String>,
+}
+
+impl SecretRedactor {
+    fn new(mut secrets: Vec<String>) -> Self {
+        secrets.retain(|secret| secret.len() >= 8);
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+
+    fn redact_value(&self, value: &mut CanonicalValue) {
+        match value {
+            CanonicalValue::String(value) => self.redact_string(value),
+            CanonicalValue::Array(values) => {
+                for value in values {
+                    self.redact_value(value);
+                }
+            }
+            CanonicalValue::Object(values) => {
+                for value in values.values_mut() {
+                    self.redact_value(value);
+                }
+            }
+            CanonicalValue::Null | CanonicalValue::Bool(_) | CanonicalValue::Integer(_) => {}
+        }
+    }
+
+    fn redact_string(&self, value: &mut String) {
+        for secret in &self.secrets {
+            if value.contains(secret) {
+                *value = value.replace(secret, "[REDACTED]");
+            }
+        }
+    }
+
+    fn contains_secret(&self, value: &str) -> bool {
+        self.secrets.iter().any(|secret| value.contains(secret))
+    }
+}
+
 impl ModelPort for CancellableModel<'_> {
     fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
         Box::pin(async move {
@@ -467,7 +608,7 @@ struct ApprovalRecord {
     run_id: RunId,
     action: lumen_core::action::ActionEnvelope,
     request: ApprovalRequest,
-    reserved: bool,
+    attempt_id: Option<ExecutionAttemptId>,
 }
 
 struct ApprovalRegistry {
@@ -513,6 +654,48 @@ impl ApprovalRegistry {
             ApprovalResult::new(command.approval_id(), command.decision()),
         ))
     }
+
+    async fn reserve(
+        &self,
+        action: &AuthorizedAction,
+        now: TimestampMillis,
+    ) -> Result<ExecutionAttemptId, lumen_core::executor::ExecutorError> {
+        let attempt_id = ExecutionAttemptId::new();
+        match action.authorization() {
+            DispatchAuthorization::PolicyAllowed => {
+                self.database
+                    .reserve_allowed_execution(attempt_id, action.action().id(), now)
+                    .await
+                    .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+            }
+            DispatchAuthorization::Approved { approval_id } => {
+                let mut records = self.records.lock().await;
+                let record = records.get_mut(&approval_id).ok_or_else(|| {
+                    lumen_core::executor::ExecutorError::new("approved action is not registered")
+                })?;
+                if record.action.fingerprint() != action.action().fingerprint()
+                    || record.attempt_id.is_some()
+                {
+                    return Err(lumen_core::executor::ExecutorError::new(
+                        "approved action cannot be reserved",
+                    ));
+                }
+                self.database
+                    .reserve_execution(DispatchReservation::new(
+                        attempt_id,
+                        action.action().id(),
+                        approval_id,
+                        action.action().fingerprint(),
+                        record.request.policy_version().clone(),
+                        now,
+                    ))
+                    .await
+                    .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+                record.attempt_id = Some(attempt_id);
+            }
+        }
+        Ok(attempt_id)
+    }
 }
 
 impl ApprovalPort for ApprovalRegistry {
@@ -531,34 +714,15 @@ impl ApprovalPort for ApprovalRegistry {
                 return match record.request.state() {
                     ApprovalState::Pending => Ok(ApprovalResolution::Pending(*approval_id)),
                     ApprovalState::Rejected => Ok(ApprovalResolution::Rejected(*approval_id)),
-                    ApprovalState::Granted if !record.reserved => {
-                        self.database
-                            .reserve_execution(DispatchReservation::new(
-                                ExecutionAttemptId::new(),
-                                action.id(),
-                                *approval_id,
-                                action.fingerprint(),
-                                policy_version.clone(),
-                                now,
-                            ))
-                            .await
-                            .map_err(|error| ApprovalPortError::new(error.to_string()))?;
-                        record.reserved = true;
+                    ApprovalState::Granted => {
                         Ok(ApprovalResolution::Granted(record.request.clone()))
                     }
-                    ApprovalState::Granted => Err(ApprovalPortError::new(
-                        "approval already has an execution reservation",
-                    )),
                     state => Err(ApprovalPortError::new(format!(
                         "approval cannot be resolved from state {state:?}"
                     ))),
                 };
             }
 
-            self.database
-                .insert_action(action, now)
-                .await
-                .map_err(|error| ApprovalPortError::new(error.to_string()))?;
             let approval_id = ApprovalId::new();
             let ttl_millis = u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX);
             let expires_at = TimestampMillis::new(now.as_u64().saturating_add(ttl_millis));
@@ -581,7 +745,7 @@ impl ApprovalPort for ApprovalRegistry {
                     run_id: action.run_id(),
                     action: action.clone(),
                     request,
-                    reserved: false,
+                    attempt_id: None,
                 },
             );
             Ok(ApprovalResolution::Pending(approval_id))
@@ -590,6 +754,19 @@ impl ApprovalPort for ApprovalRegistry {
 }
 
 struct DatabaseAudit(Database);
+
+struct DatabaseActions(Database);
+
+impl ActionPort for DatabaseActions {
+    fn persist<'a>(&'a self, action: &'a ActionEnvelope, now: TimestampMillis) -> ActionFuture<'a> {
+        Box::pin(async move {
+            self.0
+                .insert_action(action, now)
+                .await
+                .map_err(|error| ActionPortError::new(error.to_string()))
+        })
+    }
+}
 
 impl AuditPort for DatabaseAudit {
     fn record(&self, event: AuditEvent) -> AuditFuture<'_> {
@@ -614,6 +791,9 @@ pub(crate) fn now() -> TimestampMillis {
         .as_millis();
     TimestampMillis::new(u64::try_from(millis).unwrap_or(u64::MAX))
 }
+
+#[cfg(test)]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {
@@ -696,11 +876,12 @@ subject = "operator"
             )
             .await
             .expect("workspace bootstrap");
-        let service = LocalRuntimeService::build(
+        let service = LocalRuntimeService::build_with_secrets(
             &config,
             database.clone(),
             EventBroker::new(64),
             Arc::new(EnforcedSandbox),
+            Vec::new(),
         )
         .expect("runtime builds");
 

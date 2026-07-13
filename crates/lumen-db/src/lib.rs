@@ -9,7 +9,7 @@ use std::path::Path;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
-pub use repositories::{DispatchReservation, PendingApprovalView};
+pub use repositories::{DispatchReservation, PendingApprovalView, RecoveredExecution};
 
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -56,6 +56,8 @@ pub enum RepositoryError {
     ApprovalDecisionConflict,
     #[error("run state is invalid: {0}")]
     InvalidRunState(String),
+    #[error("execution attempt conflicts with its stored action or state")]
+    ExecutionStateConflict,
 }
 
 pub(crate) fn timestamp_to_i64(

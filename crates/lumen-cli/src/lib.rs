@@ -6,6 +6,10 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use clap::{Parser, Subcommand};
 use config::{Config, ConfigError};
 use lumen_core::audit::AuditIntegrityError;
+use lumen_core::{
+    action::CanonicalValue,
+    audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
+};
 use lumen_db::{Database, RepositoryError};
 use lumen_integrations::sandbox::{SandboxBackend, SystemSandbox};
 use lumen_server::{ApiState, EventBroker, router};
@@ -83,13 +87,40 @@ async fn serve(config: Config) -> Result<CommandOutput, CliError> {
             now,
         )
         .await?;
+    let recovered = database.recover_incomplete_executions(now).await?;
+    for execution in recovered {
+        database
+            .append_audit_event(AuditEvent::new(
+                AuditEventId::new(),
+                now,
+                AuditEventKind::ExecutionUnknown,
+                AuditOutcome::Unknown,
+                Some(execution.workspace_id()),
+                CanonicalValue::object([
+                    (
+                        "run_id",
+                        CanonicalValue::from(execution.run_id().to_string()),
+                    ),
+                    (
+                        "action_id",
+                        CanonicalValue::from(execution.action_id().to_string()),
+                    ),
+                    (
+                        "attempt_id",
+                        CanonicalValue::from(execution.attempt_id().to_string()),
+                    ),
+                ]),
+            ))
+            .await?;
+    }
 
     let events = EventBroker::new(1024);
-    let service = Arc::new(runtime::LocalRuntimeService::build(
+    let service = Arc::new(runtime::LocalRuntimeService::build_with_secrets(
         &config,
         database.clone(),
         events.clone(),
         sandbox,
+        vec![token.clone()],
     )?);
     let state = ApiState::new(
         service.clone(),
