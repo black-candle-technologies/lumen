@@ -133,13 +133,13 @@ docs/
 
 **Files:** `apps/web/src/lib/components/ApprovalItem.svelte`, `apps/web/src/routes/approvals/+page.svelte`, `apps/web/src/lib/components/ApprovalItem.test.ts`, `apps/web/tests/control-surface.spec.ts`
 
-- [ ] Add failing component tests for file before/after content, hashes, byte counts, new-file state, and secret reference labels without values.
-- [ ] Add failing browser tests at desktop and mobile viewports for file-write review and changed-action conflicts.
-- [ ] Confirm the tests fail before implementation.
-- [ ] Implement action-specific semantic previews while retaining the canonical fingerprint and raw normalized data where useful.
-- [ ] Verify long paths, large previews, and mobile controls do not overflow or overlap.
-- [ ] Run Svelte diagnostics, unit tests, Playwright, and production build.
-- [ ] Commit as `feat(web): show exact local action previews`.
+- [x] Add failing component tests for file before/after content, hashes, byte counts, new-file state, and secret reference labels without values.
+- [x] Add failing browser tests at desktop and mobile viewports for file-write review and changed-action conflicts.
+- [x] Confirm the tests fail before implementation.
+- [x] Implement action-specific semantic previews while retaining the canonical fingerprint and raw normalized data where useful.
+- [x] Verify long paths, large previews, and mobile controls do not overflow or overlap.
+- [x] Run Svelte diagnostics, unit tests, Playwright, and production build.
+- [x] Commit as `feat(web): show exact local action previews`.
 
 ## Task 8: Milestone 2 Security Verification
 

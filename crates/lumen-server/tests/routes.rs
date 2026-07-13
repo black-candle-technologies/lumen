@@ -14,11 +14,13 @@ use lumen_core::{
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
     identity::{PrincipalId, WorkspaceId},
+    secret::SecretRefId,
 };
 use lumen_server::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
-    ApprovalResult, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand, EventBroker,
-    RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceFuture, router,
+    ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand,
+    CreateRunCommand, EventBroker, RunCancellation, RunCreated, RuntimeService,
+    SandboxCapabilityReport, ServiceFuture, router,
 };
 use tower::ServiceExt;
 
@@ -389,24 +391,33 @@ async fn approval_listing_returns_exact_action_previews() {
     let workspace_id = WorkspaceId::new();
     let approval_id = ApprovalId::new();
     let run_id = RunId::new();
+    let secret_id =
+        SecretRefId::parse("5f7cc8b4-e848-4cb4-91ef-27c5983c41a5").expect("secret reference");
     let (app, service, _) = test_app(workspace_id);
     service
         .approval_previews
         .lock()
         .expect("approval previews")
-        .push(ApprovalPreview::new(
-            approval_id,
-            run_id,
-            "process.spawn",
-            CanonicalValue::object([("program", CanonicalValue::from("/bin/echo"))]),
-            vec![CanonicalValue::object([(
-                "name",
-                CanonicalValue::from("process.spawn"),
-            )])],
-            "a".repeat(64),
-            TimestampMillis::new(10),
-            TimestampMillis::new(20),
-        ));
+        .push(
+            ApprovalPreview::new(
+                approval_id,
+                run_id,
+                "process.spawn",
+                CanonicalValue::object([("program", CanonicalValue::from("/bin/echo"))]),
+                vec![CanonicalValue::object([(
+                    "name",
+                    CanonicalValue::from("process.spawn"),
+                )])],
+                "a".repeat(64),
+                TimestampMillis::new(10),
+                TimestampMillis::new(20),
+            )
+            .with_secret_references([ApprovalSecretReference::new(
+                secret_id,
+                "Example API token",
+                "API_TOKEN",
+            )]),
+        );
 
     let response = app
         .oneshot(request(
@@ -422,6 +433,23 @@ async fn approval_listing_returns_exact_action_previews() {
     assert_eq!(body["approvals"][0]["kind"], "process.spawn");
     assert_eq!(body["approvals"][0]["arguments"]["program"], "/bin/echo");
     assert_eq!(body["approvals"][0]["fingerprint"], "a".repeat(64));
+    assert_eq!(
+        body["approvals"][0]["secret_references"][0]["id"],
+        secret_id.to_string()
+    );
+    assert_eq!(
+        body["approvals"][0]["secret_references"][0]["label"],
+        "Example API token"
+    );
+    assert_eq!(
+        body["approvals"][0]["secret_references"][0]["environment"],
+        "API_TOKEN"
+    );
+    assert!(
+        body["approvals"][0]["secret_references"][0]
+            .get("value")
+            .is_none()
+    );
     let queries = service.approval_queries.lock().expect("approval queries");
     assert_eq!(queries[0].workspace_id(), workspace_id);
     assert_eq!(queries[0].actor().subject(), "operator");

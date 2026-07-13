@@ -36,8 +36,8 @@ use lumen_integrations::{
 };
 use lumen_server::{
     ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
-    AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand, EventBroker, RunCancellation,
-    RunCreated, RuntimeService, ServiceError, ServiceFuture,
+    ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand,
+    EventBroker, RunCancellation, RunCreated, RuntimeService, ServiceError, ServiceFuture,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -428,27 +428,56 @@ impl RuntimeService for LocalRuntimeService {
 
     fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>> {
         Box::pin(async move {
-            self.database
+            let approvals = self
+                .database
                 .list_pending_approvals(query.workspace_id())
                 .await
-                .map_err(repository_service_error)
-                .map(|approvals| {
-                    approvals
+                .map_err(repository_service_error)?;
+            let references = self
+                .database
+                .list_secret_references(query.workspace_id())
+                .await
+                .map_err(repository_service_error)?;
+            approvals
+                .into_iter()
+                .map(|approval| {
+                    let arguments =
+                        serde_json::to_value(approval.arguments()).map_err(|error| {
+                            ServiceError::Internal(format!(
+                                "approval arguments are invalid: {error}"
+                            ))
+                        })?;
+                    let used_references = arguments
+                        .get("secret_environment")
+                        .and_then(serde_json::Value::as_object)
                         .into_iter()
-                        .map(|approval| {
-                            ApprovalPreview::new(
-                                approval.approval_id(),
-                                approval.run_id(),
-                                approval.kind(),
-                                approval.arguments().clone(),
-                                approval.capabilities().to_vec(),
-                                approval.fingerprint(),
-                                approval.created_at(),
-                                approval.expires_at(),
+                        .flat_map(|bindings| bindings.values())
+                        .filter_map(serde_json::Value::as_str)
+                        .filter_map(|value| SecretRefId::parse(value).ok())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let metadata = references
+                        .iter()
+                        .filter(|reference| used_references.contains(&reference.id()))
+                        .map(|reference| {
+                            ApprovalSecretReference::new(
+                                reference.id(),
+                                reference.label(),
+                                reference.environment_name(),
                             )
-                        })
-                        .collect()
+                        });
+                    Ok(ApprovalPreview::new(
+                        approval.approval_id(),
+                        approval.run_id(),
+                        approval.kind(),
+                        approval.arguments().clone(),
+                        approval.capabilities().to_vec(),
+                        approval.fingerprint(),
+                        approval.created_at(),
+                        approval.expires_at(),
+                    )
+                    .with_secret_references(metadata))
                 })
+                .collect()
         })
     }
 

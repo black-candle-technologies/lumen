@@ -809,6 +809,23 @@ async fn approved_secret_is_injected_once_and_never_crosses_persistence_or_api_b
         },
     )
     .await;
+    let unrelated_reference = SecretReference::new(
+        SecretRefId::new(),
+        harness.workspace_id,
+        "unrelated secret label",
+        std::fs::canonicalize("/bin/echo")
+            .expect("echo executable")
+            .to_string_lossy()
+            .into_owned(),
+        "OTHER_TOKEN",
+        TimestampMillis::new(2),
+    )
+    .expect("unrelated secret metadata");
+    harness
+        .database
+        .insert_secret_reference(&unrelated_reference)
+        .await
+        .expect("unrelated secret reference stored");
 
     let run_id = harness.create_run("use the configured credential").await;
     let approval_id = harness.pending_approval_id().await;
@@ -824,6 +841,9 @@ async fn approved_secret_is_injected_once_and_never_crosses_persistence_or_api_b
     .into_owned();
     let pending_stream = harness.sse_until(&run_id, "approval.required").await;
     assert!(approval_body.contains(&reference.id().to_string()));
+    assert!(approval_body.contains("runtime test secret"));
+    assert!(approval_body.contains("API_TOKEN"));
+    assert!(!approval_body.contains("unrelated secret label"));
     assert!(!approval_body.contains(secret));
     assert!(!pending_stream.contains(secret));
 

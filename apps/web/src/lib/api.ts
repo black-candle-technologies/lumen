@@ -21,6 +21,7 @@ export type Approval = {
 	fingerprint: string;
 	created_at: number;
 	expires_at: number;
+	secret_references?: Array<{ id: string; label: string; environment: string }>;
 };
 
 export type AuditEvent = {

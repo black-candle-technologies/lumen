@@ -5,6 +5,7 @@ use lumen_core::{
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
     identity::{PrincipalId, WorkspaceId},
+    secret::SecretRefId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -244,6 +245,24 @@ pub struct ApprovalPreview {
     fingerprint: String,
     created_at: TimestampMillis,
     expires_at: TimestampMillis,
+    secret_references: Vec<ApprovalSecretReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApprovalSecretReference {
+    id: SecretRefId,
+    label: String,
+    environment: String,
+}
+
+impl ApprovalSecretReference {
+    pub fn new(id: SecretRefId, label: impl Into<String>, environment: impl Into<String>) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            environment: environment.into(),
+        }
+    }
 }
 
 impl ApprovalPreview {
@@ -267,7 +286,16 @@ impl ApprovalPreview {
             fingerprint: fingerprint.into(),
             created_at,
             expires_at,
+            secret_references: Vec::new(),
         }
+    }
+
+    pub fn with_secret_references(
+        mut self,
+        references: impl IntoIterator<Item = ApprovalSecretReference>,
+    ) -> Self {
+        self.secret_references = references.into_iter().collect();
+        self
     }
 }
 
