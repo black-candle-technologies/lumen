@@ -121,13 +121,13 @@ docs/
 
 **Files:** `apps/desktop/src-tauri/{Cargo.toml,tauri.conf.json,capabilities/main.json,src/lib.rs}`, `apps/desktop/src-tauri/tests/security_config.rs`, `pnpm-lock.yaml`
 
-- [ ] Add a failing Rust configuration test that rejects null CSP, global Tauri exposure, remote capabilities, opener/shell/process/filesystem permissions, and registered commands.
-- [ ] Confirm `cargo test -p lumen-desktop` fails against the scaffold configuration.
-- [ ] Remove the opener plugin dependency, sample command, and global Tauri object.
-- [ ] Add an explicit production CSP, development CSP, fixed `main` label, and one least-privilege capability file.
-- [ ] Validate the generated Tauri schema/configuration and build the desktop crate.
-- [ ] Run desktop tests and strict Clippy.
-- [ ] Commit as `security(desktop): minimize the Tauri authority surface`.
+- [x] Add a failing Rust configuration test that rejects null CSP, global Tauri exposure, remote capabilities, opener/shell/process/filesystem permissions, and registered commands.
+- [x] Confirm `cargo test -p lumen-desktop` fails against the scaffold configuration.
+- [x] Remove the opener plugin dependency, sample command, and global Tauri object.
+- [x] Add an explicit production CSP, development CSP, fixed `main` label, and one least-privilege capability file.
+- [x] Validate the generated Tauri schema/configuration and build the desktop crate.
+- [x] Run desktop tests and strict Clippy.
+- [x] Commit as `security(desktop): minimize the Tauri authority surface`.
 
 ## Task 7: Exact Approval UX
 

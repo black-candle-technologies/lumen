@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "No native commands are exposed to the main runtime control surface.",
+  "windows": ["main"],
+  "permissions": []
+}
