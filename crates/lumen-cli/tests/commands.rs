@@ -1,10 +1,17 @@
-use lumen_cli::{AuditCommand, Cli, CliError, Command, CommandOutput, SandboxCommand, execute};
+use std::sync::Arc;
+
+use clap::Parser;
+use lumen_cli::{
+    AuditCommand, Cli, CliError, Command, CommandOutput, SandboxCommand, SecretCommand, execute,
+    execute_with_secret_store,
+};
 use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
 };
 use lumen_db::Database;
+use lumen_integrations::secrets::{InMemorySecretStore, SecretStore};
 use tempfile::tempdir;
 
 fn write_config(directory: &std::path::Path) -> std::path::PathBuf {
@@ -139,4 +146,175 @@ async fn sandbox_report_describes_the_detected_platform_without_starting_runtime
         panic!("unexpected command output");
     };
     assert!(!report.backend().is_empty());
+}
+
+#[tokio::test]
+async fn secret_create_reads_only_supplied_standard_input_and_list_omits_values() {
+    let directory = tempdir().expect("temporary directory");
+    let config = write_config(directory.path());
+    let store = Arc::new(InMemorySecretStore::new());
+    let value = b"operator-stdin-secret".to_vec();
+
+    let created = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Secret {
+                command: SecretCommand::Create {
+                    label: "GitHub token".to_owned(),
+                    program: "/bin/echo".into(),
+                    environment: "GITHUB_TOKEN".to_owned(),
+                },
+            },
+        },
+        store.clone(),
+        Some(value.clone()),
+    )
+    .await
+    .expect("secret created");
+    let CommandOutput::SecretCreated(reference) = created else {
+        panic!("unexpected create output");
+    };
+    assert_eq!(
+        store
+            .resolve(reference.keychain_account())
+            .await
+            .expect("stored secret"),
+        value
+    );
+
+    let listed = execute_with_secret_store(
+        Cli {
+            config,
+            command: Command::Secret {
+                command: SecretCommand::List,
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("secrets listed");
+    assert_eq!(listed, CommandOutput::SecretReferences(vec![reference]));
+    assert!(!format!("{listed:?}").contains("operator-stdin-secret"));
+
+    let CommandOutput::SecretReferences(references) = listed else {
+        panic!("unexpected list output");
+    };
+    let reference = references.into_iter().next().expect("listed reference");
+    let deleted = execute_with_secret_store(
+        Cli {
+            config: directory.path().join("lumen.toml"),
+            command: Command::Secret {
+                command: SecretCommand::Delete { id: reference.id() },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("secret deleted");
+    assert_eq!(deleted, CommandOutput::SecretDeleted(reference.id()));
+    assert!(store.resolve(reference.keychain_account()).await.is_err());
+}
+
+#[tokio::test]
+async fn secret_create_rejects_command_line_values_and_duplicate_labels() {
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "secret",
+            "create",
+            "--label",
+            "token",
+            "--program",
+            "/bin/echo",
+            "--environment",
+            "TOKEN",
+            "--value",
+            "must-not-parse",
+        ])
+        .is_err()
+    );
+
+    let directory = tempdir().expect("temporary directory");
+    let config = write_config(directory.path());
+    let store = Arc::new(InMemorySecretStore::new());
+    for (value, succeeds) in [("first-secret", true), ("second-secret", false)] {
+        let result = execute_with_secret_store(
+            Cli {
+                config: config.clone(),
+                command: Command::Secret {
+                    command: SecretCommand::Create {
+                        label: "duplicate".to_owned(),
+                        program: "/bin/echo".into(),
+                        environment: "TOKEN".to_owned(),
+                    },
+                },
+            },
+            store.clone(),
+            Some(value.as_bytes().to_vec()),
+        )
+        .await;
+        assert_eq!(result.is_ok(), succeeds);
+    }
+
+    let database = Database::connect(directory.path().join("lumen.sqlite3"))
+        .await
+        .expect("database opens");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM secret_references")
+        .fetch_one(database.pool())
+        .await
+        .expect("reference count");
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn secret_delete_removes_keychain_value_before_metadata() {
+    let directory = tempdir().expect("temporary directory");
+    let config = write_config(directory.path());
+    let store = Arc::new(InMemorySecretStore::new());
+    let created = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Secret {
+                command: SecretCommand::Create {
+                    label: "delete me".to_owned(),
+                    program: "/bin/echo".into(),
+                    environment: "TOKEN".to_owned(),
+                },
+            },
+        },
+        store,
+        Some(b"delete-secret".to_vec()),
+    )
+    .await
+    .expect("secret created");
+    let CommandOutput::SecretCreated(reference) = created else {
+        panic!("unexpected create output");
+    };
+
+    let error = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Secret {
+                command: SecretCommand::Delete { id: reference.id() },
+            },
+        },
+        Arc::new(InMemorySecretStore::unavailable("locked")),
+        None,
+    )
+    .await
+    .expect_err("locked credential store must prevent metadata deletion");
+    assert!(error.to_string().contains("locked"));
+
+    let database = Database::connect(directory.path().join("lumen.sqlite3"))
+        .await
+        .expect("database opens");
+    assert!(
+        database
+            .get_secret_reference(reference.workspace_id(), reference.id())
+            .await
+            .expect("reference query")
+            .is_some()
+    );
 }

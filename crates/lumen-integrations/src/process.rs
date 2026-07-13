@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -9,7 +11,7 @@ use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue},
     capability::{Capability, CapabilityName, ResourceScope, WorkspacePath},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
-    identity::ComponentId,
+    identity::{ComponentId, WorkspaceId},
     model::ActionProposal,
     run::{ActionNormalizer, NormalizationError, RunContext},
     secret::SecretRefId,
@@ -157,6 +159,7 @@ impl ActionNormalizer for BuiltinActionNormalizer {
 pub struct BuiltinExecutor {
     filesystem: WorkspaceReader,
     process: ProcessExecutor,
+    secret_resolver: Option<Arc<dyn ProcessSecretResolver>>,
 }
 
 impl BuiltinExecutor {
@@ -164,7 +167,13 @@ impl BuiltinExecutor {
         Self {
             filesystem,
             process,
+            secret_resolver: None,
         }
+    }
+
+    pub fn with_secret_resolver(mut self, resolver: Arc<dyn ProcessSecretResolver>) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
     }
 
     async fn dispatch(&self, action: &ActionEnvelope) -> Result<ExecutionOutcome, ExecutorError> {
@@ -204,15 +213,44 @@ impl BuiltinExecutor {
             "process.spawn" => {
                 let parsed: ProcessArguments = parse_arguments(action.arguments())
                     .map_err(|error| ExecutorError::new(error.to_string()))?;
-                if !parsed.secret_environment.is_empty() {
-                    return Ok(ExecutionOutcome::Failed(
-                        "secret injection is unavailable for this runtime".to_owned(),
-                    ));
+                let secret_environment = parse_secret_environment(parsed.secret_environment)
+                    .map_err(|error| ExecutorError::new(error.to_string()))?;
+                let secret_environment_names = secret_environment.keys().cloned().collect();
+                let mut environment = parsed.environment;
+                if !secret_environment.is_empty() {
+                    let Some(resolver) = &self.secret_resolver else {
+                        return Ok(ExecutionOutcome::Failed(
+                            "secret injection is unavailable for this runtime".to_owned(),
+                        ));
+                    };
+                    let resolved = match resolver
+                        .resolve(
+                            action.workspace_id(),
+                            Path::new(&parsed.program),
+                            &secret_environment,
+                        )
+                        .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(error) => return Ok(ExecutionOutcome::Failed(error.to_string())),
+                    };
+                    if resolved.len() != secret_environment.len()
+                        || resolved
+                            .keys()
+                            .any(|name| !secret_environment.contains_key(name))
+                        || resolved.keys().any(|name| environment.contains_key(name))
+                    {
+                        return Ok(ExecutionOutcome::Failed(
+                            "secret resolver returned an invalid environment".to_owned(),
+                        ));
+                    }
+                    environment.extend(resolved);
                 }
                 match self
                     .process
-                    .execute(
-                        ProcessRequest::new(parsed.program, parsed.arguments, parsed.environment),
+                    .execute_with_resolved_secrets(
+                        ProcessRequest::new(parsed.program, parsed.arguments, environment),
+                        &secret_environment_names,
                         CancellationToken::new(),
                     )
                     .await
@@ -224,6 +262,32 @@ impl BuiltinExecutor {
             kind => Err(ExecutorError::new(format!(
                 "unsupported authorized action: {kind}"
             ))),
+        }
+    }
+}
+
+pub type ProcessSecretFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BTreeMap<String, String>, ProcessSecretError>> + Send + 'a>>;
+
+pub trait ProcessSecretResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        workspace_id: WorkspaceId,
+        program: &'a Path,
+        bindings: &'a BTreeMap<String, SecretRefId>,
+    ) -> ProcessSecretFuture<'a>;
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("secret resolution failed: {message}")]
+pub struct ProcessSecretError {
+    message: String,
+}
+
+impl ProcessSecretError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
         }
     }
 }
@@ -399,16 +463,24 @@ impl ProcessExecutor {
         request: ProcessRequest,
         cancellation: CancellationToken,
     ) -> Result<ExecutionOutcome, ProcessError> {
+        self.execute_with_resolved_secrets(request, &BTreeSet::new(), cancellation)
+            .await
+    }
+
+    async fn execute_with_resolved_secrets(
+        &self,
+        request: ProcessRequest,
+        resolved_secret_names: &BTreeSet<String>,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionOutcome, ProcessError> {
         let program = std::fs::canonicalize(&request.program)
             .map_err(|_| ProcessError::ProgramNotAllowed(request.program.clone()))?;
         if !self.allowed_programs.contains(&program) {
             return Err(ProcessError::ProgramNotAllowed(request.program));
         }
-        if let Some(name) = request
-            .environment
-            .keys()
-            .find(|name| !self.allowed_environment.contains(*name))
-        {
+        if let Some(name) = request.environment.keys().find(|name| {
+            !self.allowed_environment.contains(*name) && !resolved_secret_names.contains(*name)
+        }) {
             return Err(ProcessError::EnvironmentNotAllowed(name.clone()));
         }
 

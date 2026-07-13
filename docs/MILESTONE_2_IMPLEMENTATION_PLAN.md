@@ -91,16 +91,16 @@ docs/
 
 **Files:** `crates/lumen-cli/src/{lib,runtime}.rs`, `crates/lumen-cli/tests/commands.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`
 
-- [ ] Add failing CLI tests for create/list/delete commands, standard-input value handling, duplicate labels, and deletion ordering.
-- [ ] Add failing end-to-end tests for exact workspace/program/environment scope, missing references, and approval replay.
-- [ ] Add a failing leak test covering database rows, action JSON, approval JSON, audit JSON, and SSE events.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement operator commands without accepting secret values in arguments or ordinary config.
-- [ ] Load secret-reference capability grants for the owning workspace.
-- [ ] Resolve and inject values only inside the executor after final authorization.
-- [ ] Redact injected values from all bounded outputs before persistence or publication.
-- [ ] Run focused tests and strict Clippy.
-- [ ] Commit as `feat(runtime): inject scoped action secrets`.
+- [x] Add failing CLI tests for create/list/delete commands, standard-input value handling, duplicate labels, and deletion ordering.
+- [x] Add failing end-to-end tests for exact workspace/program/environment scope, missing references, and approval replay.
+- [x] Add a failing leak test covering database rows, action JSON, approval JSON, audit JSON, and SSE events.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement operator commands without accepting secret values in arguments or ordinary config.
+- [x] Load secret-reference capability grants for the owning workspace.
+- [x] Resolve and inject values only inside the executor after final authorization.
+- [x] Redact injected values from all bounded outputs before persistence or publication.
+- [x] Run focused tests and strict Clippy.
+- [x] Commit as `feat(runtime): inject scoped action secrets`.
 
 ## Task 5: Cancellation, Quotas, And Resource Limits
 

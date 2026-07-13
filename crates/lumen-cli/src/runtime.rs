@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    path::Path,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,13 +21,18 @@ use lumen_core::{
         ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError,
         NormalizationError, RunBudget, RunContext, RunOrchestrator, RunOutcome, RunState,
     },
+    secret::SecretRefId,
 };
 use lumen_db::{Database, DispatchReservation};
 use lumen_integrations::{
     filesystem::WorkspaceReader,
     openai_compatible::{EndpointPolicy, OpenAiCompatibleClient, OpenAiCompatibleConfig},
-    process::{BuiltinActionNormalizer, BuiltinExecutor, ProcessExecutor},
+    process::{
+        BuiltinActionNormalizer, BuiltinExecutor, ProcessExecutor, ProcessSecretError,
+        ProcessSecretFuture, ProcessSecretResolver,
+    },
     sandbox::SandboxBackend,
+    secrets::SecretStore,
 };
 use lumen_server::{
     ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
@@ -60,12 +66,13 @@ pub(crate) struct LocalRuntimeService {
 }
 
 impl LocalRuntimeService {
-    pub(crate) fn build_with_secrets(
+    pub(crate) async fn build_with_secret_store(
         config: &Config,
         database: Database,
         events: EventBroker,
         sandbox: Arc<dyn SandboxBackend>,
         secrets: Vec<String>,
+        secret_store: Arc<dyn SecretStore>,
     ) -> Result<Self, CliError> {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
         let model_config = OpenAiCompatibleConfig::new(
@@ -80,6 +87,9 @@ impl LocalRuntimeService {
         let model = OpenAiCompatibleClient::new(model_config)
             .map_err(|error| CliError::Runtime(error.to_string()))?;
         let allowed_programs: Vec<_> = config.process.allowed_programs.iter().cloned().collect();
+        let secret_references = database
+            .list_secret_references(config.workspace_id())
+            .await?;
         let process = ProcessExecutor::new(
             &workspace,
             allowed_programs.clone(),
@@ -100,8 +110,14 @@ impl LocalRuntimeService {
             Duration::from_secs(config.runtime.approval_ttl_seconds),
         ));
         let redactor = Arc::new(SecretRedactor::new(secrets));
+        let secret_resolver = Arc::new(RuntimeSecretResolver {
+            database: database.clone(),
+            store: secret_store,
+            redactor: Arc::clone(&redactor),
+        });
         let executor = RedactingExecutor {
-            inner: BuiltinExecutor::new(filesystem.clone(), process),
+            inner: BuiltinExecutor::new(filesystem.clone(), process)
+                .with_secret_resolver(secret_resolver),
             redactor: Arc::clone(&redactor),
             approvals: Arc::clone(&approvals),
         };
@@ -128,6 +144,13 @@ impl LocalRuntimeService {
             grants.push(Capability::new(
                 CapabilityName::ProcessSpawn,
                 ResourceScope::exact("executable", canonical.to_string_lossy())
+                    .map_err(|error| CliError::Runtime(error.to_string()))?,
+            ));
+        }
+        for reference in secret_references {
+            grants.push(Capability::new(
+                CapabilityName::SecretUse,
+                ResourceScope::exact("secret_reference", reference.id().to_string())
                     .map_err(|error| CliError::Runtime(error.to_string()))?,
             ));
         }
@@ -468,6 +491,49 @@ struct SecretRejectingNormalizer {
     redactor: Arc<SecretRedactor>,
 }
 
+struct RuntimeSecretResolver {
+    database: Database,
+    store: Arc<dyn SecretStore>,
+    redactor: Arc<SecretRedactor>,
+}
+
+impl ProcessSecretResolver for RuntimeSecretResolver {
+    fn resolve<'a>(
+        &'a self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        program: &'a Path,
+        bindings: &'a BTreeMap<String, SecretRefId>,
+    ) -> ProcessSecretFuture<'a> {
+        Box::pin(async move {
+            let program = program.to_string_lossy();
+            let mut resolved = BTreeMap::new();
+            for (environment, reference_id) in bindings {
+                let reference = self
+                    .database
+                    .get_secret_reference(workspace_id, *reference_id)
+                    .await
+                    .map_err(|error| ProcessSecretError::new(error.to_string()))?
+                    .ok_or_else(|| ProcessSecretError::new("secret reference was not found"))?;
+                if !reference.allows(workspace_id, &program, environment) {
+                    return Err(ProcessSecretError::new(
+                        "secret reference does not allow this process environment",
+                    ));
+                }
+                let value = self
+                    .store
+                    .resolve(reference.keychain_account())
+                    .await
+                    .map_err(|error| ProcessSecretError::new(error.to_string()))?;
+                let value = String::from_utf8(value)
+                    .map_err(|_| ProcessSecretError::new("secret value is not valid UTF-8"))?;
+                self.redactor.register(&value);
+                resolved.insert(environment.clone(), value);
+            }
+            Ok(resolved)
+        })
+    }
+}
+
 impl ActionNormalizer for SecretRejectingNormalizer {
     fn normalize(
         &self,
@@ -536,15 +602,28 @@ impl ExecutorPort for RedactingExecutor {
 }
 
 struct SecretRedactor {
-    secrets: Vec<String>,
+    secrets: RwLock<Vec<String>>,
 }
 
 impl SecretRedactor {
-    fn new(mut secrets: Vec<String>) -> Self {
-        secrets.retain(|secret| secret.len() >= 8);
+    fn new(secrets: Vec<String>) -> Self {
+        let redactor = Self {
+            secrets: RwLock::new(Vec::new()),
+        };
+        for secret in secrets {
+            redactor.register(&secret);
+        }
+        redactor
+    }
+
+    fn register(&self, secret: &str) {
+        if secret.is_empty() {
+            return;
+        }
+        let mut secrets = self.secrets.write().expect("secret redactor lock");
+        secrets.push(secret.to_owned());
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         secrets.dedup();
-        Self { secrets }
     }
 
     fn redact_value(&self, value: &mut CanonicalValue) {
@@ -565,7 +644,7 @@ impl SecretRedactor {
     }
 
     fn redact_string(&self, value: &mut String) {
-        for secret in &self.secrets {
+        for secret in self.secrets.read().expect("secret redactor lock").iter() {
             if value.contains(secret) {
                 *value = value.replace(secret, "[REDACTED]");
             }
@@ -573,7 +652,11 @@ impl SecretRedactor {
     }
 
     fn contains_secret(&self, value: &str) -> bool {
-        self.secrets.iter().any(|secret| value.contains(secret))
+        self.secrets
+            .read()
+            .expect("secret redactor lock")
+            .iter()
+            .any(|secret| value.contains(secret))
     }
 }
 
@@ -812,8 +895,12 @@ mod tests {
 
     use lumen_core::{audit::AuditEventKind, identity::PrincipalId};
     use lumen_db::Database;
-    use lumen_integrations::sandbox::{
-        SandboxBackend, SandboxError, SandboxFuture, SandboxReport, SandboxRequest, SandboxStrength,
+    use lumen_integrations::{
+        sandbox::{
+            SandboxBackend, SandboxError, SandboxFuture, SandboxReport, SandboxRequest,
+            SandboxStrength,
+        },
+        secrets::InMemorySecretStore,
     };
     use lumen_server::{CreateRunCommand, EventBroker, RuntimeService};
     use tempfile::tempdir;
@@ -887,13 +974,15 @@ subject = "operator"
             )
             .await
             .expect("workspace bootstrap");
-        let service = LocalRuntimeService::build_with_secrets(
+        let service = LocalRuntimeService::build_with_secret_store(
             &config,
             database.clone(),
             EventBroker::new(64),
             Arc::new(EnforcedSandbox),
             Vec::new(),
+            Arc::new(InMemorySecretStore::new()),
         )
+        .await
         .expect("runtime builds");
 
         service

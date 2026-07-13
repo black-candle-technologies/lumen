@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -39,6 +39,14 @@ impl Default for SecretRefId {
 impl fmt::Display for SecretRefId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for SecretRefId {
+    type Err = SecretRefError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
     }
 }
 

@@ -1,7 +1,7 @@
 pub mod config;
 mod runtime;
 
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, io::Read, path::PathBuf, sync::Arc};
 
 use clap::{Parser, Subcommand};
 use config::{Config, ConfigError};
@@ -9,9 +9,13 @@ use lumen_core::audit::AuditIntegrityError;
 use lumen_core::{
     action::CanonicalValue,
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
+    secret::SecretRefId,
 };
-use lumen_db::{Database, RepositoryError};
-use lumen_integrations::sandbox::{SandboxBackend, SandboxReport, SystemSandbox};
+use lumen_db::{Database, RepositoryError, SecretReference, SecretReferenceError};
+use lumen_integrations::{
+    sandbox::{SandboxBackend, SandboxReport, SystemSandbox},
+    secrets::{OsKeyringSecretStore, SecretStore, SecretStoreError},
+};
 use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
 use thiserror::Error;
 
@@ -36,6 +40,10 @@ pub enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
@@ -48,15 +56,59 @@ pub enum SandboxCommand {
     Report,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum SecretCommand {
+    Create {
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        program: PathBuf,
+        #[arg(long)]
+        environment: String,
+    },
+    List,
+    Delete {
+        #[arg(long)]
+        id: SecretRefId,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
     Migrated,
     AuditVerified,
     ServerStopped,
     SandboxReport(SandboxReport),
+    SecretCreated(SecretReference),
+    SecretReferences(Vec<SecretReference>),
+    SecretDeleted(SecretRefId),
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
+    let secret_input = if matches!(
+        &cli.command,
+        Command::Secret {
+            command: SecretCommand::Create { .. }
+        }
+    ) {
+        Some(
+            tokio::task::spawn_blocking(read_secret_standard_input)
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))??,
+        )
+    } else {
+        None
+    };
+    let store = Arc::new(OsKeyringSecretStore::new("dev.lumen.runtime")?);
+    execute_with_secret_store(cli, store, secret_input).await
+}
+
+#[doc(hidden)]
+pub async fn execute_with_secret_store(
+    cli: Cli,
+    secret_store: Arc<dyn SecretStore>,
+    secret_input: Option<Vec<u8>>,
+) -> Result<CommandOutput, CliError> {
     let config = Config::load(&cli.config)?;
     prepare_directories(&config)?;
     match cli.command {
@@ -81,11 +133,104 @@ pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
         } => Ok(CommandOutput::SandboxReport(
             SystemSandbox::detect().report(),
         )),
-        Command::Serve => serve(config).await,
+        Command::Secret { command } => {
+            execute_secret_command(&config, command, secret_store, secret_input).await
+        }
+        Command::Serve => serve(config, secret_store).await,
     }
 }
 
-async fn serve(config: Config) -> Result<CommandOutput, CliError> {
+async fn execute_secret_command(
+    config: &Config,
+    command: SecretCommand,
+    store: Arc<dyn SecretStore>,
+    input: Option<Vec<u8>>,
+) -> Result<CommandOutput, CliError> {
+    let database = Database::connect(&config.database.path).await?;
+    database
+        .bootstrap_workspace(
+            config.workspace_id(),
+            &config.workspace.name,
+            &config.bootstrap_principal(),
+            runtime::now(),
+        )
+        .await?;
+    let result = match command {
+        SecretCommand::Create {
+            label,
+            program,
+            environment,
+        } => {
+            let value = input.ok_or(CliError::MissingSecretInput)?;
+            validate_secret_input(&value)?;
+            let executable = std::fs::canonicalize(program)?
+                .to_string_lossy()
+                .into_owned();
+            let reference = SecretReference::new(
+                SecretRefId::new(),
+                config.workspace_id(),
+                label,
+                executable,
+                environment,
+                runtime::now(),
+            )?;
+            store.put(reference.keychain_account(), value).await?;
+            if let Err(error) = database.insert_secret_reference(&reference).await {
+                let _ = store.delete(reference.keychain_account()).await;
+                return Err(error.into());
+            }
+            CommandOutput::SecretCreated(reference)
+        }
+        SecretCommand::List => CommandOutput::SecretReferences(
+            database
+                .list_secret_references(config.workspace_id())
+                .await?,
+        ),
+        SecretCommand::Delete { id } => {
+            let reference = database
+                .get_secret_reference(config.workspace_id(), id)
+                .await?
+                .ok_or(CliError::SecretNotFound(id))?;
+            store.delete(reference.keychain_account()).await?;
+            if !database
+                .delete_secret_reference(config.workspace_id(), id)
+                .await?
+            {
+                return Err(CliError::SecretNotFound(id));
+            }
+            CommandOutput::SecretDeleted(id)
+        }
+    };
+    database.close().await;
+    Ok(result)
+}
+
+const SECRET_INPUT_LIMIT: u64 = 64 * 1024;
+
+fn read_secret_standard_input() -> Result<Vec<u8>, CliError> {
+    let mut value = Vec::new();
+    std::io::stdin()
+        .take(SECRET_INPUT_LIMIT + 1)
+        .read_to_end(&mut value)?;
+    validate_secret_input(&value)?;
+    Ok(value)
+}
+
+fn validate_secret_input(value: &[u8]) -> Result<(), CliError> {
+    if value.is_empty()
+        || u64::try_from(value.len()).unwrap_or(u64::MAX) > SECRET_INPUT_LIMIT
+        || value.contains(&0)
+        || std::str::from_utf8(value).is_err()
+    {
+        return Err(CliError::InvalidSecretInput);
+    }
+    Ok(())
+}
+
+async fn serve(
+    config: Config,
+    secret_store: Arc<dyn SecretStore>,
+) -> Result<CommandOutput, CliError> {
     let sandbox: Arc<dyn SandboxBackend> = Arc::new(SystemSandbox::detect());
     config.validate_sandbox(&sandbox.report())?;
     let token = std::env::var(&config.authentication.token_environment).map_err(|_| {
@@ -130,13 +275,17 @@ async fn serve(config: Config) -> Result<CommandOutput, CliError> {
     }
 
     let events = EventBroker::new(1024);
-    let service = Arc::new(runtime::LocalRuntimeService::build_with_secrets(
-        &config,
-        database.clone(),
-        events.clone(),
-        Arc::clone(&sandbox),
-        vec![token.clone()],
-    )?);
+    let service = Arc::new(
+        runtime::LocalRuntimeService::build_with_secret_store(
+            &config,
+            database.clone(),
+            events.clone(),
+            Arc::clone(&sandbox),
+            vec![token.clone()],
+            secret_store,
+        )
+        .await?,
+    );
     let state = ApiState::new(
         service.clone(),
         events,
@@ -189,6 +338,10 @@ pub enum CliError {
     #[error(transparent)]
     AuditIntegrity(#[from] AuditIntegrityError),
     #[error(transparent)]
+    SecretReference(#[from] SecretReferenceError),
+    #[error(transparent)]
+    SecretStore(#[from] SecretStoreError),
+    #[error(transparent)]
     ApiState(#[from] lumen_server::ApiStateError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -198,4 +351,10 @@ pub enum CliError {
     MissingDatabase(PathBuf),
     #[error("runtime composition failed: {0}")]
     Runtime(String),
+    #[error("secret creation requires a value on standard input")]
+    MissingSecretInput,
+    #[error("secret input must be non-empty UTF-8 without NUL bytes and at most 64 KiB")]
+    InvalidSecretInput,
+    #[error("secret reference was not found: {0}")]
+    SecretNotFound(SecretRefId),
 }
