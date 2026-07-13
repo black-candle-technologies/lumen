@@ -89,29 +89,40 @@ impl LocalRuntimeService {
             sandbox,
         )
         .map_err(|error| CliError::Runtime(error.to_string()))?;
-        let filesystem = WorkspaceReader::new(&workspace, config.runtime.file_read_limit_bytes)
-            .map_err(|error| CliError::Runtime(error.to_string()))?;
+        let filesystem = WorkspaceReader::with_limits(
+            &workspace,
+            config.runtime.file_read_limit_bytes,
+            config.runtime.file_write_limit_bytes,
+        )
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
         let approvals = Arc::new(ApprovalRegistry::new(
             database.clone(),
             Duration::from_secs(config.runtime.approval_ttl_seconds),
         ));
         let redactor = Arc::new(SecretRedactor::new(secrets));
         let executor = RedactingExecutor {
-            inner: BuiltinExecutor::new(filesystem, process),
+            inner: BuiltinExecutor::new(filesystem.clone(), process),
             redactor: Arc::clone(&redactor),
             approvals: Arc::clone(&approvals),
         };
         let normalizer = SecretRejectingNormalizer {
-            inner: BuiltinActionNormalizer::new(
+            inner: BuiltinActionNormalizer::with_filesystem(
                 lumen_core::identity::ComponentId::new("builtin.tools")
                     .expect("static component ID"),
+                filesystem,
             ),
             redactor: Arc::clone(&redactor),
         };
-        let mut grants = vec![Capability::new(
-            CapabilityName::FsRead,
-            ResourceScope::workspace(config.workspace_id()),
-        )];
+        let mut grants = vec![
+            Capability::new(
+                CapabilityName::FsRead,
+                ResourceScope::workspace(config.workspace_id()),
+            ),
+            Capability::new(
+                CapabilityName::FsWrite,
+                ResourceScope::workspace(config.workspace_id()),
+            ),
+        ];
         for program in allowed_programs {
             let canonical = std::fs::canonicalize(program)?;
             grants.push(Capability::new(

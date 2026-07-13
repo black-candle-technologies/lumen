@@ -115,6 +115,7 @@ impl Config {
             || self.process.timeout_seconds == 0
             || self.process.max_output_bytes == 0
             || self.runtime.file_read_limit_bytes == 0
+            || self.runtime.file_write_limit_bytes == 0
             || self.runtime.max_model_turns == 0
             || self.runtime.max_actions == 0
             || self.runtime.approval_ttl_seconds == 0
@@ -255,6 +256,7 @@ impl Default for ProcessConfig {
 pub struct RuntimeConfig {
     pub data_directory: PathBuf,
     pub file_read_limit_bytes: usize,
+    pub file_write_limit_bytes: usize,
     pub max_model_turns: u32,
     pub max_actions: u32,
     pub approval_ttl_seconds: u64,
@@ -265,6 +267,7 @@ impl Default for RuntimeConfig {
         Self {
             data_directory: PathBuf::from("runtime"),
             file_read_limit_bytes: 1024 * 1024,
+            file_write_limit_bytes: 1024 * 1024,
             max_model_turns: 8,
             max_actions: 8,
             approval_ttl_seconds: 300,

@@ -66,6 +66,258 @@ fn filesystem_proposals_are_normalized_to_path_scoped_capabilities() {
 }
 
 #[test]
+fn file_write_proposals_bind_trusted_before_and_after_snapshots() {
+    let workspace = tempdir().expect("temporary workspace");
+    std::fs::create_dir(workspace.path().join("notes")).expect("notes directory");
+    std::fs::write(workspace.path().join("notes/today.md"), "before").expect("existing note");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 1024).expect("workspace opens");
+    let context = run_context();
+    let normalizer = BuiltinActionNormalizer::with_filesystem(
+        ComponentId::new("builtin.tools").expect("component ID"),
+        filesystem,
+    );
+
+    let action = normalizer
+        .normalize(
+            &context,
+            ActionProposal::new(
+                "filesystem.write",
+                lumen_core::action::CanonicalValue::object([
+                    (
+                        "path",
+                        lumen_core::action::CanonicalValue::from("notes/today.md"),
+                    ),
+                    ("content", lumen_core::action::CanonicalValue::from("after")),
+                ]),
+            ),
+        )
+        .expect("proposal normalizes");
+
+    assert_eq!(action.kind().as_str(), "filesystem.write");
+    assert_eq!(
+        action.arguments(),
+        &lumen_core::action::CanonicalValue::object([
+            (
+                "after",
+                lumen_core::action::CanonicalValue::object([
+                    ("bytes", lumen_core::action::CanonicalValue::from(5_i64)),
+                    ("content", lumen_core::action::CanonicalValue::from("after"),),
+                    (
+                        "sha256",
+                        lumen_core::action::CanonicalValue::from(
+                            "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+                        ),
+                    ),
+                ]),
+            ),
+            (
+                "before",
+                lumen_core::action::CanonicalValue::object([
+                    ("bytes", lumen_core::action::CanonicalValue::from(6_i64)),
+                    (
+                        "content",
+                        lumen_core::action::CanonicalValue::from("before"),
+                    ),
+                    ("exists", lumen_core::action::CanonicalValue::from(true)),
+                    (
+                        "sha256",
+                        lumen_core::action::CanonicalValue::from(
+                            "6db7d803e74f1ffa7d8f5adc0bf95b3e15bf4c8373fffadf546227cc6c6742cb",
+                        ),
+                    ),
+                ]),
+            ),
+            (
+                "path",
+                lumen_core::action::CanonicalValue::from("notes/today.md"),
+            ),
+        ])
+    );
+    assert_eq!(
+        action.required_capabilities(),
+        &[Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::path(
+                context.workspace_id(),
+                WorkspacePath::parse("notes/today.md").expect("workspace path"),
+            ),
+        )]
+    );
+}
+
+#[test]
+fn new_file_write_preview_binds_target_absence() {
+    let workspace = tempdir().expect("temporary workspace");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 1024).expect("workspace opens");
+    let prepared = filesystem
+        .prepare_write(
+            &WorkspacePath::parse("new.txt").expect("workspace path"),
+            "created",
+        )
+        .expect("new file can be prepared");
+
+    assert!(!prepared.before().exists());
+    assert_eq!(prepared.before().content(), None);
+    assert_eq!(prepared.before().sha256(), None);
+    assert_eq!(prepared.before().bytes(), 0);
+}
+
+#[tokio::test]
+async fn prepared_file_write_atomically_replaces_unchanged_target() {
+    let workspace = tempdir().expect("temporary workspace");
+    std::fs::write(workspace.path().join("note.txt"), "before").expect("existing note");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 1024).expect("workspace opens");
+    let prepared = filesystem
+        .prepare_write(
+            &WorkspacePath::parse("note.txt").expect("workspace path"),
+            "after",
+        )
+        .expect("write prepared");
+
+    filesystem
+        .replace_text(&prepared)
+        .await
+        .expect("unchanged target replaced");
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).expect("note read"),
+        "after"
+    );
+}
+
+#[tokio::test]
+async fn prepared_file_write_rejects_a_changed_target() {
+    let workspace = tempdir().expect("temporary workspace");
+    std::fs::write(workspace.path().join("note.txt"), "before").expect("existing note");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 1024).expect("workspace opens");
+    let prepared = filesystem
+        .prepare_write(
+            &WorkspacePath::parse("note.txt").expect("workspace path"),
+            "after",
+        )
+        .expect("write prepared");
+    std::fs::write(workspace.path().join("note.txt"), "concurrent change")
+        .expect("concurrent change");
+
+    let error = filesystem
+        .replace_text(&prepared)
+        .await
+        .expect_err("stale write must fail");
+
+    assert_eq!(error, FilesystemError::WriteConflict);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).expect("note read"),
+        "concurrent change"
+    );
+}
+
+#[tokio::test]
+async fn prepared_file_write_rejects_mutated_replacement_content() {
+    let workspace = tempdir().expect("temporary workspace");
+    std::fs::write(workspace.path().join("note.txt"), "before").expect("existing note");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 1024).expect("workspace opens");
+    let prepared = filesystem
+        .prepare_write(
+            &WorkspacePath::parse("note.txt").expect("workspace path"),
+            "approved content",
+        )
+        .expect("write prepared");
+    let mut encoded = serde_json::to_value(prepared).expect("prepared write JSON");
+    encoded["after"]["content"] = serde_json::Value::String("mutated content".into());
+    let mutated = serde_json::from_value(encoded).expect("mutated prepared write shape");
+
+    let error = filesystem
+        .replace_text(&mutated)
+        .await
+        .expect_err("mutated replacement must fail");
+
+    assert!(matches!(error, FilesystemError::InvalidPreparedWrite(_)));
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).expect("note read"),
+        "before"
+    );
+}
+
+#[tokio::test]
+async fn new_file_write_rejects_a_target_created_after_preview() {
+    let workspace = tempdir().expect("temporary workspace");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 1024).expect("workspace opens");
+    let prepared = filesystem
+        .prepare_write(
+            &WorkspacePath::parse("note.txt").expect("workspace path"),
+            "agent content",
+        )
+        .expect("write prepared");
+    std::fs::write(workspace.path().join("note.txt"), "user content").expect("concurrent creation");
+
+    let error = filesystem
+        .replace_text(&prepared)
+        .await
+        .expect_err("new-file race must fail");
+
+    assert_eq!(error, FilesystemError::WriteConflict);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).expect("note read"),
+        "user content"
+    );
+}
+
+#[test]
+fn file_write_preparation_enforces_replacement_limit() {
+    let workspace = tempdir().expect("temporary workspace");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 8).expect("workspace opens");
+
+    let error = filesystem
+        .prepare_write(
+            &WorkspacePath::parse("note.txt").expect("workspace path"),
+            "too large",
+        )
+        .expect_err("oversized replacement must fail");
+
+    assert_eq!(
+        error,
+        FilesystemError::WriteLimitExceeded {
+            limit: 8,
+            actual: 9,
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn file_write_preparation_rejects_symlink_targets() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("temporary workspace");
+    let outside = tempdir().expect("outside directory");
+    let outside_file = outside.path().join("secret.txt");
+    std::fs::write(&outside_file, "secret").expect("outside file");
+    symlink(&outside_file, workspace.path().join("linked.txt")).expect("symlink created");
+    let filesystem =
+        WorkspaceReader::with_limits(workspace.path(), 1024, 1024).expect("workspace opens");
+
+    let error = filesystem
+        .prepare_write(
+            &WorkspacePath::parse("linked.txt").expect("workspace path"),
+            "overwrite",
+        )
+        .expect_err("symlink target must fail");
+
+    assert_eq!(error, FilesystemError::AccessDenied);
+    assert_eq!(
+        std::fs::read_to_string(outside_file).expect("outside file read"),
+        "secret"
+    );
+}
+
+#[test]
 fn process_proposals_bind_the_canonical_executable_and_read_only_workspace() {
     let context = run_context();
     let normalizer =

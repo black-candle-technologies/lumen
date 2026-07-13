@@ -17,16 +17,27 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::filesystem::WorkspaceReader;
+use crate::filesystem::{PreparedFileWrite, WorkspaceReader};
 use crate::sandbox::{MonitoredCommand, SandboxBackend, SandboxRequest, SandboxStrength};
 
 pub struct BuiltinActionNormalizer {
     component: ComponentId,
+    filesystem: Option<WorkspaceReader>,
 }
 
 impl BuiltinActionNormalizer {
     pub const fn new(component: ComponentId) -> Self {
-        Self { component }
+        Self {
+            component,
+            filesystem: None,
+        }
+    }
+
+    pub const fn with_filesystem(component: ComponentId, filesystem: WorkspaceReader) -> Self {
+        Self {
+            component,
+            filesystem: Some(filesystem),
+        }
     }
 }
 
@@ -54,6 +65,34 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                     CanonicalValue::object([("path", CanonicalValue::from(path.as_str()))]),
                     vec![Capability::new(
                         CapabilityName::FsRead,
+                        ResourceScope::path(context.workspace_id(), path),
+                    )],
+                ))
+            }
+            "filesystem.write" => {
+                let parsed: FilesystemWriteProposal = parse_arguments(&arguments)?;
+                let path = WorkspacePath::parse(parsed.path)
+                    .map_err(|error| NormalizationError::new(error.to_string()))?;
+                let filesystem = self.filesystem.as_ref().ok_or_else(|| {
+                    NormalizationError::new("file writes are unavailable for this runtime")
+                })?;
+                let prepared = filesystem
+                    .prepare_write(&path, parsed.content)
+                    .map_err(|error| NormalizationError::new(error.to_string()))?;
+                let arguments = prepared
+                    .to_canonical_value()
+                    .map_err(|error| NormalizationError::new(error.to_string()))?;
+                Ok(ActionEnvelope::new(
+                    ActionId::new(),
+                    context.run_id(),
+                    context.workspace_id(),
+                    context.actor().clone(),
+                    self.component.clone(),
+                    ActionKind::new(kind)
+                        .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    arguments,
+                    vec![Capability::new(
+                        CapabilityName::FsWrite,
                         ResourceScope::path(context.workspace_id(), path),
                     )],
                 ))
@@ -123,6 +162,23 @@ impl BuiltinExecutor {
                     CanonicalValue::from(contents),
                 )])))
             }
+            "filesystem.write" => {
+                let prepared: PreparedFileWrite = parse_arguments(action.arguments())
+                    .map_err(|error| ExecutorError::new(error.to_string()))?;
+                match self.filesystem.replace_text(&prepared).await {
+                    Ok(()) => Ok(ExecutionOutcome::Succeeded(CanonicalValue::object([
+                        ("path", CanonicalValue::from(prepared.path())),
+                        ("sha256", CanonicalValue::from(prepared.after().sha256())),
+                        (
+                            "bytes",
+                            CanonicalValue::from(
+                                i64::try_from(prepared.after().bytes()).unwrap_or(i64::MAX),
+                            ),
+                        ),
+                    ]))),
+                    Err(error) => Ok(ExecutionOutcome::Failed(error.to_string())),
+                }
+            }
             "process.spawn" => {
                 let parsed: ProcessArguments = parse_arguments(action.arguments())
                     .map_err(|error| ExecutorError::new(error.to_string()))?;
@@ -155,6 +211,13 @@ impl ExecutorPort for BuiltinExecutor {
 #[serde(deny_unknown_fields)]
 struct FilesystemReadArguments {
     path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesystemWriteProposal {
+    path: String,
+    content: String,
 }
 
 #[derive(Deserialize)]

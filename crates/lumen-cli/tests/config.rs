@@ -48,6 +48,7 @@ fn secure_defaults_are_local_and_fail_closed() {
         RequiredSandboxStrength::KernelEnforced
     );
     assert!(config.process.allowed_programs.is_empty());
+    assert_eq!(config.runtime.file_write_limit_bytes, 1024 * 1024);
 }
 
 #[test]

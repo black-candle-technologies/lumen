@@ -48,15 +48,15 @@ docs/
 
 **Files:** `crates/lumen-core/src/{capability,policy}.rs`, `crates/lumen-core/tests/core_security.rs`, `crates/lumen-integrations/src/{filesystem,process}.rs`, `crates/lumen-integrations/tests/local_executors.rs`
 
-- [ ] Add failing tests proving `fs.write` requires approval and exact path authority.
-- [ ] Add failing tests for trusted new-file and replacement snapshots, canonical hashes, size limits, and symlink rejection.
-- [ ] Add failing tests proving a changed target or mutated preview cannot be written.
-- [ ] Run `cargo test -p lumen-core -p lumen-integrations` and confirm the new tests fail for missing behavior.
-- [ ] Implement canonical `filesystem.write` normalization with trusted before/after content and hashes.
-- [ ] Implement same-directory atomic replacement with a final precondition check.
-- [ ] Grant workspace-scoped `fs.write` in composition while retaining approval-required policy.
-- [ ] Run the focused tests and strict Clippy.
-- [ ] Commit as `feat(tools): add approval-bound file writes`.
+- [x] Add failing tests proving `fs.write` requires approval and exact path authority.
+- [x] Add failing tests for trusted new-file and replacement snapshots, canonical hashes, size limits, and symlink rejection.
+- [x] Add failing tests proving a changed target or mutated preview cannot be written.
+- [x] Run `cargo test -p lumen-core -p lumen-integrations` and confirm the new tests fail for missing behavior.
+- [x] Implement canonical `filesystem.write` normalization with trusted before/after content and hashes.
+- [x] Implement same-directory atomic replacement with a final precondition check.
+- [x] Grant workspace-scoped `fs.write` in composition while retaining approval-required policy.
+- [x] Run the focused tests and strict Clippy.
+- [x] Commit as `feat(tools): add approval-bound file writes`.
 
 ## Task 2: Linux Sandbox And Capability Reporting
 

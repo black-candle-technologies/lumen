@@ -32,6 +32,16 @@ fn file_capability(path: &str) -> Capability {
     )
 }
 
+fn file_write_capability(path: &str) -> Capability {
+    Capability::new(
+        CapabilityName::FsWrite,
+        ResourceScope::path(
+            workspace_id(),
+            WorkspacePath::parse(path).expect("valid path"),
+        ),
+    )
+}
+
 fn action(arguments: CanonicalValue, capabilities: Vec<Capability>) -> ActionEnvelope {
     ActionEnvelope::new(
         action_id(),
@@ -210,5 +220,30 @@ fn default_policy_allows_reads_but_requires_approval_for_processes() {
     assert_eq!(
         Policy::default().evaluate(&process_action, &process_effective),
         PolicyDecision::RequireApproval
+    );
+}
+
+#[test]
+fn default_policy_requires_approval_for_exactly_scoped_file_writes() {
+    let required = file_write_capability("notes/today.md");
+    let write = action(
+        CanonicalValue::object([
+            ("path", CanonicalValue::from("notes/today.md")),
+            ("content", CanonicalValue::from("replacement")),
+        ]),
+        vec![required.clone()],
+    );
+    let exact = EffectiveCapabilities::new([CapabilitySet::new([required.clone()])]);
+    let sibling = EffectiveCapabilities::new([CapabilitySet::new([file_write_capability(
+        "notes/tomorrow.md",
+    )])]);
+
+    assert_eq!(
+        Policy::default().evaluate(&write, &exact),
+        PolicyDecision::RequireApproval
+    );
+    assert_eq!(
+        Policy::default().evaluate(&write, &sibling),
+        PolicyDecision::Deny(DenialReason::MissingCapability(required))
     );
 }

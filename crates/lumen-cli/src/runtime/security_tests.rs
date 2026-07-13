@@ -503,3 +503,65 @@ async fn granted_approval_dispatches_once_and_http_replay_is_rejected() {
     assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 1);
     harness.service.shutdown().await;
 }
+
+#[tokio::test]
+async fn approved_file_write_uses_the_one_shot_runtime_dispatch_path() {
+    let model = MockServer::start().await;
+    let turn = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turn = Arc::clone(&turn);
+            move |_request: &MockRequest| {
+                if turn.fetch_add(1, Ordering::SeqCst) == 0 {
+                    action_response(
+                        "filesystem.write",
+                        serde_json::json!({"path":"note.txt","content":"after"}),
+                    )
+                } else {
+                    final_response("done")
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new(&model, |workspace| {
+        std::fs::write(workspace.join("note.txt"), "before").expect("existing note");
+    })
+    .await;
+    harness.create_run("replace the note").await;
+    let approval_id = loop {
+        let approvals = harness
+            .database
+            .list_pending_approvals(harness.workspace_id)
+            .await
+            .expect("pending approvals");
+        if let Some(approval) = approvals.first() {
+            break approval.approval_id().to_string();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let note = harness._directory.path().join("workspace/note.txt");
+    assert_eq!(std::fs::read_to_string(&note).expect("note read"), "before");
+
+    let granted = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    harness
+        .wait_for_audit(AuditEventKind::ExecutionSucceeded)
+        .await;
+
+    assert_eq!(std::fs::read_to_string(note).expect("note read"), "after");
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 0);
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 1);
+    harness.service.shutdown().await;
+}
