@@ -145,14 +145,14 @@ docs/
 
 **Files:** security tests under owning crates, `README.md`, `docs/{ROADMAP,REPOSITORY,SECURITY}.md`, this plan
 
-- [ ] Add a model-to-HTTP-to-executor write test proving mutation and concurrent file changes fail closed.
-- [ ] Add a secret exfiltration attempt proving values cannot enter persisted or streamed records.
-- [ ] Add platform report, Linux profile, process cancellation, resource exhaustion, and crash-recovery adversarial scenarios.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo test --workspace`.
-- [ ] Run `pnpm check:web`, frontend unit tests, production builds, and Playwright desktop/mobile tests.
-- [ ] Inspect the rendered approval UI and validate Tauri configuration.
-- [ ] Update Roadmap Milestone 2 only for behavior proven by the suite.
-- [ ] Commit as `test: verify hardened local tool boundaries`.
-- [ ] Push `feat/milestone-2-hardened-local-tools` after confirming the worktree is clean and the remote ref matches local HEAD.
+- [x] Add a model-to-HTTP-to-executor write test proving mutation and concurrent file changes fail closed.
+- [x] Add a secret exfiltration attempt proving values cannot enter persisted or streamed records.
+- [x] Add platform report, Linux profile, process cancellation, resource exhaustion, and crash-recovery adversarial scenarios.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Run `cargo test --workspace`.
+- [x] Run `pnpm check:web`, frontend unit tests, production builds, and Playwright desktop/mobile tests.
+- [x] Inspect the rendered approval UI and validate Tauri configuration.
+- [x] Update Roadmap Milestone 2 only for behavior proven by the suite.
+- [x] Commit as `test: verify hardened local tool boundaries`.
+- [x] Push `feat/milestone-2-hardened-local-tools` after confirming the worktree is clean and the remote ref matches local HEAD.

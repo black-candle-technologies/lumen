@@ -131,7 +131,11 @@ Defenses are structural:
 
 ## Isolation And Resource Control
 
-Third-party execution occurs in WASM or a supervised subprocess. The sandbox backend applies the strongest supported platform restrictions and reports its effective guarantees. Policy can require a minimum sandbox strength; the runtime denies execution if that strength is unavailable.
+Built-in process actions run through a supervised subprocess boundary. The sandbox backend reports its effective guarantees through the authenticated runtime API and CLI. Boot configuration requires a minimum strength, and process execution is denied if the active backend cannot meet it.
+
+On Linux, Lumen uses bubblewrap only from fixed system paths and requires the complete Milestone 2 profile to start. That profile creates user, mount, PID, IPC, UTS, cgroup, and network namespaces; drops Linux capabilities; clears the environment; exposes the executable and workspace read-only; creates private process, device, and temporary mounts; starts a new session; and requests parent-death cleanup. Network access remains unavailable inside the isolated network namespace.
+
+On macOS, Lumen uses the system `sandbox-exec` backend and reports its smaller filesystem, workspace-read-only, network, executable, and environment guarantee set. Other platforms currently report the sandbox as unavailable. Lumen does not claim seccomp or Landlock enforcement in Milestone 2. Future third-party WASM and subprocess extension boundaries belong to Milestone 3 and are not implemented yet.
 
 Each action receives explicit limits for:
 
@@ -144,7 +148,7 @@ Each action receives explicit limits for:
 - Environment variables
 - Cancellation and process-tree termination
 
-The Linux backend should combine process isolation with kernel-enforced restrictions such as namespaces, resource controls, seccomp, and Landlock where available. Other platforms use platform-specific backends without pretending their guarantees are identical.
+The process monitor enforces wall-clock and captured-output bounds on every supported Unix backend. It also applies CPU, file-size, open-file, and process-count rlimits; Linux additionally applies an address-space limit. Cancellation, timeout, output exhaustion, failure, and unknown outcomes remain distinct in persisted state and audit events.
 
 ## Network Egress
 
@@ -156,7 +160,7 @@ Remote model requests are network egress and follow [Model Routing](MODEL_ROUTIN
 
 The first implementation uses the operating-system keychain through a `SecretStore` interface. SQL and configuration contain opaque secret references only. Environment variables are permitted only to bootstrap the secret store or for explicitly configured development use.
 
-Executors request a secret by reference after policy and approval checks. Secret values are scoped to the single action, omitted from audit payloads, and redacted from captured output using known-value fingerprints. Redaction is defense in depth, not permission to expose secrets broadly.
+Executors request a secret by reference after policy and approval checks and verify its workspace, executable, and destination environment name. Values are scoped to one action, omitted from normalized actions and approval responses, and redacted from model input, captured output, SSE events, SQL state, and audit payloads. Approval responses expose only an opaque reference ID, operator label, and destination environment name. Redaction is defense in depth, not permission to expose secrets broadly.
 
 ## Policy Administration
 
@@ -168,4 +172,6 @@ Lumen fails closed when it cannot authenticate a request, load policy, verify an
 
 ## Security Validation
 
-Security-sensitive code requires tests for deny-by-default behavior, scope intersection, approval mutation and replay, path canonicalization, redirect and destination enforcement, secret redaction, plugin hash changes, revocation, audit continuity, crash recovery, and resource-limit enforcement.
+Security-sensitive code requires tests for deny-by-default behavior, scope intersection, approval mutation and replay, path canonicalization, secret redaction, audit continuity, crash recovery, and resource-limit enforcement. Milestone 2 includes end-to-end tests from model output through authenticated HTTP approval and executor dispatch, Linux profile tests, process-tree cancellation and timeout tests, exact rlimit tests on Linux, and desktop configuration contract tests.
+
+Redirect and destination enforcement, plugin artifact changes, plugin revocation, and third-party extension containment remain required validation for later milestones where those features are introduced.

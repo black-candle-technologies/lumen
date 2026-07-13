@@ -31,12 +31,14 @@ fn desktop_shell_has_one_local_least_privilege_authority_surface() {
     let mut files = fs::read_dir(&capability_directory)
         .expect("capability directory")
         .map(|entry| entry.expect("capability entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
         .collect::<Vec<_>>();
     files.sort();
     assert_eq!(files, vec![capability_directory.join("main.json")]);
-    let capability: Value =
-        serde_json::from_str(&read(&files[0])).expect("main capability JSON");
+    let capability: Value = serde_json::from_str(&read(&files[0])).expect("main capability JSON");
     assert_eq!(capability["identifier"], "main");
     assert_eq!(capability["windows"], serde_json::json!(["main"]));
     assert_eq!(capability["permissions"], serde_json::json!([]));
@@ -44,8 +46,15 @@ fn desktop_shell_has_one_local_least_privilege_authority_surface() {
 
     let manifest = read(&root.join("Cargo.toml"));
     let runtime = read(&root.join("src/lib.rs"));
-    for forbidden in ["tauri-plugin-opener", "tauri-plugin-shell", "tauri-plugin-fs"] {
-        assert!(!manifest.contains(forbidden), "forbidden dependency: {forbidden}");
+    for forbidden in [
+        "tauri-plugin-opener",
+        "tauri-plugin-shell",
+        "tauri-plugin-fs",
+    ] {
+        assert!(
+            !manifest.contains(forbidden),
+            "forbidden dependency: {forbidden}"
+        );
     }
     for forbidden in [
         "#[tauri::command]",
@@ -53,6 +62,9 @@ fn desktop_shell_has_one_local_least_privilege_authority_surface() {
         "generate_handler!",
         ".plugin(",
     ] {
-        assert!(!runtime.contains(forbidden), "forbidden runtime API: {forbidden}");
+        assert!(
+            !runtime.contains(forbidden),
+            "forbidden runtime API: {forbidden}"
+        );
     }
 }

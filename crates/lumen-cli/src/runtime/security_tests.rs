@@ -764,7 +764,80 @@ async fn approved_file_write_uses_the_one_shot_runtime_dispatch_path() {
 }
 
 #[tokio::test]
-async fn approved_secret_is_injected_once_and_never_crosses_persistence_or_api_boundaries() {
+async fn file_write_decision_mutation_and_concurrent_change_fail_closed_end_to_end() {
+    let model = MockServer::start().await;
+    let turn = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turn = Arc::clone(&turn);
+            move |_request: &MockRequest| {
+                if turn.fetch_add(1, Ordering::SeqCst) == 0 {
+                    action_response(
+                        "filesystem.write",
+                        serde_json::json!({"path":"note.txt","content":"approved content"}),
+                    )
+                } else {
+                    final_response("done")
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new(&model, |workspace| {
+        std::fs::write(workspace.join("note.txt"), "before").expect("existing note");
+    })
+    .await;
+    harness.create_run("replace the note").await;
+    let approval_id = harness.pending_approval_id().await;
+    let note = harness._directory.path().join("workspace/note.txt");
+
+    let mutated = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant","arguments":{"content":"attacker mutation"}}"#,
+        )
+        .await;
+    assert_eq!(mutated.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("note read after rejected mutation"),
+        "before"
+    );
+    let attempts_before_grant: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count before grant");
+    assert_eq!(attempts_before_grant, 0);
+
+    std::fs::write(&note, "concurrent user change").expect("concurrent note change");
+    let granted = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    harness
+        .wait_for_audit(AuditEventKind::ExecutionFailed)
+        .await;
+
+    assert_eq!(
+        std::fs::read_to_string(note).expect("note read after conflict"),
+        "concurrent user change"
+    );
+    let attempt_state: String = sqlx::query_scalar("SELECT state FROM execution_attempts LIMIT 1")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt state");
+    assert_eq!(attempt_state, "failed");
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 0);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn approved_secret_output_exfiltration_is_redacted_from_every_boundary() {
     let secret = "injected-runtime-secret";
     let reference_id =
         SecretRefId::parse("5f7cc8b4-e848-4cb4-91ef-27c5983c41a5").expect("secret reference");

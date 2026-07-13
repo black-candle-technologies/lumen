@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for implementation. The project owner delegated implementation decisions and asked that the roadmap be completed one milestone at a time with incremental commits.
+Implemented and verified. The project owner delegated implementation decisions and asked that the roadmap be completed one milestone at a time with incremental commits.
 
 ## Goal
 

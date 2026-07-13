@@ -24,11 +24,13 @@ This milestone intentionally excludes remote providers, third-party plugin loadi
 
 ## Milestone 2: Hardened Local Tools
 
-- Add file writes with exact previews and approval binding.
-- Complete Linux sandbox enforcement and platform capability reporting.
-- Add OS-keychain secret references and scoped injection.
-- Add cancellation, unknown-outcome recovery, quotas, and resource-limit tests.
-- Complete desktop security configuration and approval UX.
+- [x] Add file writes with exact previews and approval binding.
+- [x] Complete Linux sandbox enforcement and platform capability reporting.
+- [x] Add OS-keychain secret references and scoped injection.
+- [x] Add cancellation, unknown-outcome recovery, quotas, and resource-limit tests.
+- [x] Complete desktop security configuration and approval UX.
+
+Linux process execution requires the complete bubblewrap profile and fails closed when it cannot start. macOS reports its narrower `sandbox-exec` guarantees explicitly. Lumen does not claim seccomp, Landlock, or protection from the host operating-system account in this milestone.
 
 ## Milestone 3: Extension Runtime
 

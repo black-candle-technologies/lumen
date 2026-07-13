@@ -76,7 +76,9 @@ The reason is practical: runtime state needs to be queryable, auditable, mutable
 
 ## Repository Status
 
-Milestone 1, the local runtime kernel, is implemented. It includes strict local configuration, SQLite state and audit chaining, a loopback OpenAI-compatible model client, capability and approval enforcement, constrained file/process execution, authenticated HTTP/SSE APIs, and the chat/approval/audit control surface. Later roadmap milestones remain intentionally unavailable.
+Milestones 1 and 2 are implemented. The repository includes strict local configuration, SQLite state and audit chaining, a loopback OpenAI-compatible model client, capability and one-shot approval enforcement, bounded workspace file reads and writes, supervised process execution, OS-keychain secret references, cancellation and resource quotas, authenticated HTTP/SSE APIs, and exact chat/approval/audit control surfaces.
+
+Linux process actions require the complete bubblewrap profile. macOS uses a narrower reported `sandbox-exec` profile. The Tauri application is a command-free packaging shell with no filesystem, shell, process, or opener permissions. Extension loading, remote providers, external channels, scheduled jobs, browser automation, and learned skills remain intentionally unavailable until their roadmap milestones are implemented.
 
 ## License
 
