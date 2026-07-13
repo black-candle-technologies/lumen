@@ -4,6 +4,7 @@ use lumen_core::capability::{
 };
 use lumen_core::identity::{ComponentId, PrincipalId, WorkspaceId};
 use lumen_core::policy::{DenialReason, Policy, PolicyDecision};
+use lumen_core::secret::SecretRefId;
 use uuid::Uuid;
 
 fn workspace_id() -> WorkspaceId {
@@ -244,6 +245,36 @@ fn default_policy_requires_approval_for_exactly_scoped_file_writes() {
     );
     assert_eq!(
         Policy::default().evaluate(&write, &sibling),
+        PolicyDecision::Deny(DenialReason::MissingCapability(required))
+    );
+}
+
+#[test]
+fn secret_references_are_uuid_identifiers_with_exact_approval_scope() {
+    let reference =
+        SecretRefId::parse("5f7cc8b4-e848-4cb4-91ef-27c5983c41a5").expect("secret reference");
+    assert!(SecretRefId::parse("production-token").is_err());
+    let required = Capability::new(
+        CapabilityName::SecretUse,
+        ResourceScope::exact("secret_reference", reference.to_string()).expect("secret scope"),
+    );
+    let secret_action = action(
+        CanonicalValue::object([("secret_ref", CanonicalValue::from(reference.to_string()))]),
+        vec![required.clone()],
+    );
+    let exact = EffectiveCapabilities::new([CapabilitySet::new([required.clone()])]);
+    let other = EffectiveCapabilities::new([CapabilitySet::new([Capability::new(
+        CapabilityName::SecretUse,
+        ResourceScope::exact("secret_reference", "34fd4908-5adb-4930-b290-f59814fec1d6")
+            .expect("other secret scope"),
+    )])]);
+
+    assert_eq!(
+        Policy::default().evaluate(&secret_action, &exact),
+        PolicyDecision::RequireApproval
+    );
+    assert_eq!(
+        Policy::default().evaluate(&secret_action, &other),
         PolicyDecision::Deny(DenialReason::MissingCapability(required))
     );
 }

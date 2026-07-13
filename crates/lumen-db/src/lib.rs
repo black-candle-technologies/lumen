@@ -9,7 +9,10 @@ use std::path::Path;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
-pub use repositories::{DispatchReservation, PendingApprovalView, RecoveredExecution};
+pub use repositories::{
+    DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
+    SecretReferenceError,
+};
 
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -58,6 +61,8 @@ pub enum RepositoryError {
     InvalidRunState(String),
     #[error("execution attempt conflicts with its stored action or state")]
     ExecutionStateConflict,
+    #[error("stored secret reference is invalid: {0}")]
+    InvalidSecretReference(String),
 }
 
 pub(crate) fn timestamp_to_i64(

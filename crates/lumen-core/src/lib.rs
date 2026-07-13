@@ -9,3 +9,4 @@ pub mod identity;
 pub mod model;
 pub mod policy;
 pub mod run;
+pub mod secret;

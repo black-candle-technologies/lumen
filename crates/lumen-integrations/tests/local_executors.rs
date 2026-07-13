@@ -13,6 +13,7 @@ use lumen_core::{
     identity::{ComponentId, PrincipalId, WorkspaceId},
     model::ActionProposal,
     run::{ActionNormalizer, RunContext},
+    secret::SecretRefId,
 };
 use lumen_integrations::{
     filesystem::{FilesystemError, WorkspaceReader},
@@ -361,6 +362,76 @@ fn process_proposals_bind_the_canonical_executable_and_read_only_workspace() {
         CapabilityName::ProcessSpawn,
         ResourceScope::exact("executable", canonical_program).expect("exact scope"),
     )));
+}
+
+#[test]
+fn process_secret_bindings_fingerprint_only_opaque_references() {
+    let context = run_context();
+    let normalizer =
+        BuiltinActionNormalizer::new(ComponentId::new("builtin.tools").expect("component ID"));
+    let reference =
+        SecretRefId::parse("5f7cc8b4-e848-4cb4-91ef-27c5983c41a5").expect("secret reference");
+
+    let action = normalizer
+        .normalize(
+            &context,
+            ActionProposal::new(
+                "process.spawn",
+                lumen_core::action::CanonicalValue::object([
+                    (
+                        "program",
+                        lumen_core::action::CanonicalValue::from("/bin/echo"),
+                    ),
+                    (
+                        "secret_environment",
+                        lumen_core::action::CanonicalValue::object([(
+                            "API_TOKEN",
+                            lumen_core::action::CanonicalValue::from(reference.to_string()),
+                        )]),
+                    ),
+                ]),
+            ),
+        )
+        .expect("secret-bearing proposal normalizes");
+
+    assert!(action.required_capabilities().contains(&Capability::new(
+        CapabilityName::SecretUse,
+        ResourceScope::exact("secret_reference", reference.to_string()).expect("secret scope"),
+    )));
+    let encoded = serde_json::to_string(&action).expect("action JSON");
+    assert!(encoded.contains("API_TOKEN"));
+    assert!(encoded.contains(&reference.to_string()));
+    assert!(!encoded.contains("actual-secret-value"));
+}
+
+#[test]
+fn process_secret_bindings_reject_non_uuid_references() {
+    let normalizer =
+        BuiltinActionNormalizer::new(ComponentId::new("builtin.tools").expect("component ID"));
+
+    let error = normalizer
+        .normalize(
+            &run_context(),
+            ActionProposal::new(
+                "process.spawn",
+                lumen_core::action::CanonicalValue::object([
+                    (
+                        "program",
+                        lumen_core::action::CanonicalValue::from("/bin/echo"),
+                    ),
+                    (
+                        "secret_environment",
+                        lumen_core::action::CanonicalValue::object([(
+                            "API_TOKEN",
+                            lumen_core::action::CanonicalValue::from("production-token"),
+                        )]),
+                    ),
+                ]),
+            ),
+        )
+        .expect_err("non-UUID secret reference must fail");
+
+    assert!(error.to_string().contains("secret reference"));
 }
 
 #[tokio::test]

@@ -1,11 +1,15 @@
+use std::path::Path;
+
 use lumen_core::{
     action::{ActionEnvelope, ActionFingerprint, ActionId, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
     identity::PrincipalId,
     identity::WorkspaceId,
     policy::PolicyVersion,
+    secret::SecretRefId,
 };
 use sqlx::Row;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{Database, RepositoryError, timestamp_to_i64};
@@ -18,6 +22,114 @@ pub struct DispatchReservation {
     action_fingerprint: ActionFingerprint,
     policy_version: PolicyVersion,
     reserved_at: TimestampMillis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretReference {
+    id: SecretRefId,
+    workspace_id: WorkspaceId,
+    label: String,
+    keychain_account: String,
+    executable: String,
+    environment_name: String,
+    created_at: TimestampMillis,
+    updated_at: TimestampMillis,
+}
+
+impl SecretReference {
+    pub fn new(
+        id: SecretRefId,
+        workspace_id: WorkspaceId,
+        label: impl Into<String>,
+        executable: impl Into<String>,
+        environment_name: impl Into<String>,
+        created_at: TimestampMillis,
+    ) -> Result<Self, SecretReferenceError> {
+        let label = label.into();
+        let executable = executable.into();
+        let environment_name = environment_name.into();
+        if label.is_empty()
+            || label.len() > 128
+            || label.trim() != label
+            || label.chars().any(char::is_control)
+        {
+            return Err(SecretReferenceError::InvalidLabel);
+        }
+        if executable.len() > 4096
+            || !Path::new(&executable).is_absolute()
+            || executable.chars().any(char::is_control)
+        {
+            return Err(SecretReferenceError::InvalidExecutable);
+        }
+        if !valid_environment_name(&environment_name) {
+            return Err(SecretReferenceError::InvalidEnvironmentName);
+        }
+        Ok(Self {
+            id,
+            workspace_id,
+            label,
+            keychain_account: format!("{workspace_id}:{id}"),
+            executable,
+            environment_name,
+            created_at,
+            updated_at: created_at,
+        })
+    }
+
+    pub const fn id(&self) -> SecretRefId {
+        self.id
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn keychain_account(&self) -> &str {
+        &self.keychain_account
+    }
+
+    pub fn executable(&self) -> &str {
+        &self.executable
+    }
+
+    pub fn environment_name(&self) -> &str {
+        &self.environment_name
+    }
+
+    pub const fn created_at(&self) -> TimestampMillis {
+        self.created_at
+    }
+
+    pub const fn updated_at(&self) -> TimestampMillis {
+        self.updated_at
+    }
+
+    pub fn allows(&self, workspace_id: WorkspaceId, executable: &str, environment: &str) -> bool {
+        self.workspace_id == workspace_id
+            && self.executable == executable
+            && self.environment_name == environment
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SecretReferenceError {
+    #[error("secret label must be trimmed, bounded, and free of control characters")]
+    InvalidLabel,
+    #[error("secret executable scope must be a bounded absolute path")]
+    InvalidExecutable,
+    #[error("secret environment scope must be a portable environment name")]
+    InvalidEnvironmentName,
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && value.len() <= 256
 }
 
 impl DispatchReservation {
@@ -113,6 +225,76 @@ impl PendingApprovalView {
 }
 
 impl Database {
+    pub async fn insert_secret_reference(
+        &self,
+        reference: &SecretReference,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO secret_references (
+                id, workspace_id, label, keychain_account, executable,
+                environment_name, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(reference.id.to_string())
+        .bind(reference.workspace_id.to_string())
+        .bind(&reference.label)
+        .bind(&reference.keychain_account)
+        .bind(&reference.executable)
+        .bind(&reference.environment_name)
+        .bind(timestamp_to_i64(reference.created_at)?)
+        .bind(timestamp_to_i64(reference.updated_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_secret_reference(
+        &self,
+        workspace_id: WorkspaceId,
+        id: SecretRefId,
+    ) -> Result<Option<SecretReference>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT id, workspace_id, label, keychain_account, executable,
+                    environment_name, created_at, updated_at
+             FROM secret_references WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(secret_reference_from_row).transpose()
+    }
+
+    pub async fn list_secret_references(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<SecretReference>, RepositoryError> {
+        sqlx::query(
+            "SELECT id, workspace_id, label, keychain_account, executable,
+                    environment_name, created_at, updated_at
+             FROM secret_references WHERE workspace_id = ? ORDER BY label, id",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(secret_reference_from_row)
+        .collect()
+    }
+
+    pub async fn delete_secret_reference(
+        &self,
+        workspace_id: WorkspaceId,
+        id: SecretRefId,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query("DELETE FROM secret_references WHERE workspace_id = ? AND id = ?")
+            .bind(workspace_id.to_string())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn recover_incomplete_executions(
         &self,
         recovered_at: TimestampMillis,
@@ -599,6 +781,41 @@ impl Database {
         transaction.commit().await?;
         Ok(())
     }
+}
+
+fn secret_reference_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<SecretReference, RepositoryError> {
+    let created_at = TimestampMillis::new(
+        u64::try_from(row.try_get::<i64, _>("created_at")?)
+            .map_err(|_| RepositoryError::TimestampOutOfRange)?,
+    );
+    let updated_at = TimestampMillis::new(
+        u64::try_from(row.try_get::<i64, _>("updated_at")?)
+            .map_err(|_| RepositoryError::TimestampOutOfRange)?,
+    );
+    let id = parse_uuid(row.try_get::<String, _>("id")?, SecretRefId::from_uuid)?;
+    let workspace_id = parse_uuid(
+        row.try_get::<String, _>("workspace_id")?,
+        WorkspaceId::from_uuid,
+    )?;
+    let stored_account: String = row.try_get("keychain_account")?;
+    let mut reference = SecretReference::new(
+        id,
+        workspace_id,
+        row.try_get::<String, _>("label")?,
+        row.try_get::<String, _>("executable")?,
+        row.try_get::<String, _>("environment_name")?,
+        created_at,
+    )
+    .map_err(|error| RepositoryError::InvalidSecretReference(error.to_string()))?;
+    if stored_account != reference.keychain_account || updated_at < created_at {
+        return Err(RepositoryError::InvalidSecretReference(
+            "stored account or timestamps do not match canonical metadata".to_owned(),
+        ));
+    }
+    reference.updated_at = updated_at;
+    Ok(reference)
 }
 
 fn parse_uuid<T>(value: String, constructor: impl FnOnce(Uuid) -> T) -> Result<T, RepositoryError> {

@@ -76,16 +76,16 @@ docs/
 
 **Files:** `crates/lumen-core/src/{capability,action}.rs`, `crates/lumen-db/migrations/0002_hardened_tools.sql`, `crates/lumen-db/src/repositories.rs`, `crates/lumen-db/tests/database.rs`, `crates/lumen-integrations/src/{lib,secrets,process}.rs`, `crates/lumen-integrations/tests/secrets.rs`
 
-- [ ] Add failing type and policy tests for opaque `secret.use` resources.
-- [ ] Add failing migration/repository tests proving SQL stores only reference metadata and enforces workspace/program/environment scope.
-- [ ] Add failing adapter contract tests for put, resolve, delete, missing entries, and unavailable credential stores.
-- [ ] Add failing process tests proving secret reference IDs are fingerprinted while values are absent from actions and previews.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement the append-only migration and typed secret-reference repository.
-- [ ] Implement `SecretStore`, the OS-keyring adapter, and an in-memory test adapter.
-- [ ] Extend process normalization with secret-reference bindings and `secret.use` requirements.
-- [ ] Run migration-from-0001, focused tests, and strict Clippy.
-- [ ] Commit as `feat(secrets): add scoped OS-keychain references`.
+- [x] Add failing type and policy tests for opaque `secret.use` resources.
+- [x] Add failing migration/repository tests proving SQL stores only reference metadata and enforces workspace/program/environment scope.
+- [x] Add failing adapter contract tests for put, resolve, delete, missing entries, and unavailable credential stores.
+- [x] Add failing process tests proving secret reference IDs are fingerprinted while values are absent from actions and previews.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement the append-only migration and typed secret-reference repository.
+- [x] Implement `SecretStore`, the OS-keyring adapter, and an in-memory test adapter.
+- [x] Extend process normalization with secret-reference bindings and `secret.use` requirements.
+- [x] Run migration-from-0001, focused tests, and strict Clippy.
+- [x] Commit as `feat(secrets): add scoped OS-keychain references`.
 
 ## Task 4: Secret Operator Commands And Injection
 

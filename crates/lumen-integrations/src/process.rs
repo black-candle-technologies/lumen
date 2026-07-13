@@ -12,6 +12,7 @@ use lumen_core::{
     identity::ComponentId,
     model::ActionProposal,
     run::{ActionNormalizer, NormalizationError, RunContext},
+    secret::SecretRefId,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -105,8 +106,35 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                 let program = program.to_string_lossy().into_owned();
                 let scope = ResourceScope::exact("executable", &program)
                     .map_err(|error| NormalizationError::new(error.to_string()))?;
-                let normalized_arguments =
-                    process_arguments_value(&program, parsed.arguments, parsed.environment);
+                let secret_environment = parse_secret_environment(parsed.secret_environment)?;
+                if secret_environment
+                    .keys()
+                    .any(|name| parsed.environment.contains_key(name))
+                {
+                    return Err(NormalizationError::new(
+                        "an environment name cannot contain both a literal and a secret reference",
+                    ));
+                }
+                let normalized_arguments = process_arguments_value(
+                    &program,
+                    parsed.arguments,
+                    parsed.environment,
+                    secret_environment.clone(),
+                );
+                let mut capabilities = vec![
+                    Capability::new(
+                        CapabilityName::FsRead,
+                        ResourceScope::workspace(context.workspace_id()),
+                    ),
+                    Capability::new(CapabilityName::ProcessSpawn, scope),
+                ];
+                for reference in secret_environment.values().collect::<BTreeSet<_>>() {
+                    capabilities.push(Capability::new(
+                        CapabilityName::SecretUse,
+                        ResourceScope::exact("secret_reference", reference.to_string())
+                            .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    ));
+                }
                 Ok(ActionEnvelope::new(
                     ActionId::new(),
                     context.run_id(),
@@ -116,13 +144,7 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                     ActionKind::new(kind)
                         .map_err(|error| NormalizationError::new(error.to_string()))?,
                     normalized_arguments,
-                    vec![
-                        Capability::new(
-                            CapabilityName::FsRead,
-                            ResourceScope::workspace(context.workspace_id()),
-                        ),
-                        Capability::new(CapabilityName::ProcessSpawn, scope),
-                    ],
+                    capabilities,
                 ))
             }
             _ => Err(NormalizationError::new(format!(
@@ -182,6 +204,11 @@ impl BuiltinExecutor {
             "process.spawn" => {
                 let parsed: ProcessArguments = parse_arguments(action.arguments())
                     .map_err(|error| ExecutorError::new(error.to_string()))?;
+                if !parsed.secret_environment.is_empty() {
+                    return Ok(ExecutionOutcome::Failed(
+                        "secret injection is unavailable for this runtime".to_owned(),
+                    ));
+                }
                 match self
                     .process
                     .execute(
@@ -228,6 +255,8 @@ struct ProcessArguments {
     arguments: Vec<String>,
     #[serde(default)]
     environment: BTreeMap<String, String>,
+    #[serde(default)]
+    secret_environment: BTreeMap<String, String>,
 }
 
 fn parse_arguments<T: for<'de> Deserialize<'de>>(
@@ -242,6 +271,7 @@ fn process_arguments_value(
     program: &str,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    secret_environment: BTreeMap<String, SecretRefId>,
 ) -> CanonicalValue {
     CanonicalValue::object([
         ("program", CanonicalValue::from(program)),
@@ -258,7 +288,41 @@ fn process_arguments_value(
                     .collect(),
             ),
         ),
+        (
+            "secret_environment",
+            CanonicalValue::Object(
+                secret_environment
+                    .into_iter()
+                    .map(|(key, reference)| (key, CanonicalValue::from(reference.to_string())))
+                    .collect(),
+            ),
+        ),
     ])
+}
+
+fn parse_secret_environment(
+    values: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, SecretRefId>, NormalizationError> {
+    values
+        .into_iter()
+        .map(|(name, value)| {
+            if !valid_environment_name(&name) {
+                return Err(NormalizationError::new(format!(
+                    "secret environment name is invalid: {name}"
+                )));
+            }
+            let reference = SecretRefId::parse(&value)
+                .map_err(|error| NormalizationError::new(error.to_string()))?;
+            Ok((name, reference))
+        })
+        .collect()
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && value.len() <= 256
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

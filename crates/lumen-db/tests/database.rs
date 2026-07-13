@@ -6,7 +6,7 @@ use lumen_core::{
     identity::{ComponentId, PrincipalId, WorkspaceId},
     policy::PolicyVersion,
 };
-use lumen_db::{Database, DispatchReservation, RepositoryError};
+use lumen_db::{Database, DispatchReservation, RepositoryError, SecretReference};
 use sqlx::Row;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -88,6 +88,7 @@ async fn empty_database_runs_the_initial_migration() {
         "audit_events",
         "execution_attempts",
         "identities",
+        "secret_references",
         "workspaces",
     ] {
         assert!(
@@ -100,7 +101,7 @@ async fn empty_database_runs_the_initial_migration() {
         .fetch_one(database.pool())
         .await
         .expect("migration metadata loads");
-    assert_eq!(migration_count, 1);
+    assert_eq!(migration_count, 2);
 }
 
 #[tokio::test]
@@ -126,7 +127,150 @@ async fn file_database_reopens_without_reapplying_migrations() {
         .expect("migration count loads");
 
     assert_eq!(workspace_count, 1);
-    assert_eq!(migration_count, 1);
+    assert_eq!(migration_count, 2);
+}
+
+#[tokio::test]
+async fn previous_schema_is_upgraded_with_opaque_secret_reference_metadata() {
+    let directory = tempdir().expect("temporary directory");
+    let path = directory.path().join("upgrade.sqlite3");
+    let database = Database::connect(&path)
+        .await
+        .expect("current database opens");
+    sqlx::query("DROP TABLE secret_references")
+        .execute(database.pool())
+        .await
+        .expect("Milestone 2 table removed");
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 2")
+        .execute(database.pool())
+        .await
+        .expect("Milestone 2 migration marker removed");
+    database.close().await;
+
+    let upgraded = Database::connect(&path)
+        .await
+        .expect("previous schema upgrades");
+
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'secret_references'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .expect("secret table query");
+    assert_eq!(table_count, 1);
+}
+
+#[tokio::test]
+async fn secret_reference_repository_never_stores_secret_values() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let reference = SecretReference::new(
+        lumen_core::secret::SecretRefId::parse("5f7cc8b4-e848-4cb4-91ef-27c5983c41a5")
+            .expect("secret reference"),
+        workspace_id(),
+        "GitHub token",
+        "/usr/bin/git",
+        "GITHUB_TOKEN",
+        TimestampMillis::new(1_100),
+    )
+    .expect("secret metadata");
+
+    database
+        .insert_secret_reference(&reference)
+        .await
+        .expect("reference inserted");
+
+    let loaded = database
+        .get_secret_reference(workspace_id(), reference.id())
+        .await
+        .expect("reference query")
+        .expect("reference found");
+    assert_eq!(loaded, reference);
+    assert!(loaded.allows(workspace_id(), "/usr/bin/git", "GITHUB_TOKEN"));
+    assert!(!loaded.allows(workspace_id(), "/usr/bin/curl", "GITHUB_TOKEN"));
+    assert!(!loaded.allows(workspace_id(), "/usr/bin/git", "OTHER_TOKEN"));
+    let schema: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'secret_references'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("secret schema");
+    assert!(!schema.to_ascii_lowercase().contains("secret_value"));
+    assert!(!schema.to_ascii_lowercase().contains("credential_value"));
+    let stored_columns: Vec<String> = sqlx::query("PRAGMA table_info(secret_references)")
+        .fetch_all(database.pool())
+        .await
+        .expect("secret columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+    assert_eq!(
+        stored_columns,
+        vec![
+            "id".to_owned(),
+            "workspace_id".to_owned(),
+            "label".to_owned(),
+            "keychain_account".to_owned(),
+            "executable".to_owned(),
+            "environment_name".to_owned(),
+            "created_at".to_owned(),
+            "updated_at".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn secret_references_are_workspace_scoped_and_deletable() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let reference = SecretReference::new(
+        lumen_core::secret::SecretRefId::new(),
+        workspace_id(),
+        "Build token",
+        "/usr/bin/env",
+        "BUILD_TOKEN",
+        TimestampMillis::new(1_100),
+    )
+    .expect("secret metadata");
+    database
+        .insert_secret_reference(&reference)
+        .await
+        .expect("reference inserted");
+
+    assert!(
+        database
+            .get_secret_reference(WorkspaceId::new(), reference.id())
+            .await
+            .expect("other workspace query")
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .list_secret_references(workspace_id())
+            .await
+            .expect("reference list"),
+        vec![reference.clone()]
+    );
+    assert!(
+        database
+            .delete_secret_reference(workspace_id(), reference.id())
+            .await
+            .expect("reference deleted")
+    );
+    assert!(
+        database
+            .list_secret_references(workspace_id())
+            .await
+            .expect("empty reference list")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
