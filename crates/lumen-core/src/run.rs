@@ -1,6 +1,11 @@
-use std::{future::Future, pin::Pin};
+use std::{
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     action::{ActionEnvelope, CanonicalValue, RunId},
@@ -85,6 +90,8 @@ impl RunContext {
 pub struct RunBudget {
     max_model_turns: u32,
     max_actions: u32,
+    max_wall_time: Option<Duration>,
+    max_captured_result_bytes: usize,
 }
 
 impl RunBudget {
@@ -92,7 +99,19 @@ impl RunBudget {
         Self {
             max_model_turns,
             max_actions,
+            max_wall_time: None,
+            max_captured_result_bytes: usize::MAX,
         }
+    }
+
+    pub const fn with_quotas(
+        mut self,
+        max_wall_time: Duration,
+        max_captured_result_bytes: usize,
+    ) -> Self {
+        self.max_wall_time = Some(max_wall_time);
+        self.max_captured_result_bytes = max_captured_result_bytes;
+        self
     }
 }
 
@@ -107,6 +126,8 @@ pub struct RunState {
     terminal_outcome: Option<RunOutcome>,
     started: bool,
     cancelled: bool,
+    started_at: Instant,
+    captured_result_bytes: usize,
 }
 
 impl RunState {
@@ -124,6 +145,8 @@ impl RunState {
             terminal_outcome: None,
             started: false,
             cancelled: false,
+            started_at: Instant::now(),
+            captured_result_bytes: 0,
         }
     }
 
@@ -156,11 +179,12 @@ pub struct RunOrchestrator<'a> {
     actions: &'a dyn ActionPort,
     policy: Policy,
     policy_version: PolicyVersion,
+    cancellation: CancellationToken,
 }
 
 impl<'a> RunOrchestrator<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         model: &'a dyn ModelPort,
         normalizer: &'a dyn ActionNormalizer,
         executor: &'a dyn ExecutorPort,
@@ -179,7 +203,13 @@ impl<'a> RunOrchestrator<'a> {
             actions,
             policy,
             policy_version,
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     pub async fn run_until_blocked(
@@ -215,6 +245,13 @@ impl<'a> RunOrchestrator<'a> {
                 return Ok(state.finish(RunOutcome::Cancelled));
             }
 
+            if self
+                .wall_time_remaining(state)
+                .is_some_and(|remaining| remaining.is_zero())
+            {
+                return self.exhaust_budget(state, BudgetKind::WallClock, now).await;
+            }
+
             if let Some(pending) = state.pending_action.take() {
                 match self
                     .resolve_approval(state, pending.action, pending.approval_id, now)
@@ -235,12 +272,20 @@ impl<'a> RunOrchestrator<'a> {
             }
 
             if state.model_turns >= state.budget.max_model_turns {
-                return Ok(state.finish(RunOutcome::BudgetExhausted(BudgetKind::ModelTurns)));
+                return self
+                    .exhaust_budget(state, BudgetKind::ModelTurns, now)
+                    .await;
             }
-            let output = self
-                .model
-                .generate(ModelInput::new(state.messages.clone()))
-                .await?;
+            let generation = self.model.generate(ModelInput::new(state.messages.clone()));
+            let output = match self.wall_time_remaining(state) {
+                Some(remaining) => match tokio::time::timeout(remaining, generation).await {
+                    Ok(output) => output?,
+                    Err(_) => {
+                        return self.exhaust_budget(state, BudgetKind::WallClock, now).await;
+                    }
+                },
+                None => generation.await?,
+            };
             state.model_turns += 1;
 
             match output {
@@ -256,7 +301,7 @@ impl<'a> RunOrchestrator<'a> {
                 }
                 ModelOutput::Action(proposal) => {
                     if state.actions >= state.budget.max_actions {
-                        return Ok(state.finish(RunOutcome::BudgetExhausted(BudgetKind::Actions)));
+                        return self.exhaust_budget(state, BudgetKind::Actions, now).await;
                     }
                     self.audit(
                         state,
@@ -465,7 +510,25 @@ impl<'a> RunOrchestrator<'a> {
             now,
         )
         .await?;
-        match self.executor.execute(&action).await? {
+        let cancellation = self.cancellation.clone();
+        let mut execution = self.executor.execute(&action, cancellation.clone());
+        let outcome = match self.wall_time_remaining(state) {
+            Some(remaining) => {
+                tokio::select! {
+                    outcome = &mut execution => outcome?,
+                    () = tokio::time::sleep(remaining) => {
+                        cancellation.cancel();
+                        let _ = execution.await;
+                        return Ok(Some(
+                            self.exhaust_budget(state, BudgetKind::WallClock, now)
+                                .await?,
+                        ));
+                    }
+                }
+            }
+            None => execution.await?,
+        };
+        match outcome {
             ExecutionOutcome::Succeeded(result) => {
                 self.audit(
                     state,
@@ -474,6 +537,21 @@ impl<'a> RunOrchestrator<'a> {
                     now,
                 )
                 .await?;
+                let captured = serde_json::to_vec(&result)
+                    .expect("canonical tool result serialization cannot fail")
+                    .len();
+                if captured
+                    > state
+                        .budget
+                        .max_captured_result_bytes
+                        .saturating_sub(state.captured_result_bytes)
+                {
+                    return Ok(Some(
+                        self.exhaust_budget(state, BudgetKind::CapturedResultBytes, now)
+                            .await?,
+                    ));
+                }
+                state.captured_result_bytes += captured;
                 state
                     .messages
                     .push(ModelMessage::new(ModelRole::Tool, result));
@@ -489,6 +567,26 @@ impl<'a> RunOrchestrator<'a> {
                 .await?;
                 Ok(Some(state.finish(RunOutcome::ExecutionFailed { message })))
             }
+            ExecutionOutcome::Cancelled => {
+                self.audit(
+                    state,
+                    AuditEventKind::ExecutionCancelled,
+                    AuditOutcome::Failure,
+                    now,
+                )
+                .await?;
+                Ok(Some(state.finish(RunOutcome::Cancelled)))
+            }
+            ExecutionOutcome::TimedOut => {
+                self.audit(
+                    state,
+                    AuditEventKind::ExecutionTimedOut,
+                    AuditOutcome::Failure,
+                    now,
+                )
+                .await?;
+                Ok(Some(state.finish(RunOutcome::ExecutionTimedOut)))
+            }
             ExecutionOutcome::Unknown(message) => {
                 self.audit(
                     state,
@@ -500,6 +598,48 @@ impl<'a> RunOrchestrator<'a> {
                 Ok(Some(state.finish(RunOutcome::ExecutionUnknown { message })))
             }
         }
+    }
+
+    fn wall_time_remaining(&self, state: &RunState) -> Option<Duration> {
+        state
+            .budget
+            .max_wall_time
+            .map(|limit| limit.saturating_sub(state.started_at.elapsed()))
+    }
+
+    async fn exhaust_budget(
+        &self,
+        state: &mut RunState,
+        kind: BudgetKind,
+        now: TimestampMillis,
+    ) -> Result<RunOutcome, RunError> {
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                now,
+                AuditEventKind::RunBudgetExhausted,
+                AuditOutcome::Failure,
+                Some(state.context.workspace_id()),
+                CanonicalValue::object([
+                    (
+                        "run_id",
+                        CanonicalValue::from(state.context.run_id().to_string()),
+                    ),
+                    (
+                        "actor",
+                        CanonicalValue::from(state.context.actor().subject()),
+                    ),
+                    ("budget", CanonicalValue::from(kind.as_str())),
+                    (
+                        "captured_result_bytes",
+                        CanonicalValue::from(
+                            i64::try_from(state.captured_result_bytes).unwrap_or(i64::MAX),
+                        ),
+                    ),
+                ]),
+            ))
+            .await?;
+        Ok(state.finish(RunOutcome::BudgetExhausted(kind)))
     }
 
     async fn audit(
@@ -546,6 +686,7 @@ pub enum RunOutcome {
     BudgetExhausted(BudgetKind),
     Cancelled,
     ExecutionFailed { message: String },
+    ExecutionTimedOut,
     ExecutionUnknown { message: String },
 }
 
@@ -553,6 +694,19 @@ pub enum RunOutcome {
 pub enum BudgetKind {
     ModelTurns,
     Actions,
+    WallClock,
+    CapturedResultBytes,
+}
+
+impl BudgetKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelTurns => "model_turns",
+            Self::Actions => "actions",
+            Self::WallClock => "wall_clock",
+            Self::CapturedResultBytes => "captured_result_bytes",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

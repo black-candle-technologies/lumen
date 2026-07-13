@@ -21,7 +21,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::filesystem::{PreparedFileWrite, WorkspaceReader};
-use crate::sandbox::{MonitoredCommand, SandboxBackend, SandboxRequest, SandboxStrength};
+use crate::sandbox::{
+    MonitoredCommand, ResourceLimits, SandboxBackend, SandboxError, SandboxRequest, SandboxStrength,
+};
 
 pub struct BuiltinActionNormalizer {
     component: ComponentId,
@@ -176,7 +178,11 @@ impl BuiltinExecutor {
         self
     }
 
-    async fn dispatch(&self, action: &ActionEnvelope) -> Result<ExecutionOutcome, ExecutorError> {
+    async fn dispatch(
+        &self,
+        action: &ActionEnvelope,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
         match action.kind().as_str() {
             "filesystem.read" => {
                 let parsed: FilesystemReadArguments = parse_arguments(action.arguments())
@@ -251,7 +257,7 @@ impl BuiltinExecutor {
                     .execute_with_resolved_secrets(
                         ProcessRequest::new(parsed.program, parsed.arguments, environment),
                         &secret_environment_names,
-                        CancellationToken::new(),
+                        cancellation,
                     )
                     .await
                 {
@@ -293,8 +299,12 @@ impl ProcessSecretError {
 }
 
 impl ExecutorPort for BuiltinExecutor {
-    fn execute<'a>(&'a self, action: &'a AuthorizedAction) -> ExecutorFuture<'a> {
-        Box::pin(async move { self.dispatch(action.action()).await })
+    fn execute<'a>(
+        &'a self,
+        action: &'a AuthorizedAction,
+        cancellation: CancellationToken,
+    ) -> ExecutorFuture<'a> {
+        Box::pin(async move { self.dispatch(action.action(), cancellation).await })
     }
 }
 
@@ -420,6 +430,7 @@ pub struct ProcessExecutor {
     allowed_environment: BTreeSet<String>,
     timeout: Duration,
     output_limit: usize,
+    resource_limits: ResourceLimits,
     sandbox: Arc<dyn SandboxBackend>,
 }
 
@@ -430,6 +441,7 @@ impl ProcessExecutor {
         allowed_environment: BTreeSet<String>,
         timeout: Duration,
         output_limit: usize,
+        resource_limits: ResourceLimits,
         sandbox: Arc<dyn SandboxBackend>,
     ) -> Result<Self, ProcessError> {
         let workspace = std::fs::canonicalize(workspace)
@@ -454,6 +466,7 @@ impl ProcessExecutor {
             allowed_environment,
             timeout,
             output_limit,
+            resource_limits,
             sandbox,
         })
     }
@@ -499,16 +512,22 @@ impl ProcessExecutor {
             .args(request.arguments)
             .current_dir(&self.workspace)
             .envs(request.environment);
-        let output = self
+        let output = match self
             .sandbox
             .execute(SandboxRequest::new(
                 command,
                 self.timeout,
                 self.output_limit,
                 cancellation,
+                self.resource_limits,
             ))
             .await
-            .map_err(|error| ProcessError::Sandbox(error.to_string()))?;
+        {
+            Ok(output) => output,
+            Err(SandboxError::Cancelled) => return Ok(ExecutionOutcome::Cancelled),
+            Err(SandboxError::TimedOut) => return Ok(ExecutionOutcome::TimedOut),
+            Err(error) => return Err(ProcessError::Sandbox(error.to_string())),
+        };
 
         let stdout = String::from_utf8_lossy(output.stdout()).into_owned();
         let stderr = String::from_utf8_lossy(output.stderr()).into_owned();

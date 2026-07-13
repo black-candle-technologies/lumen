@@ -505,9 +505,10 @@ async fn crash_recovery_marks_reserved_execution_unknown_without_retrying() {
         .insert_approval(&approval)
         .await
         .expect("approval stored");
+    let incomplete_attempt = ExecutionAttemptId::new();
     database
         .reserve_execution(DispatchReservation::new(
-            ExecutionAttemptId::new(),
+            incomplete_attempt,
             action.id(),
             approval.id(),
             action.fingerprint(),
@@ -516,6 +517,17 @@ async fn crash_recovery_marks_reserved_execution_unknown_without_retrying() {
         ))
         .await
         .expect("execution reserved");
+    let terminal_attempt = ExecutionAttemptId::new();
+    sqlx::query(
+        "INSERT INTO execution_attempts (
+            id, action_id, approval_id, state, reserved_at, completed_at
+         ) VALUES (?, ?, NULL, 'succeeded', 1200, 1250)",
+    )
+    .bind(terminal_attempt.to_string())
+    .bind(action.id().to_string())
+    .execute(database.pool())
+    .await
+    .expect("terminal attempt stored");
 
     let recovered = database
         .recover_incomplete_executions(TimestampMillis::new(1_500))
@@ -524,10 +536,12 @@ async fn crash_recovery_marks_reserved_execution_unknown_without_retrying() {
 
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].action_id(), action.id());
-    let attempt_state: String = sqlx::query_scalar("SELECT state FROM execution_attempts LIMIT 1")
-        .fetch_one(database.pool())
-        .await
-        .expect("attempt state");
+    let attempt_state: String =
+        sqlx::query_scalar("SELECT state FROM execution_attempts WHERE id = ?")
+            .bind(incomplete_attempt.to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("attempt state");
     let action_state: String = sqlx::query_scalar("SELECT state FROM actions WHERE id = ?")
         .bind(action.id().to_string())
         .fetch_one(database.pool())
@@ -541,6 +555,19 @@ async fn crash_recovery_marks_reserved_execution_unknown_without_retrying() {
     assert_eq!(attempt_state, "unknown");
     assert_eq!(action_state, "unknown");
     assert_eq!(run_state, "failed");
+    let terminal_state: String =
+        sqlx::query_scalar("SELECT state FROM execution_attempts WHERE id = ?")
+            .bind(terminal_attempt.to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("terminal attempt state");
+    assert_eq!(terminal_state, "succeeded");
+
+    let second_recovery = database
+        .recover_incomplete_executions(TimestampMillis::new(1_600))
+        .await
+        .expect("second recovery succeeds");
+    assert!(second_recovery.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

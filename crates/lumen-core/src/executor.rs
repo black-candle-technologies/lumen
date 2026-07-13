@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     action::{ActionEnvelope, CanonicalValue},
@@ -11,7 +12,11 @@ pub type ExecutorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ExecutionOutcome, ExecutorError>> + Send + 'a>>;
 
 pub trait ExecutorPort: Send + Sync {
-    fn execute<'a>(&'a self, action: &'a AuthorizedAction) -> ExecutorFuture<'a>;
+    fn execute<'a>(
+        &'a self,
+        action: &'a AuthorizedAction,
+        cancellation: CancellationToken,
+    ) -> ExecutorFuture<'a>;
 }
 
 #[derive(Debug)]
@@ -41,6 +46,8 @@ impl AuthorizedAction {
 pub enum ExecutionOutcome {
     Succeeded(CanonicalValue),
     Failed(String),
+    Cancelled,
+    TimedOut,
     Unknown(String),
 }
 

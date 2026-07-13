@@ -106,16 +106,16 @@ docs/
 
 **Files:** `crates/lumen-core/src/{executor,run}.rs`, `crates/lumen-core/tests/run_orchestrator.rs`, `crates/lumen-integrations/src/{process,sandbox}.rs`, `crates/lumen-integrations/tests/local_executors.rs`, `crates/lumen-cli/src/{config,runtime}.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`
 
-- [ ] Add failing core tests for wall-clock and cumulative captured-result quotas.
-- [ ] Add failing integration tests proving the run cancellation token reaches an executing process and terminates descendants.
-- [ ] Add failing tests for CPU, address-space, file-size, descriptor, process-count, output, and timeout limits.
-- [ ] Add a recovery regression proving terminal attempts are not changed and incomplete attempts become unknown exactly once without retry.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Make `ExecutorPort` cancellation-aware and preserve cancelled, timed-out, failed, and unknown outcomes distinctly.
-- [ ] Add explicit run quota accounting and audit payloads.
-- [ ] Apply Unix rlimits before sandbox wrapper launch and validate all configured limits.
-- [ ] Run focused tests and strict Clippy.
-- [ ] Commit as `feat(runtime): enforce cancellation and resource quotas`.
+- [x] Add failing core tests for wall-clock and cumulative captured-result quotas.
+- [x] Add failing integration tests proving the run cancellation token reaches an executing process and terminates descendants.
+- [x] Add failing tests for CPU, address-space, file-size, descriptor, process-count, output, and timeout limits.
+- [x] Add a recovery regression proving terminal attempts are not changed and incomplete attempts become unknown exactly once without retry.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Make `ExecutorPort` cancellation-aware and preserve cancelled, timed-out, failed, and unknown outcomes distinctly.
+- [x] Add explicit run quota accounting and audit payloads.
+- [x] Apply Unix rlimits before sandbox wrapper launch and validate all configured limits.
+- [x] Run focused tests and strict Clippy.
+- [x] Commit as `feat(runtime): enforce cancellation and resource quotas`.
 
 ## Task 6: Desktop Security Boundary
 

@@ -27,6 +27,68 @@ pub trait SandboxBackend: Send + Sync {
     fn execute(&self, request: SandboxRequest) -> SandboxFuture<'_>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceLimits {
+    cpu_seconds: u64,
+    address_space_bytes: u64,
+    file_size_bytes: u64,
+    open_files: u64,
+    processes: u64,
+}
+
+impl ResourceLimits {
+    pub fn new(
+        cpu_seconds: u64,
+        address_space_bytes: u64,
+        file_size_bytes: u64,
+        open_files: u64,
+        processes: u64,
+    ) -> Result<Self, ResourceLimitError> {
+        if [
+            cpu_seconds,
+            address_space_bytes,
+            file_size_bytes,
+            open_files,
+            processes,
+        ]
+        .contains(&0)
+        {
+            return Err(ResourceLimitError);
+        }
+        Ok(Self {
+            cpu_seconds,
+            address_space_bytes,
+            file_size_bytes,
+            open_files,
+            processes,
+        })
+    }
+
+    pub const fn cpu_seconds(self) -> u64 {
+        self.cpu_seconds
+    }
+
+    pub const fn address_space_bytes(self) -> u64 {
+        self.address_space_bytes
+    }
+
+    pub const fn file_size_bytes(self) -> u64 {
+        self.file_size_bytes
+    }
+
+    pub const fn open_files(self) -> u64 {
+        self.open_files
+    }
+
+    pub const fn processes(self) -> u64 {
+        self.processes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("every process resource limit must be greater than zero")]
+pub struct ResourceLimitError;
+
 pub struct SystemSandbox {
     executable: Option<PathBuf>,
     report: SandboxReport,
@@ -157,6 +219,7 @@ async fn execute_system_sandbox(
         request.timeout(),
         request.output_limit(),
         request.cancellation(),
+        request.resource_limits(),
     )
     .await
 }
@@ -172,6 +235,7 @@ async fn execute_system_sandbox(
         request.timeout(),
         request.output_limit(),
         request.cancellation(),
+        request.resource_limits(),
     )
     .await
 }
@@ -480,6 +544,7 @@ pub struct SandboxRequest {
     timeout: Duration,
     output_limit: usize,
     cancellation: CancellationToken,
+    resource_limits: ResourceLimits,
 }
 
 impl SandboxRequest {
@@ -488,12 +553,14 @@ impl SandboxRequest {
         timeout: Duration,
         output_limit: usize,
         cancellation: CancellationToken,
+        resource_limits: ResourceLimits,
     ) -> Self {
         Self {
             command,
             timeout,
             output_limit,
             cancellation,
+            resource_limits,
         }
     }
 
@@ -515,6 +582,10 @@ impl SandboxRequest {
 
     pub fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    pub const fn resource_limits(&self) -> ResourceLimits {
+        self.resource_limits
     }
 }
 
@@ -609,6 +680,7 @@ impl ProcessMonitor {
         timeout: Duration,
         output_limit: usize,
         cancellation: CancellationToken,
+        resource_limits: ResourceLimits,
     ) -> Result<SandboxOutput, SandboxError> {
         if output_limit == 0 {
             return Err(SandboxError::OutputLimitExceeded { limit: 0 });
@@ -629,6 +701,11 @@ impl ProcessMonitor {
         {
             use std::os::unix::process::CommandExt;
             process.as_std_mut().process_group(0);
+            unsafe {
+                process
+                    .as_std_mut()
+                    .pre_exec(move || apply_unix_resource_limits(resource_limits));
+            }
         }
 
         let mut child = process
@@ -704,6 +781,38 @@ impl ProcessMonitor {
             )),
         }
     }
+}
+
+#[cfg(unix)]
+fn apply_unix_resource_limits(limits: ResourceLimits) -> std::io::Result<()> {
+    use nix::sys::resource::{Resource, rlim_t, setrlimit};
+
+    let set = |resource, value: u64| {
+        let value = rlim_t::try_from(value)
+            .map_err(|_| std::io::Error::other("resource limit exceeds platform range"))?;
+        setrlimit(resource, value, value).map_err(std::io::Error::other)
+    };
+    set(Resource::RLIMIT_CPU, limits.cpu_seconds())?;
+    #[cfg(not(target_os = "macos"))]
+    set(Resource::RLIMIT_AS, limits.address_space_bytes())?;
+    set(Resource::RLIMIT_FSIZE, limits.file_size_bytes())?;
+    set(Resource::RLIMIT_NOFILE, limits.open_files())?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    set(Resource::RLIMIT_NPROC, limits.processes())?;
+    #[cfg(target_os = "macos")]
+    {
+        let value = nix::libc::rlim_t::try_from(limits.processes())
+            .map_err(|_| std::io::Error::other("process limit exceeds platform range"))?;
+        let limit = nix::libc::rlimit {
+            rlim_cur: value,
+            rlim_max: value,
+        };
+        let result = unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_NPROC, &limit) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 enum WaitResult {

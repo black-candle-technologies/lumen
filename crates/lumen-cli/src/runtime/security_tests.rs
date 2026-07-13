@@ -18,7 +18,7 @@ use lumen_core::{approval::TimestampMillis, identity::WorkspaceId, secret::Secre
 use lumen_db::{Database, SecretReference};
 use lumen_integrations::{
     sandbox::{
-        SandboxBackend, SandboxFuture, SandboxOutput, SandboxReport, SandboxRequest,
+        SandboxBackend, SandboxError, SandboxFuture, SandboxOutput, SandboxReport, SandboxRequest,
         SandboxStrength,
     },
     secrets::{InMemorySecretStore, SecretStore},
@@ -41,6 +41,7 @@ struct RecordingSandbox {
     calls: Arc<AtomicUsize>,
     environments: Arc<StdMutex<Vec<BTreeMap<String, String>>>>,
     output: Arc<StdMutex<SandboxOutput>>,
+    wait_for_cancellation: bool,
 }
 
 impl RecordingSandbox {
@@ -53,6 +54,7 @@ impl RecordingSandbox {
                 b"ok\n".to_vec(),
                 Vec::new(),
             ))),
+            wait_for_cancellation: false,
         }
     }
 
@@ -70,6 +72,11 @@ impl RecordingSandbox {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn waiting_for_cancellation(mut self) -> Self {
+        self.wait_for_cancellation = true;
+        self
+    }
 }
 
 impl SandboxBackend for RecordingSandbox {
@@ -84,7 +91,15 @@ impl SandboxBackend for RecordingSandbox {
             .expect("sandbox environment lock")
             .push(request.environment().clone());
         let output = self.output.lock().expect("sandbox output lock").clone();
-        Box::pin(async move { Ok(output) })
+        let cancellation = request.cancellation();
+        if self.wait_for_cancellation {
+            Box::pin(async move {
+                cancellation.cancelled().await;
+                Err(SandboxError::Cancelled)
+            })
+        } else {
+            Box::pin(async move { Ok(output) })
+        }
     }
 }
 
@@ -115,6 +130,69 @@ impl Harness {
     ) -> (Self, SecretReference, Arc<InMemorySecretStore>) {
         let (harness, reference, store) = Self::new_inner(model, |_| {}, Some(setup)).await;
         (harness, reference.expect("secret reference"), store)
+    }
+
+    async fn new_with_cancellable_process(model: &MockServer) -> Self {
+        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None).await;
+        let sandbox = RecordingSandbox::new().waiting_for_cancellation();
+        let config = Config::parse(&format!(
+            r#"
+[database]
+path = "ignored.sqlite3"
+
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = false
+
+[process]
+allowed_programs = ["/bin/echo"]
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "{}"
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+            model.uri(),
+            harness._directory.path().join("workspace").display()
+        ))
+        .expect("cancellable config");
+        let events = EventBroker::new(128);
+        let service = Arc::new(
+            LocalRuntimeService::build_with_secret_store(
+                &config,
+                harness.database.clone(),
+                events.clone(),
+                Arc::new(sandbox.clone()),
+                vec![TOKEN.to_owned()],
+                Arc::new(InMemorySecretStore::new()),
+            )
+            .await
+            .expect("runtime builds"),
+        );
+        let state = ApiState::new(
+            service.clone(),
+            events,
+            TOKEN,
+            config.bootstrap_principal(),
+            BTreeSet::from([config.workspace_id()]),
+            SandboxCapabilityReport::new(
+                "test",
+                "kernel_enforced",
+                ["filesystem_isolation", "network_isolation"],
+                None,
+            ),
+        )
+        .expect("API state");
+        harness.service.shutdown().await;
+        harness.app = router(state);
+        harness.service = service;
+        harness.sandbox = sandbox;
+        harness
     }
 
     async fn new_inner(
@@ -1000,5 +1078,57 @@ async fn secret_scope_does_not_expand_literal_environment_permissions() {
         .wait_for_audit(AuditEventKind::ExecutionFailed)
         .await;
     assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 0);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn run_cancellation_reaches_an_executing_process_and_persists_cancelled() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "process.spawn",
+            serde_json::json!({"program":"/bin/echo","args":["waiting"]}),
+        ),
+    )
+    .await;
+    let harness = Harness::new_with_cancellable_process(&model).await;
+    let run_id = harness.create_run("start a cancellable process").await;
+    let approval_id = harness.pending_approval_id().await;
+    let granted = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    for _ in 0..100 {
+        if harness.sandbox.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 1);
+
+    let cancelled = harness
+        .request("POST", &format!("runs/{run_id}/cancel"), "")
+        .await;
+    assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
+    harness
+        .wait_for_audit(AuditEventKind::ExecutionCancelled)
+        .await;
+
+    let attempt_state: String = sqlx::query_scalar("SELECT state FROM execution_attempts LIMIT 1")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt state");
+    let run_state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("run state");
+    assert_eq!(attempt_state, "cancelled");
+    assert_eq!(run_state, "cancelled");
     harness.service.shutdown().await;
 }

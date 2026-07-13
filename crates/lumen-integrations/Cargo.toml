@@ -20,7 +20,7 @@ tokio-util = "0.7"
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["process", "signal"] }
+nix = { version = "0.30", features = ["process", "resource", "signal"] }
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]

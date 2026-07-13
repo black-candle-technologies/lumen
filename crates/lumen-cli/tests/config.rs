@@ -49,6 +49,32 @@ fn secure_defaults_are_local_and_fail_closed() {
     );
     assert!(config.process.allowed_programs.is_empty());
     assert_eq!(config.runtime.file_write_limit_bytes, 1024 * 1024);
+    assert!(config.process.max_cpu_seconds > 0);
+    assert!(config.process.max_address_space_bytes > 0);
+    assert!(config.process.max_file_size_bytes > 0);
+    assert!(config.process.max_open_files > 0);
+    assert!(config.process.max_processes > 0);
+    assert!(config.runtime.max_wall_time_seconds > 0);
+    assert!(config.runtime.max_captured_result_bytes > 0);
+}
+
+#[test]
+fn zero_runtime_or_process_resource_limits_are_rejected() {
+    for section in [
+        "[process]\nmax_cpu_seconds = 0",
+        "[process]\nmax_address_space_bytes = 0",
+        "[process]\nmax_file_size_bytes = 0",
+        "[process]\nmax_open_files = 0",
+        "[process]\nmax_processes = 0",
+        "[runtime]\nmax_wall_time_seconds = 0",
+        "[runtime]\nmax_captured_result_bytes = 0",
+    ] {
+        let config = MINIMAL_CONFIG.replace("[database]", &format!("{section}\n\n[database]"));
+        assert_eq!(
+            Config::parse(&config).expect_err("zero limit must fail"),
+            ConfigError::InvalidLimit
+        );
+    }
 }
 
 #[test]

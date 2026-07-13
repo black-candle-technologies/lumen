@@ -41,6 +41,7 @@ pub enum AuditEventKind {
     RunCreated,
     RunCompleted,
     RunCancelled,
+    RunBudgetExhausted,
     ActionProposed,
     ActionNormalized,
     PolicyAllowed,
@@ -52,6 +53,8 @@ pub enum AuditEventKind {
     ExecutionStarted,
     ExecutionSucceeded,
     ExecutionFailed,
+    ExecutionCancelled,
+    ExecutionTimedOut,
     ExecutionUnknown,
 }
 
@@ -63,6 +66,7 @@ impl AuditEventKind {
             Self::RunCreated => "run_created",
             Self::RunCompleted => "run_completed",
             Self::RunCancelled => "run_cancelled",
+            Self::RunBudgetExhausted => "run_budget_exhausted",
             Self::ActionProposed => "action_proposed",
             Self::ActionNormalized => "action_normalized",
             Self::PolicyAllowed => "policy_allowed",
@@ -74,6 +78,8 @@ impl AuditEventKind {
             Self::ExecutionStarted => "execution_started",
             Self::ExecutionSucceeded => "execution_succeeded",
             Self::ExecutionFailed => "execution_failed",
+            Self::ExecutionCancelled => "execution_cancelled",
+            Self::ExecutionTimedOut => "execution_timed_out",
             Self::ExecutionUnknown => "execution_unknown",
         }
     }
@@ -89,6 +95,7 @@ impl FromStr for AuditEventKind {
             "run_created" => Ok(Self::RunCreated),
             "run_completed" => Ok(Self::RunCompleted),
             "run_cancelled" => Ok(Self::RunCancelled),
+            "run_budget_exhausted" => Ok(Self::RunBudgetExhausted),
             "action_proposed" => Ok(Self::ActionProposed),
             "action_normalized" => Ok(Self::ActionNormalized),
             "policy_allowed" => Ok(Self::PolicyAllowed),
@@ -100,6 +107,8 @@ impl FromStr for AuditEventKind {
             "execution_started" => Ok(Self::ExecutionStarted),
             "execution_succeeded" => Ok(Self::ExecutionSucceeded),
             "execution_failed" => Ok(Self::ExecutionFailed),
+            "execution_cancelled" => Ok(Self::ExecutionCancelled),
+            "execution_timed_out" => Ok(Self::ExecutionTimedOut),
             "execution_unknown" => Ok(Self::ExecutionUnknown),
             _ => Err(AuditValueError::UnknownEventKind(value.to_owned())),
         }

@@ -19,8 +19,9 @@ use lumen_integrations::{
     filesystem::{FilesystemError, WorkspaceReader},
     process::{BuiltinActionNormalizer, ProcessError, ProcessExecutor, ProcessRequest},
     sandbox::{
-        MonitoredCommand, ProcessMonitor, SandboxBackend, SandboxError, SandboxFuture,
-        SandboxOutput, SandboxReport, SandboxRequest, SandboxStrength, SystemSandbox,
+        MonitoredCommand, ProcessMonitor, ResourceLimits, SandboxBackend, SandboxError,
+        SandboxFuture, SandboxOutput, SandboxReport, SandboxRequest, SandboxStrength,
+        SystemSandbox,
     },
 };
 use tempfile::tempdir;
@@ -32,6 +33,10 @@ fn run_context() -> RunContext {
         WorkspaceId::new(),
         PrincipalId::new("local", "operator").expect("principal"),
     )
+}
+
+fn resource_limits() -> ResourceLimits {
+    ResourceLimits::new(2, 256 * 1024 * 1024, 1024 * 1024, 64, 512).expect("valid resource limits")
 }
 
 #[test]
@@ -457,6 +462,7 @@ async fn system_sandbox_reports_strength_and_enforces_it_when_available() {
             Duration::from_secs(2),
             1024,
             CancellationToken::new(),
+            resource_limits(),
         ))
         .await
         .expect("sandboxed command executes");
@@ -480,6 +486,7 @@ async fn system_sandbox_denies_workspace_writes() {
             Duration::from_secs(2),
             1024,
             CancellationToken::new(),
+            resource_limits(),
         ))
         .await
         .expect("sandbox reports process outcome");
@@ -508,6 +515,7 @@ async fn system_sandbox_denies_reads_outside_the_workspace() {
             Duration::from_secs(2),
             1024,
             CancellationToken::new(),
+            resource_limits(),
         ))
         .await
         .expect("sandbox reports process outcome");
@@ -569,6 +577,7 @@ struct FakeSandbox {
     report: SandboxReport,
     requests: Arc<Mutex<Vec<SandboxRequest>>>,
     calls: Arc<AtomicUsize>,
+    failure: Option<SandboxError>,
 }
 
 impl FakeSandbox {
@@ -577,6 +586,7 @@ impl FakeSandbox {
             report: SandboxReport::new("fake", SandboxStrength::KernelEnforced, None),
             requests: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(AtomicUsize::new(0)),
+            failure: None,
         }
     }
 
@@ -589,6 +599,16 @@ impl FakeSandbox {
             ),
             requests: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(AtomicUsize::new(0)),
+            failure: None,
+        }
+    }
+
+    fn failing(error: SandboxError) -> Self {
+        Self {
+            report: SandboxReport::new("fake", SandboxStrength::KernelEnforced, None),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(AtomicUsize::new(0)),
+            failure: Some(error),
         }
     }
 }
@@ -601,7 +621,13 @@ impl SandboxBackend for FakeSandbox {
     fn execute(&self, request: SandboxRequest) -> SandboxFuture<'_> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().expect("request lock").push(request);
-        Box::pin(async { Ok(SandboxOutput::new(Some(0), b"ok\n".to_vec(), Vec::new())) })
+        let failure = self.failure.clone();
+        Box::pin(async move {
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(SandboxOutput::new(Some(0), b"ok\n".to_vec(), Vec::new())),
+            }
+        })
     }
 }
 
@@ -615,6 +641,7 @@ fn process_executor(
         BTreeSet::from(["LANG".to_owned()]),
         Duration::from_secs(2),
         1024,
+        resource_limits(),
         sandbox,
     )
     .expect("process executor builds")
@@ -691,6 +718,28 @@ async fn process_executor_passes_only_validated_request_to_sandbox() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].environment().get("LANG"), Some(&"C".to_owned()));
     assert!(!requests[0].environment().contains_key("SECRET"));
+    assert_eq!(requests[0].resource_limits(), resource_limits());
+}
+
+#[tokio::test]
+async fn process_executor_preserves_sandbox_cancellation_and_timeout() {
+    for (error, expected) in [
+        (SandboxError::Cancelled, ExecutionOutcome::Cancelled),
+        (SandboxError::TimedOut, ExecutionOutcome::TimedOut),
+    ] {
+        let workspace = tempdir().expect("temporary workspace");
+        let executor = process_executor(workspace.path(), Arc::new(FakeSandbox::failing(error)));
+
+        let outcome = executor
+            .execute(
+                ProcessRequest::new("/bin/echo", ["hello"], BTreeMap::new()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("terminal sandbox outcome");
+
+        assert_eq!(outcome, expected);
+    }
 }
 
 #[tokio::test]
@@ -720,6 +769,7 @@ async fn process_monitor_enforces_output_limit() {
         Duration::from_secs(2),
         64,
         CancellationToken::new(),
+        resource_limits(),
     )
     .await;
 
@@ -729,6 +779,9 @@ async fn process_monitor_enforces_output_limit() {
 #[cfg(unix)]
 #[tokio::test]
 async fn process_monitor_honors_cancellation() {
+    let directory = tempdir().expect("temporary directory");
+    let marker = directory.path().join("leaked");
+    let script = format!("(sleep 0.3; printf leaked > '{}') & wait", marker.display());
     let cancellation = CancellationToken::new();
     let cancel = cancellation.clone();
     tokio::spawn(async move {
@@ -737,14 +790,56 @@ async fn process_monitor_honors_cancellation() {
     });
 
     let result = ProcessMonitor::run(
-        MonitoredCommand::new("/bin/sh").args(["-c", "sleep 10"]),
+        MonitoredCommand::new("/bin/sh").args(["-c", &script]),
         Duration::from_secs(2),
         1024,
         cancellation,
+        resource_limits(),
     )
     .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     assert_eq!(result, Err(SandboxError::Cancelled));
+    assert!(!marker.exists(), "grandchild survived cancellation");
+}
+
+#[test]
+fn resource_limits_reject_zero_for_every_enforced_dimension() {
+    for values in [
+        [0, 1024, 1024, 16, 512],
+        [1, 0, 1024, 16, 512],
+        [1, 1024, 0, 16, 512],
+        [1, 1024, 1024, 0, 512],
+        [1, 1024, 1024, 16, 0],
+    ] {
+        assert!(
+            ResourceLimits::new(values[0], values[1], values[2], values[3], values[4]).is_err()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn process_monitor_applies_cpu_memory_file_descriptor_and_process_limits() {
+    let limits =
+        ResourceLimits::new(2, 256 * 1024 * 1024, 4096, 32, 8).expect("valid resource limits");
+    let output = ProcessMonitor::run(
+        MonitoredCommand::new("/bin/bash").args([
+            "-c",
+            "ulimit -t; ulimit -v; ulimit -f; ulimit -n; ulimit -u",
+        ]),
+        Duration::from_secs(2),
+        1024,
+        CancellationToken::new(),
+        limits,
+    )
+    .await
+    .expect("limited shell executes");
+
+    assert_eq!(
+        String::from_utf8_lossy(output.stdout()),
+        "2\n262144\n4\n32\n8\n"
+    );
 }
 
 #[cfg(unix)]
@@ -759,6 +854,7 @@ async fn process_monitor_timeout_terminates_the_process_group() {
         Duration::from_millis(30),
         1024,
         CancellationToken::new(),
+        resource_limits(),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(400)).await;

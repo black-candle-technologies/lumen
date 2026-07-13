@@ -62,7 +62,7 @@ The Linux profile will:
 - Start a new terminal session and die with the Lumen parent.
 - Clear the environment and add only validated variables.
 - Deny network access by retaining only the isolated loopback namespace.
-- Apply inherited CPU, address-space, file-size, open-file, and process-count rlimits before starting the sandbox wrapper.
+- Apply inherited CPU, file-size, open-file, and process-count rlimits before starting the sandbox wrapper, plus address-space limits on Linux.
 
 The profile deliberately does not claim seccomp enforcement in Milestone 2. Bubblewrap supports seccomp, but a correct portable syscall policy is action- and architecture-specific. The platform report lists each guarantee separately so policy and operators do not mistake namespace isolation for seccomp filtering. Kernel-enforced strength requires the complete Milestone 2 baseline profile; otherwise startup fails closed under the default configuration.
 
@@ -70,7 +70,7 @@ The implementation follows bubblewrap's documented requirement to use `--new-ses
 
 ## Resource Limits And Cancellation
 
-`SandboxRequest` carries explicit resource limits. Zero or nonsensical limits are rejected before dispatch. Unix process launch applies hard and soft rlimits to the wrapper so the sandboxed command and descendants inherit them.
+`SandboxRequest` carries explicit resource limits. Zero or nonsensical limits are rejected before dispatch. Unix process launch applies hard and soft rlimits to the wrapper so the sandboxed command and descendants inherit them. Linux enforces the complete CPU, address-space, file-size, descriptor, and process-count set. Darwin cannot accept a practical `RLIMIT_AS` after its large inherited virtual mappings are established, so it enforces the other four limits without claiming address-space enforcement.
 
 The run cancellation token is passed through `ExecutorPort` into the process sandbox. Cancellation terminates the process group and records a cancelled outcome. It is not translated into a generic tool failure.
 
@@ -153,4 +153,3 @@ The final gate is formatting, strict Clippy, all workspace tests, Svelte diagnos
 - [Rust keyring crate](https://docs.rs/keyring/latest/keyring/)
 - [Tauri capabilities](https://v2.tauri.app/security/capabilities/)
 - [Tauri Content Security Policy](https://v2.tauri.app/security/csp/)
-

@@ -114,10 +114,17 @@ impl Config {
             || self.model.max_response_bytes == 0
             || self.process.timeout_seconds == 0
             || self.process.max_output_bytes == 0
+            || self.process.max_cpu_seconds == 0
+            || self.process.max_address_space_bytes == 0
+            || self.process.max_file_size_bytes == 0
+            || self.process.max_open_files == 0
+            || self.process.max_processes == 0
             || self.runtime.file_read_limit_bytes == 0
             || self.runtime.file_write_limit_bytes == 0
             || self.runtime.max_model_turns == 0
             || self.runtime.max_actions == 0
+            || self.runtime.max_wall_time_seconds == 0
+            || self.runtime.max_captured_result_bytes == 0
             || self.runtime.approval_ttl_seconds == 0
         {
             return Err(ConfigError::InvalidLimit);
@@ -238,6 +245,11 @@ pub struct ProcessConfig {
     pub allowed_environment: BTreeSet<String>,
     pub timeout_seconds: u64,
     pub max_output_bytes: usize,
+    pub max_cpu_seconds: u64,
+    pub max_address_space_bytes: u64,
+    pub max_file_size_bytes: u64,
+    pub max_open_files: u64,
+    pub max_processes: u64,
 }
 
 impl Default for ProcessConfig {
@@ -247,6 +259,11 @@ impl Default for ProcessConfig {
             allowed_environment: BTreeSet::new(),
             timeout_seconds: 30,
             max_output_bytes: 1024 * 1024,
+            max_cpu_seconds: 10,
+            max_address_space_bytes: 512 * 1024 * 1024,
+            max_file_size_bytes: 16 * 1024 * 1024,
+            max_open_files: 64,
+            max_processes: 512,
         }
     }
 }
@@ -259,6 +276,8 @@ pub struct RuntimeConfig {
     pub file_write_limit_bytes: usize,
     pub max_model_turns: u32,
     pub max_actions: u32,
+    pub max_wall_time_seconds: u64,
+    pub max_captured_result_bytes: usize,
     pub approval_ttl_seconds: u64,
 }
 
@@ -270,6 +289,8 @@ impl Default for RuntimeConfig {
             file_write_limit_bytes: 1024 * 1024,
             max_model_turns: 8,
             max_actions: 8,
+            max_wall_time_seconds: 300,
+            max_captured_result_bytes: 4 * 1024 * 1024,
             approval_ttl_seconds: 300,
         }
     }

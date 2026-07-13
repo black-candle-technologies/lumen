@@ -31,7 +31,7 @@ use lumen_integrations::{
         BuiltinActionNormalizer, BuiltinExecutor, ProcessExecutor, ProcessSecretError,
         ProcessSecretFuture, ProcessSecretResolver,
     },
-    sandbox::SandboxBackend,
+    sandbox::{ResourceLimits, SandboxBackend},
     secrets::SecretStore,
 };
 use lumen_server::{
@@ -96,6 +96,14 @@ impl LocalRuntimeService {
             config.process.allowed_environment.clone(),
             Duration::from_secs(config.process.timeout_seconds),
             config.process.max_output_bytes,
+            ResourceLimits::new(
+                config.process.max_cpu_seconds,
+                config.process.max_address_space_bytes,
+                config.process.max_file_size_bytes,
+                config.process.max_open_files,
+                config.process.max_processes,
+            )
+            .map_err(|error| CliError::Runtime(error.to_string()))?,
             sandbox,
         )
         .map_err(|error| CliError::Runtime(error.to_string()))?;
@@ -166,7 +174,11 @@ impl LocalRuntimeService {
             policy: Policy::default(),
             policy_version: PolicyVersion::new("local-policy-v1").expect("static policy version"),
             capabilities: EffectiveCapabilities::new([CapabilitySet::new(grants)]),
-            budget: RunBudget::new(config.runtime.max_model_turns, config.runtime.max_actions),
+            budget: RunBudget::new(config.runtime.max_model_turns, config.runtime.max_actions)
+                .with_quotas(
+                    Duration::from_secs(config.runtime.max_wall_time_seconds),
+                    config.runtime.max_captured_result_bytes,
+                ),
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -225,7 +237,8 @@ impl LocalRuntimeService {
             self.actions.as_ref(),
             self.policy.clone(),
             self.policy_version.clone(),
-        );
+        )
+        .with_cancellation(cancellation.clone());
         match orchestrator
             .run_until_blocked(&mut stored.state, &self.capabilities, now())
             .await
@@ -553,10 +566,14 @@ impl ActionNormalizer for SecretRejectingNormalizer {
 }
 
 impl ExecutorPort for RedactingExecutor {
-    fn execute<'a>(&'a self, action: &'a AuthorizedAction) -> ExecutorFuture<'a> {
+    fn execute<'a>(
+        &'a self,
+        action: &'a AuthorizedAction,
+        cancellation: CancellationToken,
+    ) -> ExecutorFuture<'a> {
         Box::pin(async move {
             let attempt_id = self.approvals.reserve(action, now()).await?;
-            let outcome = match self.inner.execute(action).await {
+            let outcome = match self.inner.execute(action, cancellation).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     let _ = self
@@ -576,6 +593,8 @@ impl ExecutorPort for RedactingExecutor {
                     self.redactor.redact_string(&mut message);
                     ExecutionOutcome::Failed(message)
                 }
+                ExecutionOutcome::Cancelled => ExecutionOutcome::Cancelled,
+                ExecutionOutcome::TimedOut => ExecutionOutcome::TimedOut,
                 ExecutionOutcome::Unknown(mut message) => {
                     self.redactor.redact_string(&mut message);
                     ExecutionOutcome::Unknown(message)
@@ -584,6 +603,8 @@ impl ExecutorPort for RedactingExecutor {
             let state = match &outcome {
                 ExecutionOutcome::Succeeded(_) => "succeeded",
                 ExecutionOutcome::Failed(_) => "failed",
+                ExecutionOutcome::Cancelled => "cancelled",
+                ExecutionOutcome::TimedOut => "timed_out",
                 ExecutionOutcome::Unknown(_) => "unknown",
             };
             if let Err(error) = self
@@ -687,6 +708,11 @@ fn terminal_event(outcome: &RunOutcome) -> (&'static str, &'static str, Canonica
         RunOutcome::Cancelled => (
             "cancelled",
             "run.cancelled",
+            CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        ),
+        RunOutcome::ExecutionTimedOut => (
+            "failed",
+            "run.timed_out",
             CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
         ),
         other => (

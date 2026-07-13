@@ -4,6 +4,7 @@ use std::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use lumen_core::{
@@ -24,6 +25,7 @@ use lumen_core::{
         RunBudget, RunContext, RunError, RunOrchestrator, RunOutcome, RunState,
     },
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const NOW: TimestampMillis = TimestampMillis::new(10_000);
@@ -152,7 +154,11 @@ impl FakeExecutor {
 }
 
 impl ExecutorPort for FakeExecutor {
-    fn execute(&self, _action: &AuthorizedAction) -> ExecutorFuture<'_> {
+    fn execute(
+        &self,
+        _action: &AuthorizedAction,
+        _cancellation: CancellationToken,
+    ) -> ExecutorFuture<'_> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             self.outcomes
@@ -221,7 +227,7 @@ impl ApprovalPort for FakeApprovals {
 
 #[derive(Default)]
 struct FakeAudit {
-    events: Mutex<Vec<AuditEventKind>>,
+    events: Mutex<Vec<AuditEvent>>,
     fail_on: Mutex<Option<AuditEventKind>>,
 }
 
@@ -234,7 +240,23 @@ impl FakeAudit {
     }
 
     fn events(&self) -> Vec<AuditEventKind> {
-        self.events.lock().expect("audit events lock").clone()
+        self.events
+            .lock()
+            .expect("audit events lock")
+            .iter()
+            .map(AuditEvent::kind)
+            .collect()
+    }
+
+    fn payload(&self, kind: AuditEventKind) -> CanonicalValue {
+        self.events
+            .lock()
+            .expect("audit events lock")
+            .iter()
+            .find(|event| event.kind() == kind)
+            .expect("audit event")
+            .payload()
+            .clone()
     }
 }
 
@@ -244,10 +266,7 @@ impl AuditPort for FakeAudit {
             if self.fail_on.lock().expect("audit failure lock").as_ref() == Some(&event.kind()) {
                 return Err(AuditPortError::new("audit unavailable"));
             }
-            self.events
-                .lock()
-                .expect("audit events lock")
-                .push(event.kind());
+            self.events.lock().expect("audit events lock").push(event);
             Ok(())
         })
     }
@@ -538,4 +557,84 @@ async fn audit_failure_before_dispatch_fails_closed() {
         Err(RunError::Audit(AuditPortError::new("audit unavailable")))
     );
     assert_eq!(executor.call_count(), 0);
+}
+
+#[tokio::test]
+async fn elapsed_wall_clock_budget_stops_before_model_or_executor_work() {
+    let model = FakeModel::new([ModelOutput::FinalText("unused".to_owned())]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let budget = RunBudget::new(3, 2).with_quotas(Duration::from_millis(1), 1024);
+    let mut state = RunState::new(run_context(), "hello", budget);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let outcome = orchestrator(&model, &executor, &approvals, &audit)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .await
+        .expect("wall-clock exhaustion is a run outcome");
+
+    assert_eq!(outcome, RunOutcome::BudgetExhausted(BudgetKind::WallClock));
+    assert_eq!(model.call_count(), 0);
+    assert_eq!(executor.call_count(), 0);
+    assert!(audit.events().contains(&AuditEventKind::RunBudgetExhausted));
+    assert!(
+        serde_json::to_string(&audit.payload(AuditEventKind::RunBudgetExhausted))
+            .expect("budget payload")
+            .contains(r#""budget":"wall_clock""#)
+    );
+}
+
+#[tokio::test]
+async fn cumulative_captured_result_budget_stops_before_another_model_turn() {
+    let model = FakeModel::new([
+        proposal("filesystem.read"),
+        ModelOutput::FinalText("must not run".to_owned()),
+    ]);
+    let executor = FakeExecutor::new([Ok(ExecutionOutcome::Succeeded(CanonicalValue::from(
+        "oversized-result",
+    )))]);
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let budget = RunBudget::new(3, 2).with_quotas(Duration::from_secs(10), 4);
+    let mut state = RunState::new(run_context(), "read", budget);
+
+    let outcome = orchestrator(&model, &executor, &approvals, &audit)
+        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
+        .await
+        .expect("result-byte exhaustion is a run outcome");
+
+    assert_eq!(
+        outcome,
+        RunOutcome::BudgetExhausted(BudgetKind::CapturedResultBytes)
+    );
+    assert_eq!(model.call_count(), 1);
+    assert_eq!(executor.call_count(), 1);
+    assert!(audit.events().contains(&AuditEventKind::RunBudgetExhausted));
+    assert!(
+        serde_json::to_string(&audit.payload(AuditEventKind::RunBudgetExhausted))
+            .expect("budget payload")
+            .contains(r#""budget":"captured_result_bytes""#)
+    );
+}
+
+#[tokio::test]
+async fn executor_cancellation_and_timeout_remain_distinct_run_outcomes() {
+    for (execution, expected) in [
+        (ExecutionOutcome::Cancelled, RunOutcome::Cancelled),
+        (ExecutionOutcome::TimedOut, RunOutcome::ExecutionTimedOut),
+    ] {
+        let model = FakeModel::new([proposal("filesystem.read")]);
+        let executor = FakeExecutor::new([Ok(execution)]);
+        let approvals = FakeApprovals::always_pending();
+        let audit = FakeAudit::default();
+        let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+
+        let outcome = orchestrator(&model, &executor, &approvals, &audit)
+            .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
+            .await
+            .expect("execution terminal outcome");
+
+        assert_eq!(outcome, expected);
+    }
 }
