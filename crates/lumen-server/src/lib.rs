@@ -9,5 +9,6 @@ pub use sse::{EventBroker, EventBrokerError, RunEvent};
 pub use state::{
     ApiState, ApiStateError, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview,
     ApprovalQuery, ApprovalResult, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand,
-    RunCancellation, RunCreated, RuntimeService, ServiceError, ServiceFuture,
+    RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceError,
+    ServiceFuture,
 };

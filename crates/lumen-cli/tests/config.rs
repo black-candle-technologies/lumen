@@ -2,7 +2,7 @@ use std::{net::IpAddr, path::PathBuf};
 
 use clap::Parser;
 use lumen_cli::{
-    AuditCommand, Cli, Command,
+    AuditCommand, Cli, Command, SandboxCommand,
     config::{Config, ConfigError, RequiredSandboxStrength},
 };
 use lumen_integrations::sandbox::{SandboxReport, SandboxStrength};
@@ -105,6 +105,14 @@ fn operator_commands_have_one_unambiguous_grammar() {
         verify.command,
         Command::Audit {
             command: AuditCommand::Verify
+        }
+    );
+
+    let report = Cli::try_parse_from(["lumen", "sandbox", "report"]).expect("sandbox command");
+    assert_eq!(
+        report.command,
+        Command::Sandbox {
+            command: SandboxCommand::Report
         }
     );
 }

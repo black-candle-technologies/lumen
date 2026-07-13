@@ -41,8 +41,28 @@ pub fn router(state: ApiState) -> Router {
             get(run_events),
         )
         .route("/api/v1/workspaces/{workspace_id}/audit", get(list_audit))
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runtime/capabilities",
+            get(runtime_capabilities),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
+}
+
+#[derive(Serialize)]
+struct RuntimeCapabilitiesResponse {
+    sandbox: crate::SandboxCapabilityReport,
+}
+
+async fn runtime_capabilities(
+    State(state): State<ApiState>,
+    Path(workspace): Path<String>,
+) -> Result<Json<RuntimeCapabilitiesResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    Ok(Json(RuntimeCapabilitiesResponse {
+        sandbox: state.sandbox().clone(),
+    }))
 }
 
 async fn authenticate(

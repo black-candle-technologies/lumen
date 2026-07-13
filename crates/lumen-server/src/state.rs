@@ -31,6 +31,7 @@ pub struct ApiState {
     pub(crate) service: Arc<dyn RuntimeService>,
     pub(crate) events: EventBroker,
     authentication: Arc<LocalAuthentication>,
+    sandbox: SandboxCapabilityReport,
 }
 
 impl ApiState {
@@ -40,6 +41,7 @@ impl ApiState {
         bearer_token: impl Into<String>,
         principal: PrincipalId,
         allowed_workspaces: BTreeSet<WorkspaceId>,
+        sandbox: SandboxCapabilityReport,
     ) -> Result<Self, ApiStateError> {
         let bearer_token = bearer_token.into();
         if bearer_token.len() < 16 || bearer_token.len() > 4096 {
@@ -56,6 +58,7 @@ impl ApiState {
                 principal,
                 allowed_workspaces,
             }),
+            sandbox,
         })
     }
 
@@ -70,6 +73,38 @@ impl ApiState {
         self.authentication
             .allowed_workspaces
             .contains(&workspace_id)
+    }
+
+    pub(crate) const fn sandbox(&self) -> &SandboxCapabilityReport {
+        &self.sandbox
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SandboxCapabilityReport {
+    backend: String,
+    strength: String,
+    guarantees: BTreeSet<String>,
+    detail: Option<String>,
+}
+
+impl SandboxCapabilityReport {
+    pub fn new<I, S>(
+        backend: impl Into<String>,
+        strength: impl Into<String>,
+        guarantees: I,
+        detail: Option<String>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            backend: backend.into(),
+            strength: strength.into(),
+            guarantees: guarantees.into_iter().map(Into::into).collect(),
+            detail,
+        }
     }
 }
 

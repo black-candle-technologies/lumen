@@ -18,7 +18,7 @@ use lumen_core::{
 use lumen_server::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
     ApprovalResult, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand, EventBroker,
-    RunCancellation, RunCreated, RuntimeService, ServiceFuture, router,
+    RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceFuture, router,
 };
 use tower::ServiceExt;
 
@@ -98,9 +98,39 @@ fn test_app(workspace_id: WorkspaceId) -> (axum::Router, Arc<FakeService>, Event
         TOKEN,
         PrincipalId::new("local", "operator").expect("principal"),
         BTreeSet::from([workspace_id]),
+        SandboxCapabilityReport::new(
+            "test-sandbox",
+            "kernel_enforced",
+            ["filesystem_isolation", "network_isolation"],
+            None,
+        ),
     )
     .expect("API state");
     (router(state), service, events)
+}
+
+#[tokio::test]
+async fn runtime_capability_report_is_authenticated_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let (app, _, _) = test_app(workspace_id);
+
+    let response = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/runtime/capabilities"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["sandbox"]["backend"], "test-sandbox");
+    assert_eq!(body["sandbox"]["strength"], "kernel_enforced");
+    assert_eq!(
+        body["sandbox"]["guarantees"],
+        serde_json::json!(["filesystem_isolation", "network_isolation"])
+    );
 }
 
 fn request(method: &str, uri: String, body: Body) -> Request<Body> {

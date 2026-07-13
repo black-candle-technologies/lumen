@@ -11,8 +11,8 @@ use lumen_core::{
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
 };
 use lumen_db::{Database, RepositoryError};
-use lumen_integrations::sandbox::{SandboxBackend, SystemSandbox};
-use lumen_server::{ApiState, EventBroker, router};
+use lumen_integrations::sandbox::{SandboxBackend, SandboxReport, SystemSandbox};
+use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Parser, PartialEq)]
@@ -32,6 +32,10 @@ pub enum Command {
         #[command(subcommand)]
         command: AuditCommand,
     },
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
@@ -39,11 +43,17 @@ pub enum AuditCommand {
     Verify,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum SandboxCommand {
+    Report,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
     Migrated,
     AuditVerified,
     ServerStopped,
+    SandboxReport(SandboxReport),
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
@@ -66,12 +76,17 @@ pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
             database.close().await;
             Ok(CommandOutput::AuditVerified)
         }
+        Command::Sandbox {
+            command: SandboxCommand::Report,
+        } => Ok(CommandOutput::SandboxReport(
+            SystemSandbox::detect().report(),
+        )),
         Command::Serve => serve(config).await,
     }
 }
 
 async fn serve(config: Config) -> Result<CommandOutput, CliError> {
-    let sandbox = Arc::new(SystemSandbox::detect());
+    let sandbox: Arc<dyn SandboxBackend> = Arc::new(SystemSandbox::detect());
     config.validate_sandbox(&sandbox.report())?;
     let token = std::env::var(&config.authentication.token_environment).map_err(|_| {
         CliError::MissingEnvironment(config.authentication.token_environment.clone())
@@ -119,7 +134,7 @@ async fn serve(config: Config) -> Result<CommandOutput, CliError> {
         &config,
         database.clone(),
         events.clone(),
-        sandbox,
+        Arc::clone(&sandbox),
         vec![token.clone()],
     )?);
     let state = ApiState::new(
@@ -128,6 +143,7 @@ async fn serve(config: Config) -> Result<CommandOutput, CliError> {
         token,
         config.bootstrap_principal(),
         BTreeSet::from([config.workspace_id()]),
+        api_sandbox_report(&sandbox.report()),
     )?;
     let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
     axum::serve(listener, router(state))
@@ -136,6 +152,18 @@ async fn serve(config: Config) -> Result<CommandOutput, CliError> {
     service.shutdown().await;
     database.close().await;
     Ok(CommandOutput::ServerStopped)
+}
+
+fn api_sandbox_report(report: &SandboxReport) -> SandboxCapabilityReport {
+    SandboxCapabilityReport::new(
+        report.backend(),
+        report.strength().as_str(),
+        report
+            .guarantees()
+            .iter()
+            .map(|guarantee| guarantee.as_str()),
+        report.detail().map(str::to_owned),
+    )
 }
 
 fn prepare_directories(config: &Config) -> Result<(), CliError> {

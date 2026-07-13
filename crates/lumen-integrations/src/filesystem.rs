@@ -318,7 +318,26 @@ fn write_and_replace(
             .map_err(|error| FilesystemError::Write(error.to_string()))?;
     }
 
-    clone_dir(parent)?
+    sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Dir) -> Result<(), FilesystemError> {
+    let descriptor = rustix::fs::openat(
+        directory,
+        ".",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| FilesystemError::Write(error.to_string()))?;
+    std::fs::File::from(descriptor)
+        .sync_all()
+        .map_err(|error| FilesystemError::Write(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(directory: &Dir) -> Result<(), FilesystemError> {
+    clone_dir(directory)?
         .into_std_file()
         .sync_all()
         .map_err(|error| FilesystemError::Write(error.to_string()))

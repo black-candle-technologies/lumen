@@ -369,9 +369,13 @@ async fn system_sandbox_reports_strength_and_enforces_it_when_available() {
     let report = sandbox.report();
     assert!(!report.backend().is_empty());
 
+    #[cfg(target_os = "linux")]
+    assert_eq!(report.strength(), SandboxStrength::KernelEnforced);
+
     if report.strength() == SandboxStrength::Unavailable {
         return;
     }
+    assert!(!report.guarantees().is_empty());
 
     let workspace = tempdir().expect("temporary workspace");
     let output = sandbox
@@ -390,7 +394,7 @@ async fn system_sandbox_reports_strength_and_enforces_it_when_available() {
     assert_eq!(output.stdout(), b"sandboxed\n");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn system_sandbox_denies_workspace_writes() {
     let sandbox = SystemSandbox::detect();
@@ -412,7 +416,7 @@ async fn system_sandbox_denies_workspace_writes() {
     assert!(!marker.exists(), "sandbox allowed a workspace write");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn system_sandbox_denies_reads_outside_the_workspace() {
     let sandbox = SystemSandbox::detect();

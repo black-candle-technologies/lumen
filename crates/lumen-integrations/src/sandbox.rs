@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use serde::Serialize;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -31,6 +32,9 @@ pub struct SystemSandbox {
     report: SandboxReport,
 }
 
+#[cfg(any(target_os = "linux", test))]
+const LINUX_BWRAP_PATHS: [&str; 2] = ["/usr/bin/bwrap", "/bin/bwrap"];
+
 impl SystemSandbox {
     pub fn detect() -> Self {
         #[cfg(target_os = "macos")]
@@ -39,9 +43,16 @@ impl SystemSandbox {
             if executable.is_file() {
                 return Self {
                     executable: Some(executable),
-                    report: SandboxReport::new(
+                    report: SandboxReport::with_guarantees(
                         "macos-sandbox-exec",
                         SandboxStrength::KernelEnforced,
+                        [
+                            SandboxGuarantee::FilesystemIsolation,
+                            SandboxGuarantee::WorkspaceReadOnly,
+                            SandboxGuarantee::NetworkIsolation,
+                            SandboxGuarantee::ExecutableIsolation,
+                            SandboxGuarantee::EnvironmentIsolation,
+                        ],
                         None,
                     ),
                 };
@@ -58,12 +69,28 @@ impl SystemSandbox {
 
         #[cfg(target_os = "linux")]
         {
+            if let Some(executable) = find_linux_bubblewrap(Path::is_file) {
+                if probe_linux_bubblewrap(&executable) {
+                    return Self {
+                        report: linux_sandbox_report(executable.clone()),
+                        executable: Some(executable),
+                    };
+                }
+                return Self {
+                    executable: None,
+                    report: SandboxReport::new(
+                        "linux-bubblewrap",
+                        SandboxStrength::Unavailable,
+                        Some("the complete bubblewrap isolation profile could not start".into()),
+                    ),
+                };
+            }
             Self {
                 executable: None,
                 report: SandboxReport::new(
-                    "linux-sandbox",
+                    "linux-bubblewrap",
                     SandboxStrength::Unavailable,
-                    Some("Linux kernel sandbox enforcement is scheduled for Milestone 2".into()),
+                    Some("bubblewrap was not found at a trusted system path".into()),
                 ),
             }
         }
@@ -134,6 +161,21 @@ async fn execute_system_sandbox(
     .await
 }
 
+#[cfg(target_os = "linux")]
+async fn execute_system_sandbox(
+    executable: PathBuf,
+    request: SandboxRequest,
+) -> Result<SandboxOutput, SandboxError> {
+    let monitored = linux_bubblewrap_command(executable, request.command())?;
+    ProcessMonitor::run(
+        monitored,
+        request.timeout(),
+        request.output_limit(),
+        request.cancellation(),
+    )
+    .await
+}
+
 #[cfg(target_os = "macos")]
 fn macos_profile(program: &Path, workspace: &Path) -> String {
     let program = sandbox_literal(program);
@@ -158,7 +200,7 @@ fn sandbox_literal(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 async fn execute_system_sandbox(
     _executable: PathBuf,
     _request: SandboxRequest,
@@ -168,16 +210,222 @@ async fn execute_system_sandbox(
     ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "linux", test))]
+fn find_linux_bubblewrap(mut available: impl FnMut(&Path) -> bool) -> Option<PathBuf> {
+    LINUX_BWRAP_PATHS
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| available(path))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_sandbox_report(_executable: PathBuf) -> SandboxReport {
+    SandboxReport::with_guarantees(
+        "linux-bubblewrap",
+        SandboxStrength::KernelEnforced,
+        [
+            SandboxGuarantee::FilesystemIsolation,
+            SandboxGuarantee::WorkspaceReadOnly,
+            SandboxGuarantee::NetworkIsolation,
+            SandboxGuarantee::ProcessIsolation,
+            SandboxGuarantee::IpcIsolation,
+            SandboxGuarantee::UserIsolation,
+            SandboxGuarantee::CgroupIsolation,
+            SandboxGuarantee::CapabilitiesDropped,
+            SandboxGuarantee::EnvironmentIsolation,
+            SandboxGuarantee::TerminalIsolation,
+            SandboxGuarantee::ParentDeathCleanup,
+            SandboxGuarantee::ExecutableIsolation,
+        ],
+        None,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_bubblewrap_command(
+    executable: PathBuf,
+    command: &MonitoredCommand,
+) -> Result<MonitoredCommand, SandboxError> {
+    let workspace = command.current_directory().ok_or_else(|| {
+        SandboxError::InvalidRequest("sandboxed commands require a working directory".into())
+    })?;
+    if !workspace.is_absolute() || !command.program().is_absolute() {
+        return Err(SandboxError::InvalidRequest(
+            "Linux sandbox paths must be absolute".into(),
+        ));
+    }
+
+    let mut arguments = vec![
+        "--die-with-parent".into(),
+        "--new-session".into(),
+        "--unshare-user".into(),
+        "--disable-userns".into(),
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+        "--unshare-cgroup".into(),
+        "--unshare-net".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--clearenv".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+        "--dir".into(),
+        "/lumen".into(),
+        "--ro-bind".into(),
+        command.program().to_string_lossy().into_owned(),
+        "/lumen/program".into(),
+        "--ro-bind".into(),
+        workspace.to_string_lossy().into_owned(),
+        "/workspace".into(),
+    ];
+    for library_directory in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
+        if Path::new(library_directory).is_dir() {
+            arguments.extend([
+                "--ro-bind".into(),
+                library_directory.into(),
+                library_directory.into(),
+            ]);
+        }
+    }
+    if Path::new("/etc/ld.so.cache").is_file() {
+        arguments.extend([
+            "--dir".into(),
+            "/etc".into(),
+            "--ro-bind".into(),
+            "/etc/ld.so.cache".into(),
+            "/etc/ld.so.cache".into(),
+        ]);
+    }
+    arguments.extend([
+        "--setenv".into(),
+        "HOME".into(),
+        "/workspace".into(),
+        "--setenv".into(),
+        "TMPDIR".into(),
+        "/tmp".into(),
+    ]);
+    for (name, value) in command.environment() {
+        if name.is_empty()
+            || name.contains('=')
+            || name.chars().any(char::is_control)
+            || value.contains('\0')
+        {
+            return Err(SandboxError::InvalidRequest(
+                "sandbox environment contains an invalid name or value".into(),
+            ));
+        }
+        arguments.extend(["--setenv".into(), name.clone(), value.clone()]);
+    }
+    arguments.extend(["--chdir".into(), "/workspace".into(), "--".into()]);
+    arguments.push("/lumen/program".into());
+    arguments.extend(command.arguments().iter().cloned());
+
+    Ok(MonitoredCommand::new(executable)
+        .args(arguments)
+        .current_dir(workspace))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn probe_linux_bubblewrap(executable: &Path) -> bool {
+    use std::{process::Stdio, thread, time::Instant};
+
+    let Ok(workspace) = std::env::current_dir() else {
+        return false;
+    };
+    let Ok(command) = linux_bubblewrap_command(
+        executable.to_path_buf(),
+        &MonitoredCommand::new("/bin/true").current_dir(workspace),
+    ) else {
+        return false;
+    };
+    let mut process = std::process::Command::new(command.program());
+    process
+        .args(command.arguments())
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = process.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SandboxStrength {
     KernelEnforced,
     Unavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl SandboxStrength {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelEnforced => "kernel_enforced",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxGuarantee {
+    FilesystemIsolation,
+    WorkspaceReadOnly,
+    NetworkIsolation,
+    ProcessIsolation,
+    IpcIsolation,
+    UserIsolation,
+    CgroupIsolation,
+    CapabilitiesDropped,
+    EnvironmentIsolation,
+    TerminalIsolation,
+    ParentDeathCleanup,
+    ExecutableIsolation,
+    Seccomp,
+}
+
+impl SandboxGuarantee {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FilesystemIsolation => "filesystem_isolation",
+            Self::WorkspaceReadOnly => "workspace_read_only",
+            Self::NetworkIsolation => "network_isolation",
+            Self::ProcessIsolation => "process_isolation",
+            Self::IpcIsolation => "ipc_isolation",
+            Self::UserIsolation => "user_isolation",
+            Self::CgroupIsolation => "cgroup_isolation",
+            Self::CapabilitiesDropped => "capabilities_dropped",
+            Self::EnvironmentIsolation => "environment_isolation",
+            Self::TerminalIsolation => "terminal_isolation",
+            Self::ParentDeathCleanup => "parent_death_cleanup",
+            Self::ExecutableIsolation => "executable_isolation",
+            Self::Seccomp => "seccomp",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SandboxReport {
     backend: String,
     strength: SandboxStrength,
+    guarantees: BTreeSet<SandboxGuarantee>,
     detail: Option<String>,
 }
 
@@ -190,6 +438,21 @@ impl SandboxReport {
         Self {
             backend: backend.into(),
             strength,
+            guarantees: BTreeSet::new(),
+            detail,
+        }
+    }
+
+    pub fn with_guarantees(
+        backend: impl Into<String>,
+        strength: SandboxStrength,
+        guarantees: impl IntoIterator<Item = SandboxGuarantee>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            backend: backend.into(),
+            strength,
+            guarantees: guarantees.into_iter().collect(),
             detail,
         }
     }
@@ -200,6 +463,10 @@ impl SandboxReport {
 
     pub fn backend(&self) -> &str {
         &self.backend
+    }
+
+    pub const fn guarantees(&self) -> &BTreeSet<SandboxGuarantee> {
+        &self.guarantees
     }
 
     pub fn detail(&self) -> Option<&str> {
@@ -516,4 +783,97 @@ pub enum SandboxError {
     TimedOut,
     #[error("process output exceeds the {limit}-byte limit")]
     OutputLimitExceeded { limit: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use super::*;
+
+    #[test]
+    fn linux_bubblewrap_detection_uses_only_fixed_system_paths() {
+        let selected = find_linux_bubblewrap(|path| path == Path::new("/bin/bwrap"));
+
+        assert_eq!(selected, Some(PathBuf::from("/bin/bwrap")));
+        assert_eq!(LINUX_BWRAP_PATHS, ["/usr/bin/bwrap", "/bin/bwrap"]);
+        assert!(!probe_linux_bubblewrap(Path::new(
+            "/definitely-not-a-lumen-bubblewrap"
+        )));
+    }
+
+    #[test]
+    fn linux_profile_isolates_namespaces_and_exposes_one_executable() {
+        let command = MonitoredCommand::new("/usr/bin/example")
+            .args(["--version"])
+            .current_dir("/home/operator/workspace")
+            .envs(BTreeMap::from([("LANG".into(), "C".into())]));
+
+        let wrapped = linux_bubblewrap_command(PathBuf::from("/usr/bin/bwrap"), &command)
+            .expect("Linux profile builds");
+        let arguments = wrapped.arguments();
+
+        assert_eq!(wrapped.program(), Path::new("/usr/bin/bwrap"));
+        for required in [
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user",
+            "--disable-userns",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--unshare-net",
+            "--cap-drop",
+            "--clearenv",
+        ] {
+            assert!(arguments.iter().any(|argument| argument == required));
+        }
+        assert!(
+            arguments
+                .windows(3)
+                .any(|values| values == ["--ro-bind", "/usr/bin/example", "/lumen/program"])
+        );
+        assert!(
+            arguments
+                .windows(3)
+                .any(|values| values == ["--ro-bind", "/home/operator/workspace", "/workspace"])
+        );
+        assert!(
+            !arguments
+                .windows(3)
+                .any(|values| values == ["--ro-bind", "/usr", "/usr"])
+        );
+        assert!(
+            arguments
+                .windows(3)
+                .any(|values| values == ["--setenv", "LANG", "C"])
+        );
+        assert_eq!(arguments.last().map(String::as_str), Some("--version"));
+        assert!(wrapped.environment().is_empty());
+    }
+
+    #[test]
+    fn linux_report_names_each_enforced_guarantee_without_claiming_seccomp() {
+        let report = linux_sandbox_report(PathBuf::from("/usr/bin/bwrap"));
+
+        assert_eq!(report.strength(), SandboxStrength::KernelEnforced);
+        for guarantee in [
+            SandboxGuarantee::FilesystemIsolation,
+            SandboxGuarantee::WorkspaceReadOnly,
+            SandboxGuarantee::NetworkIsolation,
+            SandboxGuarantee::ProcessIsolation,
+            SandboxGuarantee::IpcIsolation,
+            SandboxGuarantee::UserIsolation,
+            SandboxGuarantee::CgroupIsolation,
+            SandboxGuarantee::CapabilitiesDropped,
+            SandboxGuarantee::EnvironmentIsolation,
+            SandboxGuarantee::TerminalIsolation,
+            SandboxGuarantee::ParentDeathCleanup,
+            SandboxGuarantee::ExecutableIsolation,
+        ] {
+            assert!(report.guarantees().contains(&guarantee));
+        }
+        assert!(!report.guarantees().contains(&SandboxGuarantee::Seccomp));
+    }
 }

@@ -1,4 +1,4 @@
-use lumen_cli::{AuditCommand, Cli, CliError, Command, CommandOutput, execute};
+use lumen_cli::{AuditCommand, Cli, CliError, Command, CommandOutput, SandboxCommand, execute};
 use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
@@ -119,4 +119,24 @@ async fn audit_verify_rejects_a_tampered_persisted_event() {
     .expect_err("tampered audit must fail verification");
 
     assert!(matches!(error, CliError::AuditIntegrity(_)));
+}
+
+#[tokio::test]
+async fn sandbox_report_describes_the_detected_platform_without_starting_runtime() {
+    let directory = tempdir().expect("temporary directory");
+    let config = write_config(directory.path());
+
+    let output = execute(Cli {
+        config,
+        command: Command::Sandbox {
+            command: SandboxCommand::Report,
+        },
+    })
+    .await
+    .expect("sandbox report succeeds");
+
+    let CommandOutput::SandboxReport(report) = output else {
+        panic!("unexpected command output");
+    };
+    assert!(!report.backend().is_empty());
 }

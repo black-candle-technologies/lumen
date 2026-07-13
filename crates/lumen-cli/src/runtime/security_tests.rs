@@ -18,7 +18,7 @@ use lumen_db::Database;
 use lumen_integrations::sandbox::{
     SandboxBackend, SandboxFuture, SandboxOutput, SandboxReport, SandboxRequest, SandboxStrength,
 };
-use lumen_server::{ApiState, EventBroker, router};
+use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wiremock::{
@@ -124,6 +124,12 @@ subject = "operator"
             TOKEN,
             config.bootstrap_principal(),
             BTreeSet::from([config.workspace_id()]),
+            SandboxCapabilityReport::new(
+                "test",
+                "kernel_enforced",
+                ["filesystem_isolation", "network_isolation"],
+                None,
+            ),
         )
         .expect("API state");
         Self {

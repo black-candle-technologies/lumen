@@ -62,15 +62,15 @@ docs/
 
 **Files:** `crates/lumen-integrations/src/sandbox.rs`, `crates/lumen-integrations/tests/local_executors.rs`, `crates/lumen-cli/src/{config,lib}.rs`, `crates/lumen-cli/tests/{config,commands}.rs`, `crates/lumen-server/src/state.rs`, `crates/lumen-server/src/routes/mod.rs`, `crates/lumen-server/tests/routes.rs`
 
-- [ ] Add failing profile tests for fixed-path bubblewrap detection, namespace isolation, read-only mounts, network isolation, cleared environment, dropped capabilities, new session, and parent-death cleanup.
-- [ ] Add failing tests for structured per-guarantee platform reporting and default fail-closed validation.
-- [ ] Add failing CLI and authenticated API tests for capability reporting.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement the Linux bubblewrap command builder without action-controlled wrapper paths.
-- [ ] Implement structured `SandboxReport` guarantees and expose them through CLI and API adapters.
-- [ ] Run Linux-specific tests in a Linux container or CI-compatible target when available; keep non-Linux profile construction tests platform-independent.
-- [ ] Run focused tests and strict Clippy.
-- [ ] Commit as `feat(sandbox): enforce and report Linux isolation`.
+- [x] Add failing profile tests for fixed-path bubblewrap detection, namespace isolation, read-only mounts, network isolation, cleared environment, dropped capabilities, new session, and parent-death cleanup.
+- [x] Add failing tests for structured per-guarantee platform reporting and default fail-closed validation.
+- [x] Add failing CLI and authenticated API tests for capability reporting.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement the Linux bubblewrap command builder without action-controlled wrapper paths.
+- [x] Implement structured `SandboxReport` guarantees and expose them through CLI and API adapters.
+- [x] Run Linux-specific tests in a Linux container or CI-compatible target when available; keep non-Linux profile construction tests platform-independent.
+- [x] Run focused tests and strict Clippy.
+- [x] Commit as `feat(sandbox): enforce and report Linux isolation`.
 
 ## Task 3: OS-Keychain Secret References
 
