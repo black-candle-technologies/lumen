@@ -52,14 +52,14 @@ docs/
 
 **Files:** `crates/lumen-core/src/{lib,action,capability,extension,policy}.rs`, `crates/lumen-core/tests/extension_contract.rs`, `crates/lumen-core/tests/core_security.rs`
 
-- [ ] Add failing tests for bounded reverse-domain plugin IDs, component IDs, canonical semantic versions, lowercase SHA-256 digests, runtime/protocol versions, strict manifest fields, and canonical ordering.
-- [ ] Add failing tests proving `plugin.install`, `plugin.enable`, `plugin.capabilities.set`, `plugin.settings.set`, `plugin.quarantine.release`, and `plugin.invoke` carry exact resource scopes and authority-expanding operations require approval.
-- [ ] Add failing fingerprint tests proving plugin/version/component, package/manifest/artifact/settings/grant digests, protocol, parent action, and input all bind an action while diagnostic text does not.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement runtime-neutral extension identity, manifest, invocation, result, proposal, failure, limits, and provenance types with private fields and validated constructors.
-- [ ] Extend action envelopes with optional typed provenance while preserving built-in action serialization and existing fingerprints.
-- [ ] Run focused tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(extensions): define identity and provenance contracts`.
+- [x] Add failing tests for bounded reverse-domain plugin IDs, component IDs, canonical semantic versions, lowercase SHA-256 digests, runtime/protocol versions, strict manifest fields, and canonical ordering.
+- [x] Add failing tests proving `plugin.install`, `plugin.enable`, `plugin.capabilities.set`, `plugin.settings.set`, `plugin.quarantine.release`, and `plugin.invoke` carry exact resource scopes and authority-expanding operations require approval.
+- [x] Add failing fingerprint tests proving plugin/version/component, package/manifest/artifact/settings/grant digests, protocol, parent action, and input all bind an action while diagnostic text does not.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement runtime-neutral extension identity, manifest, invocation, result, proposal, failure, limits, and provenance types with private fields and validated constructors.
+- [x] Extend action envelopes with optional typed provenance while preserving built-in action serialization and existing fingerprints.
+- [x] Run focused tests, formatting, and strict Clippy.
+- [x] Commit as `feat(extensions): define identity and provenance contracts`.
 
 ## Task 2: Strict Packages, Schemas, And Quarantine Staging
 

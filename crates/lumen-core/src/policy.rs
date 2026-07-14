@@ -97,6 +97,9 @@ impl Default for Policy {
                 CapabilityName::PluginInstall,
                 CapabilityName::PluginUpdate,
                 CapabilityName::PluginEnable,
+                CapabilityName::PluginCapabilitiesSet,
+                CapabilityName::PluginSettingsSet,
+                CapabilityName::PluginQuarantineRelease,
                 CapabilityName::PolicyModify,
             ]
             .into_iter()

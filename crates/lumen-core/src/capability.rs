@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::identity::WorkspaceId;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum CapabilityName {
     #[serde(rename = "fs.read")]
     FsRead,
@@ -31,6 +31,14 @@ pub enum CapabilityName {
     PluginUpdate,
     #[serde(rename = "plugin.enable")]
     PluginEnable,
+    #[serde(rename = "plugin.capabilities.set")]
+    PluginCapabilitiesSet,
+    #[serde(rename = "plugin.settings.set")]
+    PluginSettingsSet,
+    #[serde(rename = "plugin.quarantine.release")]
+    PluginQuarantineRelease,
+    #[serde(rename = "plugin.invoke")]
+    PluginInvoke,
     #[serde(rename = "policy.modify")]
     PolicyModify,
 }

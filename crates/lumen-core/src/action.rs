@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     capability::Capability,
+    extension::ExtensionProvenance,
     identity::{ComponentId, PrincipalId, WorkspaceId},
 };
 
@@ -43,8 +44,8 @@ macro_rules! uuid_id {
 uuid_id!(ActionId);
 uuid_id!(RunId);
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(try_from = "String")]
 pub struct ActionKind(String);
 
 impl ActionKind {
@@ -64,6 +65,14 @@ impl ActionKind {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for ActionKind {
+    type Error = ActionError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
     }
 }
 
@@ -127,6 +136,8 @@ pub struct ActionEnvelope {
     kind: ActionKind,
     arguments: CanonicalValue,
     required_capabilities: Vec<Capability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extension_provenance: Option<ExtensionProvenance>,
 }
 
 impl ActionEnvelope {
@@ -154,7 +165,14 @@ impl ActionEnvelope {
             kind,
             arguments,
             required_capabilities,
+            extension_provenance: None,
         }
+    }
+
+    pub fn with_extension_provenance(mut self, provenance: ExtensionProvenance) -> Self {
+        self.schema_version = 2;
+        self.extension_provenance = Some(provenance);
+        self
     }
 
     pub fn required_capabilities(&self) -> &[Capability] {
@@ -187,6 +205,10 @@ impl ActionEnvelope {
 
     pub const fn arguments(&self) -> &CanonicalValue {
         &self.arguments
+    }
+
+    pub const fn extension_provenance(&self) -> Option<&ExtensionProvenance> {
+        self.extension_provenance.as_ref()
     }
 
     pub fn fingerprint(&self) -> ActionFingerprint {
