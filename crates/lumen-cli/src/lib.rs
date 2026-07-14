@@ -11,8 +11,11 @@ use lumen_core::{
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     secret::SecretRefId,
 };
-use lumen_db::{Database, RepositoryError, SecretReference, SecretReferenceError};
+use lumen_db::{
+    Database, RepositoryError, SecretReference, SecretReferenceError, StagedPluginPackage,
+};
 use lumen_integrations::{
+    extension_package::{PackageStageError, PackageStager},
     sandbox::{SandboxBackend, SandboxReport, SystemSandbox},
     secrets::{OsKeyringSecretStore, SecretStore, SecretStoreError},
 };
@@ -43,6 +46,18 @@ pub enum Command {
     Secret {
         #[command(subcommand)]
         command: SecretCommand,
+    },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum PluginCommand {
+    Stage {
+        #[arg(value_parser = parse_local_plugin_directory)]
+        directory: PathBuf,
     },
 }
 
@@ -82,6 +97,15 @@ pub enum CommandOutput {
     SecretCreated(SecretReference),
     SecretReferences(Vec<SecretReference>),
     SecretDeleted(SecretRefId),
+    PluginStaged(PluginStageSummary),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginStageSummary {
+    pub stage_id: uuid::Uuid,
+    pub plugin_id: String,
+    pub version: String,
+    pub package_digest: String,
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
@@ -136,8 +160,89 @@ pub async fn execute_with_secret_store(
         Command::Secret { command } => {
             execute_secret_command(&config, command, secret_store, secret_input).await
         }
+        Command::Plugin { command } => execute_plugin_command(&config, command).await,
         Command::Serve => serve(config, secret_store).await,
     }
+}
+
+fn parse_local_plugin_directory(value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value.contains("://") {
+        return Err("plugin stage accepts a local directory only".into());
+    }
+    Ok(PathBuf::from(value))
+}
+
+async fn execute_plugin_command(
+    config: &Config,
+    command: PluginCommand,
+) -> Result<CommandOutput, CliError> {
+    let database = Database::connect(&config.database.path).await?;
+    let now = runtime::now();
+    database
+        .bootstrap_workspace(
+            config.workspace_id(),
+            &config.workspace.name,
+            &config.bootstrap_principal(),
+            now,
+        )
+        .await?;
+    let output = match command {
+        PluginCommand::Stage { directory } => {
+            let quarantine = config.runtime.data_directory.join("plugins/quarantine");
+            let staged = PackageStager::default().stage(directory, &quarantine)?;
+            let data_root = std::fs::canonicalize(&config.runtime.data_directory)?;
+            let relative = staged
+                .quarantine_path()
+                .strip_prefix(&data_root)
+                .map_err(|_| CliError::Runtime("quarantine escaped the data directory".into()))?
+                .to_string_lossy()
+                .into_owned();
+            let stage_id = uuid::Uuid::new_v4();
+            let record = StagedPluginPackage::new(
+                stage_id,
+                staged.manifest().clone(),
+                relative,
+                staged.files().clone(),
+                staged.package_digest().clone(),
+                staged.manifest_digest().clone(),
+                config.bootstrap_principal(),
+                now,
+            )?;
+            database.insert_staged_plugin_package(&record).await?;
+            database
+                .append_audit_event(AuditEvent::new(
+                    AuditEventId::new(),
+                    now,
+                    AuditEventKind::PluginStaged,
+                    AuditOutcome::Success,
+                    Some(config.workspace_id()),
+                    CanonicalValue::object([
+                        ("stage_id", CanonicalValue::from(stage_id.to_string())),
+                        (
+                            "plugin_id",
+                            CanonicalValue::from(record.manifest().id().to_string()),
+                        ),
+                        (
+                            "version",
+                            CanonicalValue::from(record.manifest().version().to_string()),
+                        ),
+                        (
+                            "package_digest",
+                            CanonicalValue::from(record.package_digest().to_string()),
+                        ),
+                    ]),
+                ))
+                .await?;
+            CommandOutput::PluginStaged(PluginStageSummary {
+                stage_id,
+                plugin_id: record.manifest().id().to_string(),
+                version: record.manifest().version().to_string(),
+                package_digest: record.package_digest().to_string(),
+            })
+        }
+    };
+    database.close().await;
+    Ok(output)
 }
 
 async fn execute_secret_command(
@@ -341,6 +446,8 @@ pub enum CliError {
     SecretReference(#[from] SecretReferenceError),
     #[error(transparent)]
     SecretStore(#[from] SecretStoreError),
+    #[error(transparent)]
+    PackageStage(#[from] PackageStageError),
     #[error(transparent)]
     ApiState(#[from] lumen_server::ApiStateError),
     #[error(transparent)]

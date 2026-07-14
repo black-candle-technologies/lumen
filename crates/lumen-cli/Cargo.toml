@@ -26,6 +26,7 @@ uuid = "1"
 [dev-dependencies]
 futures-util = "0.3"
 http-body-util = "0.1"
+sha2 = "0.10"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
