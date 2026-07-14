@@ -562,6 +562,7 @@ impl ExtensionFailureClass {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtensionFailure {
     class: ExtensionFailureClass,
     message: String,

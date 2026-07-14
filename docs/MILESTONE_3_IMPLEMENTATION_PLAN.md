@@ -117,13 +117,13 @@ docs/
 
 **Files:** `Cargo.toml`, `Cargo.lock`, `crates/lumen-extension-sdk/**`, `crates/lumen-integrations/Cargo.toml`, `crates/lumen-integrations/src/extension_wasm.rs`, `crates/lumen-integrations/tests/{extension_wasm,extension_conformance}.rs`
 
-- [ ] Add a failing common conformance suite for structured results, returned proposals, typed failures, protocol mismatch, request correlation, and response bounds.
-- [ ] Add failing Wasmtime tests for valid fixture execution, unknown imports, WASI filesystem/socket/environment/clock/random/process denial, fresh state, memory/table/instance/result limits, fuel exhaustion, epoch deadline, cancellation, and traps.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Add the versioned WIT world, generated guest bindings, ergonomic SDK result/proposal types, and an executable component fixture.
-- [ ] Implement the Wasmtime component host with component-model validation, no WASI linker, resource limiter, fuel, epoch interruption, cancellation, and digest-keyed compilation cache metadata.
-- [ ] Run SDK docs, conformance tests, focused tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(extensions): execute bounded WASM components`.
+- [x] Add a failing common conformance suite for structured results, returned proposals, typed failures, protocol mismatch, request correlation, and response bounds.
+- [x] Add failing Wasmtime tests for valid fixture execution, unknown imports, WASI filesystem/socket/environment/clock/random/process denial, fresh state, memory/table/instance/result limits, fuel exhaustion, epoch deadline, cancellation, and traps.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Add the versioned WIT world, generated guest bindings, ergonomic SDK result/proposal types, and an executable component fixture.
+- [x] Implement the Wasmtime component host with component-model validation, no WASI linker, resource limiter, fuel, epoch interruption, cancellation, and digest-keyed compilation cache metadata.
+- [x] Run SDK docs, conformance tests, focused tests, formatting, and strict Clippy.
+- [x] Commit as `feat(extensions): execute bounded WASM components`.
 
 ## Task 7: Supervised Subprocess Host
 

@@ -11,6 +11,7 @@ futures-util = "0.3"
 jsonschema = { version = "0.47", default-features = false }
 keyring = "4"
 lumen-core = { path = "../lumen-core" }
+lumen-extension-sdk = { path = "../lumen-extension-sdk" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +22,7 @@ tokio-util = "0.7"
 toml = "0.9"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+wasmtime = { version = "46", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["fs", "process", "resource", "signal"] }
@@ -28,4 +30,5 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
+wat = "1"
 wiremock = "0.6"

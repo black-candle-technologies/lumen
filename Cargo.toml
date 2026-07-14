@@ -4,6 +4,7 @@ members = [
     "crates/lumen-cli",
     "crates/lumen-core",
     "crates/lumen-db",
+    "crates/lumen-extension-sdk",
     "crates/lumen-integrations",
     "crates/lumen-server",
 ]

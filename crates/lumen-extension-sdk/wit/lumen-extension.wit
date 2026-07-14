@@ -1,0 +1,6 @@
+package lumen:extension@1.0.0;
+
+world plugin {
+    /// Executes one bounded invocation encoded with the versioned Lumen wire contract.
+    export invoke: func(request: string) -> string;
+}

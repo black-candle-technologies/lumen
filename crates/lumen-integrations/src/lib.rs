@@ -2,6 +2,7 @@
 
 pub mod extension_package;
 pub mod extension_schema;
+pub mod extension_wasm;
 pub mod filesystem;
 pub mod openai_compatible;
 pub mod process;
