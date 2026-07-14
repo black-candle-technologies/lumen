@@ -87,6 +87,70 @@ test.beforeEach(async ({ page }) => {
 			}
 		});
 	});
+	await page.route('**/api/v1/workspaces/*/plugins/staged*', async (route) => {
+		await route.fulfill({
+			json: {
+				packages: [
+					{
+						stage_id: 'stage-plugin',
+						plugin_id: `com.example.${'very-long-plugin-id-'.repeat(5)}review`,
+						version: '1.0.0',
+						runtime: 'subprocess',
+						package_digest: 'a'.repeat(64),
+						manifest_digest: 'b'.repeat(64),
+						artifact_digest: 'c'.repeat(64),
+						file_hashes: {
+							'lumen-plugin.toml': 'b'.repeat(64),
+							'bin/plugin': 'c'.repeat(64)
+						},
+						requested_by: { provider: 'local', subject: 'operator' },
+						created_at: 10
+					}
+				]
+			}
+		});
+	});
+	await page.route('**/api/v1/workspaces/*/plugins/*/versions/*', async (route) => {
+		await route.fulfill({
+			json: {
+				plugin_id: `com.example.${'very-long-plugin-id-'.repeat(5)}review`,
+				version: '1.0.0',
+				state: 'enabled',
+				package_digest: 'a'.repeat(64),
+				manifest_digest: 'b'.repeat(64),
+				artifact_digest: 'c'.repeat(64),
+				components: [
+					{
+						id: 'summarize',
+						kind: 'tool',
+						requested_capabilities: [{ name: 'filesystem.read', scope: 'workspace' }],
+						effective_grants: [{ name: 'filesystem.read', scope: { path: longPath } }],
+						grant_revision: 4,
+						grant_set_digest: 'd'.repeat(64)
+					}
+				],
+				settings: [
+					{
+						scope_type: 'workspace',
+						scope_id: workspaceId,
+						config_version: 2,
+						config: { api_key: '[redacted]', mode: 'local' },
+						schema_digest: 'e'.repeat(64),
+						settings_digest: 'f'.repeat(64)
+					}
+				],
+				failures: [
+					{
+						class: 'host_fault',
+						count: 2,
+						diagnostic: '[redacted]',
+						diagnostic_digest: '0'.repeat(64),
+						last_seen_at: 42
+					}
+				]
+			}
+		});
+	});
 });
 
 test('streams a local chat result and can request cancellation', async ({ page }, testInfo) => {
@@ -164,4 +228,31 @@ test('opens audit event details without losing the list', async ({ page }, testI
 	await expect(page.getByText('run-1')).toBeVisible();
 	await expect(page.getByText('operator')).toBeVisible();
 	await page.screenshot({ path: testInfo.outputPath('audit.png') });
+});
+
+test('shows plugin review controls without rendering secret values or overflowing', async ({ page }, testInfo) => {
+	let requested = false;
+	await page.route('**/api/v1/workspaces/*/plugins/actions', async (route) => {
+		requested = true;
+		expect(route.request().postDataJSON()).toMatchObject({
+			kind: 'plugin.enable',
+			plugin_version: '1.0.0',
+			expected_digest: 'a'.repeat(64)
+		});
+		await route.fulfill({ status: 202, json: { run_id: 'run-plugin', state: 'approval_requested' } });
+	});
+	await page.goto('/plugins');
+
+	await expect(page.getByRole('heading', { name: 'Plugins' })).toBeVisible();
+	await expect(page.getByText('subprocess')).toBeVisible();
+	await expect(page.getByText('a'.repeat(64)).first()).toBeVisible();
+	await expect(page.getByText('filesystem.read').first()).toBeVisible();
+	await expect(page.getByText('[redacted]')).toBeVisible();
+	await expect(page.getByText('host_fault')).toBeVisible();
+	await expect(page.getByText('actual-secret-must-not-render')).toHaveCount(0);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: 'Enable' }).click();
+	expect(requested).toBe(true);
+	await expect(page.getByText('approval_requested: run-plugin')).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('plugins.png') });
 });

@@ -5,6 +5,7 @@
 	import Bot from '@lucide/svelte/icons/bot';
 	import CheckSquare from '@lucide/svelte/icons/square-check';
 	import FileClock from '@lucide/svelte/icons/file-clock';
+	import Puzzle from '@lucide/svelte/icons/puzzle';
 	import Settings from '@lucide/svelte/icons/settings';
 	import favicon from '$lib/assets/favicon.svg';
 	import ConnectionDialog from '$lib/components/ConnectionDialog.svelte';
@@ -21,6 +22,7 @@
 	const navigation = [
 		{ href: '/', label: 'Chat', icon: Bot },
 		{ href: '/approvals', label: 'Approvals', icon: CheckSquare },
+		{ href: '/plugins', label: 'Plugins', icon: Puzzle },
 		{ href: '/audit', label: 'Audit', icon: FileClock }
 	];
 </script>

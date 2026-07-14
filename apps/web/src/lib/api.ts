@@ -34,6 +34,70 @@ export type AuditEvent = {
 	payload: JsonValue;
 };
 
+export type PrincipalSummary = {
+	provider: string;
+	subject: string;
+};
+
+export type StagedPluginReview = {
+	stage_id: string;
+	plugin_id: string;
+	version: string;
+	runtime: string;
+	package_digest: string;
+	manifest_digest: string;
+	artifact_digest: string;
+	file_hashes: Record<string, string>;
+	requested_by: PrincipalSummary;
+	created_at: number;
+};
+
+export type PluginComponentReview = {
+	id: string;
+	kind: string;
+	requested_capabilities: JsonValue[];
+	effective_grants: JsonValue[];
+	grant_revision: number;
+	grant_set_digest: string;
+};
+
+export type PluginSettingReview = {
+	scope_type: string;
+	scope_id: string;
+	config_version: number;
+	config: JsonValue;
+	schema_digest: string;
+	settings_digest: string;
+};
+
+export type PluginFailureReview = {
+	class: string;
+	count: number;
+	diagnostic: string;
+	diagnostic_digest: string;
+	last_seen_at: number;
+};
+
+export type PluginVersionDetails = {
+	plugin_id: string;
+	version: string;
+	state: string;
+	package_digest: string;
+	manifest_digest: string;
+	artifact_digest: string;
+	components: PluginComponentReview[];
+	settings: PluginSettingReview[];
+	failures: PluginFailureReview[];
+};
+
+export type PluginActionRequest = {
+	kind: string;
+	plugin_id: string;
+	plugin_version: string;
+	expected_digest: string;
+	arguments?: JsonValue;
+};
+
 export class ApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -79,6 +143,25 @@ export class ApiClient {
 			`audit?after=${after}&limit=${limit}`
 		);
 		return response.events;
+	}
+
+	async listStagedPlugins(limit = 50, after = 0): Promise<StagedPluginReview[]> {
+		const response = await this.request<{ packages: StagedPluginReview[] }>(
+			`plugins/staged?after=${after}&limit=${limit}`
+		);
+		return response.packages;
+	}
+
+	async getPluginVersion(pluginId: string, version: string): Promise<PluginVersionDetails> {
+		return this.request(
+			`plugins/${encodeURIComponent(pluginId)}/versions/${encodeURIComponent(version)}`
+		);
+	}
+
+	async requestPluginAction(
+		request: PluginActionRequest
+	): Promise<{ run_id: string; state: string }> {
+		return this.request('plugins/actions', { method: 'POST', body: JSON.stringify(request) });
 	}
 
 	async streamRunEvents(

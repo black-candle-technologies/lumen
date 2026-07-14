@@ -167,13 +167,13 @@ docs/
 
 **Files:** `apps/web/src/lib/api.ts`, `apps/web/src/lib/api.test.ts`, `apps/web/src/lib/components/{PluginReview,PluginAuthority,PluginSettings,PluginFailures}.svelte`, component tests, `apps/web/src/routes/{+layout,plugins/+page}.svelte`, `apps/web/tests/control-surface.spec.ts`, `apps/web/src/app.css`
 
-- [ ] Add failing API/component tests for staged-package review, full hashes, requested-versus-granted authority, immutable versions, schema-backed scoped settings, optimistic conflicts, failure history, and action-specific approval previews.
-- [ ] Add failing browser tests for install, enable, grant, settings, and quarantine workflows at desktop and mobile viewports, including long IDs/hashes and loading/empty/error/conflict states.
-- [ ] Confirm the frontend tests fail before implementation.
-- [ ] Add a compact Plugins navigation item and work-focused page using familiar icons, native controls, bounded tables/lists, and no plugin-supplied HTML/CSS/JS/images.
-- [ ] Route sensitive commands to the existing Approvals view and display exact fingerprint-changing inputs.
-- [ ] Run Svelte diagnostics, unit tests, production build, Playwright, and desktop/mobile screenshot inspection.
-- [ ] Commit as `feat(web): add secure plugin controls`.
+- [x] Add failing API/component tests for staged-package review, full hashes, requested-versus-granted authority, immutable versions, schema-backed scoped settings, optimistic conflicts, failure history, and action-specific approval previews.
+- [x] Add failing browser tests for install, enable, grant, settings, and quarantine workflows at desktop and mobile viewports, including long IDs/hashes and loading/empty/error/conflict states.
+- [x] Confirm the frontend tests fail before implementation.
+- [x] Add a compact Plugins navigation item and work-focused page using familiar icons, native controls, bounded tables/lists, and no plugin-supplied HTML/CSS/JS/images.
+- [x] Route sensitive commands to the existing Approvals view and display exact fingerprint-changing inputs.
+- [x] Run Svelte diagnostics, unit tests, production build, Playwright, and desktop/mobile screenshot inspection.
+- [x] Commit as `feat(web): add secure plugin controls`.
 
 ## Task 11: Milestone 3 Security Verification
 
