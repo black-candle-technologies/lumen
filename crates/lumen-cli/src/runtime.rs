@@ -24,7 +24,7 @@ use lumen_core::{
     },
     secret::SecretRefId,
 };
-use lumen_db::{Database, DispatchReservation};
+use lumen_db::{Database, DispatchReservation, PluginGrantScope, PluginSettingScope};
 use lumen_integrations::{
     filesystem::WorkspaceReader,
     openai_compatible::{EndpointPolicy, OpenAiCompatibleClient, OpenAiCompatibleConfig},
@@ -38,14 +38,19 @@ use lumen_integrations::{
 use lumen_server::{
     ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
     ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand,
-    EventBroker, RunCancellation, RunCreated, RuntimeService, ServiceError, ServiceFuture,
+    EventBroker, PluginActionCommand, PluginActionRequested, PluginComponentReview,
+    PluginDetailsQuery, PluginFailureReview, PluginReviewQuery, PluginSettingReview,
+    PluginVersionDetails, PrincipalSummary, RunCancellation, RunCreated, RuntimeService,
+    ServiceError, ServiceFuture, StagedPluginReview,
 };
+use sqlx::Row;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::extension_runtime::{
-    ExtensionActionNormalizer, ExtensionExecutor, InvocationTarget, action_proposal,
-    invocation_capability, is_extension_action, prepare_invocation,
+    ExtensionActionNormalizer, ExtensionExecutor, InvocationTarget, VersionArguments,
+    action_proposal, admin_capabilities, invocation_capability, is_extension_action,
+    prepare_invocation,
 };
 use crate::{CliError, config::Config};
 
@@ -685,6 +690,337 @@ impl RuntimeService for LocalRuntimeService {
             Ok(RunCancellation::new(command.run_id()))
         })
     }
+
+    fn list_staged_plugins(
+        &self,
+        query: PluginReviewQuery,
+    ) -> ServiceFuture<'_, Vec<StagedPluginReview>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT id, manifest_json, runtime_type, file_hashes_json, package_digest,
+                        manifest_digest, artifact_digest, requested_by_provider,
+                        requested_by_subject, created_at
+                 FROM plugin_staged_packages
+                 WHERE state = 'staged' AND created_at >= ?
+                 ORDER BY created_at, id
+                 LIMIT ?",
+            )
+            .bind(i64::try_from(query.after()).map_err(|_| {
+                ServiceError::Conflict("plugin review cursor is out of range".into())
+            })?)
+            .bind(i64::from(query.limit()))
+            .fetch_all(self.database.pool())
+            .await
+            .map_err(sql_service_error)?;
+
+            rows.into_iter()
+                .map(|row| {
+                    let manifest: lumen_core::extension::PluginManifest = serde_json::from_str(
+                        &row.try_get::<String, _>("manifest_json")
+                            .map_err(sql_service_error)?,
+                    )
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+                    let requested_by = lumen_core::identity::PrincipalId::new(
+                        row.try_get::<String, _>("requested_by_provider")
+                            .map_err(sql_service_error)?,
+                        row.try_get::<String, _>("requested_by_subject")
+                            .map_err(sql_service_error)?,
+                    )
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+                    let file_hashes: BTreeMap<String, String> = serde_json::from_str(
+                        &row.try_get::<String, _>("file_hashes_json")
+                            .map_err(sql_service_error)?,
+                    )
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+                    let created_at: i64 = row.try_get("created_at").map_err(sql_service_error)?;
+                    let created_at = u64::try_from(created_at)
+                        .map_err(|_| ServiceError::Internal("invalid plugin timestamp".into()))?;
+                    Ok(StagedPluginReview::new(
+                        row.try_get::<String, _>("id").map_err(sql_service_error)?,
+                        manifest.id().as_str(),
+                        manifest.version().as_str(),
+                        row.try_get::<String, _>("runtime_type")
+                            .map_err(sql_service_error)?,
+                        row.try_get::<String, _>("package_digest")
+                            .map_err(sql_service_error)?,
+                        row.try_get::<String, _>("manifest_digest")
+                            .map_err(sql_service_error)?,
+                        row.try_get::<String, _>("artifact_digest")
+                            .map_err(sql_service_error)?,
+                        file_hashes,
+                        PrincipalSummary::new(&requested_by),
+                        TimestampMillis::new(created_at),
+                    ))
+                })
+                .collect()
+        })
+    }
+
+    fn plugin_details(&self, query: PluginDetailsQuery) -> ServiceFuture<'_, PluginVersionDetails> {
+        Box::pin(async move {
+            let plugin_id = PluginId::parse(query.plugin_id())
+                .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            let version = PluginVersion::parse(query.plugin_version())
+                .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            let installed = self
+                .database
+                .installed_plugin_version(plugin_id.clone(), version.clone())
+                .await
+                .map_err(repository_service_error)?
+                .ok_or(ServiceError::NotFound)?;
+            let state = self
+                .database
+                .plugin_workspace_state(query.workspace_id(), plugin_id.clone(), version.clone())
+                .await
+                .map_err(repository_service_error)?;
+            let state = if installed.is_artifact_quarantined() {
+                "artifact_quarantine".to_owned()
+            } else {
+                match state {
+                    Some(lumen_db::PluginWorkspaceState::Enabled) => "enabled".to_owned(),
+                    Some(lumen_db::PluginWorkspaceState::Disabled) => "disabled".to_owned(),
+                    Some(lumen_db::PluginWorkspaceState::HealthQuarantine) => {
+                        "health_quarantine".to_owned()
+                    }
+                    None => "not_enabled".to_owned(),
+                }
+            };
+
+            let mut components = Vec::new();
+            for component in installed.manifest().components() {
+                let requested = component
+                    .capabilities()
+                    .iter()
+                    .map(|request| {
+                        CanonicalValue::object([
+                            ("name", CanonicalValue::from(request.name().as_str())),
+                            ("scope", CanonicalValue::from("workspace")),
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+                let component_id = component.id().clone();
+                let grants = self
+                    .database
+                    .latest_plugin_grants(
+                        plugin_id.clone(),
+                        version.clone(),
+                        component_id,
+                        PluginGrantScope::Workspace(query.workspace_id()),
+                    )
+                    .await
+                    .map_err(repository_service_error)?;
+                let (grant_revision, grant_set_digest, effective_grants) =
+                    if let Some(grants) = grants {
+                        let effective_grants = grants
+                            .capabilities()
+                            .map(capability_review)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        (
+                            grants.revision(),
+                            grants.digest().to_string(),
+                            effective_grants,
+                        )
+                    } else {
+                        (
+                            0,
+                            lumen_core::extension::canonical_grant_set_digest(&[]).to_string(),
+                            Vec::new(),
+                        )
+                    };
+                components.push(PluginComponentReview::new(
+                    component.id().as_str(),
+                    "tool",
+                    requested,
+                    effective_grants,
+                    grant_revision,
+                    grant_set_digest,
+                ));
+            }
+
+            let settings = plugin_settings_review(
+                &self.database,
+                &self.redactor,
+                &plugin_id,
+                &version,
+                query.workspace_id(),
+                query.actor(),
+            )
+            .await?;
+            let failures =
+                plugin_failures_review(&self.database, query.workspace_id(), &plugin_id, &version)
+                    .await?;
+
+            Ok(PluginVersionDetails::new(
+                installed.manifest().id().as_str(),
+                installed.manifest().version().as_str(),
+                state,
+                installed.package_digest().to_string(),
+                installed.manifest_digest().to_string(),
+                installed.artifact_digest().to_string(),
+                components,
+                settings,
+                failures,
+            ))
+        })
+    }
+
+    fn request_plugin_action(
+        &self,
+        command: PluginActionCommand,
+    ) -> ServiceFuture<'_, PluginActionRequested> {
+        let service = self.clone();
+        Box::pin(async move {
+            let proposal = if let Some(arguments) = command.arguments().cloned() {
+                ActionProposal::new(command.kind(), arguments)
+            } else {
+                match command.kind() {
+                    "plugin.enable" | "plugin.disable" => action_proposal(
+                        command.kind(),
+                        &VersionArguments {
+                            plugin_id: command.plugin_id().to_owned(),
+                            plugin_version: command.plugin_version().to_owned(),
+                        },
+                    )
+                    .map_err(|error| ServiceError::Conflict(error.to_string()))?,
+                    _ => {
+                        return Err(ServiceError::Conflict(
+                            "plugin action requires canonical arguments".into(),
+                        ));
+                    }
+                }
+            };
+            let capabilities = admin_capabilities(command.plugin_id(), command.plugin_version())
+                .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            let run_id = service
+                .request_extension_action(
+                    command.workspace_id(),
+                    command.actor().clone(),
+                    proposal,
+                    CapabilitySet::new(capabilities),
+                )
+                .await?;
+            Ok(PluginActionRequested::new(run_id))
+        })
+    }
+}
+
+fn capability_review(capability: &Capability) -> Result<CanonicalValue, ServiceError> {
+    let scope: CanonicalValue = serde_json::from_value(
+        serde_json::to_value(capability.scope())
+            .map_err(|error| ServiceError::Internal(error.to_string()))?,
+    )
+    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    Ok(CanonicalValue::object([
+        ("name", CanonicalValue::from(capability.name().as_str())),
+        ("scope", scope),
+    ]))
+}
+
+async fn plugin_settings_review(
+    database: &Database,
+    redactor: &SecretRedactor,
+    plugin_id: &PluginId,
+    version: &PluginVersion,
+    workspace_id: lumen_core::identity::WorkspaceId,
+    actor: &lumen_core::identity::PrincipalId,
+) -> Result<Vec<PluginSettingReview>, ServiceError> {
+    let scopes = [
+        (
+            "global".to_owned(),
+            "*".to_owned(),
+            PluginSettingScope::Global,
+        ),
+        (
+            "workspace".to_owned(),
+            workspace_id.to_string(),
+            PluginSettingScope::Workspace(workspace_id),
+        ),
+        (
+            "user".to_owned(),
+            format!("{}:{}", actor.provider(), actor.subject()),
+            PluginSettingScope::User(actor.clone()),
+        ),
+    ];
+    let mut settings = Vec::new();
+    for (scope_type, scope_id, scope) in scopes {
+        let Some(revision) = database
+            .latest_plugin_setting(plugin_id.clone(), version.clone(), scope)
+            .await
+            .map_err(repository_service_error)?
+        else {
+            continue;
+        };
+        let mut config = revision.config().clone();
+        redact_json(redactor, &mut config);
+        settings.push(PluginSettingReview::new(
+            scope_type,
+            scope_id,
+            revision.config_version(),
+            config,
+            revision.schema_digest().to_string(),
+            revision.settings_digest().to_string(),
+        ));
+    }
+    Ok(settings)
+}
+
+fn redact_json(redactor: &SecretRedactor, value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => redactor.redact_string(value),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json(redactor, value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_json(redactor, value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+async fn plugin_failures_review(
+    database: &Database,
+    workspace_id: lumen_core::identity::WorkspaceId,
+    plugin_id: &PluginId,
+    version: &PluginVersion,
+) -> Result<Vec<PluginFailureReview>, ServiceError> {
+    let rows = sqlx::query(
+        "SELECT failure_class, COUNT(*) AS count, MAX(occurred_at) AS last_seen_at
+         FROM plugin_failures
+         WHERE workspace_id = ? AND plugin_id = ? AND plugin_version = ?
+         GROUP BY failure_class
+         ORDER BY last_seen_at DESC, failure_class",
+    )
+    .bind(workspace_id.to_string())
+    .bind(plugin_id.as_str())
+    .bind(version.as_str())
+    .fetch_all(database.pool())
+    .await
+    .map_err(sql_service_error)?;
+    rows.into_iter()
+        .map(|row| {
+            let count: i64 = row.try_get("count").map_err(sql_service_error)?;
+            let last_seen_at: i64 = row.try_get("last_seen_at").map_err(sql_service_error)?;
+            let last_seen_at = u64::try_from(last_seen_at)
+                .map_err(|_| ServiceError::Internal("invalid plugin failure timestamp".into()))?;
+            Ok(PluginFailureReview::new(
+                row.try_get::<String, _>("failure_class")
+                    .map_err(sql_service_error)?,
+                u64::try_from(count)
+                    .map_err(|_| ServiceError::Internal("invalid plugin failure count".into()))?,
+                "[redacted]",
+                "0".repeat(64),
+                TimestampMillis::new(last_seen_at),
+            ))
+        })
+        .collect()
+}
+
+fn sql_service_error(error: sqlx::Error) -> ServiceError {
+    ServiceError::Internal(error.to_string())
 }
 
 struct CancellableModel<'a> {

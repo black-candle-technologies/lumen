@@ -155,13 +155,13 @@ docs/
 
 **Files:** `crates/lumen-server/src/{state,routes/mod}.rs`, `crates/lumen-server/tests/routes.rs`, `crates/lumen-cli/src/extension_runtime.rs`
 
-- [ ] Add failing route tests for staged reviews, installed versions, components, requested/effective grants, scoped settings/revisions, failure history, and lifecycle action requests.
-- [ ] Add failing authentication, workspace isolation, unknown-field, body/page bound, secret-value and sensitive-diagnostic redaction, conflict, and unavailable-runtime tests while proving full package, manifest, artifact, settings, and grant digests remain visible for review.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Extend the transport-neutral service contract and authenticated workspace routes; keep handlers free of filesystem, host, and direct lifecycle-table access.
-- [ ] Return exact hashes and requested authority while exposing no plugin-controlled markup or diagnostic secrets.
-- [ ] Run server/CLI integration tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(api): expose workspace plugin controls`.
+- [x] Add failing route tests for staged reviews, installed versions, components, requested/effective grants, scoped settings/revisions, failure history, and lifecycle action requests.
+- [x] Add failing authentication, workspace isolation, unknown-field, body/page bound, secret-value and sensitive-diagnostic redaction, conflict, and unavailable-runtime tests while proving full package, manifest, artifact, settings, and grant digests remain visible for review.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Extend the transport-neutral service contract and authenticated workspace routes; keep handlers free of filesystem, host, and direct lifecycle-table access.
+- [x] Return exact hashes and requested authority while exposing no plugin-controlled markup or diagnostic secrets.
+- [x] Run server/CLI integration tests, formatting, and strict Clippy.
+- [x] Commit as `feat(api): expose workspace plugin controls`.
 
 ## Task 10: Plugins Control Surface
 

@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use axum::{
     Extension, Json, Router,
+    extract::rejection::JsonRejection,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
@@ -9,8 +10,9 @@ use axum::{
     routing::{get, post},
 };
 use lumen_core::{
-    action::RunId,
+    action::{CanonicalValue, RunId},
     approval::ApprovalId,
+    extension::{PluginId, PluginVersion, Sha256Digest},
     identity::{PrincipalId, WorkspaceId},
 };
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,8 @@ use uuid::Uuid;
 
 use crate::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
-    CancelRunCommand, CreateRunCommand, ServiceError,
+    CancelRunCommand, CreateRunCommand, PluginActionCommand, PluginDetailsQuery, PluginReviewQuery,
+    ServiceError,
 };
 
 pub fn router(state: ApiState) -> Router {
@@ -41,6 +44,18 @@ pub fn router(state: ApiState) -> Router {
             get(run_events),
         )
         .route("/api/v1/workspaces/{workspace_id}/audit", get(list_audit))
+        .route(
+            "/api/v1/workspaces/{workspace_id}/plugins/staged",
+            get(list_staged_plugins),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/plugins/{plugin_id}/versions/{plugin_version}",
+            get(plugin_details),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/plugins/actions",
+            post(request_plugin_action),
+        )
         .route(
             "/api/v1/workspaces/{workspace_id}/runtime/capabilities",
             get(runtime_capabilities),
@@ -230,6 +245,114 @@ async fn list_audit(
     Ok(Json(AuditResponse { events }))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginPageParameters {
+    #[serde(default)]
+    after: u64,
+    #[serde(default = "default_plugin_limit")]
+    limit: u16,
+}
+
+const fn default_plugin_limit() -> u16 {
+    50
+}
+
+#[derive(Serialize)]
+struct StagedPluginsResponse {
+    packages: Vec<crate::StagedPluginReview>,
+}
+
+async fn list_staged_plugins(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    Query(parameters): Query<PluginPageParameters>,
+) -> Result<Json<StagedPluginsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    if parameters.limit == 0 || parameters.limit > 100 {
+        return Err(ApiError::BadRequest("invalid plugin page bounds".into()));
+    }
+    let packages = state
+        .service
+        .list_staged_plugins(PluginReviewQuery::new(
+            workspace_id,
+            actor,
+            parameters.after,
+            parameters.limit,
+        ))
+        .await?;
+    Ok(Json(StagedPluginsResponse { packages }))
+}
+
+async fn plugin_details(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path((workspace, plugin_id, plugin_version)): Path<(String, String, String)>,
+) -> Result<Json<crate::PluginVersionDetails>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    validate_plugin_identity(&plugin_id, &plugin_version)?;
+    let details = state
+        .service
+        .plugin_details(PluginDetailsQuery::new(
+            workspace_id,
+            actor,
+            plugin_id,
+            plugin_version,
+        ))
+        .await?;
+    Ok(Json(details))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginActionBody {
+    kind: String,
+    plugin_id: String,
+    plugin_version: String,
+    expected_digest: String,
+    arguments: Option<CanonicalValue>,
+}
+
+async fn request_plugin_action(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    body: Result<Json<PluginActionBody>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError::BadRequest("invalid plugin action body".into()))?;
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    validate_plugin_identity(&body.plugin_id, &body.plugin_version)?;
+    validate_digest(&body.expected_digest)?;
+    if !matches!(
+        body.kind.as_str(),
+        "plugin.install"
+            | "plugin.enable"
+            | "plugin.disable"
+            | "plugin.capabilities.set"
+            | "plugin.settings.set"
+            | "plugin.quarantine.release"
+    ) {
+        return Err(ApiError::BadRequest("unsupported plugin action".into()));
+    }
+    let result = state
+        .service
+        .request_plugin_action(PluginActionCommand::new(
+            workspace_id,
+            actor,
+            body.kind,
+            body.plugin_id,
+            body.plugin_version,
+            body.expected_digest,
+            body.arguments,
+        ))
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(result)))
+}
+
 fn ensure_workspace(state: &ApiState, workspace_id: WorkspaceId) -> Result<(), ApiError> {
     if state.allows_workspace(workspace_id) {
         Ok(())
@@ -248,6 +371,18 @@ fn parse_run(value: &str) -> Result<RunId, ApiError> {
 
 fn parse_approval(value: &str) -> Result<ApprovalId, ApiError> {
     parse_uuid(value).map(ApprovalId::from_uuid)
+}
+
+fn validate_plugin_identity(plugin_id: &str, plugin_version: &str) -> Result<(), ApiError> {
+    PluginId::parse(plugin_id).map_err(|_| ApiError::BadRequest("invalid plugin id".into()))?;
+    PluginVersion::parse(plugin_version)
+        .map_err(|_| ApiError::BadRequest("invalid plugin version".into()))?;
+    Ok(())
+}
+
+fn validate_digest(value: &str) -> Result<(), ApiError> {
+    Sha256Digest::parse(value).map_err(|_| ApiError::BadRequest("invalid digest".into()))?;
+    Ok(())
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {

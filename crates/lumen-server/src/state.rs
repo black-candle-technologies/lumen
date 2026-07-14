@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 
 use lumen_core::{
     action::{CanonicalValue, RunId},
@@ -25,6 +30,15 @@ pub trait RuntimeService: Send + Sync {
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>>;
     fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>>;
     fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation>;
+    fn list_staged_plugins(
+        &self,
+        query: PluginReviewQuery,
+    ) -> ServiceFuture<'_, Vec<StagedPluginReview>>;
+    fn plugin_details(&self, query: PluginDetailsQuery) -> ServiceFuture<'_, PluginVersionDetails>;
+    fn request_plugin_action(
+        &self,
+        command: PluginActionCommand,
+    ) -> ServiceFuture<'_, PluginActionRequested>;
 }
 
 #[derive(Clone)]
@@ -87,6 +101,347 @@ pub struct SandboxCapabilityReport {
     strength: String,
     guarantees: BTreeSet<String>,
     detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginReviewQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    after: u64,
+    limit: u16,
+}
+
+impl PluginReviewQuery {
+    pub(crate) const fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        after: u64,
+        limit: u16,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            after,
+            limit,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn after(&self) -> u64 {
+        self.after
+    }
+
+    pub const fn limit(&self) -> u16 {
+        self.limit
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginDetailsQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    plugin_id: String,
+    plugin_version: String,
+}
+
+impl PluginDetailsQuery {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        plugin_id: String,
+        plugin_version: String,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            plugin_id,
+            plugin_version,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn plugin_version(&self) -> &str {
+        &self.plugin_version
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginActionCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    kind: String,
+    plugin_id: String,
+    plugin_version: String,
+    expected_digest: String,
+    arguments: Option<CanonicalValue>,
+}
+
+impl PluginActionCommand {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        kind: String,
+        plugin_id: String,
+        plugin_version: String,
+        expected_digest: String,
+        arguments: Option<CanonicalValue>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            kind,
+            plugin_id,
+            plugin_version,
+            expected_digest,
+            arguments,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn plugin_version(&self) -> &str {
+        &self.plugin_version
+    }
+
+    pub fn expected_digest(&self) -> &str {
+        &self.expected_digest
+    }
+
+    pub const fn arguments(&self) -> Option<&CanonicalValue> {
+        self.arguments.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PrincipalSummary {
+    provider: String,
+    subject: String,
+}
+
+impl PrincipalSummary {
+    pub fn new(principal: &PrincipalId) -> Self {
+        Self {
+            provider: principal.provider().to_owned(),
+            subject: principal.subject().to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StagedPluginReview {
+    stage_id: String,
+    plugin_id: String,
+    version: String,
+    runtime: String,
+    package_digest: String,
+    manifest_digest: String,
+    artifact_digest: String,
+    file_hashes: BTreeMap<String, String>,
+    requested_by: PrincipalSummary,
+    created_at: TimestampMillis,
+}
+
+impl StagedPluginReview {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        stage_id: impl Into<String>,
+        plugin_id: impl Into<String>,
+        version: impl Into<String>,
+        runtime: impl Into<String>,
+        package_digest: impl Into<String>,
+        manifest_digest: impl Into<String>,
+        artifact_digest: impl Into<String>,
+        file_hashes: BTreeMap<String, String>,
+        requested_by: PrincipalSummary,
+        created_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            stage_id: stage_id.into(),
+            plugin_id: plugin_id.into(),
+            version: version.into(),
+            runtime: runtime.into(),
+            package_digest: package_digest.into(),
+            manifest_digest: manifest_digest.into(),
+            artifact_digest: artifact_digest.into(),
+            file_hashes,
+            requested_by,
+            created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PluginVersionDetails {
+    plugin_id: String,
+    version: String,
+    state: String,
+    package_digest: String,
+    manifest_digest: String,
+    artifact_digest: String,
+    components: Vec<PluginComponentReview>,
+    settings: Vec<PluginSettingReview>,
+    failures: Vec<PluginFailureReview>,
+}
+
+impl PluginVersionDetails {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        plugin_id: impl Into<String>,
+        version: impl Into<String>,
+        state: impl Into<String>,
+        package_digest: impl Into<String>,
+        manifest_digest: impl Into<String>,
+        artifact_digest: impl Into<String>,
+        components: Vec<PluginComponentReview>,
+        settings: Vec<PluginSettingReview>,
+        failures: Vec<PluginFailureReview>,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            version: version.into(),
+            state: state.into(),
+            package_digest: package_digest.into(),
+            manifest_digest: manifest_digest.into(),
+            artifact_digest: artifact_digest.into(),
+            components,
+            settings,
+            failures,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PluginComponentReview {
+    id: String,
+    kind: String,
+    requested_capabilities: Vec<CanonicalValue>,
+    effective_grants: Vec<CanonicalValue>,
+    grant_revision: u64,
+    grant_set_digest: String,
+}
+
+impl PluginComponentReview {
+    pub fn new(
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        requested_capabilities: Vec<CanonicalValue>,
+        effective_grants: Vec<CanonicalValue>,
+        grant_revision: u64,
+        grant_set_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: kind.into(),
+            requested_capabilities,
+            effective_grants,
+            grant_revision,
+            grant_set_digest: grant_set_digest.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PluginSettingReview {
+    scope_type: String,
+    scope_id: String,
+    config_version: u64,
+    config: serde_json::Value,
+    schema_digest: String,
+    settings_digest: String,
+}
+
+impl PluginSettingReview {
+    pub fn new(
+        scope_type: impl Into<String>,
+        scope_id: impl Into<String>,
+        config_version: u64,
+        config: serde_json::Value,
+        schema_digest: impl Into<String>,
+        settings_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            scope_type: scope_type.into(),
+            scope_id: scope_id.into(),
+            config_version,
+            config,
+            schema_digest: schema_digest.into(),
+            settings_digest: settings_digest.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PluginFailureReview {
+    class: String,
+    count: u64,
+    diagnostic: String,
+    diagnostic_digest: String,
+    last_seen_at: TimestampMillis,
+}
+
+impl PluginFailureReview {
+    pub fn new(
+        class: impl Into<String>,
+        count: u64,
+        diagnostic: impl Into<String>,
+        diagnostic_digest: impl Into<String>,
+        last_seen_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            class: class.into(),
+            count,
+            diagnostic: diagnostic.into(),
+            diagnostic_digest: diagnostic_digest.into(),
+            last_seen_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PluginActionRequested {
+    run_id: RunId,
+    state: &'static str,
+}
+
+impl PluginActionRequested {
+    pub const fn new(run_id: RunId) -> Self {
+        Self {
+            run_id,
+            state: "approval_requested",
+        }
+    }
 }
 
 impl SandboxCapabilityReport {

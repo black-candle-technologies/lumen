@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -19,8 +19,11 @@ use lumen_core::{
 use lumen_server::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
     ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand,
-    CreateRunCommand, EventBroker, RunCancellation, RunCreated, RuntimeService,
-    SandboxCapabilityReport, ServiceFuture, router,
+    CreateRunCommand, EventBroker, PluginActionCommand, PluginActionRequested,
+    PluginComponentReview, PluginDetailsQuery, PluginFailureReview, PluginReviewQuery,
+    PluginSettingReview, PluginVersionDetails, PrincipalSummary, RunCancellation, RunCreated,
+    RuntimeService, SandboxCapabilityReport, ServiceError, ServiceFuture, StagedPluginReview,
+    router,
 };
 use tower::ServiceExt;
 
@@ -35,6 +38,9 @@ struct FakeService {
     approval_queries: Mutex<Vec<ApprovalQuery>>,
     approval_previews: Mutex<Vec<ApprovalPreview>>,
     cancellation_commands: Mutex<Vec<CancelRunCommand>>,
+    plugin_review_queries: Mutex<Vec<PluginReviewQuery>>,
+    plugin_details_queries: Mutex<Vec<PluginDetailsQuery>>,
+    plugin_action_commands: Mutex<Vec<PluginActionCommand>>,
 }
 
 impl RuntimeService for FakeService {
@@ -89,6 +95,110 @@ impl RuntimeService for FakeService {
             .push(command);
         Box::pin(async move { Ok(RunCancellation::new(run_id)) })
     }
+
+    fn list_staged_plugins(
+        &self,
+        query: PluginReviewQuery,
+    ) -> ServiceFuture<'_, Vec<StagedPluginReview>> {
+        let requested_by = PrincipalSummary::new(query.actor());
+        self.plugin_review_queries
+            .lock()
+            .expect("plugin review queries")
+            .push(query);
+        let package = StagedPluginReview::new(
+            "11111111-1111-4111-8111-111111111111",
+            "com.example.review",
+            "1.0.0",
+            "subprocess",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            BTreeMap::from([
+                ("lumen-plugin.toml".to_owned(), "b".repeat(64)),
+                ("bin/plugin".to_owned(), "c".repeat(64)),
+            ]),
+            requested_by,
+            TimestampMillis::new(100),
+        );
+        Box::pin(async move { Ok(vec![package]) })
+    }
+
+    fn plugin_details(&self, query: PluginDetailsQuery) -> ServiceFuture<'_, PluginVersionDetails> {
+        match query.plugin_id() {
+            "com.example.conflict" => {
+                return Box::pin(async {
+                    Err(ServiceError::Conflict(
+                        "review digest conflicts with current runtime state".into(),
+                    ))
+                });
+            }
+            "com.example.unavailable" => {
+                return Box::pin(async {
+                    Err(ServiceError::Unavailable(
+                        "plugin runtime is unavailable".into(),
+                    ))
+                });
+            }
+            _ => {}
+        }
+        self.plugin_details_queries
+            .lock()
+            .expect("plugin details queries")
+            .push(query);
+        let capability = CanonicalValue::object([
+            ("name", CanonicalValue::from("filesystem.read")),
+            (
+                "resource",
+                CanonicalValue::object([("workspace_path", CanonicalValue::from("docs"))]),
+            ),
+        ]);
+        let details = PluginVersionDetails::new(
+            "com.example.review",
+            "1.0.0",
+            "enabled",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            vec![PluginComponentReview::new(
+                "summarize",
+                "tool",
+                vec![capability.clone()],
+                vec![capability],
+                3,
+                "9".repeat(64),
+            )],
+            vec![PluginSettingReview::new(
+                "workspace",
+                "workspace",
+                4,
+                serde_json::json!({
+                    "api_key": "[redacted]",
+                    "mode": "local"
+                }),
+                "d".repeat(64),
+                "e".repeat(64),
+            )],
+            vec![PluginFailureReview::new(
+                "host_protocol",
+                2,
+                "[redacted]",
+                "f".repeat(64),
+                TimestampMillis::new(200),
+            )],
+        );
+        Box::pin(async move { Ok(details) })
+    }
+
+    fn request_plugin_action(
+        &self,
+        command: PluginActionCommand,
+    ) -> ServiceFuture<'_, PluginActionRequested> {
+        self.plugin_action_commands
+            .lock()
+            .expect("plugin action commands")
+            .push(command);
+        Box::pin(async { Ok(PluginActionRequested::new(RunId::new())) })
+    }
 }
 
 fn test_app(workspace_id: WorkspaceId) -> (axum::Router, Arc<FakeService>, EventBroker) {
@@ -117,6 +227,7 @@ async fn runtime_capability_report_is_authenticated_and_workspace_scoped() {
     let (app, _, _) = test_app(workspace_id);
 
     let response = app
+        .clone()
         .oneshot(request(
             "GET",
             format!("/api/v1/workspaces/{workspace_id}/runtime/capabilities"),
@@ -213,6 +324,7 @@ async fn unknown_workspace_is_rejected_before_service_dispatch() {
     let (app, service, _) = test_app(allowed_workspace);
 
     let response = app
+        .clone()
         .oneshot(request(
             "POST",
             format!("/api/v1/workspaces/{requested_workspace}/runs"),
@@ -505,4 +617,218 @@ async fn no_direct_dispatch_route_exists() {
             .expect("approval commands")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn plugin_review_lists_staged_packages_with_review_hashes() {
+    let workspace_id = WorkspaceId::new();
+    let (app, _, _) = test_app(workspace_id);
+
+    let response = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/plugins/staged?limit=20"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["packages"][0]["plugin_id"], "com.example.review");
+    assert_eq!(body["packages"][0]["package_digest"], "a".repeat(64));
+    assert_eq!(body["packages"][0]["manifest_digest"], "b".repeat(64));
+    assert_eq!(body["packages"][0]["artifact_digest"], "c".repeat(64));
+    assert_eq!(
+        body["packages"][0]["file_hashes"]["lumen-plugin.toml"],
+        "b".repeat(64)
+    );
+    assert_eq!(body["packages"][0]["requested_by"]["subject"], "operator");
+}
+
+#[tokio::test]
+async fn plugin_details_expose_authority_settings_and_failures_without_secrets() {
+    let workspace_id = WorkspaceId::new();
+    let (app, _, _) = test_app(workspace_id);
+
+    let response = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/plugins/com.example.review/versions/1.0.0"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["plugin_id"], "com.example.review");
+    assert_eq!(body["version"], "1.0.0");
+    assert_eq!(body["state"], "enabled");
+    assert_eq!(body["components"][0]["id"], "summarize");
+    assert_eq!(
+        body["components"][0]["requested_capabilities"][0]["name"],
+        "filesystem.read"
+    );
+    assert_eq!(
+        body["components"][0]["effective_grants"][0]["name"],
+        "filesystem.read"
+    );
+    assert_eq!(body["settings"][0]["scope_type"], "workspace");
+    assert_eq!(body["settings"][0]["config"]["api_key"], "[redacted]");
+    assert!(body["settings"][0]["config"].get("api_key_value").is_none());
+    assert_eq!(body["settings"][0]["schema_digest"], "d".repeat(64));
+    assert_eq!(body["settings"][0]["settings_digest"], "e".repeat(64));
+    assert_eq!(body["failures"][0]["class"], "host_protocol");
+    assert_eq!(body["failures"][0]["diagnostic"], "[redacted]");
+    assert_eq!(body["failures"][0]["diagnostic_digest"], "f".repeat(64));
+}
+
+#[tokio::test]
+async fn plugin_lifecycle_action_requests_are_authenticated_and_bounded() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/plugins/actions"),
+            Body::from(
+                r#"{
+                    "kind":"plugin.enable",
+                    "plugin_id":"com.example.review",
+                    "plugin_version":"1.0.0",
+                    "expected_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }"#,
+            ),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+    assert!(body["run_id"].as_str().is_some());
+    assert_eq!(body["state"], "approval_requested");
+    {
+        let commands = service
+            .plugin_action_commands
+            .lock()
+            .expect("plugin action commands");
+        assert_eq!(commands[0].workspace_id(), workspace_id);
+        assert_eq!(commands[0].actor().subject(), "operator");
+        assert_eq!(commands[0].kind(), "plugin.enable");
+        assert_eq!(commands[0].plugin_id(), "com.example.review");
+        assert_eq!(commands[0].plugin_version(), "1.0.0");
+        assert_eq!(commands[0].expected_digest(), "a".repeat(64));
+    }
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/plugins/actions"),
+            Body::from(
+                r#"{
+                    "kind":"plugin.settings.set",
+                    "plugin_id":"com.example.review",
+                    "plugin_version":"1.0.0",
+                    "expected_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "arguments":{
+                        "plugin_id":"com.example.review",
+                        "plugin_version":"1.0.0",
+                        "scope_type":"workspace",
+                        "scope_id":"workspace",
+                        "expected_version":4,
+                        "config":{"mode":"local"},
+                        "schema_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    }
+                }"#,
+            ),
+        ))
+        .await
+        .expect("settings response");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let commands = service
+        .plugin_action_commands
+        .lock()
+        .expect("plugin action commands");
+    assert_eq!(commands[1].kind(), "plugin.settings.set");
+    let Some(CanonicalValue::Object(arguments)) = commands[1].arguments() else {
+        panic!("settings arguments");
+    };
+    let Some(CanonicalValue::Object(config)) = arguments.get("config") else {
+        panic!("settings config");
+    };
+    assert_eq!(config.get("mode"), Some(&CanonicalValue::from("local")));
+}
+
+#[tokio::test]
+async fn plugin_routes_reject_unknown_fields_and_oversized_pages() {
+    let workspace_id = WorkspaceId::new();
+    let (app, _, _) = test_app(workspace_id);
+
+    let page_response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/plugins/staged?limit=500"),
+            Body::empty(),
+        ))
+        .await
+        .expect("page response");
+    assert_eq!(page_response.status(), StatusCode::BAD_REQUEST);
+
+    let body_response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/plugins/actions"),
+            Body::from(
+                r#"{
+                    "kind":"plugin.enable",
+                    "plugin_id":"com.example.review",
+                    "plugin_version":"1.0.0",
+                    "expected_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "surprise":true
+                }"#,
+            ),
+        ))
+        .await
+        .expect("body response");
+    assert_eq!(body_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn plugin_detail_routes_preserve_service_conflict_and_unavailable_statuses() {
+    let workspace_id = WorkspaceId::new();
+    let (app, _, _) = test_app(workspace_id);
+
+    let conflict = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{workspace_id}/plugins/com.example.conflict/versions/1.0.0"
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("conflict response");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict_body = json_body(conflict).await;
+    assert_eq!(conflict_body["error"]["code"], "conflict");
+
+    let unavailable = app
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{workspace_id}/plugins/com.example.unavailable/versions/1.0.0"
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("unavailable response");
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let unavailable_body = json_body(unavailable).await;
+    assert_eq!(unavailable_body["error"]["code"], "unavailable");
 }
