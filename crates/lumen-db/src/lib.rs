@@ -1,6 +1,7 @@
 //! SQLite persistence for Lumen runtime state.
 
 mod audit;
+mod extensions;
 mod migrations;
 mod repositories;
 
@@ -9,6 +10,10 @@ use std::path::Path;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
+pub use extensions::{
+    InstallResult, PluginGrantScope, PluginSettingRevision, PluginSettingScope,
+    PluginWorkspaceState, StagedPluginPackage,
+};
 pub use repositories::{
     DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
     SecretReferenceError,
@@ -63,6 +68,16 @@ pub enum RepositoryError {
     ExecutionStateConflict,
     #[error("stored secret reference is invalid: {0}")]
     InvalidSecretReference(String),
+    #[error("staged plugin package is invalid: {0}")]
+    InvalidPluginPackage(String),
+    #[error("plugin ID and version are already installed with different bytes")]
+    PluginVersionConflict,
+    #[error("plugin lifecycle state conflicts with the requested operation")]
+    PluginStateConflict,
+    #[error("plugin capability grant conflicts with requests or revisions")]
+    PluginGrantConflict,
+    #[error("plugin setting revision conflicts with current state")]
+    PluginSettingConflict,
 }
 
 pub(crate) fn timestamp_to_i64(

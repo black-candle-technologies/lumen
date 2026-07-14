@@ -43,6 +43,30 @@ pub enum CapabilityName {
     PolicyModify,
 }
 
+impl CapabilityName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FsRead => "fs.read",
+            Self::FsWrite => "fs.write",
+            Self::FsDelete => "fs.delete",
+            Self::ProcessSpawn => "process.spawn",
+            Self::NetConnect => "net.connect",
+            Self::SecretUse => "secret.use",
+            Self::MessageSend => "message.send",
+            Self::ScheduleCreate => "schedule.create",
+            Self::ScheduleModify => "schedule.modify",
+            Self::PluginInstall => "plugin.install",
+            Self::PluginUpdate => "plugin.update",
+            Self::PluginEnable => "plugin.enable",
+            Self::PluginCapabilitiesSet => "plugin.capabilities.set",
+            Self::PluginSettingsSet => "plugin.settings.set",
+            Self::PluginQuarantineRelease => "plugin.quarantine.release",
+            Self::PluginInvoke => "plugin.invoke",
+            Self::PolicyModify => "policy.modify",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WorkspacePath(String);
 

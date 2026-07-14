@@ -191,6 +191,15 @@ pub enum PluginRuntime {
     Subprocess,
 }
 
+impl PluginRuntime {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WasmComponent => "wasm-component",
+            Self::Subprocess => "subprocess",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ManifestPath(String);
@@ -533,6 +542,22 @@ pub enum ExtensionFailureClass {
     PolicyDenied,
     Cancelled,
     ResourceExhaustion,
+}
+
+impl ExtensionFailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PluginFault => "plugin_fault",
+            Self::HostFault => "host_fault",
+            Self::PolicyDenied => "policy_denied",
+            Self::Cancelled => "cancelled",
+            Self::ResourceExhaustion => "resource_exhaustion",
+        }
+    }
+
+    pub const fn counts_toward_health(self) -> bool {
+        matches!(self, Self::PluginFault | Self::ResourceExhaustion)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

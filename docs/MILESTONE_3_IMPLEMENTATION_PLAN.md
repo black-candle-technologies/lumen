@@ -78,14 +78,14 @@ docs/
 
 **Files:** `crates/lumen-db/migrations/0003_extension_runtime.sql`, `crates/lumen-db/src/{lib,extensions}.rs`, `crates/lumen-db/tests/{database,extensions}.rs`
 
-- [ ] Add failing migration-from-0002 and fresh-database tests for all Milestone 3 tables, constraints, indexes, and foreign keys.
-- [ ] Add failing repository tests for immutable staged records, idempotent identical installs, duplicate identity with different bytes, content-relative artifact paths, components, capability requests, and exact provenance.
-- [ ] Add failing tests for one enabled version per plugin/workspace, atomic side-by-side switches, global artifact quarantine, workspace health quarantine, and restart-persistent rolling failure windows.
-- [ ] Add failing tests for revisioned global/workspace grants, scoped optimistic settings updates, and constraints preventing grants outside manifest requests.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement the append-only migration and typed transactional repositories without storing executable bytes, secrets, or ambient source paths in SQL.
-- [ ] Run migration tests, focused repository tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(extensions): persist immutable plugin state`.
+- [x] Add failing migration-from-0002 and fresh-database tests for all Milestone 3 tables, constraints, indexes, and foreign keys.
+- [x] Add failing repository tests for immutable staged records, idempotent identical installs, duplicate identity with different bytes, content-relative artifact paths, components, capability requests, and exact provenance.
+- [x] Add failing tests for one enabled version per plugin/workspace, atomic side-by-side switches, global artifact quarantine, workspace health quarantine, and restart-persistent rolling failure windows.
+- [x] Add failing tests for revisioned global/workspace grants, scoped optimistic settings updates, and constraints preventing grants outside manifest requests.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement the append-only migration and typed transactional repositories without storing executable bytes, secrets, or ambient source paths in SQL.
+- [x] Run migration tests, focused repository tests, formatting, and strict Clippy.
+- [x] Commit as `feat(extensions): persist immutable plugin state`.
 
 ## Task 4: Grants And Deterministic Settings
 
