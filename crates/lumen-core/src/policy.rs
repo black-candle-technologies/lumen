@@ -70,6 +70,10 @@ impl Policy {
             }
         }
 
+        if action.kind().as_str() == "plugin.disable" {
+            return PolicyDecision::Allow;
+        }
+
         if action
             .required_capabilities()
             .iter()

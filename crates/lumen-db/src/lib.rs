@@ -11,8 +11,8 @@ use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
 pub use extensions::{
-    InstallResult, PluginGrantRevision, PluginGrantScope, PluginSettingRevision,
-    PluginSettingScope, PluginWorkspaceState, StagedPluginPackage,
+    InstallResult, InstalledPluginVersion, PluginGrantRevision, PluginGrantScope,
+    PluginSettingRevision, PluginSettingScope, PluginWorkspaceState, StagedPluginPackage,
 };
 pub use repositories::{
     DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,

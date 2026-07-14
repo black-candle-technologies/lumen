@@ -254,6 +254,53 @@ async fn install_is_immutable_idempotent_and_disabled_without_grants() {
 }
 
 #[tokio::test]
+async fn staged_and_installed_records_round_trip_exact_review_identity() {
+    let database = database().await;
+    let staged = staged("1.2.3", '1', '2');
+    database
+        .insert_staged_plugin_package(&staged)
+        .await
+        .expect("stage");
+
+    let loaded = database
+        .staged_plugin_package(staged.id())
+        .await
+        .expect("load stage")
+        .expect("staged record");
+    assert_eq!(loaded.id(), staged.id());
+    assert_eq!(loaded.manifest(), staged.manifest());
+    assert_eq!(loaded.file_hashes(), staged.file_hashes());
+    assert_eq!(loaded.package_digest(), staged.package_digest());
+    assert_eq!(loaded.manifest_digest(), staged.manifest_digest());
+
+    database
+        .install_staged_plugin(
+            staged.id(),
+            "plugins/installed/1111",
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("install");
+    let installed = database
+        .installed_plugin_version(
+            PluginId::parse("dev.example.git-tools").expect("ID"),
+            PluginVersion::parse("1.2.3").expect("version"),
+        )
+        .await
+        .expect("load installed")
+        .expect("installed record");
+    assert_eq!(installed.manifest(), staged.manifest());
+    assert_eq!(installed.artifact_path(), "plugins/installed/1111");
+    assert_eq!(installed.package_digest(), staged.package_digest());
+    assert_eq!(installed.manifest_digest(), staged.manifest_digest());
+    assert_eq!(
+        installed.artifact_digest(),
+        staged.manifest().integrity().artifact()
+    );
+    assert!(!installed.is_artifact_quarantined());
+}
+
+#[tokio::test]
 async fn workspace_version_switch_is_atomic_and_artifact_quarantine_is_global() {
     let database = database().await;
     for (version, package, artifact) in [("1.0.0", '1', '2'), ("2.0.0", '3', '4')] {
@@ -315,6 +362,112 @@ async fn workspace_version_switch_is_atomic_and_artifact_quarantine_is_global() 
             .enable_plugin_version(workspace_id(), plugin, second, TimestampMillis::new(2_300))
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn disable_and_quarantine_release_are_explicit_state_transitions() {
+    let database = database().await;
+    let staged = staged("1.2.3", '1', '2');
+    database
+        .insert_staged_plugin_package(&staged)
+        .await
+        .expect("stage");
+    database
+        .install_staged_plugin(
+            staged.id(),
+            "plugins/installed/1111",
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("install");
+    let plugin = PluginId::parse("dev.example.git-tools").expect("ID");
+    let version = PluginVersion::parse("1.2.3").expect("version");
+    database
+        .enable_plugin_version(
+            workspace_id(),
+            plugin.clone(),
+            version.clone(),
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("enable");
+    database
+        .disable_plugin_version(
+            workspace_id(),
+            plugin.clone(),
+            version.clone(),
+            TimestampMillis::new(1_300),
+        )
+        .await
+        .expect("disable");
+    assert_eq!(
+        database
+            .plugin_workspace_state(workspace_id(), plugin.clone(), version.clone())
+            .await
+            .expect("state"),
+        Some(PluginWorkspaceState::Disabled)
+    );
+
+    database
+        .enable_plugin_version(
+            workspace_id(),
+            plugin.clone(),
+            version.clone(),
+            TimestampMillis::new(1_400),
+        )
+        .await
+        .expect("enable");
+    for timestamp in [2_000, 3_000, 4_000] {
+        database
+            .record_plugin_failure(
+                workspace_id(),
+                plugin.clone(),
+                version.clone(),
+                PluginComponentId::parse("status").expect("component"),
+                Uuid::new_v4(),
+                ExtensionFailureClass::PluginFault,
+                TimestampMillis::new(timestamp),
+            )
+            .await
+            .expect("failure");
+    }
+    database
+        .release_plugin_health_quarantine(
+            workspace_id(),
+            plugin.clone(),
+            version.clone(),
+            TimestampMillis::new(5_000),
+        )
+        .await
+        .expect("release health quarantine");
+    assert_eq!(
+        database
+            .plugin_workspace_state(workspace_id(), plugin.clone(), version.clone())
+            .await
+            .expect("state"),
+        Some(PluginWorkspaceState::Disabled)
+    );
+
+    database
+        .quarantine_plugin_artifact(plugin.clone(), version.clone(), TimestampMillis::new(6_000))
+        .await
+        .expect("artifact quarantine");
+    database
+        .release_plugin_artifact_quarantine(
+            plugin.clone(),
+            version.clone(),
+            TimestampMillis::new(7_000),
+        )
+        .await
+        .expect("release artifact quarantine");
+    assert!(
+        !database
+            .installed_plugin_version(plugin, version)
+            .await
+            .expect("installed")
+            .expect("record")
+            .is_artifact_quarantined()
     );
 }
 

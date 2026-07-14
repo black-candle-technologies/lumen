@@ -165,6 +165,29 @@ fn authority_changing_plugin_capabilities_require_approval_by_default() {
 }
 
 #[test]
+fn authenticated_plugin_disablement_is_allowed_after_capability_validation() {
+    let required = Capability::new(
+        CapabilityName::PluginEnable,
+        ResourceScope::exact("plugin", "dev.example.git-tools@1.2.3").expect("scope"),
+    );
+    let action = ActionEnvelope::new(
+        action_id(),
+        run_id(),
+        workspace_id(),
+        PrincipalId::new("local", "admin").expect("principal"),
+        ComponentId::new("runtime.extensions").expect("component"),
+        ActionKind::new("plugin.disable").expect("kind"),
+        CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        vec![required.clone()],
+    );
+    let effective = EffectiveCapabilities::new([CapabilitySet::new([required])]);
+    assert_eq!(
+        Policy::default().evaluate(&action, &effective),
+        PolicyDecision::Allow
+    );
+}
+
+#[test]
 fn extension_provenance_and_input_bind_the_action_fingerprint() {
     let original = invocation(provenance(), CanonicalValue::from("first"));
     let changed_input = invocation(provenance(), CanonicalValue::from("second"));

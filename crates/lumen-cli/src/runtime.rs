@@ -42,6 +42,9 @@ use lumen_server::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::extension_runtime::{
+    ExtensionActionNormalizer, ExtensionAdminExecutor, is_extension_action,
+};
 use crate::{CliError, config::Config};
 
 #[derive(Clone)]
@@ -75,6 +78,8 @@ impl LocalRuntimeService {
         secret_store: Arc<dyn SecretStore>,
     ) -> Result<Self, CliError> {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
+        std::fs::create_dir_all(&config.runtime.data_directory)?;
+        let data_root = std::fs::canonicalize(&config.runtime.data_directory)?;
         let model_config = OpenAiCompatibleConfig::new(
             &config.model.endpoint,
             &config.model.model,
@@ -123,18 +128,30 @@ impl LocalRuntimeService {
             store: secret_store,
             redactor: Arc::clone(&redactor),
         });
+        let builtin_executor: Arc<dyn ExecutorPort> = Arc::new(
+            BuiltinExecutor::new(filesystem.clone(), process).with_secret_resolver(secret_resolver),
+        );
+        let extension_executor: Arc<dyn ExecutorPort> =
+            Arc::new(ExtensionAdminExecutor::new(database.clone(), data_root));
         let executor = RedactingExecutor {
-            inner: BuiltinExecutor::new(filesystem.clone(), process)
-                .with_secret_resolver(secret_resolver),
+            inner: Arc::new(RoutingExecutor {
+                builtin: builtin_executor,
+                extension: extension_executor,
+            }),
             redactor: Arc::clone(&redactor),
             approvals: Arc::clone(&approvals),
         };
-        let normalizer = SecretRejectingNormalizer {
-            inner: BuiltinActionNormalizer::with_filesystem(
+        let builtin_normalizer: Arc<dyn ActionNormalizer> =
+            Arc::new(BuiltinActionNormalizer::with_filesystem(
                 lumen_core::identity::ComponentId::new("builtin.tools")
                     .expect("static component ID"),
                 filesystem,
-            ),
+            ));
+        let normalizer = SecretRejectingNormalizer {
+            inner: Arc::new(RoutingNormalizer {
+                builtin: builtin_normalizer,
+                extension: Arc::new(ExtensionActionNormalizer),
+            }),
             redactor: Arc::clone(&redactor),
         };
         let mut grants = vec![
@@ -224,8 +241,12 @@ impl LocalRuntimeService {
             .get(&run_id)
             .cloned()
             .unwrap_or_else(CancellationToken::new);
+        let selected_model = stored
+            .model_override
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.model));
         let model = CancellableModel {
-            inner: self.model.as_ref(),
+            inner: selected_model.as_ref(),
             cancellation: cancellation.clone(),
         };
         let orchestrator = RunOrchestrator::new(
@@ -240,7 +261,14 @@ impl LocalRuntimeService {
         )
         .with_cancellation(cancellation.clone());
         match orchestrator
-            .run_until_blocked(&mut stored.state, &self.capabilities, now())
+            .run_until_blocked(
+                &mut stored.state,
+                stored
+                    .capabilities_override
+                    .as_ref()
+                    .unwrap_or(&self.capabilities),
+                now(),
+            )
             .await
         {
             Ok(RunOutcome::AwaitingApproval { approval_id }) => {
@@ -323,6 +351,52 @@ impl LocalRuntimeService {
         self.cancellations.lock().await.remove(&run_id);
         self.run_workspaces.lock().await.remove(&run_id);
     }
+
+    pub(crate) async fn request_extension_action(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        actor: lumen_core::identity::PrincipalId,
+        proposal: ActionProposal,
+        capabilities: CapabilitySet,
+    ) -> Result<RunId, ServiceError> {
+        let run_id = RunId::new();
+        self.database
+            .create_run(run_id, workspace_id, &actor, now())
+            .await
+            .map_err(repository_service_error)?;
+        let model: Arc<dyn ModelPort> = Arc::new(ActionRequestModel { proposal });
+        self.runs.lock().await.insert(
+            run_id,
+            StoredRun {
+                workspace_id,
+                state: RunState::new(
+                    RunContext::new(run_id, workspace_id, actor),
+                    "authenticated extension administration request",
+                    self.budget,
+                ),
+                model_override: Some(model),
+                capabilities_override: Some(EffectiveCapabilities::new([capabilities])),
+            },
+        );
+        self.cancellations
+            .lock()
+            .await
+            .insert(run_id, CancellationToken::new());
+        self.run_workspaces
+            .lock()
+            .await
+            .insert(run_id, workspace_id);
+        self.events
+            .publish(
+                workspace_id,
+                run_id,
+                "run.created",
+                CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+            )
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        self.spawn_advance(run_id).await;
+        Ok(run_id)
+    }
 }
 
 impl RuntimeService for LocalRuntimeService {
@@ -345,6 +419,8 @@ impl RuntimeService for LocalRuntimeService {
                 StoredRun {
                     workspace_id: command.workspace_id(),
                     state,
+                    model_override: None,
+                    capabilities_override: None,
                 },
             );
             service
@@ -523,13 +599,13 @@ struct CancellableModel<'a> {
 }
 
 struct RedactingExecutor {
-    inner: BuiltinExecutor,
+    inner: Arc<dyn ExecutorPort>,
     redactor: Arc<SecretRedactor>,
     approvals: Arc<ApprovalRegistry>,
 }
 
 struct SecretRejectingNormalizer {
-    inner: BuiltinActionNormalizer,
+    inner: Arc<dyn ActionNormalizer>,
     redactor: Arc<SecretRedactor>,
 }
 
@@ -725,6 +801,65 @@ impl ModelPort for CancellableModel<'_> {
 struct StoredRun {
     workspace_id: lumen_core::identity::WorkspaceId,
     state: RunState,
+    model_override: Option<Arc<dyn ModelPort>>,
+    capabilities_override: Option<EffectiveCapabilities>,
+}
+
+struct RoutingNormalizer {
+    builtin: Arc<dyn ActionNormalizer>,
+    extension: Arc<dyn ActionNormalizer>,
+}
+
+impl ActionNormalizer for RoutingNormalizer {
+    fn normalize(
+        &self,
+        context: &RunContext,
+        proposal: ActionProposal,
+    ) -> Result<ActionEnvelope, NormalizationError> {
+        if is_extension_action(proposal.kind()) {
+            self.extension.normalize(context, proposal)
+        } else {
+            self.builtin.normalize(context, proposal)
+        }
+    }
+}
+
+struct RoutingExecutor {
+    builtin: Arc<dyn ExecutorPort>,
+    extension: Arc<dyn ExecutorPort>,
+}
+
+impl ExecutorPort for RoutingExecutor {
+    fn execute<'a>(
+        &'a self,
+        action: &'a AuthorizedAction,
+        cancellation: CancellationToken,
+    ) -> ExecutorFuture<'a> {
+        if is_extension_action(action.action().kind().as_str()) {
+            self.extension.execute(action, cancellation)
+        } else {
+            self.builtin.execute(action, cancellation)
+        }
+    }
+}
+
+struct ActionRequestModel {
+    proposal: ActionProposal,
+}
+
+impl ModelPort for ActionRequestModel {
+    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
+        let has_tool_result = input
+            .messages()
+            .iter()
+            .any(|message| message.role() == lumen_core::model::ModelRole::Tool);
+        let output = if has_tool_result {
+            lumen_core::model::ModelOutput::FinalText("extension action completed".into())
+        } else {
+            lumen_core::model::ModelOutput::Action(self.proposal.clone())
+        };
+        Box::pin(async move { Ok(output) })
+    }
 }
 
 fn terminal_event(outcome: &RunOutcome) -> (&'static str, &'static str, CanonicalValue) {

@@ -1,13 +1,19 @@
 pub mod config;
+mod extension_runtime;
 mod runtime;
 
-use std::{collections::BTreeSet, io::Read, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use clap::{Parser, Subcommand};
 use config::{Config, ConfigError};
 use lumen_core::audit::AuditIntegrityError;
 use lumen_core::{
-    action::CanonicalValue,
+    action::{CanonicalValue, RunId},
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     secret::SecretRefId,
 };
@@ -20,6 +26,7 @@ use lumen_integrations::{
     secrets::{OsKeyringSecretStore, SecretStore, SecretStoreError},
 };
 use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
+use sha2::Digest as _;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Parser, PartialEq)]
@@ -58,6 +65,49 @@ pub enum PluginCommand {
     Stage {
         #[arg(value_parser = parse_local_plugin_directory)]
         directory: PathBuf,
+    },
+    Review {
+        stage_id: uuid::Uuid,
+    },
+    Install {
+        stage_id: uuid::Uuid,
+    },
+    Enable {
+        plugin_id: String,
+        version: String,
+    },
+    Disable {
+        plugin_id: String,
+        version: String,
+    },
+    CapabilitiesSet {
+        plugin_id: String,
+        version: String,
+        component_id: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        expected_revision: Option<u64>,
+        #[arg(long)]
+        grants: PathBuf,
+    },
+    SettingsSet {
+        plugin_id: String,
+        version: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        scope_id: Option<String>,
+        #[arg(long)]
+        expected_version: Option<u64>,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    QuarantineRelease {
+        plugin_id: String,
+        version: String,
+        #[arg(long)]
+        kind: String,
     },
 }
 
@@ -98,6 +148,8 @@ pub enum CommandOutput {
     SecretReferences(Vec<SecretReference>),
     SecretDeleted(SecretRefId),
     PluginStaged(PluginStageSummary),
+    PluginReview(PluginReviewSummary),
+    PluginActionRequested(PluginActionRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +158,26 @@ pub struct PluginStageSummary {
     pub plugin_id: String,
     pub version: String,
     pub package_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginReviewSummary {
+    pub stage_id: uuid::Uuid,
+    pub plugin_id: String,
+    pub version: String,
+    pub runtime: String,
+    pub name: String,
+    pub description: String,
+    pub package_digest: String,
+    pub manifest_digest: String,
+    pub artifact_digest: String,
+    pub file_hashes: BTreeMap<String, String>,
+    pub requested_capabilities: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PluginActionRequest {
+    pub run_id: RunId,
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
@@ -160,7 +232,7 @@ pub async fn execute_with_secret_store(
         Command::Secret { command } => {
             execute_secret_command(&config, command, secret_store, secret_input).await
         }
-        Command::Plugin { command } => execute_plugin_command(&config, command).await,
+        Command::Plugin { command } => execute_plugin_command(&config, command, secret_store).await,
         Command::Serve => serve(config, secret_store).await,
     }
 }
@@ -175,6 +247,7 @@ fn parse_local_plugin_directory(value: &str) -> Result<PathBuf, String> {
 async fn execute_plugin_command(
     config: &Config,
     command: PluginCommand,
+    secret_store: Arc<dyn SecretStore>,
 ) -> Result<CommandOutput, CliError> {
     let database = Database::connect(&config.database.path).await?;
     let now = runtime::now();
@@ -240,9 +313,263 @@ async fn execute_plugin_command(
                 package_digest: record.package_digest().to_string(),
             })
         }
+        PluginCommand::Review { stage_id } => {
+            let staged = database
+                .staged_plugin_package(stage_id)
+                .await?
+                .ok_or_else(|| CliError::Runtime("staged plugin package was not found".into()))?;
+            let requested_capabilities = staged
+                .manifest()
+                .components()
+                .iter()
+                .flat_map(|component| {
+                    component.capabilities().iter().map(move |request| {
+                        format!(
+                            "{}:{}:{}",
+                            component.id(),
+                            request.name().as_str(),
+                            match request.scope() {
+                                lumen_core::extension::ManifestCapabilityScope::Workspace => {
+                                    "workspace"
+                                }
+                            }
+                        )
+                    })
+                })
+                .collect();
+            CommandOutput::PluginReview(PluginReviewSummary {
+                stage_id,
+                plugin_id: staged.manifest().id().to_string(),
+                version: staged.manifest().version().to_string(),
+                runtime: staged.manifest().runtime().runtime().as_str().to_owned(),
+                name: staged.manifest().name().to_owned(),
+                description: staged.manifest().description().to_owned(),
+                package_digest: staged.package_digest().to_string(),
+                manifest_digest: staged.manifest_digest().to_string(),
+                artifact_digest: staged.manifest().integrity().artifact().to_string(),
+                file_hashes: staged
+                    .file_hashes()
+                    .iter()
+                    .map(|(path, digest)| (path.clone(), digest.to_string()))
+                    .collect(),
+                requested_capabilities,
+            })
+        }
+        command => {
+            let (proposal, plugin_id, version) =
+                extension_action_proposal(config, &database, command).await?;
+            let capabilities = lumen_core::capability::CapabilitySet::new(
+                extension_runtime::admin_capabilities(&plugin_id, &version)
+                    .map_err(|error| CliError::Runtime(error.to_string()))?,
+            );
+            let sandbox: Arc<dyn SandboxBackend> = Arc::new(SystemSandbox::detect());
+            let service = runtime::LocalRuntimeService::build_with_secret_store(
+                config,
+                database.clone(),
+                EventBroker::new(64),
+                sandbox,
+                Vec::new(),
+                secret_store,
+            )
+            .await?;
+            let run_id = service
+                .request_extension_action(
+                    config.workspace_id(),
+                    config.bootstrap_principal(),
+                    proposal,
+                    capabilities,
+                )
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            service.shutdown().await;
+            CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
+        }
     };
     database.close().await;
     Ok(output)
+}
+
+async fn extension_action_proposal(
+    config: &Config,
+    database: &Database,
+    command: PluginCommand,
+) -> Result<(lumen_core::model::ActionProposal, String, String), CliError> {
+    use extension_runtime::{
+        GrantArguments, GrantInput, InstallArguments, QuarantineReleaseArguments, SettingArguments,
+        VersionArguments, action_proposal,
+    };
+
+    let result = match command {
+        PluginCommand::Install { stage_id } => {
+            let staged = database
+                .staged_plugin_package(stage_id)
+                .await?
+                .ok_or_else(|| CliError::Runtime("staged plugin package was not found".into()))?;
+            let arguments = InstallArguments {
+                stage_id,
+                plugin_id: staged.manifest().id().to_string(),
+                plugin_version: staged.manifest().version().to_string(),
+                package_digest: staged.package_digest().to_string(),
+                manifest_digest: staged.manifest_digest().to_string(),
+                artifact_digest: staged.manifest().integrity().artifact().to_string(),
+            };
+            let plugin = arguments.plugin_id.clone();
+            let version = arguments.plugin_version.clone();
+            (
+                action_proposal("plugin.install", &arguments),
+                plugin,
+                version,
+            )
+        }
+        PluginCommand::Enable { plugin_id, version } => {
+            let arguments = VersionArguments {
+                plugin_id: plugin_id.clone(),
+                plugin_version: version.clone(),
+            };
+            (
+                action_proposal("plugin.enable", &arguments),
+                plugin_id,
+                version,
+            )
+        }
+        PluginCommand::Disable { plugin_id, version } => {
+            let arguments = VersionArguments {
+                plugin_id: plugin_id.clone(),
+                plugin_version: version.clone(),
+            };
+            (
+                action_proposal("plugin.disable", &arguments),
+                plugin_id,
+                version,
+            )
+        }
+        PluginCommand::CapabilitiesSet {
+            plugin_id,
+            version,
+            component_id,
+            scope,
+            expected_revision,
+            grants,
+        } => {
+            let grants: Vec<GrantInput> = serde_json::from_slice(&std::fs::read(grants)?)
+                .map_err(|error| CliError::Runtime(format!("invalid grants file: {error}")))?;
+            let scope_id = match scope.as_str() {
+                "global" => "*".to_owned(),
+                "workspace" => config.workspace_id().to_string(),
+                _ => {
+                    return Err(CliError::Runtime(
+                        "grant scope must be global or workspace".into(),
+                    ));
+                }
+            };
+            let arguments = GrantArguments {
+                plugin_id: plugin_id.clone(),
+                plugin_version: version.clone(),
+                component_id,
+                scope_type: scope,
+                scope_id,
+                expected_revision,
+                grants,
+            };
+            (
+                action_proposal("plugin.capabilities.set", &arguments),
+                plugin_id,
+                version,
+            )
+        }
+        PluginCommand::SettingsSet {
+            plugin_id,
+            version,
+            scope,
+            scope_id,
+            expected_version,
+            config: config_path,
+        } => {
+            let installed = database
+                .installed_plugin_version(
+                    lumen_core::extension::PluginId::parse(&plugin_id)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                    lumen_core::extension::PluginVersion::parse(&version)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                )
+                .await?
+                .ok_or_else(|| {
+                    CliError::Runtime("installed plugin version was not found".into())
+                })?;
+            let settings = installed
+                .manifest()
+                .settings()
+                .ok_or_else(|| CliError::Runtime("plugin does not declare settings".into()))?;
+            let package_root = config
+                .runtime
+                .data_directory
+                .join(installed.artifact_path())
+                .parent()
+                .ok_or_else(|| CliError::Runtime("installed artifact has no package root".into()))?
+                .to_path_buf();
+            let schema = std::fs::read(package_root.join(settings.schema().as_str()))?;
+            let schema_digest = format!("{:x}", sha2::Sha256::digest(schema));
+            let config_value: CanonicalValue = serde_json::from_slice(&std::fs::read(config_path)?)
+                .map_err(|error| CliError::Runtime(format!("invalid settings file: {error}")))?;
+            let scope_id = match (scope.as_str(), scope_id) {
+                ("global", None) => "*".to_owned(),
+                ("workspace", None) => config.workspace_id().to_string(),
+                ("user", None) => format!(
+                    "{}:{}",
+                    config.bootstrap_principal().provider(),
+                    config.bootstrap_principal().subject()
+                ),
+                ("agent", Some(id)) => id,
+                _ => {
+                    return Err(CliError::Runtime(
+                        "invalid settings scope or scope ID".into(),
+                    ));
+                }
+            };
+            let arguments = SettingArguments {
+                plugin_id: plugin_id.clone(),
+                plugin_version: version.clone(),
+                scope_type: scope,
+                scope_id,
+                expected_version,
+                config: config_value,
+                schema_digest,
+            };
+            (
+                action_proposal("plugin.settings.set", &arguments),
+                plugin_id,
+                version,
+            )
+        }
+        PluginCommand::QuarantineRelease {
+            plugin_id,
+            version,
+            kind,
+        } => {
+            let arguments = QuarantineReleaseArguments {
+                plugin_id: plugin_id.clone(),
+                plugin_version: version.clone(),
+                quarantine_type: kind,
+            };
+            (
+                action_proposal("plugin.quarantine.release", &arguments),
+                plugin_id,
+                version,
+            )
+        }
+        PluginCommand::Stage { .. } | PluginCommand::Review { .. } => {
+            return Err(CliError::Runtime(
+                "command is not an extension action".into(),
+            ));
+        }
+    };
+    Ok((
+        result
+            .0
+            .map_err(|error| CliError::Runtime(error.to_string()))?,
+        result.1,
+        result.2,
+    ))
 }
 
 async fn execute_secret_command(

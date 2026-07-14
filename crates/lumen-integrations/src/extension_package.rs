@@ -134,6 +134,111 @@ impl PackageStager {
             quarantine_path: destination,
         })
     }
+
+    pub fn install_staged(
+        &self,
+        staged_path: impl AsRef<Path>,
+        installed_root: impl AsRef<Path>,
+        approved: &PackageIdentity,
+    ) -> Result<InstalledPackage, PackageStageError> {
+        let staged_path = fs::canonicalize(staged_path.as_ref())?;
+        let metadata = fs::symlink_metadata(&staged_path)?;
+        if !metadata.file_type().is_dir() {
+            return Err(PackageStageError::ApprovedIdentityMismatch);
+        }
+
+        let mut snapshots = Vec::new();
+        collect_files(&staged_path, &staged_path, 0, self.limits, &mut snapshots)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        snapshots.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest_snapshot = snapshot(&snapshots, MANIFEST_NAME)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        let manifest_text = std::str::from_utf8(&manifest_snapshot.bytes)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        let manifest: PluginManifest = toml::from_str(manifest_text)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        validate_schemas(&manifest, &snapshots, self.limits.schema)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        let canonical_manifest = serde_json::to_vec(&manifest)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        let artifact = snapshot(&snapshots, manifest.runtime().entrypoint().as_str())
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        let files = snapshots
+            .iter()
+            .map(|file| (file.path.clone(), file.digest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if manifest != approved.manifest
+            || files != approved.files
+            || package_digest(&snapshots) != approved.package_digest
+            || sha256(&canonical_manifest) != approved.manifest_digest
+            || artifact.digest != approved.artifact_digest
+            || artifact.digest != *manifest.integrity().artifact()
+        {
+            return Err(PackageStageError::ApprovedIdentityMismatch);
+        }
+
+        fs::create_dir_all(installed_root.as_ref())?;
+        let installed_root = fs::canonicalize(installed_root.as_ref())?;
+        if installed_root.starts_with(&staged_path) {
+            return Err(PackageStageError::InvalidInstalledRoot);
+        }
+        let destination = installed_root.join(approved.package_digest.as_str());
+        if !destination.exists() {
+            write_snapshot(&installed_root, &destination, &snapshots)?;
+            seal_directories(&destination)?;
+        }
+        verify_existing(&destination, &snapshots, self.limits)
+            .map_err(|_| PackageStageError::InstalledContentConflict)?;
+        Ok(InstalledPackage {
+            path: destination,
+            identity: approved.clone(),
+        })
+    }
+
+    pub fn verify_installed(
+        &self,
+        installed_path: impl AsRef<Path>,
+        approved: &PackageIdentity,
+    ) -> Result<(), PackageStageError> {
+        let installed_path = fs::canonicalize(installed_path.as_ref())?;
+        let mut snapshots = Vec::new();
+        collect_files(
+            &installed_path,
+            &installed_path,
+            0,
+            self.limits,
+            &mut snapshots,
+        )
+        .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        snapshots.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest_bytes = &snapshot(&snapshots, MANIFEST_NAME)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?
+            .bytes;
+        let manifest: PluginManifest = toml::from_str(
+            std::str::from_utf8(manifest_bytes)
+                .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?,
+        )
+        .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        validate_schemas(&manifest, &snapshots, self.limits.schema)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        let artifact = snapshot(&snapshots, manifest.runtime().entrypoint().as_str())
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        let files = snapshots
+            .iter()
+            .map(|file| (file.path.clone(), file.digest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let canonical_manifest = serde_json::to_vec(&manifest)
+            .map_err(|_| PackageStageError::ApprovedIdentityMismatch)?;
+        if manifest != approved.manifest
+            || files != approved.files
+            || package_digest(&snapshots) != approved.package_digest
+            || sha256(&canonical_manifest) != approved.manifest_digest
+            || artifact.digest != approved.artifact_digest
+        {
+            return Err(PackageStageError::ApprovedIdentityMismatch);
+        }
+        Ok(())
+    }
 }
 
 impl Default for PackageStager {
@@ -150,6 +255,81 @@ pub struct StagedPackage {
     manifest_digest: Sha256Digest,
     artifact_digest: Sha256Digest,
     quarantine_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageIdentity {
+    manifest: PluginManifest,
+    files: BTreeMap<String, Sha256Digest>,
+    package_digest: Sha256Digest,
+    manifest_digest: Sha256Digest,
+    artifact_digest: Sha256Digest,
+}
+
+impl PackageIdentity {
+    pub fn new(
+        manifest: PluginManifest,
+        files: BTreeMap<String, Sha256Digest>,
+        package_digest: Sha256Digest,
+        manifest_digest: Sha256Digest,
+        artifact_digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            manifest,
+            files,
+            package_digest,
+            manifest_digest,
+            artifact_digest,
+        }
+    }
+
+    pub const fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    pub const fn files(&self) -> &BTreeMap<String, Sha256Digest> {
+        &self.files
+    }
+
+    pub const fn package_digest(&self) -> &Sha256Digest {
+        &self.package_digest
+    }
+
+    pub const fn manifest_digest(&self) -> &Sha256Digest {
+        &self.manifest_digest
+    }
+
+    pub const fn artifact_digest(&self) -> &Sha256Digest {
+        &self.artifact_digest
+    }
+}
+
+impl From<&StagedPackage> for PackageIdentity {
+    fn from(package: &StagedPackage) -> Self {
+        Self::new(
+            package.manifest.clone(),
+            package.files.clone(),
+            package.package_digest.clone(),
+            package.manifest_digest.clone(),
+            package.artifact_digest.clone(),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InstalledPackage {
+    path: PathBuf,
+    identity: PackageIdentity,
+}
+
+impl InstalledPackage {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub const fn identity(&self) -> &PackageIdentity {
+        &self.identity
+    }
 }
 
 impl StagedPackage {
@@ -208,6 +388,12 @@ pub enum PackageStageError {
     ArtifactDigestMismatch,
     #[error("existing quarantined bytes do not match their content address")]
     QuarantineConflict,
+    #[error("staged bytes do not match the exact approved package identity")]
+    ApprovedIdentityMismatch,
+    #[error("installed package root must not be nested inside the staged package")]
+    InvalidInstalledRoot,
+    #[error("existing installed bytes do not match their content address")]
+    InstalledContentConflict,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -379,6 +565,29 @@ fn write_snapshot(
         let _ = fs::remove_dir_all(&temporary);
     }
     result
+}
+
+fn seal_directories(root: &Path) -> Result<(), PackageStageError> {
+    fn collect(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
+        output.push(directory.to_path_buf());
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                collect(&entry.path(), output)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut directories = Vec::new();
+    collect(root, &mut directories)?;
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        let mut permissions = fs::metadata(&directory)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(directory, permissions)?;
+    }
+    Ok(())
 }
 
 fn verify_existing(

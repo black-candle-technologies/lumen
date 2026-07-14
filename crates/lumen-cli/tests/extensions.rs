@@ -80,6 +80,18 @@ fn plugin_operator_commands_have_explicit_local_grammar() {
         }
     );
     assert!(Cli::try_parse_from(["lumen", "plugin", "stage", "https://example.com/p"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "plugin",
+            "install",
+            "26db5a31-94f0-4e92-a9c9-4cdf19d71c31",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from(["lumen", "plugin", "enable", "dev.example.fixture", "1.0.0",]).is_ok()
+    );
 }
 
 #[tokio::test]
@@ -119,4 +131,135 @@ async fn stage_records_quarantine_identity_without_installing_or_enabling() {
         .await
         .expect("enabled count");
     assert_eq!((staged, installed, enabled), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn review_returns_full_staged_identity_without_mutating_state() {
+    let root = tempdir().expect("root");
+    let config = write_config(root.path());
+    let package = root.path().join("fixture");
+    fs::create_dir(&package).expect("package");
+    write_package(&package);
+    let staged = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Stage { directory: package },
+            },
+        },
+        Arc::new(InMemorySecretStore::new()),
+        None,
+    )
+    .await
+    .expect("stage");
+    let CommandOutput::PluginStaged(staged) = staged else {
+        panic!("unexpected stage output");
+    };
+
+    let reviewed = execute_with_secret_store(
+        Cli {
+            config,
+            command: Command::Plugin {
+                command: PluginCommand::Review {
+                    stage_id: staged.stage_id,
+                },
+            },
+        },
+        Arc::new(InMemorySecretStore::new()),
+        None,
+    )
+    .await
+    .expect("review");
+    let CommandOutput::PluginReview(review) = reviewed else {
+        panic!("unexpected review output");
+    };
+    assert_eq!(review.stage_id, staged.stage_id);
+    assert_eq!(review.plugin_id, "dev.example.fixture");
+    assert_eq!(review.version, "1.0.0");
+    assert_eq!(review.package_digest, staged.package_digest);
+    assert_eq!(review.package_digest.len(), 64);
+    assert_eq!(review.manifest_digest.len(), 64);
+    assert_eq!(review.artifact_digest.len(), 64);
+    assert!(review.file_hashes.contains_key("lumen-plugin.toml"));
+
+    let database = Database::connect(root.path().join("lumen.sqlite3"))
+        .await
+        .expect("database");
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions")
+        .fetch_one(database.pool())
+        .await
+        .expect("action count");
+    let installed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_versions")
+        .fetch_one(database.pool())
+        .await
+        .expect("installed count");
+    assert_eq!((actions, installed), (0, 0));
+}
+
+#[tokio::test]
+async fn install_command_creates_approval_bound_action_without_installing_directly() {
+    let root = tempdir().expect("root");
+    let config = write_config(root.path());
+    let package = root.path().join("fixture");
+    fs::create_dir(&package).expect("package");
+    write_package(&package);
+    let store = Arc::new(InMemorySecretStore::new());
+    let staged = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Stage { directory: package },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("stage");
+    let CommandOutput::PluginStaged(staged) = staged else {
+        panic!("unexpected stage output");
+    };
+
+    let requested = execute_with_secret_store(
+        Cli {
+            config,
+            command: Command::Plugin {
+                command: PluginCommand::Install {
+                    stage_id: staged.stage_id,
+                },
+            },
+        },
+        store,
+        None,
+    )
+    .await
+    .expect("request install");
+    assert!(matches!(requested, CommandOutput::PluginActionRequested(_)));
+
+    let database = Database::connect(root.path().join("lumen.sqlite3"))
+        .await
+        .expect("database");
+    let action: (String, String) =
+        sqlx::query_as("SELECT kind, state FROM actions ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("stored action");
+    let approvals: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
+            .fetch_one(database.pool())
+            .await
+            .expect("approval count");
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
+        .fetch_one(database.pool())
+        .await
+        .expect("attempt count");
+    let installed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_versions")
+        .fetch_one(database.pool())
+        .await
+        .expect("installed count");
+    assert_eq!(
+        action,
+        ("plugin.install".to_owned(), "normalized".to_owned())
+    );
+    assert_eq!((approvals, attempts, installed), (1, 0, 0));
 }

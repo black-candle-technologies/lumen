@@ -104,14 +104,14 @@ docs/
 
 **Files:** `crates/lumen-cli/src/{lib,runtime,extension_runtime}.rs`, `crates/lumen-cli/tests/{commands,extensions}.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`, `crates/lumen-integrations/src/extension_package.rs`
 
-- [ ] Add failing CLI/service tests for stage, review, install, enable, disable, grant updates, setting updates, side-by-side switches, and quarantine release.
-- [ ] Add failing tests proving stage is acquisition only and every state-changing operation except allowed narrowing/disablement persists, evaluates, approves when required, pre-audits, reserves, executes, and records a terminal outcome.
-- [ ] Add failing substitution and crash-recovery tests proving exact approved hashes are rechecked and administrative actions are never direct SQL updates or automatic retries.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement the transport-neutral administrative service and executor; make CLI commands thin authenticated adapters.
-- [ ] Copy an unchanged approved package into a content-addressed immutable directory transactionally and leave new versions disabled with no grants.
-- [ ] Run focused tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(extensions): route plugin lifecycle through approvals`.
+- [x] Add failing CLI/service tests for stage, review, install, enable, disable, grant updates, setting updates, side-by-side switches, and quarantine release.
+- [x] Add failing tests proving stage is acquisition only and every state-changing operation except allowed narrowing/disablement persists, evaluates, approves when required, pre-audits, reserves, executes, and records a terminal outcome.
+- [x] Add failing substitution and crash-recovery tests proving exact approved hashes are rechecked and administrative actions are never direct SQL updates or automatic retries.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement the transport-neutral administrative service and executor; make CLI commands thin authenticated adapters.
+- [x] Copy an unchanged approved package into a content-addressed immutable directory transactionally and leave new versions disabled with no grants.
+- [x] Run focused tests, formatting, and strict Clippy.
+- [x] Commit as `feat(extensions): route plugin lifecycle through approvals`.
 
 ## Task 6: Extension SDK And WASM Component Host
 

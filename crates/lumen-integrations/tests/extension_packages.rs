@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use lumen_integrations::{
-    extension_package::{PackageLimits, PackageStageError, PackageStager},
+    extension_package::{PackageIdentity, PackageLimits, PackageStageError, PackageStager},
     extension_schema::{BoundedSchema, SchemaLimits, merge_scoped_settings},
 };
 use serde_json::json;
@@ -213,6 +213,76 @@ fn content_addressed_quarantine_rejects_extra_or_changed_files() {
         stager.stage(source.path(), quarantine.path()),
         Err(PackageStageError::QuarantineConflict)
     ));
+}
+
+#[test]
+fn approved_staged_bytes_install_idempotently_under_their_content_address() {
+    let quarantine = tempdir().expect("quarantine");
+    let installed = tempdir().expect("installed");
+    let source = tempdir().expect("source");
+    write_package(source.path(), b"reviewed component");
+    let stager = PackageStager::default();
+    let staged = stager
+        .stage(source.path(), quarantine.path())
+        .expect("stage");
+    let identity = PackageIdentity::from(&staged);
+
+    let first = stager
+        .install_staged(staged.quarantine_path(), installed.path(), &identity)
+        .expect("install");
+    let second = stager
+        .install_staged(staged.quarantine_path(), installed.path(), &identity)
+        .expect("idempotent install");
+
+    assert_eq!(first.path(), second.path());
+    assert_eq!(
+        first.path().file_name().and_then(std::ffi::OsStr::to_str),
+        Some(staged.package_digest().as_str())
+    );
+    assert_eq!(
+        fs::read(first.path().join("plugin.wasm")).expect("installed artifact"),
+        b"reviewed component"
+    );
+}
+
+#[test]
+fn install_rechecks_every_approved_digest_before_copying() {
+    let quarantine = tempdir().expect("quarantine");
+    let installed = tempdir().expect("installed");
+    let source = tempdir().expect("source");
+    write_package(source.path(), b"reviewed component");
+    let stager = PackageStager::default();
+    let staged = stager
+        .stage(source.path(), quarantine.path())
+        .expect("stage");
+    let identity = PackageIdentity::from(&staged);
+
+    let artifact = staged.quarantine_path().join("plugin.wasm");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(&artifact).expect("metadata").permissions();
+        permissions.set_mode(permissions.mode() | 0o200);
+        fs::set_permissions(&artifact, permissions).expect("make mutable for adversarial test");
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(&artifact).expect("metadata").permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&artifact, permissions).expect("make mutable for adversarial test");
+    }
+    fs::write(&artifact, b"substituted after approval").expect("substitute");
+
+    assert!(matches!(
+        stager.install_staged(staged.quarantine_path(), installed.path(), &identity),
+        Err(PackageStageError::ApprovedIdentityMismatch)
+    ));
+    assert_eq!(
+        fs::read_dir(installed.path())
+            .expect("installed root")
+            .count(),
+        0
+    );
 }
 
 #[test]

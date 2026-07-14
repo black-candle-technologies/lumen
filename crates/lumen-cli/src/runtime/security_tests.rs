@@ -14,16 +14,27 @@ use axum::{
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use lumen_core::audit::AuditEventKind;
-use lumen_core::{approval::TimestampMillis, identity::WorkspaceId, secret::SecretRefId};
-use lumen_db::{Database, SecretReference};
+use lumen_core::{
+    action::CanonicalValue,
+    approval::TimestampMillis,
+    capability::CapabilitySet,
+    executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
+    identity::{PrincipalId, WorkspaceId},
+    secret::SecretRefId,
+};
+use lumen_db::{Database, SecretReference, StagedPluginPackage};
 use lumen_integrations::{
+    extension_package::PackageStager,
     sandbox::{
         SandboxBackend, SandboxError, SandboxFuture, SandboxOutput, SandboxReport, SandboxRequest,
         SandboxStrength,
     },
     secrets::{InMemorySecretStore, SecretStore},
 };
-use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
+use lumen_server::{
+    ApiState, ApprovalDecision, ApprovalDecisionCommand, EventBroker, RuntimeService,
+    SandboxCapabilityReport, router,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wiremock::{
@@ -31,8 +42,14 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use super::{LocalRuntimeService, now};
-use crate::config::Config;
+use super::{LocalRuntimeService, RedactingExecutor, now};
+use crate::{
+    config::Config,
+    extension_runtime::{
+        GrantArguments, GrantInput, InstallArguments, QuarantineReleaseArguments, SettingArguments,
+        VersionArguments, action_proposal, admin_capabilities,
+    },
+};
 
 const TOKEN: &str = "security-test-token";
 
@@ -100,6 +117,23 @@ impl SandboxBackend for RecordingSandbox {
         } else {
             Box::pin(async move { Ok(output) })
         }
+    }
+}
+
+struct CrashPointExecutor {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+impl ExecutorPort for CrashPointExecutor {
+    fn execute<'a>(
+        &'a self,
+        _action: &'a AuthorizedAction,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> ExecutorFuture<'a> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            std::future::pending().await
+        })
     }
 }
 
@@ -203,6 +237,7 @@ subject = "operator"
         let directory = tempfile::tempdir().expect("temporary runtime");
         let workspace = directory.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace directory");
+        std::fs::create_dir(directory.path().join("runtime")).expect("runtime directory");
         prepare_workspace(&workspace);
         let config = Config::parse(&format!(
             r#"
@@ -213,6 +248,9 @@ path = "ignored.sqlite3"
 endpoint = "{}/v1/"
 model = "local-model"
 streaming = false
+
+[runtime]
+data_directory = "{}"
 
 [process]
 allowed_programs = ["/bin/echo"]
@@ -227,6 +265,7 @@ provider = "local"
 subject = "operator"
 "#,
             model.uri(),
+            directory.path().join("runtime").display(),
             workspace.display()
         ))
         .expect("security config");
@@ -410,6 +449,175 @@ subject = "operator"
     }
 }
 
+fn write_extension_package(root: &std::path::Path, version: &str, artifact: &[u8]) {
+    use sha2::{Digest, Sha256};
+
+    std::fs::create_dir_all(root.join("schemas")).expect("schemas");
+    std::fs::write(root.join("plugin.wasm"), artifact).expect("artifact");
+    std::fs::write(root.join("schemas/input.json"), r#"{"type":"object"}"#).expect("input schema");
+    std::fs::write(root.join("schemas/output.json"), r#"{"type":"object"}"#)
+        .expect("output schema");
+    std::fs::write(
+        root.join("schemas/settings.json"),
+        r#"{"type":"object","properties":{"prefix":{"type":"string","maxLength":32}},"additionalProperties":false}"#,
+    )
+    .expect("settings schema");
+    let digest = format!("{:x}", Sha256::digest(artifact));
+    std::fs::write(
+        root.join("lumen-plugin.toml"),
+        format!(
+            r#"manifest_version = 1
+id = "dev.example.lifecycle"
+name = "Lifecycle Fixture"
+version = "{version}"
+description = "Lifecycle fixture"
+[runtime]
+type = "wasm-component"
+entrypoint = "plugin.wasm"
+protocol_version = 1
+[[components]]
+id = "echo"
+kind = "tool"
+description = "Echo"
+input_schema = "schemas/input.json"
+output_schema = "schemas/output.json"
+action_kinds = ["filesystem.read"]
+[[components.capabilities]]
+name = "fs.read"
+scope = "workspace"
+[settings]
+schema = "schemas/settings.json"
+[integrity]
+algorithm = "sha256"
+artifact = "{digest}"
+"#,
+        ),
+    )
+    .expect("manifest");
+}
+
+async fn stage_lifecycle_fixture(harness: &Harness) -> (StagedPluginPackage, std::path::PathBuf) {
+    stage_lifecycle_version(harness, "1.0.0", b"approved component bytes").await
+}
+
+async fn stage_lifecycle_version(
+    harness: &Harness,
+    version: &str,
+    artifact: &[u8],
+) -> (StagedPluginPackage, std::path::PathBuf) {
+    let source = harness
+        ._directory
+        .path()
+        .join(format!("plugin-source-{version}"));
+    std::fs::create_dir(&source).expect("source");
+    write_extension_package(&source, version, artifact);
+    let data_root = std::fs::canonicalize(harness._directory.path().join("runtime"))
+        .expect("canonical data root");
+    let staged = PackageStager::default()
+        .stage(&source, data_root.join("plugins/quarantine"))
+        .expect("stage");
+    let stage_id = uuid::Uuid::new_v4();
+    let record = StagedPluginPackage::new(
+        stage_id,
+        staged.manifest().clone(),
+        staged
+            .quarantine_path()
+            .strip_prefix(&data_root)
+            .expect("relative quarantine")
+            .to_string_lossy(),
+        staged.files().clone(),
+        staged.package_digest().clone(),
+        staged.manifest_digest().clone(),
+        PrincipalId::new("local", "operator").expect("principal"),
+        now(),
+    )
+    .expect("staged record");
+    harness
+        .database
+        .insert_staged_plugin_package(&record)
+        .await
+        .expect("persist stage");
+    (record, staged.quarantine_path().to_path_buf())
+}
+
+async fn request_install(harness: &Harness, staged: &StagedPluginPackage) -> String {
+    let arguments = InstallArguments {
+        stage_id: staged.id(),
+        plugin_id: staged.manifest().id().to_string(),
+        plugin_version: staged.manifest().version().to_string(),
+        package_digest: staged.package_digest().to_string(),
+        manifest_digest: staged.manifest_digest().to_string(),
+        artifact_digest: staged.manifest().integrity().artifact().to_string(),
+    };
+    let proposal = action_proposal("plugin.install", &arguments).expect("proposal");
+    let capabilities = CapabilitySet::new(
+        admin_capabilities(&arguments.plugin_id, &arguments.plugin_version)
+            .expect("admin capabilities"),
+    );
+    harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("principal"),
+            proposal,
+            capabilities,
+        )
+        .await
+        .expect("request install")
+        .to_string()
+}
+
+async fn request_admin_action(
+    harness: &Harness,
+    kind: &str,
+    plugin_id: &str,
+    version: &str,
+    arguments: &impl serde::Serialize,
+) -> String {
+    let proposal = action_proposal(kind, arguments).expect("action proposal");
+    let capabilities =
+        CapabilitySet::new(admin_capabilities(plugin_id, version).expect("admin capabilities"));
+    harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("principal"),
+            proposal,
+            capabilities,
+        )
+        .await
+        .expect("request action")
+        .to_string()
+}
+
+async fn approve_pending(harness: &Harness) {
+    let approval_id = harness.pending_approval_id().await;
+    let response = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn wait_for_action_state(harness: &Harness, run_id: &str, expected: &str) {
+    for _ in 0..100 {
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM actions WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_optional(harness.database.pool())
+                .await
+                .expect("action state");
+        if state.as_deref() == Some(expected) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("action for run {run_id} did not reach {expected}");
+}
+
 fn final_response(text: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "choices": [{"message": {"content": text, "tool_calls": []}}]
@@ -426,6 +634,509 @@ fn action_response(kind: &str, arguments: serde_json::Value) -> ResponseTemplate
             }}]
         }}]
     }))
+}
+
+#[tokio::test]
+async fn approved_plugin_install_rechecks_identity_and_uses_reserved_action_path() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let (staged, _) = stage_lifecycle_fixture(&harness).await;
+    request_install(&harness, &staged).await;
+    let approval_id = harness.pending_approval_id().await;
+
+    let installed_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_versions")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("installed count");
+    let attempts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!((installed_before, attempts_before), (0, 0));
+
+    let granted = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    harness
+        .wait_for_audit(AuditEventKind::ExecutionSucceeded)
+        .await;
+
+    let installed: (String, String, String) =
+        sqlx::query_as("SELECT artifact_path, package_digest, artifact_state FROM plugin_versions")
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("installed version");
+    assert!(installed.0.starts_with("plugins/installed/"));
+    assert!(installed.0.ends_with("/plugin.wasm"));
+    assert_eq!(installed.1, staged.package_digest().as_str());
+    assert_eq!(installed.2, "installed");
+    assert_eq!(
+        std::fs::read(harness._directory.path().join("runtime").join(&installed.0))
+            .expect("installed bytes"),
+        b"approved component bytes"
+    );
+    let attempt_state: String = sqlx::query_scalar("SELECT state FROM execution_attempts LIMIT 1")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt state");
+    assert_eq!(attempt_state, "succeeded");
+
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 200)
+        .await
+        .expect("audit records");
+    let kinds = records
+        .iter()
+        .map(|record| record.event().kind())
+        .collect::<Vec<_>>();
+    let consumed = kinds
+        .iter()
+        .position(|kind| *kind == AuditEventKind::ApprovalConsumed)
+        .expect("approval consumed");
+    let started = kinds
+        .iter()
+        .position(|kind| *kind == AuditEventKind::ExecutionStarted)
+        .expect("execution started");
+    let succeeded = kinds
+        .iter()
+        .position(|kind| *kind == AuditEventKind::ExecutionSucceeded)
+        .expect("execution succeeded");
+    assert!(consumed < started && started < succeeded);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn approved_plugin_install_rejects_post_approval_substitution_without_retry() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let (staged, quarantine_path) = stage_lifecycle_fixture(&harness).await;
+    request_install(&harness, &staged).await;
+    let approval_id = harness.pending_approval_id().await;
+
+    let artifact = quarantine_path.join("plugin.wasm");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&artifact)
+            .expect("artifact metadata")
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o200);
+        std::fs::set_permissions(&artifact, permissions).expect("make artifact mutable");
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = std::fs::metadata(&artifact)
+            .expect("artifact metadata")
+            .permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&artifact, permissions).expect("make artifact mutable");
+    }
+    std::fs::write(&artifact, b"substituted after approval").expect("substitute artifact");
+
+    let granted = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    harness
+        .wait_for_audit(AuditEventKind::ExecutionFailed)
+        .await;
+
+    let installed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_versions")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("installed count");
+    let attempts: Vec<String> = sqlx::query_scalar("SELECT state FROM execution_attempts")
+        .fetch_all(harness.database.pool())
+        .await
+        .expect("attempts");
+    assert_eq!(installed, 0);
+    assert_eq!(attempts, vec!["failed"]);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn crashed_administrative_reservation_recovers_unknown_without_retry() {
+    let directory = tempfile::tempdir().expect("runtime");
+    let workspace = directory.path().join("workspace");
+    let data_root = directory.path().join("runtime");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::create_dir(&data_root).expect("data root");
+    let model = MockServer::start().await;
+    let config = Config::parse(&format!(
+        r#"
+[database]
+path = "ignored.sqlite3"
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = false
+[runtime]
+data_directory = "{}"
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "{}"
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+        model.uri(),
+        data_root.display(),
+        workspace.display()
+    ))
+    .expect("config");
+    let database = Database::connect_in_memory().await.expect("database");
+    database
+        .bootstrap_workspace(
+            config.workspace_id(),
+            &config.workspace.name,
+            &config.bootstrap_principal(),
+            now(),
+        )
+        .await
+        .expect("workspace bootstrap");
+    let source = directory.path().join("source");
+    std::fs::create_dir(&source).expect("source");
+    write_extension_package(&source, "1.0.0", b"approved component bytes");
+    let staged = PackageStager::default()
+        .stage(&source, data_root.join("plugins/quarantine"))
+        .expect("stage");
+    let staged_record = StagedPluginPackage::new(
+        uuid::Uuid::new_v4(),
+        staged.manifest().clone(),
+        staged
+            .quarantine_path()
+            .strip_prefix(std::fs::canonicalize(&data_root).expect("canonical root"))
+            .expect("relative quarantine")
+            .to_string_lossy(),
+        staged.files().clone(),
+        staged.package_digest().clone(),
+        staged.manifest_digest().clone(),
+        config.bootstrap_principal(),
+        now(),
+    )
+    .expect("stage record");
+    database
+        .insert_staged_plugin_package(&staged_record)
+        .await
+        .expect("persist stage");
+
+    let events = EventBroker::new(32);
+    let mut service = LocalRuntimeService::build_with_secret_store(
+        &config,
+        database.clone(),
+        events,
+        Arc::new(RecordingSandbox::new()),
+        Vec::new(),
+        Arc::new(InMemorySecretStore::new()),
+    )
+    .await
+    .expect("runtime");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    service.executor = Arc::new(RedactingExecutor {
+        inner: Arc::new(CrashPointExecutor {
+            entered: Arc::clone(&entered),
+        }),
+        redactor: Arc::clone(&service.redactor),
+        approvals: Arc::clone(&service.approvals),
+    });
+    let service = Arc::new(service);
+    let arguments = InstallArguments {
+        stage_id: staged_record.id(),
+        plugin_id: staged_record.manifest().id().to_string(),
+        plugin_version: staged_record.manifest().version().to_string(),
+        package_digest: staged_record.package_digest().to_string(),
+        manifest_digest: staged_record.manifest_digest().to_string(),
+        artifact_digest: staged_record.manifest().integrity().artifact().to_string(),
+    };
+    let run_id = service
+        .request_extension_action(
+            config.workspace_id(),
+            config.bootstrap_principal(),
+            action_proposal("plugin.install", &arguments).expect("proposal"),
+            CapabilitySet::new(
+                admin_capabilities(&arguments.plugin_id, &arguments.plugin_version)
+                    .expect("capabilities"),
+            ),
+        )
+        .await
+        .expect("request");
+    let approval = loop {
+        let pending = database
+            .list_pending_approvals(config.workspace_id())
+            .await
+            .expect("pending approvals");
+        if let Some(approval) = pending.first() {
+            break approval.approval_id();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    service
+        .decide_approval(ApprovalDecisionCommand::new(
+            config.workspace_id(),
+            approval,
+            config.bootstrap_principal(),
+            ApprovalDecision::Grant,
+        ))
+        .await
+        .expect("grant");
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("executor entered");
+    let tasks = std::mem::take(&mut *service.tasks.lock().await);
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+
+    let recovered = database
+        .recover_incomplete_executions(now())
+        .await
+        .expect("recover");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].run_id(), run_id);
+    let action_state: String = sqlx::query_scalar("SELECT state FROM actions WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("action state");
+    let attempts: Vec<String> = sqlx::query_scalar("SELECT state FROM execution_attempts")
+        .fetch_all(database.pool())
+        .await
+        .expect("attempts");
+    let installed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_versions")
+        .fetch_one(database.pool())
+        .await
+        .expect("installed count");
+    assert_eq!(action_state, "unknown");
+    assert_eq!(attempts, vec!["unknown"]);
+    assert_eq!(installed, 0);
+}
+
+#[tokio::test]
+async fn plugin_lifecycle_changes_all_dispatch_as_actions() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let (staged, _) = stage_lifecycle_fixture(&harness).await;
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+
+    let install_run = request_install(&harness, &staged).await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &install_run, "succeeded").await;
+
+    let grant_scope = CanonicalValue::object([
+        ("type", CanonicalValue::from("workspace")),
+        (
+            "workspace_id",
+            CanonicalValue::from(harness.workspace_id.to_string()),
+        ),
+    ]);
+    let grants = GrantArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+        component_id: "echo".into(),
+        scope_type: "global".into(),
+        scope_id: "*".into(),
+        expected_revision: None,
+        grants: vec![GrantInput {
+            name: "fs.read".into(),
+            scope: grant_scope,
+        }],
+    };
+    let grant_run = request_admin_action(
+        &harness,
+        "plugin.capabilities.set",
+        &plugin_id,
+        &version,
+        &grants,
+    )
+    .await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &grant_run, "succeeded").await;
+
+    let settings = SettingArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+        scope_type: "global".into(),
+        scope_id: "*".into(),
+        expected_version: None,
+        config: CanonicalValue::object([("prefix", CanonicalValue::from("safe"))]),
+        schema_digest: staged
+            .file_hashes()
+            .get("schemas/settings.json")
+            .expect("settings schema digest")
+            .to_string(),
+    };
+    let settings_run = request_admin_action(
+        &harness,
+        "plugin.settings.set",
+        &plugin_id,
+        &version,
+        &settings,
+    )
+    .await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &settings_run, "succeeded").await;
+
+    let target = VersionArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+    };
+    let enable_run =
+        request_admin_action(&harness, "plugin.enable", &plugin_id, &version, &target).await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &enable_run, "succeeded").await;
+    assert_eq!(
+        harness
+            .database
+            .plugin_workspace_state(
+                harness.workspace_id,
+                lumen_core::extension::PluginId::parse(&plugin_id).expect("plugin"),
+                lumen_core::extension::PluginVersion::parse(&version).expect("version"),
+            )
+            .await
+            .expect("workspace state"),
+        Some(lumen_db::PluginWorkspaceState::Enabled)
+    );
+
+    let pending_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("pending approvals");
+    let disable_run =
+        request_admin_action(&harness, "plugin.disable", &plugin_id, &version, &target).await;
+    wait_for_action_state(&harness, &disable_run, "succeeded").await;
+    let pending_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("pending approvals");
+    assert_eq!(pending_after, pending_before);
+
+    let reenable_run =
+        request_admin_action(&harness, "plugin.enable", &plugin_id, &version, &target).await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &reenable_run, "succeeded").await;
+    for timestamp in [now().as_u64(), now().as_u64() + 1, now().as_u64() + 2] {
+        harness
+            .database
+            .record_plugin_failure(
+                harness.workspace_id,
+                lumen_core::extension::PluginId::parse(&plugin_id).expect("plugin"),
+                lumen_core::extension::PluginVersion::parse(&version).expect("version"),
+                lumen_core::extension::PluginComponentId::parse("echo").expect("component"),
+                uuid::Uuid::new_v4(),
+                lumen_core::extension::ExtensionFailureClass::PluginFault,
+                TimestampMillis::new(timestamp),
+            )
+            .await
+            .expect("record failure");
+    }
+    let release = QuarantineReleaseArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+        quarantine_type: "health".into(),
+    };
+    let release_run = request_admin_action(
+        &harness,
+        "plugin.quarantine.release",
+        &plugin_id,
+        &version,
+        &release,
+    )
+    .await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &release_run, "succeeded").await;
+
+    let first_reenable_run =
+        request_admin_action(&harness, "plugin.enable", &plugin_id, &version, &target).await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &first_reenable_run, "succeeded").await;
+
+    let (second_stage, _) =
+        stage_lifecycle_version(&harness, "2.0.0", b"second component bytes").await;
+    let second_install_run = request_install(&harness, &second_stage).await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &second_install_run, "succeeded").await;
+    let second_version = second_stage.manifest().version().to_string();
+    let second_target = VersionArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: second_version.clone(),
+    };
+    let switch_run = request_admin_action(
+        &harness,
+        "plugin.enable",
+        &plugin_id,
+        &second_version,
+        &second_target,
+    )
+    .await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &switch_run, "succeeded").await;
+    assert_eq!(
+        harness
+            .database
+            .plugin_workspace_state(
+                harness.workspace_id,
+                lumen_core::extension::PluginId::parse(&plugin_id).expect("plugin"),
+                lumen_core::extension::PluginVersion::parse(&version).expect("version"),
+            )
+            .await
+            .expect("first state"),
+        Some(lumen_db::PluginWorkspaceState::Disabled)
+    );
+    assert_eq!(
+        harness
+            .database
+            .plugin_workspace_state(
+                harness.workspace_id,
+                lumen_core::extension::PluginId::parse(&plugin_id).expect("plugin"),
+                lumen_core::extension::PluginVersion::parse(&second_version).expect("version"),
+            )
+            .await
+            .expect("second state"),
+        Some(lumen_db::PluginWorkspaceState::Enabled)
+    );
+
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT kind FROM actions WHERE kind LIKE 'plugin.%' ORDER BY created_at, id",
+    )
+    .fetch_all(harness.database.pool())
+    .await
+    .expect("action kinds");
+    for required in [
+        "plugin.install",
+        "plugin.capabilities.set",
+        "plugin.settings.set",
+        "plugin.enable",
+        "plugin.disable",
+        "plugin.quarantine.release",
+    ] {
+        assert!(
+            kinds.iter().any(|kind| kind == required),
+            "missing {required}"
+        );
+    }
+    let incomplete: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM actions WHERE kind LIKE 'plugin.%' AND state != 'succeeded'",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("incomplete actions");
+    assert_eq!(incomplete, 0);
+    harness.service.shutdown().await;
 }
 
 async fn mount_response(model: &MockServer, response: ResponseTemplate) {

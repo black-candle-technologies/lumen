@@ -89,12 +89,52 @@ impl StagedPluginPackage {
         &self.manifest_digest
     }
 
+    pub const fn file_hashes(&self) -> &BTreeMap<String, Sha256Digest> {
+        &self.file_hashes
+    }
+
     pub const fn requested_by(&self) -> &PrincipalId {
         &self.requested_by
     }
 
     pub const fn created_at(&self) -> TimestampMillis {
         self.created_at
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InstalledPluginVersion {
+    manifest: PluginManifest,
+    artifact_path: String,
+    package_digest: Sha256Digest,
+    manifest_digest: Sha256Digest,
+    artifact_digest: Sha256Digest,
+    artifact_quarantined: bool,
+}
+
+impl InstalledPluginVersion {
+    pub const fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    pub fn artifact_path(&self) -> &str {
+        &self.artifact_path
+    }
+
+    pub const fn package_digest(&self) -> &Sha256Digest {
+        &self.package_digest
+    }
+
+    pub const fn manifest_digest(&self) -> &Sha256Digest {
+        &self.manifest_digest
+    }
+
+    pub const fn artifact_digest(&self) -> &Sha256Digest {
+        &self.artifact_digest
+    }
+
+    pub const fn is_artifact_quarantined(&self) -> bool {
+        self.artifact_quarantined
     }
 }
 
@@ -211,6 +251,92 @@ impl PluginSettingRevision {
 }
 
 impl Database {
+    pub async fn staged_plugin_package(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<StagedPluginPackage>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT manifest_json, quarantine_path, file_hashes_json, package_digest,
+                    manifest_digest, requested_by_provider, requested_by_subject, created_at
+             FROM plugin_staged_packages WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            let created_at = row.try_get::<i64, _>("created_at")?;
+            let created_at = u64::try_from(created_at)
+                .map_err(|_| RepositoryError::InvalidPluginPackage("invalid timestamp".into()))?;
+            StagedPluginPackage::new(
+                id,
+                serde_json::from_str(&row.try_get::<String, _>("manifest_json")?)?,
+                row.try_get::<String, _>("quarantine_path")?,
+                serde_json::from_str(&row.try_get::<String, _>("file_hashes_json")?)?,
+                Sha256Digest::parse(row.try_get::<String, _>("package_digest")?)
+                    .map_err(|error| RepositoryError::InvalidPluginPackage(error.to_string()))?,
+                Sha256Digest::parse(row.try_get::<String, _>("manifest_digest")?)
+                    .map_err(|error| RepositoryError::InvalidPluginPackage(error.to_string()))?,
+                PrincipalId::new(
+                    row.try_get::<String, _>("requested_by_provider")?,
+                    row.try_get::<String, _>("requested_by_subject")?,
+                )
+                .map_err(|error| RepositoryError::InvalidPluginPackage(error.to_string()))?,
+                TimestampMillis::new(created_at),
+            )
+        })
+        .transpose()
+    }
+
+    pub async fn staged_plugin_package_by_digest(
+        &self,
+        package_digest: Sha256Digest,
+    ) -> Result<Option<StagedPluginPackage>, RepositoryError> {
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM plugin_staged_packages WHERE package_digest = ?")
+                .bind(package_digest.as_str())
+                .fetch_optional(self.pool())
+                .await?;
+        let Some(id) = id else { return Ok(None) };
+        let id = Uuid::parse_str(&id)
+            .map_err(|error| RepositoryError::InvalidPluginPackage(error.to_string()))?;
+        self.staged_plugin_package(id).await
+    }
+
+    pub async fn installed_plugin_version(
+        &self,
+        plugin_id: PluginId,
+        version: PluginVersion,
+    ) -> Result<Option<InstalledPluginVersion>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT manifest_json, artifact_path, package_digest, manifest_digest,
+                    artifact_digest, artifact_state
+             FROM plugin_versions WHERE plugin_id = ? AND version = ?",
+        )
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            let digest = |column| -> Result<Sha256Digest, RepositoryError> {
+                Sha256Digest::parse(row.try_get::<String, _>(column)?)
+                    .map_err(|error| RepositoryError::InvalidPluginPackage(error.to_string()))
+            };
+            let state: String = row.try_get("artifact_state")?;
+            if !matches!(state.as_str(), "installed" | "artifact_quarantine") {
+                return Err(RepositoryError::PluginStateConflict);
+            }
+            Ok(InstalledPluginVersion {
+                manifest: serde_json::from_str(&row.try_get::<String, _>("manifest_json")?)?,
+                artifact_path: row.try_get("artifact_path")?,
+                package_digest: digest("package_digest")?,
+                manifest_digest: digest("manifest_digest")?,
+                artifact_digest: digest("artifact_digest")?,
+                artifact_quarantined: state == "artifact_quarantine",
+            })
+        })
+        .transpose()
+    }
+
     pub async fn latest_plugin_grants(
         &self,
         plugin_id: PluginId,
@@ -500,6 +626,85 @@ impl Database {
         .bind(plugin_id.as_str())
         .bind(version.as_str())
         .bind(updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn disable_plugin_version(
+        &self,
+        workspace_id: WorkspaceId,
+        plugin_id: PluginId,
+        version: PluginVersion,
+        updated_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE plugin_workspace_versions SET state = 'disabled', updated_at = ?
+             WHERE workspace_id = ? AND plugin_id = ? AND plugin_version = ?
+               AND state IN ('enabled', 'disabled')",
+        )
+        .bind(timestamp_to_i64(updated_at)?)
+        .bind(workspace_id.to_string())
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .execute(self.pool())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::PluginStateConflict);
+        }
+        Ok(())
+    }
+
+    pub async fn release_plugin_health_quarantine(
+        &self,
+        workspace_id: WorkspaceId,
+        plugin_id: PluginId,
+        version: PluginVersion,
+        updated_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE plugin_workspace_versions SET state = 'disabled', updated_at = ?
+             WHERE workspace_id = ? AND plugin_id = ? AND plugin_version = ?
+               AND state = 'health_quarantine'",
+        )
+        .bind(timestamp_to_i64(updated_at)?)
+        .bind(workspace_id.to_string())
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .execute(self.pool())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::PluginStateConflict);
+        }
+        Ok(())
+    }
+
+    pub async fn release_plugin_artifact_quarantine(
+        &self,
+        plugin_id: PluginId,
+        version: PluginVersion,
+        released_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            "UPDATE plugin_versions SET artifact_state = 'installed', artifact_quarantined_at = NULL
+             WHERE plugin_id = ? AND version = ? AND artifact_state = 'artifact_quarantine'",
+        )
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::PluginStateConflict);
+        }
+        sqlx::query(
+            "UPDATE plugin_workspace_versions SET state = 'disabled', updated_at = ?
+             WHERE plugin_id = ? AND plugin_version = ?",
+        )
+        .bind(timestamp_to_i64(released_at)?)
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
