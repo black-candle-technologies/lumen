@@ -65,14 +65,14 @@ docs/
 
 **Files:** `crates/lumen-integrations/Cargo.toml`, `crates/lumen-integrations/src/{lib,extension_package,extension_schema}.rs`, `crates/lumen-integrations/tests/extension_packages.rs`, `crates/lumen-integrations/tests/fixtures/packages/`
 
-- [ ] Add failing fixtures for valid WASM/subprocess packages and unknown manifest fields, invalid IDs/versions/digests, absolute/traversal paths, symlinks, hard links, devices, duplicate canonical paths, file mutation, excessive counts, and byte limits; prove additional bounded regular files are included in package identity.
-- [ ] Add failing schema tests for unsupported keywords, remote/external/recursive references, regex/resource-heavy constructs, excessive schema depth/size, and bounded input/output validation.
-- [ ] Add failing staging tests proving verified bytes are copied into a Lumen-owned quarantine, never execute, and produce deterministic file/package/manifest/artifact/schema hashes.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement strict TOML parsing, normalized package walking without link following, stable hashing, race checks, bounded schema compilation, and immutable staged-package descriptors.
-- [ ] Reopen and rehash staged bytes through directory capabilities before returning any install input.
-- [ ] Run focused tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(extensions): stage strict local packages`.
+- [x] Add failing fixtures for valid WASM/subprocess packages and unknown manifest fields, invalid IDs/versions/digests, absolute/traversal paths, symlinks, hard links, devices, duplicate canonical paths, file mutation, excessive counts, and byte limits; prove additional bounded regular files are included in package identity.
+- [x] Add failing schema tests for unsupported keywords, remote/external/recursive references, regex/resource-heavy constructs, excessive schema depth/size, and bounded input/output validation.
+- [x] Add failing staging tests proving verified bytes are copied into a Lumen-owned quarantine, never execute, and produce deterministic file/package/manifest/artifact/schema hashes.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement strict TOML parsing, normalized package walking without link following, stable hashing, race checks, bounded schema compilation, and immutable staged-package descriptors.
+- [x] Reopen and rehash staged bytes through directory capabilities before returning any install input.
+- [x] Run focused tests, formatting, and strict Clippy.
+- [x] Commit as `feat(extensions): stage strict local packages`.
 
 ## Task 3: Append-Only Extension Persistence
 

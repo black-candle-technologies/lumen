@@ -8,6 +8,7 @@ cap-std = "4"
 cap-fs-ext = "4"
 eventsource-stream = "0.2"
 futures-util = "0.3"
+jsonschema = { version = "0.47", default-features = false }
 keyring = "4"
 lumen-core = { path = "../lumen-core" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
@@ -17,10 +18,12 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
+toml = "0.9"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["process", "resource", "signal"] }
+nix = { version = "0.30", features = ["fs", "process", "resource", "signal"] }
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
