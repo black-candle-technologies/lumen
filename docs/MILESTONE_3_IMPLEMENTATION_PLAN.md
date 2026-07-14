@@ -129,14 +129,14 @@ docs/
 
 **Files:** `crates/lumen-extension-sdk/src/lib.rs`, `crates/lumen-extension-sdk/examples/subprocess_tool.rs`, `crates/lumen-integrations/src/{extension_process,sandbox}.rs`, `crates/lumen-integrations/tests/{extension_process,extension_conformance,local_executors}.rs`
 
-- [ ] Add failing protocol tests for one four-byte big-endian frame, protocol/request/nonce correlation, exact one response, trailing data, malformed UTF-8/JSON, oversized frames/stdout/stderr, nonzero exit, crash, timeout, and cancellation.
-- [ ] Add failing sandbox tests proving the plugin profile mounts the executable and loader files only, with no workspace, home, Lumen data, package directory, inherited environment, network, or write access.
-- [ ] Add failing process-tree tests for deadline/cancellation termination and distinct resource-exhaustion outcomes.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement bounded SDK frame helpers and the one-shot subprocess fixture.
-- [ ] Implement the plugin-specific sandbox request/profile and supervisor with digest recheck, empty environment, fresh nonce, bounded diagnostic redaction, and typed outcomes.
-- [ ] Run the shared conformance suite, focused tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(extensions): supervise native plugin processes`.
+- [x] Add failing protocol tests for one four-byte big-endian frame, protocol/request/nonce correlation, exact one response, trailing data, malformed UTF-8/JSON, oversized frames/stdout/stderr, nonzero exit, crash, timeout, and cancellation.
+- [x] Add failing sandbox tests proving the plugin profile mounts the executable and loader files only, with no workspace, home, Lumen data, package directory, inherited environment, network, or write access.
+- [x] Add failing process-tree tests for deadline/cancellation termination and distinct resource-exhaustion outcomes.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement bounded SDK frame helpers and the one-shot subprocess fixture.
+- [x] Implement the plugin-specific sandbox request/profile and supervisor with digest recheck, empty environment, fresh nonce, bounded diagnostic redaction, and typed outcomes.
+- [x] Run the shared conformance suite, focused tests, formatting, and strict Clippy.
+- [x] Commit as `feat(extensions): supervise native plugin processes`.
 
 ## Task 8: Approval-Bound Invocation And Child Proposals
 

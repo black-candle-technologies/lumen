@@ -13,7 +13,7 @@ use std::{
 use serde::Serialize;
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::Notify,
 };
@@ -82,6 +82,13 @@ impl ResourceLimits {
 
     pub const fn processes(self) -> u64 {
         self.processes
+    }
+
+    pub const fn with_max_address_space(mut self, max_bytes: u64) -> Self {
+        if max_bytes < self.address_space_bytes {
+            self.address_space_bytes = max_bytes;
+        }
+        self
     }
 }
 
@@ -202,7 +209,15 @@ async fn execute_system_sandbox(
     let workspace = command.current_directory().ok_or_else(|| {
         SandboxError::InvalidRequest("sandboxed commands require a working directory".into())
     })?;
-    let profile = macos_profile(command.program(), workspace);
+    if request.profile() == SandboxProfile::Plugin && !command.environment().is_empty() {
+        return Err(SandboxError::InvalidRequest(
+            "plugin sandbox environment must be empty".into(),
+        ));
+    }
+    let profile = match request.profile() {
+        SandboxProfile::WorkspaceReadOnly => macos_workspace_profile(command.program(), workspace),
+        SandboxProfile::Plugin => macos_plugin_profile(command.program()),
+    };
     let monitored = MonitoredCommand::new(executable)
         .args(
             ["-p".to_owned(), profile, "--".to_owned()]
@@ -214,12 +229,13 @@ async fn execute_system_sandbox(
         )
         .current_dir(workspace)
         .envs(command.environment().clone());
-    ProcessMonitor::run(
+    ProcessMonitor::run_with_stdin(
         monitored,
         request.timeout(),
         request.output_limit(),
         request.cancellation(),
         request.resource_limits(),
+        request.stdin().map(ToOwned::to_owned),
     )
     .await
 }
@@ -229,19 +245,20 @@ async fn execute_system_sandbox(
     executable: PathBuf,
     request: SandboxRequest,
 ) -> Result<SandboxOutput, SandboxError> {
-    let monitored = linux_bubblewrap_command(executable, request.command())?;
-    ProcessMonitor::run(
+    let monitored = linux_bubblewrap_command(executable, request.command(), request.profile())?;
+    ProcessMonitor::run_with_stdin(
         monitored,
         request.timeout(),
         request.output_limit(),
         request.cancellation(),
         request.resource_limits(),
+        request.stdin().map(ToOwned::to_owned),
     )
     .await
 }
 
 #[cfg(target_os = "macos")]
-fn macos_profile(program: &Path, workspace: &Path) -> String {
+fn macos_workspace_profile(program: &Path, workspace: &Path) -> String {
     let program = sandbox_literal(program);
     let workspace = sandbox_literal(workspace);
     format!(
@@ -251,6 +268,24 @@ fn macos_profile(program: &Path, workspace: &Path) -> String {
          (allow file-read* (literal \"/\"))\n\
          (allow file-read* (literal \"{program}\"))\n\
          (allow file-read* (subpath \"{workspace}\"))\n\
+         (allow file-read* (subpath \"/System/Library\"))\n\
+         (allow file-read* (subpath \"/usr/lib\"))\n\
+         (allow file-read* (subpath \"/private/var/db/dyld\"))"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_plugin_profile(program: &Path) -> String {
+    let program = sandbox_literal(program);
+    format!(
+        "(version 1)\n\
+         (deny default)\n\
+         (allow process-exec (literal \"{program}\"))\n\
+         (allow sysctl-read\n\
+             (sysctl-name \"hw.pagesize_compat\")\n\
+             (sysctl-name \"machdep.ptrauth_enabled\"))\n\
+         (allow file-read* (literal \"/\"))\n\
+         (allow file-read* (literal \"{program}\"))\n\
          (allow file-read* (subpath \"/System/Library\"))\n\
          (allow file-read* (subpath \"/usr/lib\"))\n\
          (allow file-read* (subpath \"/private/var/db/dyld\"))"
@@ -309,6 +344,7 @@ fn linux_sandbox_report(_executable: PathBuf) -> SandboxReport {
 fn linux_bubblewrap_command(
     executable: PathBuf,
     command: &MonitoredCommand,
+    profile: SandboxProfile,
 ) -> Result<MonitoredCommand, SandboxError> {
     let workspace = command.current_directory().ok_or_else(|| {
         SandboxError::InvalidRequest("sandboxed commands require a working directory".into())
@@ -343,10 +379,14 @@ fn linux_bubblewrap_command(
         "--ro-bind".into(),
         command.program().to_string_lossy().into_owned(),
         "/lumen/program".into(),
-        "--ro-bind".into(),
-        workspace.to_string_lossy().into_owned(),
-        "/workspace".into(),
     ];
+    if profile == SandboxProfile::WorkspaceReadOnly {
+        arguments.extend([
+            "--ro-bind".into(),
+            workspace.to_string_lossy().into_owned(),
+            "/workspace".into(),
+        ]);
+    }
     for library_directory in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
         if Path::new(library_directory).is_dir() {
             arguments.extend([
@@ -365,14 +405,20 @@ fn linux_bubblewrap_command(
             "/etc/ld.so.cache".into(),
         ]);
     }
-    arguments.extend([
-        "--setenv".into(),
-        "HOME".into(),
-        "/workspace".into(),
-        "--setenv".into(),
-        "TMPDIR".into(),
-        "/tmp".into(),
-    ]);
+    if profile == SandboxProfile::WorkspaceReadOnly {
+        arguments.extend([
+            "--setenv".into(),
+            "HOME".into(),
+            "/workspace".into(),
+            "--setenv".into(),
+            "TMPDIR".into(),
+            "/tmp".into(),
+        ]);
+    } else if !command.environment().is_empty() {
+        return Err(SandboxError::InvalidRequest(
+            "plugin sandbox environment must be empty".into(),
+        ));
+    }
     for (name, value) in command.environment() {
         if name.is_empty()
             || name.contains('=')
@@ -385,7 +431,15 @@ fn linux_bubblewrap_command(
         }
         arguments.extend(["--setenv".into(), name.clone(), value.clone()]);
     }
-    arguments.extend(["--chdir".into(), "/workspace".into(), "--".into()]);
+    arguments.extend([
+        "--chdir".into(),
+        if profile == SandboxProfile::WorkspaceReadOnly {
+            "/workspace".into()
+        } else {
+            "/tmp".into()
+        },
+        "--".into(),
+    ]);
     arguments.push("/lumen/program".into());
     arguments.extend(command.arguments().iter().cloned());
 
@@ -404,6 +458,7 @@ fn probe_linux_bubblewrap(executable: &Path) -> bool {
     let Ok(command) = linux_bubblewrap_command(
         executable.to_path_buf(),
         &MonitoredCommand::new("/bin/true").current_dir(workspace),
+        SandboxProfile::WorkspaceReadOnly,
     ) else {
         return false;
     };
@@ -545,6 +600,14 @@ pub struct SandboxRequest {
     output_limit: usize,
     cancellation: CancellationToken,
     resource_limits: ResourceLimits,
+    profile: SandboxProfile,
+    stdin: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxProfile {
+    WorkspaceReadOnly,
+    Plugin,
 }
 
 impl SandboxRequest {
@@ -561,7 +624,19 @@ impl SandboxRequest {
             output_limit,
             cancellation,
             resource_limits,
+            profile: SandboxProfile::WorkspaceReadOnly,
+            stdin: None,
         }
+    }
+
+    pub fn with_profile(mut self, profile: SandboxProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    pub fn with_stdin(mut self, stdin: Vec<u8>) -> Self {
+        self.stdin = Some(stdin);
+        self
     }
 
     pub fn command(&self) -> &MonitoredCommand {
@@ -586,6 +661,14 @@ impl SandboxRequest {
 
     pub const fn resource_limits(&self) -> ResourceLimits {
         self.resource_limits
+    }
+
+    pub const fn profile(&self) -> SandboxProfile {
+        self.profile
+    }
+
+    pub fn stdin(&self) -> Option<&[u8]> {
+        self.stdin.as_deref()
     }
 }
 
@@ -646,6 +729,7 @@ impl MonitoredCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxOutput {
     exit_code: Option<i32>,
+    termination_signal: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -654,6 +738,7 @@ impl SandboxOutput {
     pub fn new(exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         Self {
             exit_code,
+            termination_signal: None,
             stdout,
             stderr,
         }
@@ -661,6 +746,19 @@ impl SandboxOutput {
 
     pub const fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    pub fn terminated_by_signal(signal: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        Self {
+            exit_code: None,
+            termination_signal: Some(signal),
+            stdout,
+            stderr,
+        }
+    }
+
+    pub const fn termination_signal(&self) -> Option<i32> {
+        self.termination_signal
     }
 
     pub fn stdout(&self) -> &[u8] {
@@ -682,6 +780,25 @@ impl ProcessMonitor {
         cancellation: CancellationToken,
         resource_limits: ResourceLimits,
     ) -> Result<SandboxOutput, SandboxError> {
+        Self::run_with_stdin(
+            command,
+            timeout,
+            output_limit,
+            cancellation,
+            resource_limits,
+            None,
+        )
+        .await
+    }
+
+    pub async fn run_with_stdin(
+        command: MonitoredCommand,
+        timeout: Duration,
+        output_limit: usize,
+        cancellation: CancellationToken,
+        resource_limits: ResourceLimits,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<SandboxOutput, SandboxError> {
         if output_limit == 0 {
             return Err(SandboxError::OutputLimitExceeded { limit: 0 });
         }
@@ -692,6 +809,11 @@ impl ProcessMonitor {
             .env_clear()
             .envs(command.environment())
             .kill_on_drop(true)
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if let Some(directory) = command.current_directory() {
@@ -712,6 +834,16 @@ impl ProcessMonitor {
             .spawn()
             .map_err(|error| SandboxError::Spawn(error.to_string()))?;
         let process_id = child.id();
+        let stdin_task = match stdin {
+            Some(input) => {
+                let mut writer = child.stdin.take().ok_or(SandboxError::MissingPipe)?;
+                Some(tokio::spawn(async move {
+                    let _ = writer.write_all(&input).await;
+                    let _ = writer.shutdown().await;
+                }))
+            }
+            None => None,
+        };
         let stdout = child.stdout.take().ok_or(SandboxError::MissingPipe)?;
         let stderr = child.stderr.take().ok_or(SandboxError::MissingPipe)?;
         let total = Arc::new(AtomicUsize::new(0));
@@ -762,6 +894,9 @@ impl ProcessMonitor {
         let stderr = stderr_task
             .await
             .map_err(|error| SandboxError::Read(error.to_string()))??;
+        if let Some(task) = stdin_task {
+            let _ = task.await;
+        }
 
         match termination {
             Termination::Cancelled => Err(SandboxError::Cancelled),
@@ -774,11 +909,22 @@ impl ProcessMonitor {
                     limit: output_limit,
                 })
             }
-            Termination::Exited => Ok(SandboxOutput::new(
-                status.and_then(|value| value.code()),
-                stdout,
-                stderr,
-            )),
+            Termination::Exited => {
+                let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
+                #[cfg(unix)]
+                let termination_signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.as_ref().and_then(ExitStatusExt::signal)
+                };
+                #[cfg(not(unix))]
+                let termination_signal = None;
+                Ok(SandboxOutput {
+                    exit_code,
+                    termination_signal,
+                    stdout,
+                    stderr,
+                })
+            }
         }
     }
 }
@@ -918,8 +1064,12 @@ mod tests {
             .current_dir("/home/operator/workspace")
             .envs(BTreeMap::from([("LANG".into(), "C".into())]));
 
-        let wrapped = linux_bubblewrap_command(PathBuf::from("/usr/bin/bwrap"), &command)
-            .expect("Linux profile builds");
+        let wrapped = linux_bubblewrap_command(
+            PathBuf::from("/usr/bin/bwrap"),
+            &command,
+            SandboxProfile::WorkspaceReadOnly,
+        )
+        .expect("Linux profile builds");
         let arguments = wrapped.arguments();
 
         assert_eq!(wrapped.program(), Path::new("/usr/bin/bwrap"));
@@ -960,6 +1110,77 @@ mod tests {
         );
         assert_eq!(arguments.last().map(String::as_str), Some("--version"));
         assert!(wrapped.environment().is_empty());
+    }
+
+    #[test]
+    fn linux_plugin_profile_has_no_workspace_home_or_inherited_environment() {
+        let command = MonitoredCommand::new("/lumen-data/plugins/example/tool")
+            .current_dir("/lumen-data/plugins/example");
+        let wrapped = linux_bubblewrap_command(
+            PathBuf::from("/usr/bin/bwrap"),
+            &command,
+            SandboxProfile::Plugin,
+        )
+        .expect("plugin profile builds");
+        let arguments = wrapped.arguments();
+
+        assert!(arguments.windows(3).any(|values| {
+            values
+                == [
+                    "--ro-bind",
+                    "/lumen-data/plugins/example/tool",
+                    "/lumen/program",
+                ]
+        }));
+        assert!(!arguments.iter().any(|value| value == "/workspace"));
+        assert!(!arguments.iter().any(|value| value == "HOME"));
+        assert!(!arguments.iter().any(|value| value == "TMPDIR"));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|values| values == ["--chdir", "/tmp"])
+        );
+        assert!(wrapped.environment().is_empty());
+
+        let invalid = MonitoredCommand::new("/usr/bin/example")
+            .current_dir("/")
+            .envs(BTreeMap::from([("SECRET".into(), "value".into())]));
+        assert!(matches!(
+            linux_bubblewrap_command(
+                PathBuf::from("/usr/bin/bwrap"),
+                &invalid,
+                SandboxProfile::Plugin,
+            ),
+            Err(SandboxError::InvalidRequest(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plugin_profile_exposes_only_executable_and_system_loader_roots() {
+        let profile = macos_plugin_profile(Path::new("/lumen-data/plugins/example/tool"));
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(allow process-exec"));
+        assert!(profile.contains("/lumen-data/plugins/example/tool"));
+        assert!(!profile.contains("/workspace"));
+        assert!(!profile.contains("network"));
+        assert!(!profile.contains("file-write"));
+    }
+
+    #[tokio::test]
+    async fn process_monitor_writes_exact_stdin_without_inheriting_terminal_input() {
+        let output = ProcessMonitor::run_with_stdin(
+            MonitoredCommand::new("/bin/cat").current_dir("/"),
+            Duration::from_secs(1),
+            1024,
+            CancellationToken::new(),
+            ResourceLimits::new(1, 64 * 1024 * 1024, 1024, 16, 2).unwrap(),
+            Some(b"framed input".to_vec()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.stdout(), b"framed input");
+        assert_eq!(output.stderr(), b"");
     }
 
     #[test]

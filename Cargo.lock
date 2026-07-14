@@ -3109,6 +3109,7 @@ dependencies = [
  "cap-std",
  "eventsource-stream",
  "futures-util",
+ "getrandom 0.4.2",
  "jsonschema",
  "keyring",
  "lumen-core",

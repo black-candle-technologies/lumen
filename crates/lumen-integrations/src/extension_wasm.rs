@@ -7,17 +7,8 @@ use std::{
     time::Duration,
 };
 
-use lumen_core::{
-    action::{ActionKind, CanonicalValue},
-    extension::{
-        ExtensionFailure, ExtensionFailureClass, ExtensionInvocationLimits, ExtensionResponse,
-        Sha256Digest,
-    },
-};
-use lumen_extension_sdk::{
-    FailureClass as WireFailureClass, InvocationRequest, InvocationResponse,
-    Response as WireResponse, WireContractError,
-};
+use lumen_core::extension::{ExtensionInvocationLimits, ExtensionResponse, Sha256Digest};
+use lumen_extension_sdk::{InvocationRequest, InvocationResponse, WireContractError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
@@ -27,6 +18,8 @@ use wasmtime::component::{
     types::{ComponentItem, Type},
 };
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
+
+use crate::extension_protocol::wire_response_to_core;
 
 const MAX_COMPONENT_INSTANCES: usize = 64;
 const MAX_COMPONENT_MEMORIES: usize = 4;
@@ -159,7 +152,7 @@ impl WasmComponentHost {
             InvocationResponse::decode_bounded(&encoded_response, limits.max_result_bytes())?
                 .validate_for(expected_protocol, &expected_request_id)
                 .map_err(WasmHostError::from)?;
-        wire_response_to_core(response)
+        wire_response_to_core(response).map_err(|_| WasmHostError::InvalidResponse)
     }
 
     fn get_or_compile(
@@ -251,32 +244,6 @@ fn verify_digest(expected: &Sha256Digest, bytes: &[u8]) -> Result<(), WasmHostEr
         return Err(WasmHostError::ArtifactDigestMismatch);
     }
     Ok(())
-}
-
-fn wire_response_to_core(response: WireResponse) -> Result<ExtensionResponse, WasmHostError> {
-    match response {
-        WireResponse::Result { value } => Ok(ExtensionResponse::result(canonical_value(value)?)),
-        WireResponse::Proposal { kind, arguments } => Ok(ExtensionResponse::proposal(
-            ActionKind::new(kind).map_err(|_| WasmHostError::InvalidResponse)?,
-            canonical_value(arguments)?,
-        )),
-        WireResponse::Failure { failure } => {
-            let class = match failure.class() {
-                WireFailureClass::PluginFault => ExtensionFailureClass::PluginFault,
-                WireFailureClass::HostFault => ExtensionFailureClass::HostFault,
-                WireFailureClass::PolicyDenied => ExtensionFailureClass::PolicyDenied,
-                WireFailureClass::Cancelled => ExtensionFailureClass::Cancelled,
-                WireFailureClass::ResourceExhaustion => ExtensionFailureClass::ResourceExhaustion,
-            };
-            let failure = ExtensionFailure::new(class, failure.message())
-                .map_err(|_| WasmHostError::InvalidResponse)?;
-            Ok(ExtensionResponse::failure(failure))
-        }
-    }
-}
-
-fn canonical_value(value: serde_json::Value) -> Result<CanonicalValue, WasmHostError> {
-    serde_json::from_value(value).map_err(|_| WasmHostError::InvalidResponse)
 }
 
 fn validate_world(engine: &Engine, component: &Component) -> Result<(), WasmHostError> {
@@ -390,7 +357,9 @@ impl From<WireContractError> for WasmHostError {
             | WireContractError::InvalidComponentId
             | WireContractError::InvalidDeadline
             | WireContractError::InvalidFailure
-            | WireContractError::InvalidJson => Self::InvalidResponse,
+            | WireContractError::InvalidJson
+            | WireContractError::InvalidNonce
+            | WireContractError::NonceMismatch => Self::InvalidResponse,
         }
     }
 }

@@ -8,6 +8,7 @@ cap-std = "4"
 cap-fs-ext = "4"
 eventsource-stream = "0.2"
 futures-util = "0.3"
+getrandom = "0.4"
 jsonschema = { version = "0.47", default-features = false }
 keyring = "4"
 lumen-core = { path = "../lumen-core" }
