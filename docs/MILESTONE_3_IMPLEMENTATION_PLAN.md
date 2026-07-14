@@ -142,14 +142,14 @@ docs/
 
 **Files:** `crates/lumen-core/src/{extension,run}.rs`, `crates/lumen-core/tests/run_orchestrator.rs`, `crates/lumen-cli/src/{runtime,extension_runtime}.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`, `crates/lumen-db/src/extensions.rs`
 
-- [ ] Add failing tests proving no host byte executes before a persisted, policy-evaluated, approved where required, pre-audited, reserved `plugin.invoke` action with exact provenance.
-- [ ] Add failing end-to-end tests for WASM and subprocess results plus returned filesystem/process action proposals re-entering normalization, budgets, capability intersection, approval, execution, and audit as attributed child actions.
-- [ ] Add failing tests for disabled/missing/tampered/quarantined versions, undeclared action kinds, broader normalized requirements, late responses, changed settings/grants, cancellation, unknown recovery, and no automatic non-idempotent retry.
-- [ ] Add failing tests for three counted faults in ten minutes, workspace-only health quarantine, global artifact quarantine, exclusions for policy denial/user cancellation, approval-bound release, and cancellation of active invocations when a material grant is revoked or their workspace/version enters quarantine.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Compose a host router behind `ExecutorPort`, pin immutable invocation context, normalize plugin responses as child work, persist failure accounting, and emit exact audit provenance.
-- [ ] Run both host conformance suites, end-to-end security tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(runtime): invoke plugins through the action lifecycle`.
+- [x] Add failing tests proving no host byte executes before a persisted, policy-evaluated, approved where required, pre-audited, reserved `plugin.invoke` action with exact provenance.
+- [x] Add failing end-to-end tests for WASM and subprocess results plus returned filesystem/process action proposals re-entering normalization, budgets, capability intersection, approval, execution, and audit as attributed child actions.
+- [x] Add failing tests for disabled/missing/tampered/quarantined versions, undeclared action kinds, broader normalized requirements, late responses, changed settings/grants, cancellation, unknown recovery, and no automatic non-idempotent retry.
+- [x] Add failing tests for three counted faults in ten minutes, workspace-only health quarantine, global artifact quarantine, exclusions for policy denial/user cancellation, approval-bound release, and cancellation of active invocations when a material grant is revoked or their workspace/version enters quarantine.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Compose a host router behind `ExecutorPort`, pin immutable invocation context, normalize plugin responses as child work, persist failure accounting, and emit exact audit provenance.
+- [x] Run both host conformance suites, end-to-end security tests, formatting, and strict Clippy.
+- [x] Commit as `feat(runtime): invoke plugins through the action lifecycle`.
 
 ## Task 9: Authenticated Plugin API
 

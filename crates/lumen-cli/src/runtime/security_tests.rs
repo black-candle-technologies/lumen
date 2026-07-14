@@ -26,8 +26,8 @@ use lumen_db::{Database, SecretReference, StagedPluginPackage};
 use lumen_integrations::{
     extension_package::PackageStager,
     sandbox::{
-        SandboxBackend, SandboxError, SandboxFuture, SandboxOutput, SandboxReport, SandboxRequest,
-        SandboxStrength,
+        SandboxBackend, SandboxError, SandboxFuture, SandboxOutput, SandboxProfile, SandboxReport,
+        SandboxRequest, SandboxStrength,
     },
     secrets::{InMemorySecretStore, SecretStore},
 };
@@ -42,7 +42,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use super::{LocalRuntimeService, RedactingExecutor, now};
+use super::{LocalRuntimeService, PluginInvocationCommand, RedactingExecutor, now};
 use crate::{
     config::Config,
     extension_runtime::{
@@ -59,6 +59,7 @@ struct RecordingSandbox {
     environments: Arc<StdMutex<Vec<BTreeMap<String, String>>>>,
     output: Arc<StdMutex<SandboxOutput>>,
     wait_for_cancellation: bool,
+    plugin_response: Option<lumen_extension_sdk::Response>,
 }
 
 impl RecordingSandbox {
@@ -72,6 +73,7 @@ impl RecordingSandbox {
                 Vec::new(),
             ))),
             wait_for_cancellation: false,
+            plugin_response: None,
         }
     }
 
@@ -94,6 +96,11 @@ impl RecordingSandbox {
         self.wait_for_cancellation = true;
         self
     }
+
+    fn with_plugin_response(mut self, response: lumen_extension_sdk::Response) -> Self {
+        self.plugin_response = Some(response);
+        self
+    }
 }
 
 impl SandboxBackend for RecordingSandbox {
@@ -107,7 +114,30 @@ impl SandboxBackend for RecordingSandbox {
             .lock()
             .expect("sandbox environment lock")
             .push(request.environment().clone());
-        let output = self.output.lock().expect("sandbox output lock").clone();
+        let output = if request.profile() == SandboxProfile::Plugin
+            && let Some(response) = self.plugin_response.clone()
+        {
+            let request: lumen_extension_sdk::SubprocessRequest =
+                lumen_extension_sdk::decode_frame(
+                    request.stdin().expect("plugin request frame"),
+                    lumen_extension_sdk::MAX_FRAME_BYTES,
+                )
+                .expect("decode plugin request");
+            let invocation = request.invocation();
+            let response =
+                lumen_extension_sdk::InvocationResponse::new(invocation.request_id(), response)
+                    .expect("invocation response");
+            let response = lumen_extension_sdk::SubprocessResponse::new(request.nonce(), response)
+                .expect("subprocess response");
+            SandboxOutput::new(
+                Some(0),
+                lumen_extension_sdk::encode_frame(&response, lumen_extension_sdk::MAX_FRAME_BYTES)
+                    .expect("encode plugin response"),
+                Vec::new(),
+            )
+        } else {
+            self.output.lock().expect("sandbox output lock").clone()
+        };
         let cancellation = request.cancellation();
         if self.wait_for_cancellation {
             Box::pin(async move {
@@ -155,19 +185,46 @@ struct Harness {
 
 impl Harness {
     async fn new(model: &MockServer, prepare_workspace: impl FnOnce(&std::path::Path)) -> Self {
-        Self::new_inner(model, prepare_workspace, None).await.0
+        Self::new_inner(model, prepare_workspace, None, None)
+            .await
+            .0
+    }
+
+    async fn new_with_plugin_response(
+        model: &MockServer,
+        prepare_workspace: impl FnOnce(&std::path::Path),
+        response: lumen_extension_sdk::Response,
+    ) -> Self {
+        Self::new_inner(
+            model,
+            prepare_workspace,
+            None,
+            Some(RecordingSandbox::new().with_plugin_response(response)),
+        )
+        .await
+        .0
+    }
+
+    async fn new_with_sandbox(
+        model: &MockServer,
+        prepare_workspace: impl FnOnce(&std::path::Path),
+        sandbox: RecordingSandbox,
+    ) -> Self {
+        Self::new_inner(model, prepare_workspace, None, Some(sandbox))
+            .await
+            .0
     }
 
     async fn new_with_secret(
         model: &MockServer,
         setup: SecretSetup,
     ) -> (Self, SecretReference, Arc<InMemorySecretStore>) {
-        let (harness, reference, store) = Self::new_inner(model, |_| {}, Some(setup)).await;
+        let (harness, reference, store) = Self::new_inner(model, |_| {}, Some(setup), None).await;
         (harness, reference.expect("secret reference"), store)
     }
 
     async fn new_with_cancellable_process(model: &MockServer) -> Self {
-        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None).await;
+        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None, None).await;
         let sandbox = RecordingSandbox::new().waiting_for_cancellation();
         let config = Config::parse(&format!(
             r#"
@@ -233,6 +290,7 @@ subject = "operator"
         model: &MockServer,
         prepare_workspace: impl FnOnce(&std::path::Path),
         secret: Option<SecretSetup>,
+        sandbox_override: Option<RecordingSandbox>,
     ) -> (Self, Option<SecretReference>, Arc<InMemorySecretStore>) {
         let directory = tempfile::tempdir().expect("temporary runtime");
         let workspace = directory.path().join("workspace");
@@ -303,19 +361,23 @@ subject = "operator"
             None
         };
         let events = EventBroker::new(128);
-        let sandbox = match &reference {
-            Some(_) => RecordingSandbox::new().with_stdout(
-                secret_store
-                    .resolve(
-                        reference
-                            .as_ref()
-                            .expect("secret reference")
-                            .keychain_account(),
-                    )
-                    .await
-                    .expect("secret output"),
-            ),
-            None => RecordingSandbox::new(),
+        let sandbox = if let Some(sandbox) = sandbox_override {
+            sandbox
+        } else {
+            match &reference {
+                Some(_) => RecordingSandbox::new().with_stdout(
+                    secret_store
+                        .resolve(
+                            reference
+                                .as_ref()
+                                .expect("secret reference")
+                                .keychain_account(),
+                        )
+                        .await
+                        .expect("secret output"),
+                ),
+                None => RecordingSandbox::new(),
+            }
         };
         let service = Arc::new(
             LocalRuntimeService::build_with_secret_store(
@@ -496,6 +558,134 @@ artifact = "{digest}"
     .expect("manifest");
 }
 
+fn write_subprocess_extension_package(root: &std::path::Path) {
+    use sha2::{Digest, Sha256};
+
+    std::fs::create_dir_all(root.join("schemas")).expect("schemas");
+    let artifact = b"#!/bin/sh\nexit 0\n";
+    let artifact_path = root.join("plugin-bin");
+    std::fs::write(&artifact_path, artifact).expect("artifact");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&artifact_path, std::fs::Permissions::from_mode(0o755))
+            .expect("executable permissions");
+    }
+    std::fs::write(
+        root.join("schemas/input.json"),
+        r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"#,
+    )
+    .expect("input schema");
+    std::fs::write(root.join("schemas/output.json"), r#"{"type":"object"}"#)
+        .expect("output schema");
+    let digest = format!("{:x}", Sha256::digest(artifact));
+    std::fs::write(
+        root.join("lumen-plugin.toml"),
+        format!(
+            r#"manifest_version = 1
+id = "dev.example.subprocess"
+name = "Subprocess Fixture"
+version = "1.0.0"
+description = "Subprocess fixture"
+[runtime]
+type = "subprocess"
+entrypoint = "plugin-bin"
+protocol_version = 1
+[[components]]
+id = "reader"
+kind = "tool"
+description = "Read a file through a returned action"
+input_schema = "schemas/input.json"
+output_schema = "schemas/output.json"
+action_kinds = ["filesystem.read", "process.spawn"]
+[[components.capabilities]]
+name = "fs.read"
+scope = "workspace"
+[[components.capabilities]]
+name = "process.spawn"
+scope = "workspace"
+[integrity]
+algorithm = "sha256"
+artifact = "{digest}"
+"#,
+        ),
+    )
+    .expect("manifest");
+}
+
+fn wasm_response_component(response: &lumen_extension_sdk::InvocationResponse) -> Vec<u8> {
+    let encoded = response.encode().expect("response encoding");
+    let data = encoded
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("\\{byte:02x}"))
+        .collect::<String>();
+    wat::parse_str(format!(
+        r#"(component
+            (core module $guest
+                (memory (export "memory") 1)
+                (data (i32.const 1024) "{data}")
+                (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+                    i32.const 4096)
+                (func (export "invoke") (param i32 i32) (result i32)
+                    i32.const 512
+                    i32.const 1024
+                    i32.store
+                    i32.const 512
+                    i32.const {length}
+                    i32.store offset=4
+                    i32.const 512))
+            (core instance $guest-instance (instantiate $guest))
+            (alias core export $guest-instance "memory" (core memory $memory))
+            (alias core export $guest-instance "cabi_realloc" (core func $realloc))
+            (alias core export $guest-instance "invoke" (core func $core-invoke))
+            (type $invoke-type (func (param "request" string) (result string)))
+            (func $invoke (type $invoke-type)
+                (canon lift (core func $core-invoke)
+                    (memory $memory)
+                    (realloc $realloc)))
+            (export "invoke" (func $invoke)))"#,
+        length = encoded.len()
+    ))
+    .expect("WASM response component")
+}
+
+fn write_wasm_extension_package(root: &std::path::Path, artifact: &[u8]) {
+    use sha2::{Digest, Sha256};
+
+    std::fs::create_dir_all(root.join("schemas")).expect("schemas");
+    std::fs::write(root.join("plugin.wasm"), artifact).expect("artifact");
+    std::fs::write(root.join("schemas/input.json"), r#"{"type":"object"}"#).expect("input schema");
+    std::fs::write(root.join("schemas/output.json"), r#"{"type":"object"}"#)
+        .expect("output schema");
+    let digest = format!("{:x}", Sha256::digest(artifact));
+    std::fs::write(
+        root.join("lumen-plugin.toml"),
+        format!(
+            r#"manifest_version = 1
+id = "dev.example.wasm"
+name = "WASM Fixture"
+version = "1.0.0"
+description = "WASM fixture"
+[runtime]
+type = "wasm-component"
+entrypoint = "plugin.wasm"
+protocol_version = 1
+[[components]]
+id = "echo"
+kind = "tool"
+description = "Return a bounded result"
+input_schema = "schemas/input.json"
+output_schema = "schemas/output.json"
+[integrity]
+algorithm = "sha256"
+artifact = "{digest}"
+"#,
+        ),
+    )
+    .expect("manifest");
+}
+
 async fn stage_lifecycle_fixture(harness: &Harness) -> (StagedPluginPackage, std::path::PathBuf) {
     stage_lifecycle_version(harness, "1.0.0", b"approved component bytes").await
 }
@@ -538,6 +728,70 @@ async fn stage_lifecycle_version(
         .await
         .expect("persist stage");
     (record, staged.quarantine_path().to_path_buf())
+}
+
+async fn stage_subprocess_fixture(harness: &Harness) -> StagedPluginPackage {
+    let source = harness._directory.path().join("subprocess-plugin-source");
+    std::fs::create_dir(&source).expect("source");
+    write_subprocess_extension_package(&source);
+    let data_root = std::fs::canonicalize(harness._directory.path().join("runtime"))
+        .expect("canonical data root");
+    let staged = PackageStager::default()
+        .stage(&source, data_root.join("plugins/quarantine"))
+        .expect("stage");
+    let record = StagedPluginPackage::new(
+        uuid::Uuid::new_v4(),
+        staged.manifest().clone(),
+        staged
+            .quarantine_path()
+            .strip_prefix(&data_root)
+            .expect("relative quarantine")
+            .to_string_lossy(),
+        staged.files().clone(),
+        staged.package_digest().clone(),
+        staged.manifest_digest().clone(),
+        PrincipalId::new("local", "operator").expect("principal"),
+        now(),
+    )
+    .expect("staged record");
+    harness
+        .database
+        .insert_staged_plugin_package(&record)
+        .await
+        .expect("persist stage");
+    record
+}
+
+async fn stage_wasm_fixture(harness: &Harness, artifact: &[u8]) -> StagedPluginPackage {
+    let source = harness._directory.path().join("wasm-plugin-source");
+    std::fs::create_dir(&source).expect("source");
+    write_wasm_extension_package(&source, artifact);
+    let data_root = std::fs::canonicalize(harness._directory.path().join("runtime"))
+        .expect("canonical data root");
+    let staged = PackageStager::default()
+        .stage(&source, data_root.join("plugins/quarantine"))
+        .expect("stage");
+    let record = StagedPluginPackage::new(
+        uuid::Uuid::new_v4(),
+        staged.manifest().clone(),
+        staged
+            .quarantine_path()
+            .strip_prefix(&data_root)
+            .expect("relative quarantine")
+            .to_string_lossy(),
+        staged.files().clone(),
+        staged.package_digest().clone(),
+        staged.manifest_digest().clone(),
+        PrincipalId::new("local", "operator").expect("principal"),
+        now(),
+    )
+    .expect("staged record");
+    harness
+        .database
+        .insert_staged_plugin_package(&record)
+        .await
+        .expect("persist stage");
+    record
 }
 
 async fn request_install(harness: &Harness, staged: &StagedPluginPackage) -> String {
@@ -590,6 +844,71 @@ async fn request_admin_action(
         .to_string()
 }
 
+async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage {
+    let staged = stage_subprocess_fixture(harness).await;
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+    let install_run = request_install(harness, &staged).await;
+    approve_pending(harness).await;
+    wait_for_action_state(harness, &install_run, "succeeded").await;
+
+    let fs_grant = GrantInput {
+        name: "fs.read".into(),
+        scope: CanonicalValue::object([
+            ("type", CanonicalValue::from("workspace")),
+            (
+                "workspace_id",
+                CanonicalValue::from(harness.workspace_id.to_string()),
+            ),
+        ]),
+    };
+    let executable = std::fs::canonicalize("/bin/echo")
+        .expect("echo executable")
+        .to_string_lossy()
+        .into_owned();
+    let process_grant = GrantInput {
+        name: "process.spawn".into(),
+        scope: CanonicalValue::object([
+            ("type", CanonicalValue::from("exact")),
+            ("resource_type", CanonicalValue::from("executable")),
+            ("value", CanonicalValue::from(executable)),
+        ]),
+    };
+    for (scope_type, scope_id) in [
+        ("global", "*".to_owned()),
+        ("workspace", harness.workspace_id.to_string()),
+    ] {
+        let arguments = GrantArguments {
+            plugin_id: plugin_id.clone(),
+            plugin_version: version.clone(),
+            component_id: "reader".into(),
+            scope_type: scope_type.into(),
+            scope_id,
+            expected_revision: None,
+            grants: vec![fs_grant.clone(), process_grant.clone()],
+        };
+        let run = request_admin_action(
+            harness,
+            "plugin.capabilities.set",
+            &plugin_id,
+            &version,
+            &arguments,
+        )
+        .await;
+        approve_pending(harness).await;
+        wait_for_action_state(harness, &run, "succeeded").await;
+    }
+    let target = VersionArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+    };
+    let enable_run =
+        request_admin_action(harness, "plugin.enable", &plugin_id, &version, &target).await;
+    approve_pending(harness).await;
+    wait_for_action_state(harness, &enable_run, "succeeded").await;
+    staged
+}
+
 async fn approve_pending(harness: &Harness) {
     let approval_id = harness.pending_approval_id().await;
     let response = harness
@@ -615,7 +934,13 @@ async fn wait_for_action_state(harness: &Harness, run_id: &str, expected: &str) 
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("action for run {run_id} did not reach {expected}");
+    let actual: Option<(String, String)> =
+        sqlx::query_as("SELECT kind, state FROM actions WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_optional(harness.database.pool())
+            .await
+            .expect("final action state");
+    panic!("action for run {run_id} did not reach {expected}: {actual:?}");
 }
 
 fn final_response(text: &str) -> ResponseTemplate {
@@ -1137,6 +1462,472 @@ async fn plugin_lifecycle_changes_all_dispatch_as_actions() {
     .expect("incomplete actions");
     assert_eq!(incomplete, 0);
     harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn subprocess_invocation_and_returned_action_share_the_reserved_action_lifecycle() {
+    let model = MockServer::start().await;
+    let harness = Harness::new_with_plugin_response(
+        &model,
+        |workspace| {
+            std::fs::write(workspace.join("note.txt"), "approved contents")
+                .expect("workspace fixture");
+        },
+        lumen_extension_sdk::Response::proposal(
+            "filesystem.read",
+            serde_json::json!({"path": "note.txt"}),
+        ),
+    )
+    .await;
+    let staged = install_and_enable_subprocess(&harness).await;
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+
+    let run_id = harness
+        .service
+        .request_plugin_invocation(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("principal"),
+            &plugin_id,
+            &version,
+            "reader",
+            serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                .expect("canonical input"),
+        )
+        .await
+        .expect("request invocation")
+        .to_string();
+    for _ in 0..150 {
+        let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("run state");
+        if state == "completed" {
+            break;
+        }
+        if state == "failed" {
+            let actions: Vec<(String, String)> = sqlx::query_as(
+                "SELECT kind, state FROM actions WHERE run_id = ? ORDER BY created_at, id",
+            )
+            .bind(&run_id)
+            .fetch_all(harness.database.pool())
+            .await
+            .expect("failed invocation actions");
+            let events = harness.sse_until(&run_id, "run.failed").await;
+            panic!("invocation run failed with actions {actions:?}: {events}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let actions: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT kind, state, id, extension_provenance_json FROM actions
+         WHERE run_id = ? ORDER BY created_at, id",
+    )
+    .bind(&run_id)
+    .fetch_all(harness.database.pool())
+    .await
+    .expect("invocation actions");
+    assert_eq!(actions.len(), 2);
+    assert!(actions.iter().all(|(_, state, _, _)| state == "succeeded"));
+    let invocation = actions
+        .iter()
+        .find(|(kind, _, _, _)| kind == "plugin.invoke")
+        .expect("invocation action");
+    let child = actions
+        .iter()
+        .find(|(kind, _, _, _)| kind == "filesystem.read")
+        .expect("child action");
+    let invocation_id = &invocation.2;
+    let child_provenance: serde_json::Value =
+        serde_json::from_str(child.3.as_deref().expect("child provenance"))
+            .expect("provenance JSON");
+    assert_eq!(
+        child_provenance["parent_action_id"].as_str(),
+        Some(invocation_id.as_str())
+    );
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_attempts WHERE action_id = ? AND state = 'succeeded'",
+    )
+    .bind(invocation_id)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("reserved invocation attempt");
+    assert_eq!(attempts, 1);
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn plugin_process_proposal_requires_child_approval_and_exact_executable_grant() {
+    let model = MockServer::start().await;
+    let harness = Harness::new_with_plugin_response(
+        &model,
+        |_| {},
+        lumen_extension_sdk::Response::proposal(
+            "process.spawn",
+            serde_json::json!({"program": "/bin/echo", "args": ["hello"]}),
+        ),
+    )
+    .await;
+    let staged = install_and_enable_subprocess(&harness).await;
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+    let run_id = harness
+        .service
+        .request_plugin_invocation(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("principal"),
+            &plugin_id,
+            &version,
+            "reader",
+            serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                .expect("canonical input"),
+        )
+        .await
+        .expect("request invocation")
+        .to_string();
+    let approval_id = harness.pending_approval_id().await;
+    let response = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    for _ in 0..100 {
+        let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("run state");
+        if state == "completed" {
+            break;
+        }
+        assert_ne!(state, "failed", "process proposal run failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let actions: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind, state FROM actions WHERE run_id = ? ORDER BY kind")
+            .bind(&run_id)
+            .fetch_all(harness.database.pool())
+            .await
+            .expect("actions");
+    assert_eq!(
+        actions,
+        vec![
+            ("plugin.invoke".into(), "succeeded".into()),
+            ("process.spawn".into(), "succeeded".into())
+        ]
+    );
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn wasm_invocation_returns_a_schema_validated_result_after_reservation() {
+    let model = MockServer::start().await;
+    let request_id = uuid::Uuid::new_v4();
+    let response = lumen_extension_sdk::InvocationResponse::new(
+        request_id.to_string(),
+        lumen_extension_sdk::Response::result(serde_json::json!({"status": "ok"})),
+    )
+    .expect("response");
+    let artifact = wasm_response_component(&response);
+    let harness = Harness::new(&model, |_| {}).await;
+    let staged = stage_wasm_fixture(&harness, &artifact).await;
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+
+    let install_run = request_install(&harness, &staged).await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &install_run, "succeeded").await;
+    let target = VersionArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+    };
+    let enable_run =
+        request_admin_action(&harness, "plugin.enable", &plugin_id, &version, &target).await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &enable_run, "succeeded").await;
+
+    let run_id = harness
+        .service
+        .request_plugin_invocation_request(PluginInvocationCommand {
+            workspace_id: harness.workspace_id,
+            actor: PrincipalId::new("local", "operator").expect("principal"),
+            plugin_id: plugin_id.clone(),
+            plugin_version: version.clone(),
+            component_id: "echo".into(),
+            request_id,
+            input: CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        })
+        .await
+        .expect("request invocation")
+        .to_string();
+    for _ in 0..150 {
+        let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("run state");
+        if state == "completed" {
+            break;
+        }
+        assert_ne!(state, "failed", "WASM invocation run failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let action: (String, String) =
+        sqlx::query_as("SELECT id, state FROM actions WHERE run_id = ? AND kind = 'plugin.invoke'")
+            .bind(&run_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("invocation action");
+    assert_eq!(action.1, "succeeded");
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_attempts WHERE action_id = ? AND state = 'succeeded'",
+    )
+    .bind(action.0)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("reserved invocation attempt");
+    assert_eq!(attempts, 1);
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn tampered_installed_artifact_is_globally_quarantined_before_host_entry() {
+    let model = MockServer::start().await;
+    let harness = Harness::new_with_plugin_response(
+        &model,
+        |_| {},
+        lumen_extension_sdk::Response::result(serde_json::json!({"status": "ok"})),
+    )
+    .await;
+    let staged = install_and_enable_subprocess(&harness).await;
+    let plugin = staged.manifest().id().clone();
+    let version = staged.manifest().version().clone();
+    let installed = harness
+        .database
+        .installed_plugin_version(plugin.clone(), version.clone())
+        .await
+        .expect("installed lookup")
+        .expect("installed version");
+    let artifact = harness
+        ._directory
+        .path()
+        .join("runtime")
+        .join(installed.artifact_path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o755))
+            .expect("unseal test artifact");
+    }
+    std::fs::write(&artifact, b"tampered bytes").expect("tamper artifact");
+
+    let run_id = harness
+        .service
+        .request_plugin_invocation(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("principal"),
+            plugin.as_str(),
+            version.as_str(),
+            "reader",
+            serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                .expect("canonical input"),
+        )
+        .await
+        .expect("request invocation")
+        .to_string();
+    wait_for_action_state(&harness, &run_id, "failed").await;
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 0);
+    let installed = harness
+        .database
+        .installed_plugin_version(plugin.clone(), version.clone())
+        .await
+        .expect("installed lookup")
+        .expect("installed version");
+    assert!(installed.is_artifact_quarantined());
+    assert_eq!(
+        harness
+            .database
+            .plugin_workspace_state(harness.workspace_id, plugin.clone(), version.clone())
+            .await
+            .expect("workspace state"),
+        Some(lumen_db::PluginWorkspaceState::Disabled)
+    );
+    assert!(
+        harness
+            .service
+            .request_plugin_invocation(
+                harness.workspace_id,
+                PrincipalId::new("local", "operator").expect("principal"),
+                plugin.as_str(),
+                version.as_str(),
+                "reader",
+                serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                    .expect("canonical input"),
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn three_guest_faults_health_quarantine_only_the_invoking_workspace() {
+    let model = MockServer::start().await;
+    let guest_failure = lumen_extension_sdk::Failure::new(
+        lumen_extension_sdk::FailureClass::Cancelled,
+        "guest-declared cancellation",
+    )
+    .expect("guest failure");
+    let harness = Harness::new_with_plugin_response(
+        &model,
+        |_| {},
+        lumen_extension_sdk::Response::failure(guest_failure),
+    )
+    .await;
+    let staged = install_and_enable_subprocess(&harness).await;
+    let plugin = staged.manifest().id().clone();
+    let version = staged.manifest().version().clone();
+    for _ in 0..3 {
+        let run_id = harness
+            .service
+            .request_plugin_invocation(
+                harness.workspace_id,
+                PrincipalId::new("local", "operator").expect("principal"),
+                plugin.as_str(),
+                version.as_str(),
+                "reader",
+                serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                    .expect("canonical input"),
+            )
+            .await
+            .expect("request invocation")
+            .to_string();
+        wait_for_action_state(&harness, &run_id, "failed").await;
+    }
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        harness
+            .database
+            .plugin_workspace_state(harness.workspace_id, plugin.clone(), version.clone())
+            .await
+            .expect("workspace state"),
+        Some(lumen_db::PluginWorkspaceState::HealthQuarantine)
+    );
+    let counted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plugin_failures WHERE plugin_id = ? AND counted = 1",
+    )
+    .bind(plugin.as_str())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("counted failures");
+    assert_eq!(counted, 3);
+    let installed = harness
+        .database
+        .installed_plugin_version(plugin.clone(), version.clone())
+        .await
+        .expect("installed lookup")
+        .expect("installed version");
+    assert!(!installed.is_artifact_quarantined());
+    assert!(
+        harness
+            .service
+            .request_plugin_invocation(
+                harness.workspace_id,
+                PrincipalId::new("local", "operator").expect("principal"),
+                plugin.as_str(),
+                version.as_str(),
+                "reader",
+                serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                    .expect("canonical input"),
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn material_grant_revocation_cancels_active_invocation_without_health_penalty() {
+    let model = MockServer::start().await;
+    let sandbox = RecordingSandbox::new().waiting_for_cancellation();
+    let harness = Harness::new_with_sandbox(&model, |_| {}, sandbox).await;
+    let staged = install_and_enable_subprocess(&harness).await;
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+    let invocation_run = harness
+        .service
+        .request_plugin_invocation(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("principal"),
+            &plugin_id,
+            &version,
+            "reader",
+            serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                .expect("canonical input"),
+        )
+        .await
+        .expect("request invocation")
+        .to_string();
+    for _ in 0..100 {
+        if harness.sandbox.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 1);
+
+    let revoke = GrantArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+        component_id: "reader".into(),
+        scope_type: "workspace".into(),
+        scope_id: harness.workspace_id.to_string(),
+        expected_revision: Some(1),
+        grants: Vec::new(),
+    };
+    let revoke_run = request_admin_action(
+        &harness,
+        "plugin.capabilities.set",
+        &plugin_id,
+        &version,
+        &revoke,
+    )
+    .await;
+    approve_pending(&harness).await;
+    wait_for_action_state(&harness, &revoke_run, "succeeded").await;
+    for _ in 0..100 {
+        let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(&invocation_run)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("invocation state");
+        if state == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let cancellation: (String, i64) = sqlx::query_as(
+        "SELECT failure_class, counted FROM plugin_failures WHERE plugin_id = ? ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(&plugin_id)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("cancellation failure record");
+    assert_eq!(cancellation, ("cancelled".into(), 0));
+    assert_eq!(
+        harness
+            .database
+            .plugin_workspace_state(
+                harness.workspace_id,
+                lumen_core::extension::PluginId::parse(&plugin_id).expect("plugin"),
+                lumen_core::extension::PluginVersion::parse(&version).expect("version"),
+            )
+            .await
+            .expect("workspace state"),
+        Some(lumen_db::PluginWorkspaceState::Enabled)
+    );
 }
 
 async fn mount_response(model: &MockServer, response: ResponseTemplate) {

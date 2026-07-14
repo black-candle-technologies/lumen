@@ -92,6 +92,19 @@ fn plugin_operator_commands_have_explicit_local_grammar() {
     assert!(
         Cli::try_parse_from(["lumen", "plugin", "enable", "dev.example.fixture", "1.0.0",]).is_ok()
     );
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "plugin",
+            "invoke",
+            "dev.example.fixture",
+            "1.0.0",
+            "echo",
+            "--input",
+            "input.json",
+        ])
+        .is_ok()
+    );
 }
 
 #[tokio::test]

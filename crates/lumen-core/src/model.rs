@@ -1,5 +1,6 @@
 use std::{future::Future, pin::Pin};
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::action::CanonicalValue;
@@ -59,7 +60,7 @@ pub enum ModelOutput {
     Action(ActionProposal),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActionProposal {
     kind: String,
     arguments: CanonicalValue,

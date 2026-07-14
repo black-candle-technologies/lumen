@@ -12,6 +12,7 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 lumen-core = { path = "../lumen-core" }
 lumen-db = { path = "../lumen-db" }
+lumen-extension-sdk = { path = "../lumen-extension-sdk" }
 lumen-integrations = { path = "../lumen-integrations" }
 lumen-server = { path = "../lumen-server" }
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +33,4 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
+wat = "1"

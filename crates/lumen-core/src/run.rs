@@ -11,9 +11,10 @@ use crate::{
     action::{ActionEnvelope, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, DispatchError, TimestampMillis, authorize_dispatch},
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
-    capability::EffectiveCapabilities,
+    capability::{Capability, CapabilitySet, EffectiveCapabilities},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorPort},
-    identity::{PrincipalId, WorkspaceId},
+    extension::{AttributedActionProposal, ExtensionProvenance},
+    identity::{ComponentId, PrincipalId, WorkspaceId},
     model::{
         ActionProposal, ModelError, ModelInput, ModelMessage, ModelOutput, ModelPort, ModelRole,
     },
@@ -123,6 +124,7 @@ pub struct RunState {
     model_turns: u32,
     actions: u32,
     pending_action: Option<PendingAction>,
+    pending_extension_proposal: Option<AttributedActionProposal>,
     terminal_outcome: Option<RunOutcome>,
     started: bool,
     cancelled: bool,
@@ -142,6 +144,7 @@ impl RunState {
             model_turns: 0,
             actions: 0,
             pending_action: None,
+            pending_extension_proposal: None,
             terminal_outcome: None,
             started: false,
             cancelled: false,
@@ -168,6 +171,19 @@ impl RunState {
 struct PendingAction {
     action: ActionEnvelope,
     approval_id: ApprovalId,
+}
+
+struct ChildAttribution {
+    provenance: ExtensionProvenance,
+    effective_grants: Vec<Capability>,
+}
+
+enum NextOutput {
+    FinalText(String),
+    Action {
+        proposal: ActionProposal,
+        attribution: Option<Box<ChildAttribution>>,
+    },
 }
 
 pub struct RunOrchestrator<'a> {
@@ -271,25 +287,44 @@ impl<'a> RunOrchestrator<'a> {
                 }
             }
 
-            if state.model_turns >= state.budget.max_model_turns {
-                return self
-                    .exhaust_budget(state, BudgetKind::ModelTurns, now)
-                    .await;
-            }
-            let generation = self.model.generate(ModelInput::new(state.messages.clone()));
-            let output = match self.wall_time_remaining(state) {
-                Some(remaining) => match tokio::time::timeout(remaining, generation).await {
-                    Ok(output) => output?,
-                    Err(_) => {
-                        return self.exhaust_budget(state, BudgetKind::WallClock, now).await;
-                    }
-                },
-                None => generation.await?,
+            let output = if let Some(proposal) = state.pending_extension_proposal.take() {
+                let (proposal, provenance, _declared_action_kinds, effective_grants) =
+                    proposal.into_parts();
+                NextOutput::Action {
+                    proposal,
+                    attribution: Some(Box::new(ChildAttribution {
+                        provenance,
+                        effective_grants,
+                    })),
+                }
+            } else {
+                if state.model_turns >= state.budget.max_model_turns {
+                    return self
+                        .exhaust_budget(state, BudgetKind::ModelTurns, now)
+                        .await;
+                }
+                let generation = self.model.generate(ModelInput::new(state.messages.clone()));
+                let output = match self.wall_time_remaining(state) {
+                    Some(remaining) => match tokio::time::timeout(remaining, generation).await {
+                        Ok(output) => output?,
+                        Err(_) => {
+                            return self.exhaust_budget(state, BudgetKind::WallClock, now).await;
+                        }
+                    },
+                    None => generation.await?,
+                };
+                state.model_turns += 1;
+                match output {
+                    ModelOutput::FinalText(text) => NextOutput::FinalText(text),
+                    ModelOutput::Action(proposal) => NextOutput::Action {
+                        proposal,
+                        attribution: None,
+                    },
+                }
             };
-            state.model_turns += 1;
 
             match output {
-                ModelOutput::FinalText(text) => {
+                NextOutput::FinalText(text) => {
                     self.audit(
                         state,
                         AuditEventKind::RunCompleted,
@@ -299,7 +334,10 @@ impl<'a> RunOrchestrator<'a> {
                     .await?;
                     return Ok(state.finish(RunOutcome::Completed { text }));
                 }
-                ModelOutput::Action(proposal) => {
+                NextOutput::Action {
+                    proposal,
+                    attribution,
+                } => {
                     if state.actions >= state.budget.max_actions {
                         return self.exhaust_budget(state, BudgetKind::Actions, now).await;
                     }
@@ -311,6 +349,20 @@ impl<'a> RunOrchestrator<'a> {
                     )
                     .await?;
                     let action = self.normalizer.normalize(&state.context, proposal)?;
+                    let (action, evaluation_capabilities) = match attribution {
+                        Some(attribution) => (
+                            action
+                                .with_requesting_component(
+                                    ComponentId::new("runtime.extensions")
+                                        .expect("static component ID"),
+                                )
+                                .with_extension_provenance(attribution.provenance),
+                            capabilities
+                                .clone()
+                                .with_layer(CapabilitySet::new(attribution.effective_grants)),
+                        ),
+                        None => (action, capabilities.clone()),
+                    };
                     state.actions += 1;
                     self.actions.persist(&action, now).await?;
                     self.audit(
@@ -321,7 +373,7 @@ impl<'a> RunOrchestrator<'a> {
                     )
                     .await?;
 
-                    let decision = self.policy.evaluate(&action, capabilities);
+                    let decision = self.policy.evaluate(&action, &evaluation_capabilities);
                     match &decision {
                         PolicyDecision::Deny(reason) => {
                             self.audit(
@@ -555,6 +607,32 @@ impl<'a> RunOrchestrator<'a> {
                 state
                     .messages
                     .push(ModelMessage::new(ModelRole::Tool, result));
+                Ok(None)
+            }
+            ExecutionOutcome::Proposed(proposal) => {
+                self.audit(
+                    state,
+                    AuditEventKind::ExecutionSucceeded,
+                    AuditOutcome::Success,
+                    now,
+                )
+                .await?;
+                let captured = serde_json::to_vec(&proposal)
+                    .expect("attributed extension proposal serialization cannot fail")
+                    .len();
+                if captured
+                    > state
+                        .budget
+                        .max_captured_result_bytes
+                        .saturating_sub(state.captured_result_bytes)
+                {
+                    return Ok(Some(
+                        self.exhaust_budget(state, BudgetKind::CapturedResultBytes, now)
+                            .await?,
+                    ));
+                }
+                state.captured_result_bytes += captured;
+                state.pending_extension_proposal = Some(*proposal);
                 Ok(None)
             }
             ExecutionOutcome::Failed(message) => {

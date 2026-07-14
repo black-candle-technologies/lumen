@@ -14,6 +14,7 @@ use lumen_core::{
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
+    extension::{PluginComponentId, PluginId, PluginVersion},
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort},
     policy::{Policy, PolicyVersion},
     run::{
@@ -43,7 +44,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::extension_runtime::{
-    ExtensionActionNormalizer, ExtensionAdminExecutor, is_extension_action,
+    ExtensionActionNormalizer, ExtensionExecutor, InvocationTarget, action_proposal,
+    invocation_capability, is_extension_action, prepare_invocation,
 };
 use crate::{CliError, config::Config};
 
@@ -56,9 +58,11 @@ pub(crate) struct LocalRuntimeService {
     audit: Arc<DatabaseAudit>,
     actions: Arc<DatabaseActions>,
     database: Database,
+    data_root: Arc<Path>,
     events: EventBroker,
     policy: Policy,
     policy_version: PolicyVersion,
+    ambient_capabilities: CapabilitySet,
     capabilities: EffectiveCapabilities,
     budget: RunBudget,
     runs: Arc<Mutex<BTreeMap<RunId, StoredRun>>>,
@@ -66,6 +70,16 @@ pub(crate) struct LocalRuntimeService {
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     redactor: Arc<SecretRedactor>,
+}
+
+struct PluginInvocationCommand {
+    workspace_id: lumen_core::identity::WorkspaceId,
+    actor: lumen_core::identity::PrincipalId,
+    plugin_id: String,
+    plugin_version: String,
+    component_id: String,
+    request_id: uuid::Uuid,
+    input: CanonicalValue,
 }
 
 impl LocalRuntimeService {
@@ -95,21 +109,22 @@ impl LocalRuntimeService {
         let secret_references = database
             .list_secret_references(config.workspace_id())
             .await?;
+        let resource_limits = ResourceLimits::new(
+            config.process.max_cpu_seconds,
+            config.process.max_address_space_bytes,
+            config.process.max_file_size_bytes,
+            config.process.max_open_files,
+            config.process.max_processes,
+        )
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
         let process = ProcessExecutor::new(
             &workspace,
             allowed_programs.clone(),
             config.process.allowed_environment.clone(),
             Duration::from_secs(config.process.timeout_seconds),
             config.process.max_output_bytes,
-            ResourceLimits::new(
-                config.process.max_cpu_seconds,
-                config.process.max_address_space_bytes,
-                config.process.max_file_size_bytes,
-                config.process.max_open_files,
-                config.process.max_processes,
-            )
-            .map_err(|error| CliError::Runtime(error.to_string()))?,
-            sandbox,
+            resource_limits,
+            Arc::clone(&sandbox),
         )
         .map_err(|error| CliError::Runtime(error.to_string()))?;
         let filesystem = WorkspaceReader::with_limits(
@@ -131,8 +146,16 @@ impl LocalRuntimeService {
         let builtin_executor: Arc<dyn ExecutorPort> = Arc::new(
             BuiltinExecutor::new(filesystem.clone(), process).with_secret_resolver(secret_resolver),
         );
-        let extension_executor: Arc<dyn ExecutorPort> =
-            Arc::new(ExtensionAdminExecutor::new(database.clone(), data_root));
+        let extension_executor: Arc<dyn ExecutorPort> = Arc::new(
+            ExtensionExecutor::new(
+                database.clone(),
+                data_root.clone(),
+                sandbox,
+                resource_limits,
+                config.process.max_output_bytes,
+            )
+            .map_err(CliError::Runtime)?,
+        );
         let executor = RedactingExecutor {
             inner: Arc::new(RoutingExecutor {
                 builtin: builtin_executor,
@@ -179,6 +202,7 @@ impl LocalRuntimeService {
                     .map_err(|error| CliError::Runtime(error.to_string()))?,
             ));
         }
+        let ambient_capabilities = CapabilitySet::new(grants);
         Ok(Self {
             model: Arc::new(model),
             normalizer: Arc::new(normalizer),
@@ -187,10 +211,12 @@ impl LocalRuntimeService {
             audit: Arc::new(DatabaseAudit(database.clone())),
             actions: Arc::new(DatabaseActions(database.clone())),
             database,
+            data_root: Arc::from(data_root),
             events,
             policy: Policy::default(),
             policy_version: PolicyVersion::new("local-policy-v1").expect("static policy version"),
-            capabilities: EffectiveCapabilities::new([CapabilitySet::new(grants)]),
+            capabilities: EffectiveCapabilities::new([ambient_capabilities.clone()]),
+            ambient_capabilities,
             budget: RunBudget::new(config.runtime.max_model_turns, config.runtime.max_actions)
                 .with_quotas(
                     Duration::from_secs(config.runtime.max_wall_time_seconds),
@@ -396,6 +422,74 @@ impl LocalRuntimeService {
             .map_err(|error| ServiceError::Internal(error.to_string()))?;
         self.spawn_advance(run_id).await;
         Ok(run_id)
+    }
+
+    pub(crate) async fn request_plugin_invocation(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        actor: lumen_core::identity::PrincipalId,
+        plugin_id: &str,
+        plugin_version: &str,
+        component_id: &str,
+        input: CanonicalValue,
+    ) -> Result<RunId, ServiceError> {
+        self.request_plugin_invocation_request(PluginInvocationCommand {
+            workspace_id,
+            actor,
+            plugin_id: plugin_id.to_owned(),
+            plugin_version: plugin_version.to_owned(),
+            component_id: component_id.to_owned(),
+            request_id: uuid::Uuid::new_v4(),
+            input,
+        })
+        .await
+    }
+
+    async fn request_plugin_invocation_request(
+        &self,
+        command: PluginInvocationCommand,
+    ) -> Result<RunId, ServiceError> {
+        let plugin = PluginId::parse(&command.plugin_id)
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+        let version = PluginVersion::parse(&command.plugin_version)
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+        let component = PluginComponentId::parse(&command.component_id)
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+        let arguments = prepare_invocation(
+            &self.database,
+            self.data_root.as_ref(),
+            InvocationTarget {
+                workspace: command.workspace_id,
+                actor: command.actor.clone(),
+                plugin,
+                version,
+                component,
+                request_id: command.request_id,
+            },
+            command.input,
+        )
+        .await
+        .map_err(ServiceError::Conflict)?;
+        let capability = invocation_capability(
+            &command.plugin_id,
+            &command.plugin_version,
+            &command.component_id,
+        )
+        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+        let mut run_capabilities = self
+            .ambient_capabilities
+            .capabilities()
+            .cloned()
+            .collect::<Vec<_>>();
+        run_capabilities.push(capability);
+        self.request_extension_action(
+            command.workspace_id,
+            command.actor,
+            action_proposal("plugin.invoke", &arguments)
+                .map_err(|error| ServiceError::Conflict(error.to_string()))?,
+            CapabilitySet::new(run_capabilities),
+        )
+        .await
     }
 }
 
@@ -694,6 +788,7 @@ impl ExecutorPort for RedactingExecutor {
                     self.redactor.redact_value(&mut value);
                     ExecutionOutcome::Succeeded(value)
                 }
+                ExecutionOutcome::Proposed(proposal) => ExecutionOutcome::Proposed(proposal),
                 ExecutionOutcome::Failed(mut message) => {
                     self.redactor.redact_string(&mut message);
                     ExecutionOutcome::Failed(message)
@@ -707,6 +802,7 @@ impl ExecutorPort for RedactingExecutor {
             };
             let state = match &outcome {
                 ExecutionOutcome::Succeeded(_) => "succeeded",
+                ExecutionOutcome::Proposed(_) => "succeeded",
                 ExecutionOutcome::Failed(_) => "failed",
                 ExecutionOutcome::Cancelled => "cancelled",
                 ExecutionOutcome::TimedOut => "timed_out",

@@ -175,6 +175,11 @@ impl ActionEnvelope {
         self
     }
 
+    pub fn with_requesting_component(mut self, component: ComponentId) -> Self {
+        self.requesting_component = component;
+        self
+    }
+
     pub fn required_capabilities(&self) -> &[Capability] {
         &self.required_capabilities
     }

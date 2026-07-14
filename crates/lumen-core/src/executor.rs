@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     action::{ActionEnvelope, CanonicalValue},
     approval::DispatchAuthorization,
+    extension::AttributedActionProposal,
 };
 
 pub type ExecutorFuture<'a> =
@@ -45,6 +46,7 @@ impl AuthorizedAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionOutcome {
     Succeeded(CanonicalValue),
+    Proposed(Box<AttributedActionProposal>),
     Failed(String),
     Cancelled,
     TimedOut,

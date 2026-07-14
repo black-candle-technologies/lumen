@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::{
     action::{ActionId, ActionKind, CanonicalValue},
     capability::{Capability, CapabilityName},
+    model::ActionProposal,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -604,6 +605,56 @@ pub enum ExtensionResponse {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AttributedActionProposal {
+    proposal: ActionProposal,
+    provenance: ExtensionProvenance,
+    declared_action_kinds: Vec<ActionKind>,
+    effective_grants: Vec<Capability>,
+}
+
+impl AttributedActionProposal {
+    pub fn new(
+        proposal: ActionProposal,
+        provenance: ExtensionProvenance,
+        mut declared_action_kinds: Vec<ActionKind>,
+        mut effective_grants: Vec<Capability>,
+    ) -> Result<Self, InvocationContractError> {
+        declared_action_kinds.sort_unstable();
+        declared_action_kinds.dedup();
+        if !declared_action_kinds
+            .iter()
+            .any(|kind| kind.as_str() == proposal.kind())
+        {
+            return Err(InvocationContractError::UndeclaredActionKind);
+        }
+        effective_grants.sort_unstable();
+        effective_grants.dedup();
+        Ok(Self {
+            proposal,
+            provenance,
+            declared_action_kinds,
+            effective_grants,
+        })
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ActionProposal,
+        ExtensionProvenance,
+        Vec<ActionKind>,
+        Vec<Capability>,
+    ) {
+        (
+            self.proposal,
+            self.provenance,
+            self.declared_action_kinds,
+            self.effective_grants,
+        )
+    }
+}
+
 impl ExtensionResponse {
     pub const fn result(value: CanonicalValue) -> Self {
         Self::Result { value }
@@ -624,6 +675,8 @@ pub enum InvocationContractError {
     InvalidLimits,
     #[error("extension failure text must be non-empty, bounded, and free of controls")]
     InvalidFailure,
+    #[error("extension proposed an action kind it did not declare")]
+    UndeclaredActionKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -685,6 +738,11 @@ impl ExtensionProvenance {
 
     pub fn with_grant_set_digest(mut self, digest: Sha256Digest) -> Self {
         self.grant_set_digest = digest;
+        self
+    }
+
+    pub fn with_parent_action_id(mut self, action_id: ActionId) -> Self {
+        self.parent_action_id = Some(action_id);
         self
     }
 

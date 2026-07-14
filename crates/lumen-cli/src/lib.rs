@@ -80,6 +80,13 @@ pub enum PluginCommand {
         plugin_id: String,
         version: String,
     },
+    Invoke {
+        plugin_id: String,
+        version: String,
+        component_id: String,
+        #[arg(long)]
+        input: PathBuf,
+    },
     CapabilitiesSet {
         plugin_id: String,
         version: String,
@@ -355,6 +362,38 @@ async fn execute_plugin_command(
                 requested_capabilities,
             })
         }
+        PluginCommand::Invoke {
+            plugin_id,
+            version,
+            component_id,
+            input,
+        } => {
+            let input: CanonicalValue = serde_json::from_slice(&std::fs::read(input)?)
+                .map_err(|error| CliError::Runtime(format!("invalid plugin input: {error}")))?;
+            let sandbox: Arc<dyn SandboxBackend> = Arc::new(SystemSandbox::detect());
+            let service = runtime::LocalRuntimeService::build_with_secret_store(
+                config,
+                database.clone(),
+                EventBroker::new(64),
+                sandbox,
+                Vec::new(),
+                secret_store,
+            )
+            .await?;
+            let run_id = service
+                .request_plugin_invocation(
+                    config.workspace_id(),
+                    config.bootstrap_principal(),
+                    &plugin_id,
+                    &version,
+                    &component_id,
+                    input,
+                )
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            service.shutdown().await;
+            CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
+        }
         command => {
             let (proposal, plugin_id, version) =
                 extension_action_proposal(config, &database, command).await?;
@@ -557,7 +596,9 @@ async fn extension_action_proposal(
                 version,
             )
         }
-        PluginCommand::Stage { .. } | PluginCommand::Review { .. } => {
+        PluginCommand::Stage { .. }
+        | PluginCommand::Review { .. }
+        | PluginCommand::Invoke { .. } => {
             return Err(CliError::Runtime(
                 "command is not an extension action".into(),
             ));

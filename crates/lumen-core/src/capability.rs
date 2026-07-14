@@ -228,6 +228,10 @@ impl CapabilitySet {
     pub fn allows(&self, requested: &Capability) -> bool {
         self.0.iter().any(|grant| grant.allows(requested))
     }
+
+    pub fn capabilities(&self) -> impl Iterator<Item = &Capability> {
+        self.0.iter()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -241,6 +245,11 @@ impl EffectiveCapabilities {
 
     pub fn allows(&self, requested: &Capability) -> bool {
         !self.0.is_empty() && self.0.iter().all(|layer| layer.allows(requested))
+    }
+
+    pub fn with_layer(mut self, layer: CapabilitySet) -> Self {
+        self.0.push(layer);
+        self
     }
 }
 

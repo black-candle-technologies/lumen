@@ -187,6 +187,10 @@ impl PluginGrantRevision {
     pub fn allows(&self, capability: &Capability) -> bool {
         self.grants.allows(capability)
     }
+
+    pub fn capabilities(&self) -> impl Iterator<Item = &Capability> {
+        self.grants.capabilities()
+    }
 }
 
 impl PluginGrantScope {
@@ -814,14 +818,6 @@ impl Database {
             if requested != 1 {
                 return Err(RepositoryError::PluginGrantConflict);
             }
-            if matches!(scope, PluginGrantScope::Global)
-                && !matches!(
-                    grant.scope(),
-                    ResourceScope::Workspace { .. } | ResourceScope::Path { .. }
-                )
-            {
-                return Err(RepositoryError::PluginGrantConflict);
-            }
         }
         if let PluginGrantScope::Workspace(workspace_id) = &scope {
             let latest_global: i64 = sqlx::query_scalar(
@@ -861,12 +857,16 @@ impl Database {
             let global = CapabilitySet::new(global);
             if grants.iter().any(|grant| {
                 !global.allows(grant)
-                    || !matches!(
-                        grant.scope(),
-                        ResourceScope::Workspace { workspace_id: grant_workspace }
-                            | ResourceScope::Path { workspace_id: grant_workspace, .. }
-                            if grant_workspace == workspace_id
-                    )
+                    || match grant.scope() {
+                        ResourceScope::Workspace {
+                            workspace_id: grant_workspace,
+                        }
+                        | ResourceScope::Path {
+                            workspace_id: grant_workspace,
+                            ..
+                        } => grant_workspace != workspace_id,
+                        ResourceScope::Exact { .. } => false,
+                    }
             }) {
                 return Err(RepositoryError::PluginGrantConflict);
             }

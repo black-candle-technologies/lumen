@@ -3035,6 +3035,7 @@ dependencies = [
  "http-body-util",
  "lumen-core",
  "lumen-db",
+ "lumen-extension-sdk",
  "lumen-integrations",
  "lumen-server",
  "serde",
@@ -3049,6 +3050,7 @@ dependencies = [
  "tower",
  "url",
  "uuid",
+ "wat",
  "wiremock",
 ]
 

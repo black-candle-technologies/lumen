@@ -46,10 +46,14 @@ kind = "tool"
 description = "Read status"
 input_schema = "schemas/input.json"
 output_schema = "schemas/output.json"
-action_kinds = ["filesystem.read"]
+action_kinds = ["filesystem.read", "process.spawn"]
 
 [[components.capabilities]]
 name = "fs.read"
+scope = "workspace"
+
+[[components.capabilities]]
+name = "process.spawn"
 scope = "workspace"
 
 [integrity]
@@ -494,7 +498,12 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
         CapabilityName::FsRead,
         ResourceScope::workspace(workspace_id()),
     );
-    let fs_read_digest = canonical_grant_set_digest(std::slice::from_ref(&fs_read));
+    let process_spawn = Capability::new(
+        CapabilityName::ProcessSpawn,
+        ResourceScope::exact("executable", "/usr/bin/echo").expect("scope"),
+    );
+    let global_grants = vec![fs_read.clone(), process_spawn.clone()];
+    let fs_read_digest = canonical_grant_set_digest(&global_grants);
     let revision = database
         .append_plugin_grant_revision(
             plugin.clone(),
@@ -502,7 +511,7 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
             component.clone(),
             PluginGrantScope::Global,
             None,
-            vec![fs_read.clone()],
+            global_grants,
             fs_read_digest,
             TimestampMillis::new(1_200),
         )
@@ -577,6 +586,11 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
         .expect("grant revision");
     assert_eq!(loaded_grants.revision(), 1);
     assert!(loaded_grants.allows(&fs_read));
+    assert!(loaded_grants.allows(&process_spawn));
+    assert_eq!(
+        loaded_grants.capabilities().cloned().collect::<Vec<_>>(),
+        vec![fs_read.clone(), process_spawn]
+    );
     let loaded_setting = database
         .latest_plugin_setting(
             plugin.clone(),

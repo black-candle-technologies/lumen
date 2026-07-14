@@ -16,6 +16,10 @@ use lumen_core::{
         WorkspacePath,
     },
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
+    extension::{
+        AttributedActionProposal, ExtensionProvenance, PluginComponentId, PluginId, PluginRuntime,
+        PluginVersion, ProtocolVersion, Sha256Digest,
+    },
     identity::{ComponentId, PrincipalId, WorkspaceId},
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelOutput, ModelPort},
     policy::{DenialReason, Policy, PolicyVersion},
@@ -298,6 +302,207 @@ impl ActionPort for CountingActions {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
+}
+
+#[derive(Default)]
+struct RecordingActions(Mutex<Vec<ActionEnvelope>>);
+
+impl ActionPort for RecordingActions {
+    fn persist<'a>(
+        &'a self,
+        action: &'a ActionEnvelope,
+        _now: TimestampMillis,
+    ) -> ActionFuture<'a> {
+        self.0
+            .lock()
+            .expect("recorded actions lock")
+            .push(action.clone());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn digest(byte: char) -> Sha256Digest {
+    Sha256Digest::parse(byte.to_string().repeat(64)).expect("digest")
+}
+
+fn child_provenance(parent: ActionId) -> ExtensionProvenance {
+    ExtensionProvenance::new(
+        PluginId::parse("dev.example.fixture").expect("plugin"),
+        PluginVersion::parse("1.0.0").expect("version"),
+        PluginComponentId::parse("writer").expect("component"),
+        PluginRuntime::WasmComponent,
+        digest('1'),
+        digest('2'),
+        digest('3'),
+        digest('4'),
+        digest('5'),
+        ProtocolVersion::new(1).expect("protocol"),
+        Some(parent),
+    )
+}
+
+#[tokio::test]
+async fn extension_proposal_reenters_action_budget_policy_approval_and_audit() {
+    let parent = ActionId::new();
+    let child = AttributedActionProposal::new(
+        ActionProposal::new(
+            "filesystem.write",
+            CanonicalValue::object([("path", CanonicalValue::from("notes/today.md"))]),
+        ),
+        child_provenance(parent),
+        vec![ActionKind::new("filesystem.write").expect("kind")],
+        vec![Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::path(
+                workspace_id(),
+                WorkspacePath::parse("notes/today.md").expect("path"),
+            ),
+        )],
+    )
+    .expect("attributed proposal");
+    let model = FakeModel::new([
+        proposal("filesystem.read"),
+        ModelOutput::FinalText("done".into()),
+    ]);
+    let executor = FakeExecutor::new([
+        Ok(ExecutionOutcome::Proposed(Box::new(child))),
+        Ok(ExecutionOutcome::Succeeded(CanonicalValue::from("written"))),
+    ]);
+    let approvals = FakeApprovals::pending_then_grant();
+    let audit = FakeAudit::default();
+    let actions = RecordingActions::default();
+    let mut state = RunState::new(run_context(), "invoke", RunBudget::new(3, 2));
+    let capabilities = EffectiveCapabilities::new([CapabilitySet::new([
+        Capability::new(
+            CapabilityName::FsRead,
+            ResourceScope::workspace(workspace_id()),
+        ),
+        Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(workspace_id()),
+        ),
+    ])]);
+    let orchestrator = RunOrchestrator::new(
+        &model,
+        &NORMALIZER,
+        &executor,
+        &approvals,
+        &audit,
+        &actions,
+        Policy::default(),
+        policy_version(),
+    );
+
+    assert!(matches!(
+        orchestrator
+            .run_until_blocked(&mut state, &capabilities, NOW)
+            .await
+            .expect("first advance"),
+        RunOutcome::AwaitingApproval { .. }
+    ));
+    assert_eq!(executor.call_count(), 1);
+    let outcome = orchestrator
+        .run_until_blocked(&mut state, &capabilities, NOW)
+        .await
+        .expect("second advance");
+    assert_eq!(
+        outcome,
+        RunOutcome::Completed {
+            text: "done".into()
+        }
+    );
+    assert_eq!(executor.call_count(), 2);
+    assert_eq!(model.call_count(), 2);
+    let actions = actions.0.lock().expect("actions lock");
+    assert_eq!(actions.len(), 2);
+    let child = &actions[1];
+    assert_eq!(child.kind().as_str(), "filesystem.write");
+    assert_eq!(child.requesting_component().as_str(), "runtime.extensions");
+    assert_eq!(
+        child
+            .extension_provenance()
+            .expect("child provenance")
+            .parent_action_id(),
+        Some(parent)
+    );
+    assert!(audit.events().contains(&AuditEventKind::ApprovalCreated));
+    assert!(audit.events().contains(&AuditEventKind::ApprovalConsumed));
+}
+
+#[test]
+fn extension_proposal_rejects_undeclared_action_kind() {
+    let result = AttributedActionProposal::new(
+        ActionProposal::new(
+            "filesystem.write",
+            CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        ),
+        child_provenance(ActionId::new()),
+        vec![ActionKind::new("filesystem.read").expect("kind")],
+        Vec::new(),
+    );
+    assert_eq!(
+        result.expect_err("undeclared proposal must fail"),
+        lumen_core::extension::InvocationContractError::UndeclaredActionKind
+    );
+}
+
+#[tokio::test]
+async fn extension_child_broader_than_effective_grants_is_persisted_but_not_executed() {
+    let child = AttributedActionProposal::new(
+        ActionProposal::new(
+            "filesystem.write",
+            CanonicalValue::object([("path", CanonicalValue::from("notes/today.md"))]),
+        ),
+        child_provenance(ActionId::new()),
+        vec![ActionKind::new("filesystem.write").expect("kind")],
+        vec![Capability::new(
+            CapabilityName::FsRead,
+            ResourceScope::workspace(workspace_id()),
+        )],
+    )
+    .expect("attributed proposal");
+    let model = FakeModel::new([proposal("filesystem.read")]);
+    let executor = FakeExecutor::new([Ok(ExecutionOutcome::Proposed(Box::new(child)))]);
+    let approvals = FakeApprovals::pending_then_grant();
+    let audit = FakeAudit::default();
+    let actions = RecordingActions::default();
+    let mut state = RunState::new(run_context(), "invoke", RunBudget::new(2, 2));
+    let capabilities = EffectiveCapabilities::new([CapabilitySet::new([
+        Capability::new(
+            CapabilityName::FsRead,
+            ResourceScope::workspace(workspace_id()),
+        ),
+        Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(workspace_id()),
+        ),
+    ])]);
+    let orchestrator = RunOrchestrator::new(
+        &model,
+        &NORMALIZER,
+        &executor,
+        &approvals,
+        &audit,
+        &actions,
+        Policy::default(),
+        policy_version(),
+    );
+
+    let outcome = orchestrator
+        .run_until_blocked(&mut state, &capabilities, NOW)
+        .await
+        .expect("run outcome");
+    assert!(matches!(
+        outcome,
+        RunOutcome::Denied {
+            reason: DenialReason::MissingCapability(_)
+        }
+    ));
+    assert_eq!(executor.call_count(), 1);
+    let actions = actions.0.lock().expect("actions lock");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[1].kind().as_str(), "filesystem.write");
+    assert!(audit.events().contains(&AuditEventKind::PolicyDenied));
 }
 
 fn orchestrator<'a>(
