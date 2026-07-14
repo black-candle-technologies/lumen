@@ -24,6 +24,9 @@ CREATE TABLE plugin_staged_packages (
         REFERENCES identities(provider, subject) ON DELETE RESTRICT
 ) STRICT;
 
+ALTER TABLE actions ADD COLUMN extension_provenance_json TEXT
+    CHECK (extension_provenance_json IS NULL OR json_valid(extension_provenance_json));
+
 CREATE TABLE plugins (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -135,6 +138,7 @@ CREATE TABLE plugin_settings (
     config_version INTEGER NOT NULL CHECK (config_version > 0),
     config_json TEXT NOT NULL CHECK (json_valid(config_json)),
     schema_digest TEXT NOT NULL CHECK (length(schema_digest) = 64 AND schema_digest NOT GLOB '*[^0-9a-f]*'),
+    settings_digest TEXT NOT NULL CHECK (length(settings_digest) = 64 AND settings_digest NOT GLOB '*[^0-9a-f]*'),
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
     PRIMARY KEY (plugin_id, plugin_version, scope_type, scope_id, config_version),
     FOREIGN KEY (plugin_id, plugin_version)

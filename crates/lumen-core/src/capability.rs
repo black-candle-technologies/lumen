@@ -65,6 +65,29 @@ impl CapabilityName {
             Self::PolicyModify => "policy.modify",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "fs.read" => Self::FsRead,
+            "fs.write" => Self::FsWrite,
+            "fs.delete" => Self::FsDelete,
+            "process.spawn" => Self::ProcessSpawn,
+            "net.connect" => Self::NetConnect,
+            "secret.use" => Self::SecretUse,
+            "message.send" => Self::MessageSend,
+            "schedule.create" => Self::ScheduleCreate,
+            "schedule.modify" => Self::ScheduleModify,
+            "plugin.install" => Self::PluginInstall,
+            "plugin.update" => Self::PluginUpdate,
+            "plugin.enable" => Self::PluginEnable,
+            "plugin.capabilities.set" => Self::PluginCapabilitiesSet,
+            "plugin.settings.set" => Self::PluginSettingsSet,
+            "plugin.quarantine.release" => Self::PluginQuarantineRelease,
+            "plugin.invoke" => Self::PluginInvoke,
+            "policy.modify" => Self::PolicyModify,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

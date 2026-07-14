@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 
 use lumen_core::{
     approval::TimestampMillis,
-    capability::Capability,
+    capability::{Capability, CapabilityName, CapabilitySet, ResourceScope, WorkspacePath},
     extension::{
         ExtensionFailureClass, ManifestPath, PluginComponentId, PluginId, PluginManifest,
-        PluginVersion, Sha256Digest,
+        PluginVersion, Sha256Digest, canonical_grant_set_digest,
     },
     identity::{PrincipalId, WorkspaceId},
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -127,6 +128,27 @@ pub enum PluginGrantScope {
     Workspace(WorkspaceId),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginGrantRevision {
+    revision: u64,
+    digest: Sha256Digest,
+    grants: CapabilitySet,
+}
+
+impl PluginGrantRevision {
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
+    pub fn allows(&self, capability: &Capability) -> bool {
+        self.grants.allows(capability)
+    }
+}
+
 impl PluginGrantScope {
     fn parts(&self) -> (&'static str, String) {
         match self {
@@ -167,6 +189,7 @@ pub struct PluginSettingRevision {
     config_version: u64,
     config: Value,
     schema_digest: Sha256Digest,
+    settings_digest: Sha256Digest,
 }
 
 impl PluginSettingRevision {
@@ -181,9 +204,96 @@ impl PluginSettingRevision {
     pub const fn schema_digest(&self) -> &Sha256Digest {
         &self.schema_digest
     }
+
+    pub const fn settings_digest(&self) -> &Sha256Digest {
+        &self.settings_digest
+    }
 }
 
 impl Database {
+    pub async fn latest_plugin_grants(
+        &self,
+        plugin_id: PluginId,
+        version: PluginVersion,
+        component: PluginComponentId,
+        scope: PluginGrantScope,
+    ) -> Result<Option<PluginGrantRevision>, RepositoryError> {
+        let (scope_type, scope_id) = scope.parts();
+        let row = sqlx::query(
+            "SELECT revision, grant_set_digest FROM plugin_grant_revisions
+             WHERE plugin_id = ? AND plugin_version = ? AND component_id = ?
+               AND scope_type = ? AND scope_id = ? ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .bind(component.as_str())
+        .bind(scope_type)
+        .bind(&scope_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let revision: i64 = row.try_get("revision")?;
+        let rows = sqlx::query(
+            "SELECT capability_name, resource_json FROM plugin_capability_grants
+             WHERE plugin_id = ? AND plugin_version = ? AND component_id = ?
+               AND scope_type = ? AND scope_id = ? AND revision = ?",
+        )
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .bind(component.as_str())
+        .bind(scope_type)
+        .bind(&scope_id)
+        .bind(revision)
+        .fetch_all(self.pool())
+        .await?;
+        let mut grants = Vec::new();
+        for grant in rows {
+            let name = CapabilityName::parse(&grant.try_get::<String, _>("capability_name")?)
+                .ok_or(RepositoryError::PluginGrantConflict)?;
+            grants.push(Capability::new(
+                name,
+                parse_resource_scope(&grant.try_get::<String, _>("resource_json")?)?,
+            ));
+        }
+        Ok(Some(PluginGrantRevision {
+            revision: revision as u64,
+            digest: Sha256Digest::parse(row.try_get::<String, _>("grant_set_digest")?)
+                .map_err(|_| RepositoryError::PluginGrantConflict)?,
+            grants: CapabilitySet::new(grants),
+        }))
+    }
+
+    pub async fn latest_plugin_setting(
+        &self,
+        plugin_id: PluginId,
+        version: PluginVersion,
+        scope: PluginSettingScope,
+    ) -> Result<Option<PluginSettingRevision>, RepositoryError> {
+        let (scope_type, scope_id) = scope.parts()?;
+        let row = sqlx::query(
+            "SELECT config_version, config_json, schema_digest, settings_digest
+             FROM plugin_settings WHERE plugin_id = ? AND plugin_version = ?
+               AND scope_type = ? AND scope_id = ? ORDER BY config_version DESC LIMIT 1",
+        )
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .bind(scope_type)
+        .bind(&scope_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            Ok(PluginSettingRevision {
+                config_version: row.try_get::<i64, _>("config_version")? as u64,
+                config: serde_json::from_str(&row.try_get::<String, _>("config_json")?)?,
+                schema_digest: Sha256Digest::parse(row.try_get::<String, _>("schema_digest")?)
+                    .map_err(|_| RepositoryError::PluginSettingConflict)?,
+                settings_digest: Sha256Digest::parse(row.try_get::<String, _>("settings_digest")?)
+                    .map_err(|_| RepositoryError::PluginSettingConflict)?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn insert_staged_plugin_package(
         &self,
         package: &StagedPluginPackage,
@@ -464,6 +574,9 @@ impl Database {
         created_at: TimestampMillis,
     ) -> Result<u64, RepositoryError> {
         let (scope_type, scope_id) = scope.parts();
+        if canonical_grant_set_digest(&grants) != grant_set_digest {
+            return Err(RepositoryError::PluginGrantConflict);
+        }
         let created_at = timestamp_to_i64(created_at)?;
         let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let current: i64 = sqlx::query_scalar(
@@ -494,6 +607,62 @@ impl Database {
             .fetch_one(&mut *transaction)
             .await?;
             if requested != 1 {
+                return Err(RepositoryError::PluginGrantConflict);
+            }
+            if matches!(scope, PluginGrantScope::Global)
+                && !matches!(
+                    grant.scope(),
+                    ResourceScope::Workspace { .. } | ResourceScope::Path { .. }
+                )
+            {
+                return Err(RepositoryError::PluginGrantConflict);
+            }
+        }
+        if let PluginGrantScope::Workspace(workspace_id) = &scope {
+            let latest_global: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(revision), 0) FROM plugin_grant_revisions
+                 WHERE plugin_id = ? AND plugin_version = ? AND component_id = ?
+                   AND scope_type = 'global' AND scope_id = '*'",
+            )
+            .bind(plugin_id.as_str())
+            .bind(version.as_str())
+            .bind(component.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
+            if latest_global == 0 {
+                return Err(RepositoryError::PluginGrantConflict);
+            }
+            let rows = sqlx::query(
+                "SELECT capability_name, resource_json FROM plugin_capability_grants
+                 WHERE plugin_id = ? AND plugin_version = ? AND component_id = ?
+                   AND scope_type = 'global' AND scope_id = '*' AND revision = ?",
+            )
+            .bind(plugin_id.as_str())
+            .bind(version.as_str())
+            .bind(component.as_str())
+            .bind(latest_global)
+            .fetch_all(&mut *transaction)
+            .await?;
+            let mut global = Vec::new();
+            for row in rows {
+                let name: String = row.try_get("capability_name")?;
+                let Some(candidate) = grants.iter().find(|grant| grant.name().as_str() == name)
+                else {
+                    continue;
+                };
+                let resource = parse_resource_scope(&row.try_get::<String, _>("resource_json")?)?;
+                global.push(Capability::new(candidate.name(), resource));
+            }
+            let global = CapabilitySet::new(global);
+            if grants.iter().any(|grant| {
+                !global.allows(grant)
+                    || !matches!(
+                        grant.scope(),
+                        ResourceScope::Workspace { workspace_id: grant_workspace }
+                            | ResourceScope::Path { workspace_id: grant_workspace, .. }
+                            if grant_workspace == workspace_id
+                    )
+            }) {
                 return Err(RepositoryError::PluginGrantConflict);
             }
         }
@@ -532,6 +701,14 @@ impl Database {
             .execute(&mut *transaction)
             .await?;
         }
+        invalidate_plugin_approvals(
+            &mut transaction,
+            plugin_id.as_str(),
+            version.as_str(),
+            "grant_set_digest",
+            grant_set_digest.as_str(),
+        )
+        .await?;
         transaction.commit().await?;
         Ok(revision as u64)
     }
@@ -564,11 +741,21 @@ impl Database {
             return Err(RepositoryError::PluginSettingConflict);
         }
         let config_version = current + 1;
+        let settings_digest = Sha256Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&serde_json::json!({
+                "config": &config,
+                "config_version": config_version,
+                "scope_type": scope_type,
+                "scope_id": &scope_id,
+            }))?)
+        ))
+        .expect("SHA-256 output is canonical");
         sqlx::query(
             "INSERT INTO plugin_settings (
                 plugin_id, plugin_version, scope_type, scope_id, config_version,
-                config_json, schema_digest, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                config_json, schema_digest, settings_digest, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(plugin_id.as_str())
         .bind(version.as_str())
@@ -577,14 +764,24 @@ impl Database {
         .bind(config_version)
         .bind(serde_json::to_string(&config)?)
         .bind(schema_digest.as_str())
+        .bind(settings_digest.as_str())
         .bind(created_at)
         .execute(&mut *transaction)
+        .await?;
+        invalidate_plugin_approvals(
+            &mut transaction,
+            plugin_id.as_str(),
+            version.as_str(),
+            "settings_digest",
+            settings_digest.as_str(),
+        )
         .await?;
         transaction.commit().await?;
         Ok(PluginSettingRevision {
             config_version: config_version as u64,
             config,
             schema_digest,
+            settings_digest,
         })
     }
 
@@ -656,4 +853,78 @@ impl Database {
         transaction.commit().await?;
         PluginWorkspaceState::parse(&state)
     }
+}
+
+fn parse_resource_scope(encoded: &str) -> Result<ResourceScope, RepositoryError> {
+    let value: Value = serde_json::from_str(encoded)?;
+    let object = value
+        .as_object()
+        .ok_or(RepositoryError::PluginGrantConflict)?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(RepositoryError::PluginGrantConflict)?;
+    let workspace = || -> Result<WorkspaceId, RepositoryError> {
+        let value = object
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or(RepositoryError::PluginGrantConflict)?;
+        let uuid = Uuid::parse_str(value).map_err(|_| RepositoryError::PluginGrantConflict)?;
+        Ok(WorkspaceId::from_uuid(uuid))
+    };
+    match kind {
+        "workspace" => Ok(ResourceScope::workspace(workspace()?)),
+        "path" => {
+            let path = object
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or(RepositoryError::PluginGrantConflict)?;
+            let path =
+                WorkspacePath::parse(path).map_err(|_| RepositoryError::PluginGrantConflict)?;
+            Ok(ResourceScope::path(workspace()?, path))
+        }
+        "exact" => ResourceScope::exact(
+            object
+                .get("resource_type")
+                .and_then(Value::as_str)
+                .ok_or(RepositoryError::PluginGrantConflict)?,
+            object
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or(RepositoryError::PluginGrantConflict)?,
+        )
+        .map_err(|_| RepositoryError::PluginGrantConflict),
+        _ => Err(RepositoryError::PluginGrantConflict),
+    }
+}
+
+async fn invalidate_plugin_approvals(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    plugin_id: &str,
+    version: &str,
+    digest_field: &str,
+    current_digest: &str,
+) -> Result<(), RepositoryError> {
+    let digest_path = match digest_field {
+        "grant_set_digest" => "$.grant_set_digest",
+        "settings_digest" => "$.settings_digest",
+        _ => return Err(RepositoryError::PluginStateConflict),
+    };
+    sqlx::query(
+        "UPDATE approval_requests SET state = 'invalidated'
+         WHERE state IN ('pending', 'granted') AND EXISTS (
+             SELECT 1 FROM actions
+             WHERE actions.id = approval_requests.action_id
+               AND json_extract(actions.extension_provenance_json, '$.plugin_id') = ?
+               AND json_extract(actions.extension_provenance_json, '$.plugin_version') = ?
+               AND json_extract(actions.extension_provenance_json, ?) != ?
+         )",
+    )
+    .bind(plugin_id)
+    .bind(version)
+    .bind(digest_path)
+    .bind(current_digest)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }

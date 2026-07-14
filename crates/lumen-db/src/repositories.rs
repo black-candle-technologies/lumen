@@ -511,8 +511,8 @@ impl Database {
             "INSERT INTO actions (
                 id, run_id, workspace_id, actor_provider, actor_subject,
                 requesting_component, kind, arguments_json, capabilities_json,
-                fingerprint, state, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normalized', ?)",
+                extension_provenance_json, fingerprint, state, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normalized', ?)",
         )
         .bind(action.id().to_string())
         .bind(action.run_id().to_string())
@@ -523,6 +523,12 @@ impl Database {
         .bind(action.kind().as_str())
         .bind(serde_json::to_string(action.arguments())?)
         .bind(serde_json::to_string(action.required_capabilities())?)
+        .bind(
+            action
+                .extension_provenance()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .bind(action.fingerprint().to_string())
         .bind(created_at)
         .execute(&mut *transaction)

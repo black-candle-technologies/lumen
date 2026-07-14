@@ -4,7 +4,7 @@ use lumen_core::{
     extension::{
         ExtensionFailure, ExtensionFailureClass, ExtensionInvocationLimits, ExtensionProvenance,
         ExtensionResponse, PluginComponentId, PluginId, PluginManifest, PluginRuntime,
-        PluginVersion, ProtocolVersion, Sha256Digest,
+        PluginVersion, ProtocolVersion, Sha256Digest, canonical_grant_set_digest,
     },
     identity::{ComponentId, PrincipalId, WorkspaceId},
     policy::{Policy, PolicyDecision},
@@ -275,4 +275,29 @@ fn invocation_limits_and_responses_are_typed_and_bounded() {
         ExtensionResponse::Failure { .. }
     ));
     assert!(ExtensionFailure::new(ExtensionFailureClass::PluginFault, "x".repeat(4097)).is_err());
+}
+
+#[test]
+fn every_invocation_and_effect_authority_layer_must_allow_the_action() {
+    let required = Capability::new(
+        CapabilityName::FsRead,
+        ResourceScope::exact("workspace_file", "src/lib.rs").expect("scope"),
+    );
+    let broad = Capability::new(
+        CapabilityName::FsRead,
+        ResourceScope::exact("workspace_file", "src/lib.rs").expect("scope"),
+    );
+    let layers = (0..8).map(|_| CapabilitySet::new([broad.clone()]));
+    let effective = EffectiveCapabilities::new(layers);
+    assert!(effective.allows(&required));
+    let denied = EffectiveCapabilities::new(
+        (0..7)
+            .map(|_| CapabilitySet::new([broad.clone()]))
+            .chain(std::iter::once(CapabilitySet::default())),
+    );
+    assert!(!denied.allows(&required));
+
+    let digest = canonical_grant_set_digest(&[required.clone(), required]);
+    let single = canonical_grant_set_digest(&[broad]);
+    assert_eq!(digest, single, "grant hashing sorts and deduplicates");
 }

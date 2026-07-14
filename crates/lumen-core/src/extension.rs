@@ -2,11 +2,12 @@ use std::fmt;
 
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use sha2::Digest as _;
 use thiserror::Error;
 
 use crate::{
     action::{ActionId, ActionKind, CanonicalValue},
-    capability::CapabilityName,
+    capability::{Capability, CapabilityName},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -729,6 +730,15 @@ impl ExtensionProvenance {
     pub const fn parent_action_id(&self) -> Option<ActionId> {
         self.parent_action_id
     }
+}
+
+pub fn canonical_grant_set_digest(grants: &[Capability]) -> Sha256Digest {
+    let mut grants = grants.to_vec();
+    grants.sort_unstable();
+    grants.dedup();
+    let encoded = serde_json::to_vec(&grants).expect("capability serialization cannot fail");
+    Sha256Digest::parse(format!("{:x}", sha2::Sha256::digest(encoded)))
+        .expect("SHA-256 output is canonical")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

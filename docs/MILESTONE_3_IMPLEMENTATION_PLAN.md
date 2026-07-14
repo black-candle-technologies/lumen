@@ -91,14 +91,14 @@ docs/
 
 **Files:** `crates/lumen-core/src/extension.rs`, `crates/lumen-core/tests/extension_contract.rs`, `crates/lumen-db/src/extensions.rs`, `crates/lumen-db/tests/extensions.rs`, `crates/lumen-integrations/src/extension_schema.rs`, `crates/lumen-integrations/tests/extension_packages.rs`
 
-- [ ] Add failing tests proving global grants cannot exceed manifest requests and workspace grants can only narrow global grants.
-- [ ] Add failing tests for actor/workspace/agent/run plus global/workspace/component/action intersections and independent exact `plugin.invoke` authority.
-- [ ] Add failing settings tests for `global -> workspace -> user -> agent`, recursive object merge, scalar/array replacement, optimistic revisions, canonical hashes, unknown fields, depth/byte limits, and secret-reference metadata only.
-- [ ] Add failing tests proving grant or settings revision changes alter invocation fingerprints, invalidate pending approvals bound to prior revisions, and revoke new effects immediately.
-- [ ] Confirm the focused tests fail before implementation.
-- [ ] Implement canonical grant-set hashing, settings merge/validation, revision writes, and effective invocation context loading.
-- [ ] Run focused tests, formatting, and strict Clippy.
-- [ ] Commit as `feat(extensions): enforce grants and scoped settings`.
+- [x] Add failing tests proving global grants cannot exceed manifest requests and workspace grants can only narrow global grants.
+- [x] Add failing tests for actor/workspace/agent/run plus global/workspace/component/action intersections and independent exact `plugin.invoke` authority.
+- [x] Add failing settings tests for `global -> workspace -> user -> agent`, recursive object merge, scalar/array replacement, optimistic revisions, canonical hashes, unknown fields, depth/byte limits, and secret-reference metadata only.
+- [x] Add failing tests proving grant or settings revision changes alter invocation fingerprints, invalidate pending approvals bound to prior revisions, and revoke new effects immediately.
+- [x] Confirm the focused tests fail before implementation.
+- [x] Implement canonical grant-set hashing, settings merge/validation, revision writes, and effective invocation context loading.
+- [x] Run focused tests, formatting, and strict Clippy.
+- [x] Commit as `feat(extensions): enforce grants and scoped settings`.
 
 ## Task 5: Administrative Lifecycle Through Actions
 

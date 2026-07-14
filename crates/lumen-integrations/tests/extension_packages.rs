@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use lumen_integrations::{
     extension_package::{PackageLimits, PackageStageError, PackageStager},
-    extension_schema::{BoundedSchema, SchemaLimits},
+    extension_schema::{BoundedSchema, SchemaLimits, merge_scoped_settings},
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -266,4 +266,55 @@ fn schema_validation_enforces_shape_and_runtime_bounds() {
             .validate(&json!({"name": "ok", "nested": [[[[[[[[[1]]]]]]]]]}))
             .is_err()
     );
+}
+
+#[test]
+fn scoped_settings_merge_objects_replace_arrays_and_bind_revisions() {
+    let schema = BoundedSchema::compile(
+        json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "left": {"type": "string"},
+                        "right": {"type": "string"}
+                    },
+                    "additionalProperties": false
+                },
+                "items": {"type": "array", "items": {"type": "string"}}
+            },
+            "additionalProperties": false
+        }),
+        SchemaLimits::default(),
+    )
+    .expect("schema");
+    let first = merge_scoped_settings(
+        &schema,
+        [
+            (
+                1,
+                json!({"nested": {"left": "global"}, "items": ["a", "b"]}),
+            ),
+            (4, json!({"nested": {"right": "workspace"}, "items": ["c"]})),
+        ],
+    )
+    .expect("settings");
+    assert_eq!(
+        first.value(),
+        &json!({"nested": {"left": "global", "right": "workspace"}, "items": ["c"]})
+    );
+    let changed_revision = merge_scoped_settings(
+        &schema,
+        [
+            (
+                1,
+                json!({"nested": {"left": "global"}, "items": ["a", "b"]}),
+            ),
+            (5, json!({"nested": {"right": "workspace"}, "items": ["c"]})),
+        ],
+    )
+    .expect("settings");
+    assert_ne!(first.digest(), changed_revision.digest());
+    assert!(merge_scoped_settings(&schema, [(1, json!({"unknown": true}))]).is_err());
 }

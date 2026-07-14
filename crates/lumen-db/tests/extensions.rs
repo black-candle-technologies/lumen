@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
 use lumen_core::{
-    approval::TimestampMillis,
-    capability::{Capability, CapabilityName, ResourceScope},
+    action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
+    approval::{ApprovalId, ApprovalRequest, TimestampMillis},
+    capability::{Capability, CapabilityName, ResourceScope, WorkspacePath},
     extension::{
-        ExtensionFailureClass, PluginComponentId, PluginId, PluginManifest, PluginVersion,
-        Sha256Digest,
+        ExtensionFailureClass, ExtensionProvenance, PluginComponentId, PluginId, PluginManifest,
+        PluginRuntime, PluginVersion, ProtocolVersion, Sha256Digest, canonical_grant_set_digest,
     },
-    identity::{PrincipalId, WorkspaceId},
+    identity::{ComponentId, PrincipalId, WorkspaceId},
+    policy::PolicyVersion,
 };
 use lumen_db::{
     Database, InstallResult, PluginGrantScope, PluginSettingScope, PluginWorkspaceState,
@@ -144,6 +146,10 @@ async fn milestone_two_database_upgrades_without_rewriting_existing_tables() {
             .await
             .expect("drop Milestone 3 table");
     }
+    sqlx::query("ALTER TABLE actions DROP COLUMN extension_provenance_json")
+        .execute(database.pool())
+        .await
+        .expect("restore Milestone 2 actions table");
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 3")
         .execute(database.pool())
         .await
@@ -335,6 +341,7 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
         CapabilityName::FsRead,
         ResourceScope::workspace(workspace_id()),
     );
+    let fs_read_digest = canonical_grant_set_digest(std::slice::from_ref(&fs_read));
     let revision = database
         .append_plugin_grant_revision(
             plugin.clone(),
@@ -342,17 +349,39 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
             component.clone(),
             PluginGrantScope::Global,
             None,
-            vec![fs_read],
-            digest('8'),
+            vec![fs_read.clone()],
+            fs_read_digest,
             TimestampMillis::new(1_200),
         )
         .await
         .expect("declared grant");
     assert_eq!(revision, 1);
+    let narrow = Capability::new(
+        CapabilityName::FsRead,
+        ResourceScope::path(workspace_id(), WorkspacePath::parse("src").expect("path")),
+    );
+    let narrow_digest = canonical_grant_set_digest(std::slice::from_ref(&narrow));
+    assert_eq!(
+        database
+            .append_plugin_grant_revision(
+                plugin.clone(),
+                version.clone(),
+                component.clone(),
+                PluginGrantScope::Workspace(workspace_id()),
+                None,
+                vec![narrow],
+                narrow_digest,
+                TimestampMillis::new(1_250),
+            )
+            .await
+            .expect("narrow workspace grant"),
+        1
+    );
     let undeclared = Capability::new(
         CapabilityName::NetConnect,
         ResourceScope::exact("host", "example.com:443").expect("scope"),
     );
+    let undeclared_digest = canonical_grant_set_digest(std::slice::from_ref(&undeclared));
     assert!(matches!(
         database
             .append_plugin_grant_revision(
@@ -362,7 +391,7 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
                 PluginGrantScope::Workspace(workspace_id()),
                 None,
                 vec![undeclared],
-                digest('9'),
+                undeclared_digest,
                 TimestampMillis::new(1_300),
             )
             .await,
@@ -382,6 +411,29 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
         .await
         .expect("first setting");
     assert_eq!(setting.config_version(), 1);
+    assert_ne!(setting.settings_digest(), setting.schema_digest());
+    let loaded_grants = database
+        .latest_plugin_grants(
+            plugin.clone(),
+            version.clone(),
+            PluginComponentId::parse("status").expect("component"),
+            PluginGrantScope::Global,
+        )
+        .await
+        .expect("load grants")
+        .expect("grant revision");
+    assert_eq!(loaded_grants.revision(), 1);
+    assert!(loaded_grants.allows(&fs_read));
+    let loaded_setting = database
+        .latest_plugin_setting(
+            plugin.clone(),
+            version.clone(),
+            PluginSettingScope::Workspace(workspace_id()),
+        )
+        .await
+        .expect("load setting")
+        .expect("setting revision");
+    assert_eq!(loaded_setting, setting);
     assert!(matches!(
         database
             .put_plugin_setting(
@@ -396,6 +448,175 @@ async fn grants_require_a_manifest_request_and_settings_are_optimistic_revisions
             .await,
         Err(RepositoryError::PluginSettingConflict)
     ));
+}
+
+#[tokio::test]
+async fn grant_and_setting_revisions_invalidate_stale_pending_approvals() {
+    let database = database().await;
+    let staged = staged("1.2.3", '1', '2');
+    database
+        .insert_staged_plugin_package(&staged)
+        .await
+        .expect("stage");
+    database
+        .install_staged_plugin(
+            staged.id(),
+            "plugins/git/1.2.3/artifact",
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("install");
+    let plugin = PluginId::parse("dev.example.git-tools").expect("ID");
+    let version = PluginVersion::parse("1.2.3").expect("version");
+    let component = PluginComponentId::parse("status").expect("component");
+    let grant = Capability::new(
+        CapabilityName::FsRead,
+        ResourceScope::workspace(workspace_id()),
+    );
+    let initial_grant_digest = canonical_grant_set_digest(std::slice::from_ref(&grant));
+    database
+        .append_plugin_grant_revision(
+            plugin.clone(),
+            version.clone(),
+            component.clone(),
+            PluginGrantScope::Global,
+            None,
+            vec![grant.clone()],
+            initial_grant_digest.clone(),
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("grant");
+    let setting = database
+        .put_plugin_setting(
+            plugin.clone(),
+            version.clone(),
+            PluginSettingScope::Workspace(workspace_id()),
+            None,
+            json!({"prefix": "one"}),
+            digest('a'),
+            TimestampMillis::new(1_250),
+        )
+        .await
+        .expect("setting");
+    let provenance = ExtensionProvenance::new(
+        plugin.clone(),
+        version.clone(),
+        component.clone(),
+        PluginRuntime::WasmComponent,
+        digest('1'),
+        digest('b'),
+        digest('2'),
+        setting.settings_digest().clone(),
+        initial_grant_digest,
+        ProtocolVersion::new(1).expect("protocol"),
+        None,
+    );
+    let action = ActionEnvelope::new(
+        ActionId::new(),
+        RunId::new(),
+        workspace_id(),
+        PrincipalId::new("local", "admin").expect("principal"),
+        ComponentId::new("runtime.extensions").expect("component"),
+        ActionKind::new("plugin.invoke").expect("kind"),
+        CanonicalValue::object([("input", CanonicalValue::from("{}"))]),
+        vec![Capability::new(
+            CapabilityName::PluginInvoke,
+            ResourceScope::exact("plugin_component", provenance.resource_key()).expect("scope"),
+        )],
+    )
+    .with_extension_provenance(provenance);
+    database
+        .insert_action(&action, TimestampMillis::new(1_300))
+        .await
+        .expect("action");
+    let approval = ApprovalRequest::new(
+        ApprovalId::new(),
+        action.fingerprint(),
+        PolicyVersion::new("extension-policy-v1").expect("policy"),
+        TimestampMillis::new(1_300),
+        TimestampMillis::new(10_000),
+    )
+    .expect("approval");
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+
+    let narrower_grant = Capability::new(
+        CapabilityName::FsRead,
+        ResourceScope::path(workspace_id(), WorkspacePath::parse("src").expect("path")),
+    );
+    let narrower_digest = canonical_grant_set_digest(std::slice::from_ref(&narrower_grant));
+    database
+        .append_plugin_grant_revision(
+            plugin.clone(),
+            version.clone(),
+            component,
+            PluginGrantScope::Global,
+            Some(1),
+            vec![narrower_grant],
+            narrower_digest,
+            TimestampMillis::new(1_400),
+        )
+        .await
+        .expect("grant revision");
+    let state: String = sqlx::query_scalar("SELECT state FROM approval_requests WHERE id = ?")
+        .bind(approval.id().to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("approval state");
+    assert_eq!(state, "invalidated");
+
+    let second = ActionEnvelope::new(
+        ActionId::new(),
+        RunId::new(),
+        workspace_id(),
+        PrincipalId::new("local", "admin").expect("principal"),
+        ComponentId::new("runtime.extensions").expect("component"),
+        ActionKind::new("plugin.invoke").expect("kind"),
+        CanonicalValue::object([("input", CanonicalValue::from("{}"))]),
+        vec![Capability::new(
+            CapabilityName::PluginInvoke,
+            ResourceScope::exact("plugin_component", "dev.example.git-tools@1.2.3#status")
+                .expect("scope"),
+        )],
+    )
+    .with_extension_provenance(action.extension_provenance().expect("provenance").clone());
+    database
+        .insert_action(&second, TimestampMillis::new(1_500))
+        .await
+        .expect("action");
+    let second_approval = ApprovalRequest::new(
+        ApprovalId::new(),
+        second.fingerprint(),
+        PolicyVersion::new("extension-policy-v1").expect("policy"),
+        TimestampMillis::new(1_500),
+        TimestampMillis::new(10_000),
+    )
+    .expect("approval");
+    database
+        .insert_approval(&second_approval)
+        .await
+        .expect("approval");
+    database
+        .put_plugin_setting(
+            plugin,
+            version,
+            PluginSettingScope::Workspace(workspace_id()),
+            Some(1),
+            json!({"prefix": "two"}),
+            digest('a'),
+            TimestampMillis::new(1_600),
+        )
+        .await
+        .expect("setting revision");
+    let state: String = sqlx::query_scalar("SELECT state FROM approval_requests WHERE id = ?")
+        .bind(second_approval.id().to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("approval state");
+    assert_eq!(state, "invalidated");
 }
 
 #[tokio::test]

@@ -1,5 +1,7 @@
 use jsonschema::Validator;
+use lumen_core::extension::Sha256Digest;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +55,22 @@ pub struct BoundedSchema {
     limits: SchemaLimits,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectiveSettings {
+    value: Value,
+    digest: Sha256Digest,
+}
+
+impl EffectiveSettings {
+    pub const fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+}
+
 impl BoundedSchema {
     pub fn compile(schema: Value, limits: SchemaLimits) -> Result<Self, SchemaError> {
         let bytes = serde_json::to_vec(&schema).map_err(|_| SchemaError::InvalidSchema)?;
@@ -75,6 +93,33 @@ impl BoundedSchema {
             .validate(instance)
             .map_err(|error| SchemaError::Validation(error.to_string()))
     }
+}
+
+pub fn merge_scoped_settings(
+    schema: &BoundedSchema,
+    layers: impl IntoIterator<Item = (u64, Value)>,
+) -> Result<EffectiveSettings, SchemaError> {
+    let mut effective = Value::Object(Default::default());
+    let mut revisions = Vec::new();
+    for (revision, layer) in layers {
+        if !layer.is_object() {
+            return Err(SchemaError::InvalidSettingsLayer);
+        }
+        merge_value(&mut effective, layer);
+        revisions.push(revision);
+    }
+    schema.validate(&effective)?;
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "settings": &effective,
+        "revisions": revisions,
+    }))
+    .map_err(|_| SchemaError::InvalidInstance)?;
+    let digest = Sha256Digest::parse(format!("{:x}", Sha256::digest(encoded)))
+        .expect("SHA-256 output is canonical");
+    Ok(EffectiveSettings {
+        value: effective,
+        digest,
+    })
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -101,6 +146,26 @@ pub enum SchemaError {
     InstanceStructure,
     #[error("instance does not satisfy the schema: {0}")]
     Validation(String),
+    #[error("each scoped settings layer must be a JSON object")]
+    InvalidSettingsLayer,
+}
+
+fn merge_value(target: &mut Value, overlay: Value) {
+    match (target, overlay) {
+        (Value::Object(target), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match target.get_mut(&key) {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        merge_value(existing, value);
+                    }
+                    _ => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+        }
+        (target, overlay) => *target = overlay,
+    }
 }
 
 fn inspect_schema(value: &Value, depth: usize, max_depth: usize) -> Result<(), SchemaError> {
