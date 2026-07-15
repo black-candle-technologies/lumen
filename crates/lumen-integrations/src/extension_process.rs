@@ -103,6 +103,9 @@ impl SubprocessHost {
         }
         match output.exit_code() {
             Some(0) => {}
+            Some(code) if is_resource_exit_code(code) => {
+                return Err(SubprocessHostError::ResourceExhaustion);
+            }
             Some(code) => return Err(SubprocessHostError::NonZeroExit(code)),
             None => return Err(SubprocessHostError::Crash),
         }
@@ -121,8 +124,20 @@ fn is_resource_signal(signal: i32) -> bool {
     signal == nix::libc::SIGXCPU || signal == nix::libc::SIGXFSZ
 }
 
+#[cfg(unix)]
+fn is_resource_exit_code(code: i32) -> bool {
+    code == 128 + nix::libc::SIGXCPU
+        || code == 128 + nix::libc::SIGXFSZ
+        || code == 128 + nix::libc::SIGKILL
+}
+
 #[cfg(not(unix))]
 fn is_resource_signal(_signal: i32) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn is_resource_exit_code(_code: i32) -> bool {
     false
 }
 

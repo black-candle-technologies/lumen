@@ -375,7 +375,7 @@ async fn rejects_digest_nonce_request_protocol_and_trailing_substitution() {
 #[tokio::test]
 async fn classifies_malformed_oversized_exit_timeout_and_cancellation() {
     let (_directory, path, digest) = fixture();
-    let cases: Vec<(Result<SandboxOutput, SandboxError>, SubprocessHostError)> = vec![
+    let mut cases: Vec<(Result<SandboxOutput, SandboxError>, SubprocessHostError)> = vec![
         (
             Ok(SandboxOutput::new(Some(0), vec![0, 0, 0, 1, 0xff], vec![])),
             SubprocessHostError::InvalidUtf8,
@@ -434,6 +434,15 @@ async fn classifies_malformed_oversized_exit_timeout_and_cancellation() {
         ),
         (Err(SandboxError::Cancelled), SubprocessHostError::Cancelled),
     ];
+    #[cfg(unix)]
+    cases.push((
+        Ok(SandboxOutput::new(
+            Some(128 + nix::libc::SIGKILL),
+            vec![],
+            vec![],
+        )),
+        SubprocessHostError::ResourceExhaustion,
+    ));
     for (result, expected) in cases {
         let result = Arc::new(Mutex::new(Some(result)));
         let sandbox = Arc::new(FakeSandbox::new(move |_| {

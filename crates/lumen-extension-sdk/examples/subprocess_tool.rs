@@ -54,8 +54,19 @@ fn main() {
             .arg("denied")
             .status()
             .is_ok();
+        let inherited_environment = [
+            "HOME",
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "CI",
+            "GITHUB_TOKEN",
+            "RUST_LOG",
+        ]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some());
         serde_json::json!({
-            "environment": std::env::vars_os().next().is_some(),
+            "environment": inherited_environment,
             "network": network,
             "process": process,
             "read": read,
