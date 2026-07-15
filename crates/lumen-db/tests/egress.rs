@@ -1,6 +1,9 @@
 use lumen_core::{
     approval::TimestampMillis,
-    egress::{DataClass, DestinationScope, ProviderId},
+    egress::{
+        DataClass, DestinationScope, EndpointClass, ProviderId, RoutingFailure,
+        select_model_provider,
+    },
     identity::WorkspaceId,
     secret::SecretRefId,
 };
@@ -74,6 +77,7 @@ async fn provider_revisions_keep_remote_policy_and_secret_references_only() {
         DestinationScope::parse("https://models.example.com/v1/").unwrap(),
         "gpt-compatible",
         true,
+        20,
         Some(secret_ref()),
         [DataClass::Public],
         TimestampMillis::new(1_000),
@@ -90,6 +94,7 @@ async fn provider_revisions_keep_remote_policy_and_secret_references_only() {
         .expect("provider loaded")
         .expect("provider exists");
     assert_eq!(loaded, first);
+    assert_eq!(loaded.priority(), 20);
     assert!(loaded.allows(DataClass::Public));
     assert!(!loaded.allows(DataClass::Workspace));
 
@@ -100,6 +105,7 @@ async fn provider_revisions_keep_remote_policy_and_secret_references_only() {
         DestinationScope::parse("https://models.example.com/v1/").unwrap(),
         "gpt-compatible",
         true,
+        10,
         Some(secret_ref()),
         [DataClass::Public, DataClass::Workspace],
         TimestampMillis::new(2_000),
@@ -141,6 +147,7 @@ async fn provider_revisions_reject_secret_data_class() {
         DestinationScope::parse("https://models.example.com/v1/").unwrap(),
         "gpt-compatible",
         true,
+        10,
         Some(secret_ref()),
         [DataClass::Secret],
         TimestampMillis::new(1_000),
@@ -161,6 +168,7 @@ async fn workspace_policy_revisions_are_provider_scoped_and_versioned() {
         DestinationScope::parse("https://models.example.com/v1/").unwrap(),
         "gpt-compatible",
         true,
+        10,
         Some(secret_ref()),
         [DataClass::Public, DataClass::Workspace],
         TimestampMillis::new(1_000),
@@ -191,4 +199,166 @@ async fn workspace_policy_revisions_are_provider_scoped_and_versioned() {
             .expect("workspace policy loaded"),
         Some(workspace_policy)
     );
+}
+
+#[tokio::test]
+async fn model_provider_routes_use_latest_provider_and_workspace_revisions() {
+    let database = database().await;
+    let provider = provider_id();
+    let endpoint = DestinationScope::parse("https://models.example.com/v1/").unwrap();
+    let first_provider = ModelProviderRevision::new(
+        provider.clone(),
+        1,
+        ModelEndpointClass::Remote,
+        endpoint.clone(),
+        "gpt-compatible",
+        true,
+        20,
+        Some(secret_ref()),
+        [DataClass::Public],
+        TimestampMillis::new(1_000),
+    )
+    .expect("provider");
+    let second_provider = ModelProviderRevision::new(
+        provider.clone(),
+        2,
+        ModelEndpointClass::Remote,
+        endpoint,
+        "gpt-compatible",
+        true,
+        10,
+        Some(secret_ref()),
+        [DataClass::Public, DataClass::Workspace],
+        TimestampMillis::new(2_000),
+    )
+    .expect("provider");
+    database
+        .append_model_provider_revision(&first_provider)
+        .await
+        .expect("first provider stored");
+    database
+        .append_model_provider_revision(&second_provider)
+        .await
+        .expect("second provider stored");
+
+    for revision in [
+        WorkspaceModelEgressRevision::new(
+            workspace_id(),
+            provider.clone(),
+            1,
+            [DataClass::Public],
+            TimestampMillis::new(1_100),
+        )
+        .expect("workspace policy"),
+        WorkspaceModelEgressRevision::new(
+            workspace_id(),
+            provider.clone(),
+            2,
+            [DataClass::Workspace],
+            TimestampMillis::new(2_100),
+        )
+        .expect("workspace policy"),
+    ] {
+        database
+            .append_workspace_model_egress_revision(&revision)
+            .await
+            .expect("workspace policy stored");
+    }
+
+    let routes = database
+        .model_provider_routes(workspace_id())
+        .await
+        .expect("routes loaded");
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].provider(), &provider);
+    assert_eq!(routes[0].endpoint_class(), EndpointClass::Remote);
+    assert_eq!(routes[0].priority(), 10);
+
+    let decision =
+        select_model_provider(DataClass::Workspace, routes.clone()).expect("workspace allowed");
+    assert_eq!(decision.provider(), &provider);
+    assert_eq!(decision.endpoint_class(), EndpointClass::Remote);
+    assert!(decision.egress_occurred());
+
+    let error = select_model_provider(DataClass::Public, routes).expect_err("public denied");
+    assert_eq!(error, RoutingFailure::RemoteEgressDenied);
+}
+
+#[tokio::test]
+async fn local_model_provider_route_does_not_require_workspace_egress_policy() {
+    let database = database().await;
+    let provider = ProviderId::parse("llama-local").expect("provider");
+    let provider_revision = ModelProviderRevision::new(
+        provider.clone(),
+        1,
+        ModelEndpointClass::Local,
+        DestinationScope::parse("https://localhost.localdomain/v1/").unwrap(),
+        "local-qwen",
+        true,
+        5,
+        None,
+        [DataClass::Sensitive],
+        TimestampMillis::new(1_000),
+    )
+    .expect("provider");
+    database
+        .append_model_provider_revision(&provider_revision)
+        .await
+        .expect("provider stored");
+
+    let routes = database
+        .model_provider_routes(workspace_id())
+        .await
+        .expect("routes loaded");
+    let decision =
+        select_model_provider(DataClass::Sensitive, routes).expect("local sensitive allowed");
+
+    assert_eq!(decision.provider(), &provider);
+    assert_eq!(decision.endpoint_class(), EndpointClass::Local);
+    assert!(!decision.egress_occurred());
+}
+
+#[tokio::test]
+async fn disabled_provider_routes_are_loaded_but_not_eligible() {
+    let database = database().await;
+    let provider = provider_id();
+    let provider_revision = ModelProviderRevision::new(
+        provider.clone(),
+        1,
+        ModelEndpointClass::Remote,
+        DestinationScope::parse("https://models.example.com/v1/").unwrap(),
+        "gpt-compatible",
+        false,
+        10,
+        Some(secret_ref()),
+        [DataClass::Public],
+        TimestampMillis::new(1_000),
+    )
+    .expect("provider");
+    let workspace_policy = WorkspaceModelEgressRevision::new(
+        workspace_id(),
+        provider,
+        1,
+        [DataClass::Public],
+        TimestampMillis::new(1_100),
+    )
+    .expect("workspace policy");
+    database
+        .append_model_provider_revision(&provider_revision)
+        .await
+        .expect("provider stored");
+    database
+        .append_workspace_model_egress_revision(&workspace_policy)
+        .await
+        .expect("workspace policy stored");
+
+    let routes = database
+        .model_provider_routes(workspace_id())
+        .await
+        .expect("routes loaded");
+
+    assert_eq!(routes.len(), 1);
+    assert!(!routes[0].enabled());
+    let error = select_model_provider(DataClass::Public, routes).expect_err("disabled");
+    assert_eq!(error, RoutingFailure::NoEligibleProvider);
 }

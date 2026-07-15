@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use lumen_core::{
     approval::TimestampMillis,
-    egress::{DataClass, DestinationScope, ProviderId},
+    egress::{DataClass, DestinationScope, EndpointClass, ProviderId, ProviderRoute},
     identity::WorkspaceId,
     secret::SecretRefId,
 };
@@ -31,6 +31,13 @@ impl ModelEndpointClass {
             _ => Err(RepositoryError::InvalidEgressPolicy),
         }
     }
+
+    const fn to_core(self) -> EndpointClass {
+        match self {
+            Self::Local => EndpointClass::Local,
+            Self::Remote => EndpointClass::Remote,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +48,7 @@ pub struct ModelProviderRevision {
     endpoint: DestinationScope,
     model: String,
     enabled: bool,
+    priority: u32,
     credential_secret_ref: Option<SecretRefId>,
     allowed_data_classes: BTreeSet<DataClass>,
     created_at: TimestampMillis,
@@ -55,6 +63,7 @@ impl ModelProviderRevision {
         endpoint: DestinationScope,
         model: impl Into<String>,
         enabled: bool,
+        priority: u32,
         credential_secret_ref: Option<SecretRefId>,
         allowed_data_classes: impl IntoIterator<Item = DataClass>,
         created_at: TimestampMillis,
@@ -78,6 +87,7 @@ impl ModelProviderRevision {
             endpoint,
             model,
             enabled,
+            priority,
             credential_secret_ref,
             allowed_data_classes,
             created_at,
@@ -106,6 +116,10 @@ impl ModelProviderRevision {
 
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub const fn priority(&self) -> u32 {
+        self.priority
     }
 
     pub const fn credential_secret_ref(&self) -> Option<SecretRefId> {
@@ -184,6 +198,7 @@ impl Database {
         let revision_number =
             i64::try_from(revision.revision).map_err(|_| RepositoryError::InvalidEgressPolicy)?;
         let allowed = serde_json::to_string(&revision.allowed_data_classes)?;
+        let priority = i64::from(revision.priority);
         let mut transaction = self.pool().begin().await?;
         sqlx::query(
             "INSERT OR IGNORE INTO egress_model_providers (provider_id, created_at)
@@ -196,8 +211,8 @@ impl Database {
         sqlx::query(
             "INSERT INTO egress_model_provider_revisions (
                 provider_id, revision, endpoint_class, endpoint_url, model, enabled,
-                credential_secret_ref, allowed_data_classes_json, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                priority, credential_secret_ref, allowed_data_classes_json, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(revision.provider_id.as_str())
         .bind(revision_number)
@@ -205,6 +220,7 @@ impl Database {
         .bind(revision.endpoint.as_str())
         .bind(&revision.model)
         .bind(if revision.enabled { 1_i64 } else { 0_i64 })
+        .bind(priority)
         .bind(revision.credential_secret_ref.map(|id| id.to_string()))
         .bind(allowed)
         .bind(created_at)
@@ -220,7 +236,7 @@ impl Database {
     ) -> Result<Option<ModelProviderRevision>, RepositoryError> {
         let row = sqlx::query(
             "SELECT revision, endpoint_class, endpoint_url, model, enabled,
-                    credential_secret_ref, allowed_data_classes_json, created_at
+                    priority, credential_secret_ref, allowed_data_classes_json, created_at
              FROM egress_model_provider_revisions
              WHERE provider_id = ? ORDER BY revision DESC LIMIT 1",
         )
@@ -246,6 +262,8 @@ impl Database {
                 endpoint,
                 row.try_get::<String, _>("model")?,
                 row.try_get::<i64, _>("enabled")? == 1,
+                u32::try_from(row.try_get::<i64, _>("priority")?)
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
                 credential,
                 serde_json::from_str::<BTreeSet<DataClass>>(
                     &row.try_get::<String, _>("allowed_data_classes_json")?,
@@ -254,6 +272,75 @@ impl Database {
             )
         })
         .transpose()
+    }
+
+    pub async fn model_provider_routes(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<ProviderRoute>, RepositoryError> {
+        let rows = sqlx::query(
+            "WITH latest_provider_revisions AS (
+                SELECT provider_id, MAX(revision) AS revision
+                FROM egress_model_provider_revisions
+                GROUP BY provider_id
+             ),
+             latest_workspace_policies AS (
+                SELECT provider_id, MAX(revision) AS revision
+                FROM egress_workspace_model_policies
+                WHERE workspace_id = ?
+                GROUP BY provider_id
+             )
+             SELECT
+                provider.provider_id,
+                provider.endpoint_class,
+                provider.enabled,
+                provider.priority,
+                provider.allowed_data_classes_json AS provider_allowed_data_classes_json,
+                workspace_policy.allowed_data_classes_json
+                    AS workspace_allowed_data_classes_json
+             FROM latest_provider_revisions latest_provider
+             JOIN egress_model_provider_revisions provider
+                ON provider.provider_id = latest_provider.provider_id
+               AND provider.revision = latest_provider.revision
+             LEFT JOIN latest_workspace_policies latest_workspace
+                ON latest_workspace.provider_id = provider.provider_id
+             LEFT JOIN egress_workspace_model_policies workspace_policy
+                ON workspace_policy.workspace_id = ?
+               AND workspace_policy.provider_id = latest_workspace.provider_id
+               AND workspace_policy.revision = latest_workspace.revision
+             ORDER BY provider.priority ASC, provider.provider_id ASC",
+        )
+        .bind(workspace_id.to_string())
+        .bind(workspace_id.to_string())
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let provider_id = ProviderId::parse(row.try_get::<String, _>("provider_id")?)
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+                let endpoint_class =
+                    ModelEndpointClass::parse(&row.try_get::<String, _>("endpoint_class")?)?
+                        .to_core();
+                let provider_classes = serde_json::from_str::<BTreeSet<DataClass>>(
+                    &row.try_get::<String, _>("provider_allowed_data_classes_json")?,
+                )?;
+                let workspace_classes = row
+                    .try_get::<Option<String>, _>("workspace_allowed_data_classes_json")?
+                    .map(|json| serde_json::from_str::<BTreeSet<DataClass>>(&json))
+                    .transpose()?;
+                ProviderRoute::new(
+                    provider_id,
+                    endpoint_class,
+                    row.try_get::<i64, _>("enabled")? == 1,
+                    provider_classes,
+                    workspace_classes,
+                    u32::try_from(row.try_get::<i64, _>("priority")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                )
+                .map_err(|_| RepositoryError::InvalidEgressPolicy)
+            })
+            .collect()
     }
 
     pub async fn append_workspace_model_egress_revision(
@@ -319,6 +406,7 @@ impl Database {
         endpoint: DestinationScope,
         model: String,
         enabled: bool,
+        priority: u32,
         credential_secret_ref: Option<SecretRefId>,
         allowed_data_classes: BTreeSet<DataClass>,
         created_at: TimestampMillis,
@@ -330,6 +418,7 @@ impl Database {
             endpoint,
             model,
             enabled,
+            priority,
             credential_secret_ref,
             allowed_data_classes,
             created_at,

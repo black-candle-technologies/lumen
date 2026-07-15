@@ -10,6 +10,7 @@ CREATE TABLE egress_model_provider_revisions (
     endpoint_url TEXT NOT NULL,
     model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 256),
     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    priority INTEGER NOT NULL CHECK (priority >= 0),
     credential_secret_ref TEXT,
     allowed_data_classes_json TEXT NOT NULL CHECK (json_valid(allowed_data_classes_json)),
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
