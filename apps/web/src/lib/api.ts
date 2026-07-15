@@ -98,6 +98,28 @@ export type PluginActionRequest = {
 	arguments?: JsonValue;
 };
 
+export type ChannelMapping = {
+	provider: string;
+	external_workspace_id: string;
+	channel_id: string;
+	external_user_id: string;
+	lumen_identity: PrincipalSummary;
+	workspace_id: string;
+	allowed: boolean;
+	created_at: number;
+	updated_at: number;
+};
+
+export type ChannelMappingUpdate = {
+	provider: string;
+	external_workspace_id: string;
+	channel_id: string;
+	external_user_id: string;
+	lumen_provider: string;
+	lumen_subject: string;
+	allowed: boolean;
+};
+
 export class ApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -162,6 +184,15 @@ export class ApiClient {
 		request: PluginActionRequest
 	): Promise<{ run_id: string; state: string }> {
 		return this.request('plugins/actions', { method: 'POST', body: JSON.stringify(request) });
+	}
+
+	async listChannelMappings(): Promise<ChannelMapping[]> {
+		const response = await this.request<{ mappings: ChannelMapping[] }>('egress/channels');
+		return response.mappings;
+	}
+
+	async updateChannelMapping(request: ChannelMappingUpdate): Promise<ChannelMapping> {
+		return this.request('egress/channels', { method: 'POST', body: JSON.stringify(request) });
 	}
 
 	async streamRunEvents(

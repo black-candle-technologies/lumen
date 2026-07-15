@@ -131,4 +131,75 @@ describe('ApiClient', () => {
 
 		expect(result.state).toBe('approval_requested');
 	});
+
+	it('lists and updates channel egress mappings through workspace-scoped endpoints', async () => {
+		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (init?.method === 'POST') {
+				expect(url).toBe(
+					'http://127.0.0.1:3210/api/v1/workspaces/26db5a31-94f0-4e92-a9c9-4cdf19d71c31/egress/channels'
+				);
+				expect(JSON.parse(String(init.body))).toEqual({
+					provider: 'slack',
+					external_workspace_id: 'T123',
+					channel_id: 'C456',
+					external_user_id: 'U789',
+					lumen_provider: 'local',
+					lumen_subject: 'alice',
+					allowed: true
+				});
+				return new Response(
+					JSON.stringify({
+						provider: 'slack',
+						external_workspace_id: 'T123',
+						channel_id: 'C456',
+						external_user_id: 'U789',
+						lumen_identity: { provider: 'local', subject: 'alice' },
+						workspace_id: settings.workspaceId,
+						allowed: true,
+						created_at: 10,
+						updated_at: 20
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } }
+				);
+			}
+			expect(url).toBe(
+				'http://127.0.0.1:3210/api/v1/workspaces/26db5a31-94f0-4e92-a9c9-4cdf19d71c31/egress/channels'
+			);
+			return new Response(
+				JSON.stringify({
+					mappings: [
+						{
+							provider: 'slack',
+							external_workspace_id: 'T123',
+							channel_id: 'C456',
+							external_user_id: 'U789',
+							lumen_identity: { provider: 'local', subject: 'alice' },
+							workspace_id: settings.workspaceId,
+							allowed: false,
+							created_at: 10,
+							updated_at: 20
+						}
+					]
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			);
+		});
+		const client = new ApiClient(settings, fetchMock as typeof fetch);
+
+		const mappings = await client.listChannelMappings();
+		const updated = await client.updateChannelMapping({
+			provider: 'slack',
+			external_workspace_id: 'T123',
+			channel_id: 'C456',
+			external_user_id: 'U789',
+			lumen_provider: 'local',
+			lumen_subject: 'alice',
+			allowed: true
+		});
+
+		expect(mappings[0].allowed).toBe(false);
+		expect(updated.allowed).toBe(true);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
 });

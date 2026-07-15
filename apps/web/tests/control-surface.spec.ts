@@ -151,6 +151,61 @@ test.beforeEach(async ({ page }) => {
 			}
 		});
 	});
+	await page.route('**/api/v1/workspaces/*/egress/channels', async (route) => {
+		if (route.request().method() === 'POST') {
+			expect(route.request().postDataJSON()).toMatchObject({
+				provider: 'slack',
+				external_workspace_id: 'T123',
+				channel_id: 'C456',
+				external_user_id: 'U789',
+				lumen_provider: 'local',
+				lumen_subject: 'operator',
+				allowed: false
+			});
+			await route.fulfill({
+				json: {
+					provider: 'slack',
+					external_workspace_id: 'T123',
+					channel_id: 'C456',
+					external_user_id: 'U789',
+					lumen_identity: { provider: 'local', subject: 'operator' },
+					workspace_id: workspaceId,
+					allowed: false,
+					created_at: 10,
+					updated_at: 30
+				}
+			});
+			return;
+		}
+		await route.fulfill({
+			json: {
+				mappings: [
+					{
+						provider: 'slack',
+						external_workspace_id: 'T123',
+						channel_id: 'C456',
+						external_user_id: 'U789',
+						lumen_identity: { provider: 'local', subject: 'operator' },
+						workspace_id: workspaceId,
+						allowed: true,
+						created_at: 10,
+						updated_at: 20
+					},
+					{
+						provider: 'discord',
+						external_workspace_id: 'guild-1',
+						channel_id: 'ops',
+						external_user_id: 'user-2',
+						lumen_identity: { provider: 'local', subject: 'observer' },
+						workspace_id: workspaceId,
+						allowed: false,
+						created_at: 11,
+						updated_at: 21
+					}
+				]
+			}
+		});
+	});
 });
 
 test('streams a local chat result and can request cancellation', async ({ page }, testInfo) => {
@@ -255,4 +310,18 @@ test('shows plugin review controls without rendering secret values or overflowin
 	expect(requested).toBe(true);
 	await expect(page.getByText('approval_requested: run-plugin')).toBeVisible();
 	await page.screenshot({ path: testInfo.outputPath('plugins.png') });
+});
+
+test('shows egress channel controls and updates allowlisting', async ({ page }, testInfo) => {
+	await page.goto('/egress');
+
+	await expect(page.getByRole('heading', { name: 'Egress' })).toBeVisible();
+	await expect(page.getByText('slack:T123:C456')).toBeVisible();
+	await expect(page.getByText('local/operator')).toBeVisible();
+	await expect(page.getByText('discord:guild-1:ops')).toBeVisible();
+	await expect(page.getByText('browser-secret-must-not-render')).toHaveCount(0);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: 'Disable slack T123 C456' }).click();
+	await expect(page.getByText('Disabled slack:T123:C456')).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('egress.png') });
 });

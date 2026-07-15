@@ -6,6 +6,7 @@
 	import CheckSquare from '@lucide/svelte/icons/square-check';
 	import FileClock from '@lucide/svelte/icons/file-clock';
 	import Puzzle from '@lucide/svelte/icons/puzzle';
+	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import Settings from '@lucide/svelte/icons/settings';
 	import favicon from '$lib/assets/favicon.svg';
 	import ConnectionDialog from '$lib/components/ConnectionDialog.svelte';
@@ -23,6 +24,7 @@
 		{ href: '/', label: 'Chat', icon: Bot },
 		{ href: '/approvals', label: 'Approvals', icon: CheckSquare },
 		{ href: '/plugins', label: 'Plugins', icon: Puzzle },
+		{ href: '/egress', label: 'Egress', icon: ShieldCheck },
 		{ href: '/audit', label: 'Audit', icon: FileClock }
 	];
 </script>
