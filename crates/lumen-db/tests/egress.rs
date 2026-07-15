@@ -543,32 +543,30 @@ async fn allowed_channel_mappings_load_exact_channel_send_capabilities() {
         ExternalChannelIdentity::new("slack", "T123", "C456", "U789").expect("allowed identity");
     let disabled =
         ExternalChannelIdentity::new("slack", "T123", "C999", "U789").expect("disabled identity");
+    let allowed_mapping = ChannelIdentityMapping::new(
+        allowed.clone(),
+        principal(),
+        workspace_id(),
+        true,
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(1_000),
+    )
+    .expect("allowed mapping");
+    let disabled_mapping = ChannelIdentityMapping::new(
+        disabled,
+        principal(),
+        workspace_id(),
+        false,
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(1_000),
+    )
+    .expect("disabled mapping");
     database
-        .upsert_channel_identity_mapping(
-            &ChannelIdentityMapping::new(
-                allowed.clone(),
-                principal(),
-                workspace_id(),
-                true,
-                TimestampMillis::new(1_000),
-                TimestampMillis::new(1_000),
-            )
-            .expect("allowed mapping"),
-        )
+        .upsert_channel_identity_mapping(&allowed_mapping)
         .await
         .expect("allowed stored");
     database
-        .upsert_channel_identity_mapping(
-            &ChannelIdentityMapping::new(
-                disabled,
-                principal(),
-                workspace_id(),
-                false,
-                TimestampMillis::new(1_000),
-                TimestampMillis::new(1_000),
-            )
-            .expect("disabled mapping"),
-        )
+        .upsert_channel_identity_mapping(&disabled_mapping)
         .await
         .expect("disabled stored");
 
@@ -588,5 +586,12 @@ async fn allowed_channel_mappings_load_exact_channel_send_capabilities() {
             CapabilityName::ChannelSend,
             ResourceScope::exact("channel", destination.as_scope_value()).expect("channel scope"),
         )]
+    );
+    assert_eq!(
+        database
+            .list_channel_identity_mappings(workspace_id())
+            .await
+            .expect("channel mappings"),
+        vec![allowed_mapping, disabled_mapping]
     );
 }

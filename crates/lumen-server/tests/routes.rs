@@ -14,17 +14,17 @@ use lumen_core::{
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
     egress::DataClass,
-    identity::{PrincipalId, WorkspaceId},
+    identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
 use lumen_server::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
     ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand,
-    CreateRunCommand, EventBroker, PluginActionCommand, PluginActionRequested,
-    PluginComponentReview, PluginDetailsQuery, PluginFailureReview, PluginReviewQuery,
-    PluginSettingReview, PluginVersionDetails, PrincipalSummary, RunCancellation, RunCreated,
-    RuntimeService, SandboxCapabilityReport, ServiceError, ServiceFuture, StagedPluginReview,
-    router,
+    ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview, CreateRunCommand,
+    EventBroker, PluginActionCommand, PluginActionRequested, PluginComponentReview,
+    PluginDetailsQuery, PluginFailureReview, PluginReviewQuery, PluginSettingReview,
+    PluginVersionDetails, PrincipalSummary, RunCancellation, RunCreated, RuntimeService,
+    SandboxCapabilityReport, ServiceError, ServiceFuture, StagedPluginReview, router,
 };
 use tower::ServiceExt;
 
@@ -42,6 +42,9 @@ struct FakeService {
     plugin_review_queries: Mutex<Vec<PluginReviewQuery>>,
     plugin_details_queries: Mutex<Vec<PluginDetailsQuery>>,
     plugin_action_commands: Mutex<Vec<PluginActionCommand>>,
+    channel_mapping_queries: Mutex<Vec<ChannelMappingQuery>>,
+    channel_mapping_commands: Mutex<Vec<ChannelMappingCommand>>,
+    channel_mapping_reviews: Mutex<Vec<ChannelMappingReview>>,
 }
 
 impl RuntimeService for FakeService {
@@ -200,6 +203,42 @@ impl RuntimeService for FakeService {
             .push(command);
         Box::pin(async { Ok(PluginActionRequested::new(RunId::new())) })
     }
+
+    fn list_channel_mappings(
+        &self,
+        query: ChannelMappingQuery,
+    ) -> ServiceFuture<'_, Vec<ChannelMappingReview>> {
+        self.channel_mapping_queries
+            .lock()
+            .expect("channel mapping queries")
+            .push(query);
+        let reviews = self
+            .channel_mapping_reviews
+            .lock()
+            .expect("channel mapping reviews")
+            .clone();
+        Box::pin(async move { Ok(reviews) })
+    }
+
+    fn update_channel_mapping(
+        &self,
+        command: ChannelMappingCommand,
+    ) -> ServiceFuture<'_, ChannelMappingReview> {
+        self.channel_mapping_commands
+            .lock()
+            .expect("channel mapping commands")
+            .push(command.clone());
+        Box::pin(async move {
+            Ok(ChannelMappingReview::new(
+                command.external().clone(),
+                PrincipalSummary::new(command.principal()),
+                command.workspace_id(),
+                command.allowed(),
+                TimestampMillis::new(1_000),
+                TimestampMillis::new(2_000),
+            ))
+        })
+    }
 }
 
 fn test_app(workspace_id: WorkspaceId) -> (axum::Router, Arc<FakeService>, EventBroker) {
@@ -245,6 +284,116 @@ async fn runtime_capability_report_is_authenticated_and_workspace_scoped() {
         body["sandbox"]["guarantees"],
         serde_json::json!(["filesystem_isolation", "network_isolation"])
     );
+}
+
+#[tokio::test]
+async fn channel_mapping_review_is_authenticated_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    service
+        .channel_mapping_reviews
+        .lock()
+        .expect("channel mapping reviews")
+        .push(ChannelMappingReview::new(
+            ExternalChannelIdentity::new("slack", "T123", "C456", "U789")
+                .expect("external identity"),
+            PrincipalSummary::new(&PrincipalId::new("local", "alice").expect("principal")),
+            workspace_id,
+            true,
+            TimestampMillis::new(1_000),
+            TimestampMillis::new(2_000),
+        ));
+
+    let response = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/egress/channels"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["mappings"][0]["provider"], "slack");
+    assert_eq!(body["mappings"][0]["external_workspace_id"], "T123");
+    assert_eq!(body["mappings"][0]["channel_id"], "C456");
+    assert_eq!(body["mappings"][0]["external_user_id"], "U789");
+    assert_eq!(body["mappings"][0]["lumen_identity"]["subject"], "alice");
+    assert_eq!(
+        body["mappings"][0]["workspace_id"],
+        workspace_id.to_string()
+    );
+    assert_eq!(body["mappings"][0]["allowed"], true);
+    let queries = service
+        .channel_mapping_queries
+        .lock()
+        .expect("channel mapping queries");
+    assert_eq!(queries[0].workspace_id(), workspace_id);
+    assert_eq!(queries[0].actor().subject(), "operator");
+}
+
+#[tokio::test]
+async fn channel_mapping_updates_are_validated_and_forwarded() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/egress/channels"),
+            Body::from(
+                r#"{
+                    "provider":"slack",
+                    "external_workspace_id":"T123",
+                    "channel_id":"C456",
+                    "external_user_id":"U789",
+                    "lumen_provider":"local",
+                    "lumen_subject":"alice",
+                    "allowed":true
+                }"#,
+            ),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["provider"], "slack");
+    assert_eq!(body["lumen_identity"]["subject"], "alice");
+    assert_eq!(body["allowed"], true);
+    {
+        let commands = service
+            .channel_mapping_commands
+            .lock()
+            .expect("channel mapping commands");
+        assert_eq!(commands[0].workspace_id(), workspace_id);
+        assert_eq!(commands[0].actor().subject(), "operator");
+        assert_eq!(commands[0].external().channel_id(), "C456");
+        assert_eq!(commands[0].principal().subject(), "alice");
+        assert!(commands[0].allowed());
+    }
+
+    let bad_response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/egress/channels"),
+            Body::from(
+                r#"{
+                    "provider":"slack",
+                    "external_workspace_id":"T123",
+                    "channel_id":"bad/channel",
+                    "external_user_id":"U789",
+                    "lumen_provider":"local",
+                    "lumen_subject":"alice",
+                    "allowed":true
+                }"#,
+            ),
+        ))
+        .await
+        .expect("bad response");
+    assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
 }
 
 fn request(method: &str, uri: String, body: Body) -> Request<Body> {

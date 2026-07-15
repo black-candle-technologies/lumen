@@ -678,6 +678,52 @@ impl Database {
         .transpose()
     }
 
+    pub async fn list_channel_identity_mappings(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<ChannelIdentityMapping>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT
+                provider, external_workspace_id, channel_id, external_user_id,
+                lumen_provider, lumen_subject, allowed, created_at, updated_at
+             FROM egress_channel_mappings
+             WHERE workspace_id = ?
+             ORDER BY provider ASC, external_workspace_id ASC, channel_id ASC, external_user_id ASC",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                ChannelIdentityMapping::new(
+                    ExternalChannelIdentity::new(
+                        row.try_get::<String, _>("provider")?,
+                        row.try_get::<String, _>("external_workspace_id")?,
+                        row.try_get::<String, _>("channel_id")?,
+                        row.try_get::<String, _>("external_user_id")?,
+                    )
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    PrincipalId::new(
+                        row.try_get::<String, _>("lumen_provider")?,
+                        row.try_get::<String, _>("lumen_subject")?,
+                    )
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    workspace_id,
+                    row.try_get::<i64, _>("allowed")? == 1,
+                    TimestampMillis::new(
+                        u64::try_from(row.try_get::<i64, _>("created_at")?)
+                            .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    ),
+                    TimestampMillis::new(
+                        u64::try_from(row.try_get::<i64, _>("updated_at")?)
+                            .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    ),
+                )
+            })
+            .collect()
+    }
+
     pub async fn allowed_channel_send_capabilities(
         &self,
         workspace_id: WorkspaceId,

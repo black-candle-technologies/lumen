@@ -10,7 +10,7 @@ use lumen_core::{
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
     egress::DataClass,
-    identity::{PrincipalId, WorkspaceId},
+    identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,14 @@ pub trait RuntimeService: Send + Sync {
         &self,
         command: PluginActionCommand,
     ) -> ServiceFuture<'_, PluginActionRequested>;
+    fn list_channel_mappings(
+        &self,
+        query: ChannelMappingQuery,
+    ) -> ServiceFuture<'_, Vec<ChannelMappingReview>>;
+    fn update_channel_mapping(
+        &self,
+        command: ChannelMappingCommand,
+    ) -> ServiceFuture<'_, ChannelMappingReview>;
 }
 
 #[derive(Clone)]
@@ -461,6 +469,112 @@ impl SandboxCapabilityReport {
             strength: strength.into(),
             guarantees: guarantees.into_iter().map(Into::into).collect(),
             detail,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelMappingQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl ChannelMappingQuery {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelMappingCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    external: ExternalChannelIdentity,
+    principal: PrincipalId,
+    allowed: bool,
+}
+
+impl ChannelMappingCommand {
+    pub(crate) const fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        external: ExternalChannelIdentity,
+        principal: PrincipalId,
+        allowed: bool,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            external,
+            principal,
+            allowed,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn external(&self) -> &ExternalChannelIdentity {
+        &self.external
+    }
+
+    pub const fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+
+    pub const fn allowed(&self) -> bool {
+        self.allowed
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ChannelMappingReview {
+    provider: String,
+    external_workspace_id: String,
+    channel_id: String,
+    external_user_id: String,
+    lumen_identity: PrincipalSummary,
+    workspace_id: WorkspaceId,
+    allowed: bool,
+    created_at: TimestampMillis,
+    updated_at: TimestampMillis,
+}
+
+impl ChannelMappingReview {
+    pub fn new(
+        external: ExternalChannelIdentity,
+        lumen_identity: PrincipalSummary,
+        workspace_id: WorkspaceId,
+        allowed: bool,
+        created_at: TimestampMillis,
+        updated_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            provider: external.provider().to_owned(),
+            external_workspace_id: external.external_workspace_id().to_owned(),
+            channel_id: external.channel_id().to_owned(),
+            external_user_id: external.external_user_id().to_owned(),
+            lumen_identity,
+            workspace_id,
+            allowed,
+            created_at,
+            updated_at,
         }
     }
 }

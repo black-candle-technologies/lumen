@@ -14,15 +14,15 @@ use lumen_core::{
     approval::ApprovalId,
     egress::DataClass,
     extension::{PluginId, PluginVersion, Sha256Digest},
-    identity::{PrincipalId, WorkspaceId},
+    identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
-    CancelRunCommand, CreateRunCommand, PluginActionCommand, PluginDetailsQuery, PluginReviewQuery,
-    ServiceError,
+    CancelRunCommand, ChannelMappingCommand, ChannelMappingQuery, CreateRunCommand,
+    PluginActionCommand, PluginDetailsQuery, PluginReviewQuery, ServiceError,
 };
 
 pub fn router(state: ApiState) -> Router {
@@ -61,6 +61,10 @@ pub fn router(state: ApiState) -> Router {
             "/api/v1/workspaces/{workspace_id}/runtime/capabilities",
             get(runtime_capabilities),
         )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/egress/channels",
+            get(list_channel_mappings).post(update_channel_mapping),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
 }
@@ -79,6 +83,69 @@ async fn runtime_capabilities(
     Ok(Json(RuntimeCapabilitiesResponse {
         sandbox: state.sandbox().clone(),
     }))
+}
+
+#[derive(Serialize)]
+struct ChannelMappingsResponse {
+    mappings: Vec<crate::ChannelMappingReview>,
+}
+
+async fn list_channel_mappings(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<ChannelMappingsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let mappings = state
+        .service
+        .list_channel_mappings(ChannelMappingQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(ChannelMappingsResponse { mappings }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelMappingBody {
+    provider: String,
+    external_workspace_id: String,
+    channel_id: String,
+    external_user_id: String,
+    lumen_provider: String,
+    lumen_subject: String,
+    allowed: bool,
+}
+
+async fn update_channel_mapping(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    body: Result<Json<ChannelMappingBody>, JsonRejection>,
+) -> Result<Json<crate::ChannelMappingReview>, ApiError> {
+    let Json(body) =
+        body.map_err(|_| ApiError::BadRequest("invalid channel mapping body".into()))?;
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let external = ExternalChannelIdentity::new(
+        body.provider,
+        body.external_workspace_id,
+        body.channel_id,
+        body.external_user_id,
+    )
+    .map_err(|_| ApiError::BadRequest("invalid external channel identity".into()))?;
+    let principal = PrincipalId::new(body.lumen_provider, body.lumen_subject)
+        .map_err(|_| ApiError::BadRequest("invalid Lumen identity".into()))?;
+    let mapping = state
+        .service
+        .update_channel_mapping(ChannelMappingCommand::new(
+            workspace_id,
+            actor,
+            external,
+            principal,
+            body.allowed,
+        ))
+        .await?;
+    Ok(Json(mapping))
 }
 
 async fn authenticate(

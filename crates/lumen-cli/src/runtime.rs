@@ -26,8 +26,8 @@ use lumen_core::{
     secret::SecretRefId,
 };
 use lumen_db::{
-    Database, DispatchReservation, ModelEndpointClass, ModelProviderRevision, PluginGrantScope,
-    PluginSettingScope, WorkspaceModelEgressRevision,
+    ChannelIdentityMapping, Database, DispatchReservation, ModelEndpointClass,
+    ModelProviderRevision, PluginGrantScope, PluginSettingScope, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     filesystem::WorkspaceReader,
@@ -41,11 +41,11 @@ use lumen_integrations::{
 };
 use lumen_server::{
     ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
-    ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand, CreateRunCommand,
-    EventBroker, PluginActionCommand, PluginActionRequested, PluginComponentReview,
-    PluginDetailsQuery, PluginFailureReview, PluginReviewQuery, PluginSettingReview,
-    PluginVersionDetails, PrincipalSummary, RunCancellation, RunCreated, RuntimeService,
-    ServiceError, ServiceFuture, StagedPluginReview,
+    ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand, ChannelMappingCommand,
+    ChannelMappingQuery, ChannelMappingReview, CreateRunCommand, EventBroker, PluginActionCommand,
+    PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
+    PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
+    RunCancellation, RunCreated, RuntimeService, ServiceError, ServiceFuture, StagedPluginReview,
 };
 use sqlx::Row;
 use tokio::sync::Mutex;
@@ -1005,6 +1005,57 @@ impl RuntimeService for LocalRuntimeService {
             Ok(PluginActionRequested::new(run_id))
         })
     }
+
+    fn list_channel_mappings(
+        &self,
+        query: ChannelMappingQuery,
+    ) -> ServiceFuture<'_, Vec<ChannelMappingReview>> {
+        Box::pin(async move {
+            self.database
+                .list_channel_identity_mappings(query.workspace_id())
+                .await
+                .map_err(repository_service_error)?
+                .into_iter()
+                .map(channel_mapping_review)
+                .collect()
+        })
+    }
+
+    fn update_channel_mapping(
+        &self,
+        command: ChannelMappingCommand,
+    ) -> ServiceFuture<'_, ChannelMappingReview> {
+        Box::pin(async move {
+            let timestamp = now();
+            let mapping = ChannelIdentityMapping::new(
+                command.external().clone(),
+                command.principal().clone(),
+                command.workspace_id(),
+                command.allowed(),
+                timestamp,
+                timestamp,
+            )
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            self.database
+                .upsert_channel_identity_mapping(&mapping)
+                .await
+                .map_err(repository_service_error)?;
+            channel_mapping_review(mapping)
+        })
+    }
+}
+
+fn channel_mapping_review(
+    mapping: ChannelIdentityMapping,
+) -> Result<ChannelMappingReview, ServiceError> {
+    Ok(ChannelMappingReview::new(
+        mapping.external().clone(),
+        PrincipalSummary::new(mapping.principal()),
+        mapping.workspace_id(),
+        mapping.allowed(),
+        mapping.created_at(),
+        mapping.updated_at(),
+    ))
 }
 
 fn capability_review(capability: &Capability) -> Result<CanonicalValue, ServiceError> {
