@@ -54,8 +54,11 @@ Owns adapters with external side effects:
 - Linux bubblewrap and macOS `sandbox-exec` backends
 - Process monitoring, output bounds, cancellation, timeouts, and Unix resource limits
 - OS keychain and in-memory test secret stores
+- Strict local plugin package staging and schema validation
+- WASM component host and supervised subprocess plugin host
+- Shared extension conformance fixtures
 
-Adapters receive authorized actions through core contracts. There is no alternate direct-dispatch API. WASM, MCP, and third-party subprocess extension hosts are Milestone 3 work and are not present yet.
+Adapters receive authorized actions through core contracts. There is no alternate direct-dispatch API.
 
 ### `crates/lumen-server`
 
@@ -65,6 +68,7 @@ Owns the local transport surface:
 - Run creation and cancellation
 - Pending approval listing and decisions
 - Audit listing and sandbox capability reporting
+- Plugin review, installed-version, authority, settings, failure, and lifecycle-action routes
 - SSE run-event replay and streaming
 
 Handlers call the composed runtime service. They do not independently authorize or execute tools.
@@ -78,11 +82,12 @@ Owns process composition and operator commands:
 - Audit-chain verification
 - Sandbox capability reporting
 - Secret-reference create, list, and delete commands
+- Plugin stage, review, install, enable, disable, grant, settings, quarantine-release, and invocation composition
 - Wiring of the model, policy, persistence, approval, executor, secret, and event ports
 
 ### `apps/web`
 
-Owns the browser control surface. It provides local chat with cancellation, exact action approvals, audit inspection, and runtime connection settings. File approvals show trusted before/after content, byte counts, hashes, and the canonical fingerprint. Secret-bearing process approvals show reference metadata but never resolve values.
+Owns the browser control surface. It provides local chat with cancellation, exact action approvals, audit inspection, plugin review controls, and runtime connection settings. File approvals show trusted before/after content, byte counts, hashes, and the canonical fingerprint. Secret-bearing process approvals show reference metadata but never resolve values. Plugin controls show review hashes, requested authority, effective grants, scoped settings, failures, and lifecycle actions without rendering plugin-supplied HTML/CSS/JS.
 
 ### `apps/desktop`
 
@@ -100,14 +105,15 @@ lumen-integrations -> lumen-core
 lumen-core -> domain-focused dependencies only
 ```
 
-Cross-cutting abstractions should be extracted only after an implemented boundary needs independent ownership. The next planned boundary is the Milestone 3 extension protocol, not another path around the runtime kernel.
+Cross-cutting abstractions should be extracted only after an implemented boundary needs independent ownership. The extension protocol is now an owned boundary; future integrations must still enter through the runtime kernel.
 
 ## Verification Areas
 
 - Core state-machine, policy, approval, quota, and outcome tests live under `crates/lumen-core/tests`.
 - SQLite migration, transaction, audit-chain, and recovery tests live under `crates/lumen-db/tests`.
 - Filesystem, sandbox, process, model-client, and secret-store tests live under `crates/lumen-integrations/tests` and the sandbox module tests.
-- Model-to-HTTP-to-executor security tests live with runtime composition in `crates/lumen-cli/src/runtime/security_tests.rs`.
+- Extension package, schema, WASM, subprocess, and shared conformance tests live under `crates/lumen-integrations/tests`.
+- Model-to-HTTP-to-executor and plugin-lifecycle security tests live with runtime composition in `crates/lumen-cli/src/runtime/security_tests.rs`.
 - Authenticated route contracts live under `crates/lumen-server/tests`.
 - Svelte component and Playwright desktop/mobile tests live under `apps/web`.
 - Tauri authority-surface tests live under `apps/desktop/src-tauri/tests`.

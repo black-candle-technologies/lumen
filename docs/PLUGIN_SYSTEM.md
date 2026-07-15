@@ -64,20 +64,20 @@ Manifests are parsed as structured data with unknown security-relevant fields re
 
 ## Installation Lifecycle
 
-Installation is a staged transaction:
+Installation is a staged and approval-bound transaction:
 
 1. Acquire the package into a quarantine directory.
 2. Parse and validate the manifest without executing plugin code.
 3. Compute hashes for the canonical manifest and every executable artifact.
-4. Record source provenance and signature information when available.
+4. Record local source provenance and the authenticated reviewer identity.
 5. Present requested capabilities and version changes for approval.
 6. Atomically install an immutable version directory.
 7. Create a disabled plugin-version record.
 8. Enable components only after grants and settings pass validation.
 
-Updates install side by side and never replace an executing artifact. A changed executable, manifest, or effective configuration produces a new action fingerprint and invalidates prior approvals that depend on it. Uninstall disables the version first and removes files only after active runs have ended.
+Updates install side by side and never replace an executing artifact. A changed executable, manifest, grant set, or effective configuration produces a new action fingerprint and invalidates prior approvals that depend on it. Disablement and quarantine release are explicit lifecycle actions.
 
-Hashes establish artifact identity, not trust. Signatures establish publisher continuity only when the signer is trusted. Neither replaces sandboxing or least privilege.
+Hashes establish artifact identity, not trust. Signature verification is not part of the current local-package slice. Future signatures should establish publisher continuity only when the signer is trusted, and they must not replace sandboxing or least privilege.
 
 ## Capability Grants
 
@@ -116,6 +116,8 @@ Plugin crashes fail the current action without crashing the runtime. Restart pol
 
 Skill bundles contain versioned instructions and supporting resources. Skill content is hashed, attributed, scoped, and audited when loaded. Skills cannot call host APIs directly and cannot expand the capability set of the agent using them. A workflow-derived skill is disabled until reviewed and explicitly enabled.
 
-## MVP Boundary
+## Current Boundary
 
-The first vertical slice defines the plugin contracts and uses built-in executors. Third-party installation and execution remain disabled until the policy, approval, sandbox, secret, and audit paths have integration tests. This prevents the extension ecosystem from solidifying around a bypassable early boundary.
+The current vertical slice supports local package staging, review, approval-bound installation, immutable versions, WASM-component execution, supervised subprocess execution, global and workspace grants, deterministic scoped settings, runtime-owned audit provenance, and authenticated plugin review APIs. It does not yet support public marketplaces, automatic updates, remote signature trust, plugin-supplied UI, external channel adapters, scheduled-job plugins, or remote network egress.
+
+Milestone completion still requires the privileged Linux plugin-sandbox gate in a Linux container or equivalent CI Linux target. Until that gate passes, Linux subprocess containment should be treated as implemented but not release-complete.

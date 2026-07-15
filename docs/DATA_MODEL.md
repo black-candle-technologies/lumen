@@ -46,10 +46,15 @@ Lumen uses SQLite as its only initial database target. The persistence layer use
 ### Extensions
 
 - `plugins`
+- `plugin_staged_packages`
 - `plugin_versions`
 - `plugin_components`
 - `plugin_capability_requests`
+- `plugin_workspace_versions`
+- `plugin_grant_revisions`
+- `plugin_capability_grants`
 - `plugin_settings`
+- `plugin_failures`
 - `agent_skills`
 - `skill_versions`
 
@@ -64,6 +69,11 @@ Lumen uses SQLite as its only initial database target. The persistence layer use
 - Dispatch requires a current allow decision and a valid approval when one is required.
 - Execution attempt creation and approval consumption are atomic.
 - Enabled plugin versions reference installed immutable artifacts.
+- Staged plugin package identity is immutable after review.
+- Installed plugin version identity is immutable after installation.
+- One plugin version can be enabled per workspace/plugin at a time.
+- Plugin grants can only reference capabilities requested by the manifest.
+- Plugin failure windows survive database reopen and can quarantine one workspace/version.
 - Capability grants reference an existing principal and scope.
 - Every action terminal state has a corresponding audit event.
 - Audit sequence numbers and hash-chain links are committed in order.

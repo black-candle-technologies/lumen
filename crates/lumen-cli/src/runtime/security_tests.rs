@@ -922,7 +922,8 @@ async fn approve_pending(harness: &Harness) {
 }
 
 async fn wait_for_action_state(harness: &Harness, run_id: &str, expected: &str) {
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
         let state: Option<String> =
             sqlx::query_scalar("SELECT state FROM actions WHERE run_id = ?")
                 .bind(run_id)
@@ -931,6 +932,9 @@ async fn wait_for_action_state(harness: &Harness, run_id: &str, expected: &str) 
                 .expect("action state");
         if state.as_deref() == Some(expected) {
             return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -941,6 +945,317 @@ async fn wait_for_action_state(harness: &Harness, run_id: &str, expected: &str) 
             .await
             .expect("final action state");
     panic!("action for run {run_id} did not reach {expected}: {actual:?}");
+}
+
+async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    serde_json::from_slice(&body).expect("response JSON")
+}
+
+async fn wait_for_run_completed(harness: &Harness, run_id: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("run state");
+        if state == "completed" {
+            return;
+        }
+        if state == "failed" {
+            let actions: Vec<(String, String)> = sqlx::query_as(
+                "SELECT kind, state FROM actions WHERE run_id = ? ORDER BY created_at, id",
+            )
+            .bind(run_id)
+            .fetch_all(harness.database.pool())
+            .await
+            .expect("failed run actions");
+            panic!("run {run_id} failed with actions {actions:?}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("run {run_id} did not complete");
+}
+
+async fn assert_staged_review_visible(harness: &Harness, staged: &StagedPluginPackage) {
+    let response = harness.request("GET", "plugins/staged?limit=20", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    let package = body["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .find(|package| package["stage_id"] == staged.id().to_string())
+        .expect("staged package in review API");
+    assert_eq!(package["plugin_id"], staged.manifest().id().as_str());
+    assert_eq!(package["version"], staged.manifest().version().as_str());
+    assert_eq!(package["package_digest"], staged.package_digest().as_str());
+    assert_eq!(
+        package["manifest_digest"],
+        staged.manifest_digest().as_str()
+    );
+    assert_eq!(
+        package["artifact_digest"],
+        staged.manifest().integrity().artifact().as_str()
+    );
+    assert_eq!(package["requested_by"]["subject"], "operator");
+}
+
+async fn assert_installed_detail_visible(harness: &Harness, staged: &StagedPluginPackage) {
+    let response = harness
+        .request(
+            "GET",
+            &format!(
+                "plugins/{}/versions/{}",
+                staged.manifest().id(),
+                staged.manifest().version()
+            ),
+            "",
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["plugin_id"], staged.manifest().id().as_str());
+    assert_eq!(body["version"], staged.manifest().version().as_str());
+    assert_eq!(body["package_digest"], staged.package_digest().as_str());
+    assert_eq!(body["manifest_digest"], staged.manifest_digest().as_str());
+    assert_eq!(
+        body["artifact_digest"],
+        staged.manifest().integrity().artifact().as_str()
+    );
+    assert!(
+        body["components"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+}
+
+async fn grant_subprocess_effect_authority(harness: &Harness, staged: &StagedPluginPackage) {
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+    let fs_grant = GrantInput {
+        name: "fs.read".into(),
+        scope: CanonicalValue::object([
+            ("type", CanonicalValue::from("workspace")),
+            (
+                "workspace_id",
+                CanonicalValue::from(harness.workspace_id.to_string()),
+            ),
+        ]),
+    };
+    let executable = std::fs::canonicalize("/bin/echo")
+        .expect("echo executable")
+        .to_string_lossy()
+        .into_owned();
+    let process_grant = GrantInput {
+        name: "process.spawn".into(),
+        scope: CanonicalValue::object([
+            ("type", CanonicalValue::from("exact")),
+            ("resource_type", CanonicalValue::from("executable")),
+            ("value", CanonicalValue::from(executable)),
+        ]),
+    };
+    for (scope_type, scope_id) in [
+        ("global", "*".to_owned()),
+        ("workspace", harness.workspace_id.to_string()),
+    ] {
+        let arguments = GrantArguments {
+            plugin_id: plugin_id.clone(),
+            plugin_version: version.clone(),
+            component_id: "reader".into(),
+            scope_type: scope_type.into(),
+            scope_id,
+            expected_revision: None,
+            grants: vec![fs_grant.clone(), process_grant.clone()],
+        };
+        let run = request_admin_action(
+            harness,
+            "plugin.capabilities.set",
+            &plugin_id,
+            &version,
+            &arguments,
+        )
+        .await;
+        approve_pending(harness).await;
+        wait_for_action_state(harness, &run, "succeeded").await;
+    }
+}
+
+async fn enable_installed_plugin(harness: &Harness, staged: &StagedPluginPackage) {
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+    let target = VersionArguments {
+        plugin_id: plugin_id.clone(),
+        plugin_version: version.clone(),
+    };
+    let enable_run =
+        request_admin_action(harness, "plugin.enable", &plugin_id, &version, &target).await;
+    approve_pending(harness).await;
+    wait_for_action_state(harness, &enable_run, "succeeded").await;
+}
+
+async fn install_grant_enable_and_invoke_subprocess(
+    harness: &Harness,
+    staged: &StagedPluginPackage,
+) {
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+    let install_run = request_install(harness, staged).await;
+    approve_pending(harness).await;
+    wait_for_action_state(harness, &install_run, "succeeded").await;
+    grant_subprocess_effect_authority(harness, staged).await;
+    enable_installed_plugin(harness, staged).await;
+    assert_installed_detail_visible(harness, staged).await;
+
+    let run_id = harness
+        .service
+        .request_plugin_invocation(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("principal"),
+            &plugin_id,
+            &version,
+            "reader",
+            serde_json::from_value(serde_json::json!({"path": "note.txt"}))
+                .expect("canonical input"),
+        )
+        .await
+        .expect("request subprocess invocation")
+        .to_string();
+    wait_for_run_completed(harness, &run_id).await;
+    assert_plugin_invoke_provenance(harness, &run_id, staged, Some("filesystem.read")).await;
+    assert_approval_execution_audit_order(harness, &run_id).await;
+}
+
+async fn install_enable_and_invoke_wasm(
+    harness: &Harness,
+    staged: &StagedPluginPackage,
+    request_id: uuid::Uuid,
+) {
+    let plugin_id = staged.manifest().id().to_string();
+    let version = staged.manifest().version().to_string();
+    let install_run = request_install(harness, staged).await;
+    approve_pending(harness).await;
+    wait_for_action_state(harness, &install_run, "succeeded").await;
+    enable_installed_plugin(harness, staged).await;
+    assert_installed_detail_visible(harness, staged).await;
+
+    let run_id = harness
+        .service
+        .request_plugin_invocation_request(PluginInvocationCommand {
+            workspace_id: harness.workspace_id,
+            actor: PrincipalId::new("local", "operator").expect("principal"),
+            plugin_id,
+            plugin_version: version,
+            component_id: "echo".into(),
+            request_id,
+            input: CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        })
+        .await
+        .expect("request WASM invocation")
+        .to_string();
+    wait_for_run_completed(harness, &run_id).await;
+    assert_plugin_invoke_provenance(harness, &run_id, staged, None).await;
+    assert_approval_execution_audit_order(harness, &run_id).await;
+}
+
+async fn assert_plugin_invoke_provenance(
+    harness: &Harness,
+    run_id: &str,
+    staged: &StagedPluginPackage,
+    expected_child_kind: Option<&str>,
+) {
+    let actions: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, kind, state, extension_provenance_json FROM actions
+         WHERE run_id = ? ORDER BY created_at, id",
+    )
+    .bind(run_id)
+    .fetch_all(harness.database.pool())
+    .await
+    .expect("actions");
+    let invocation = actions
+        .iter()
+        .find(|(_, kind, _, _)| kind == "plugin.invoke")
+        .expect("plugin invocation action");
+    assert_eq!(invocation.2, "succeeded");
+    let provenance: serde_json::Value =
+        serde_json::from_str(invocation.3.as_deref().expect("invocation provenance"))
+            .expect("invocation provenance JSON");
+    assert_eq!(provenance["plugin_id"], staged.manifest().id().as_str());
+    assert_eq!(
+        provenance["plugin_version"],
+        staged.manifest().version().as_str()
+    );
+    assert_eq!(
+        provenance["package_digest"],
+        staged.package_digest().as_str()
+    );
+    assert_eq!(
+        provenance["manifest_digest"],
+        staged.manifest_digest().as_str()
+    );
+    assert_eq!(
+        provenance["artifact_digest"],
+        staged.manifest().integrity().artifact().as_str()
+    );
+    assert!(provenance["settings_digest"].as_str().is_some());
+    assert!(provenance["grant_set_digest"].as_str().is_some());
+
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_attempts WHERE action_id = ? AND state = 'succeeded'",
+    )
+    .bind(&invocation.0)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("execution attempts");
+    assert_eq!(attempts, 1);
+
+    if let Some(child_kind) = expected_child_kind {
+        let child = actions
+            .iter()
+            .find(|(_, kind, _, _)| kind == child_kind)
+            .expect("child action");
+        assert_eq!(child.2, "succeeded");
+        let child_provenance: serde_json::Value =
+            serde_json::from_str(child.3.as_deref().expect("child provenance"))
+                .expect("child provenance JSON");
+        assert_eq!(child_provenance["parent_action_id"], invocation.0);
+    }
+}
+
+async fn assert_approval_execution_audit_order(harness: &Harness, run_id: &str) {
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 500)
+        .await
+        .expect("audit records");
+    let run_records = records
+        .iter()
+        .filter(|record| match record.event().payload() {
+            CanonicalValue::Object(payload) => {
+                payload.get("run_id") == Some(&CanonicalValue::from(run_id))
+            }
+            _ => false,
+        })
+        .map(|record| record.event().kind())
+        .collect::<Vec<_>>();
+    let started = run_records
+        .iter()
+        .position(|kind| *kind == AuditEventKind::ExecutionStarted)
+        .expect("execution started");
+    let succeeded = run_records
+        .iter()
+        .position(|kind| *kind == AuditEventKind::ExecutionSucceeded)
+        .expect("execution succeeded");
+    assert!(started < succeeded);
 }
 
 fn final_response(text: &str) -> ResponseTemplate {
@@ -1465,6 +1780,40 @@ async fn plugin_lifecycle_changes_all_dispatch_as_actions() {
 }
 
 #[tokio::test]
+async fn milestone3_review_approval_grant_enable_and_invoke_are_proven_for_both_hosts() {
+    let model = MockServer::start().await;
+    let subprocess_harness = Harness::new_with_plugin_response(
+        &model,
+        |workspace| {
+            std::fs::write(workspace.join("note.txt"), "approved contents")
+                .expect("workspace fixture");
+        },
+        lumen_extension_sdk::Response::proposal(
+            "filesystem.read",
+            serde_json::json!({"path": "note.txt"}),
+        ),
+    )
+    .await;
+    let subprocess = stage_subprocess_fixture(&subprocess_harness).await;
+    assert_staged_review_visible(&subprocess_harness, &subprocess).await;
+    install_grant_enable_and_invoke_subprocess(&subprocess_harness, &subprocess).await;
+    subprocess_harness.service.shutdown().await;
+
+    let request_id = uuid::Uuid::new_v4();
+    let response = lumen_extension_sdk::InvocationResponse::new(
+        request_id.to_string(),
+        lumen_extension_sdk::Response::result(serde_json::json!({"status": "ok"})),
+    )
+    .expect("WASM response");
+    let artifact = wasm_response_component(&response);
+    let wasm_harness = Harness::new(&model, |_| {}).await;
+    let wasm = stage_wasm_fixture(&wasm_harness, &artifact).await;
+    assert_staged_review_visible(&wasm_harness, &wasm).await;
+    install_enable_and_invoke_wasm(&wasm_harness, &wasm, request_id).await;
+    wasm_harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn subprocess_invocation_and_returned_action_share_the_reserved_action_lifecycle() {
     let model = MockServer::start().await;
     let harness = Harness::new_with_plugin_response(
@@ -1595,18 +1944,7 @@ async fn plugin_process_proposal_requires_child_approval_and_exact_executable_gr
         )
         .await;
     assert_eq!(response.status(), StatusCode::OK);
-    for _ in 0..100 {
-        let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
-            .bind(&run_id)
-            .fetch_one(harness.database.pool())
-            .await
-            .expect("run state");
-        if state == "completed" {
-            break;
-        }
-        assert_ne!(state, "failed", "process proposal run failed");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_run_completed(&harness, &run_id).await;
     let actions: Vec<(String, String)> =
         sqlx::query_as("SELECT kind, state FROM actions WHERE run_id = ? ORDER BY kind")
             .bind(&run_id)

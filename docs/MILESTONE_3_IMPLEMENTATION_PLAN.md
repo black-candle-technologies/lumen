@@ -179,17 +179,19 @@ docs/
 
 **Files:** security tests under owning crates, `README.md`, `docs/{ARCHITECTURE,DATA_MODEL,PLUGIN_SYSTEM,REPOSITORY,ROADMAP,RUNTIME_EXECUTION,SECURITY}.md`, this plan
 
-- [ ] Add a full stage-to-review-to-approval-to-install-to-grant-to-enable-to-invoke test for both hosts, including approved child effects and exact audit provenance.
-- [ ] Add adversarial substitution, traversal/link, malformed schema/protocol, capability escalation, secret exfiltration, ambient-access, resource exhaustion, crash, restart recovery, revocation, side-by-side upgrade, and quarantine scenarios.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `CARGO_INCREMENTAL=0 cargo test --workspace`.
-- [ ] Run SDK documentation and both host conformance fixtures.
+- [x] Add a full stage-to-review-to-approval-to-install-to-grant-to-enable-to-invoke test for both hosts, including approved child effects and exact audit provenance.
+- [x] Add adversarial substitution, traversal/link, malformed schema/protocol, capability escalation, secret exfiltration, ambient-access, resource exhaustion, crash, restart recovery, revocation, side-by-side upgrade, and quarantine scenarios.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Run `CARGO_INCREMENTAL=0 cargo test --workspace`.
+- [x] Run SDK documentation and both host conformance fixtures.
 - [ ] Run Linux plugin-sandbox tests in a privileged Linux container or equivalent CI-compatible Linux target; failure to run or pass this mandatory gate blocks milestone completion.
-- [ ] Run `pnpm check:web`, frontend unit tests, production builds, and Playwright desktop/mobile tests.
-- [ ] Inspect rendered plugin and approval UI at desktop and mobile sizes and validate Tauri configuration.
-- [ ] Update Roadmap Milestone 3 only for behavior proven by the suite and reconcile all extension/security documentation.
-- [ ] Run `git diff --check` before the final commit.
+- [x] Run `pnpm check:web`, frontend unit tests, production builds, and Playwright desktop/mobile tests.
+- [x] Inspect rendered plugin and approval UI at desktop and mobile sizes and validate Tauri configuration.
+- [x] Update Roadmap Milestone 3 only for behavior proven by the suite and reconcile all extension/security documentation.
+- [x] Run `git diff --check` before the final commit.
 - [ ] Commit as `test: verify extension runtime boundaries`.
 - [ ] Push `feat/milestone-3-extension-runtime`.
 - [ ] Confirm the worktree is clean and verify the remote ref matches local HEAD after push.
+
+Verification note: `CARGO_INCREMENTAL=0 cargo test --workspace` covered SDK doc tests, host conformance tests, macOS plugin-sandbox execution tests, Linux sandbox construction/unit tests, route tests, Tauri security configuration, and the full runtime security suite. The mandatory privileged Linux plugin-sandbox execution gate was not run in this macOS environment because Docker is installed but the daemon socket is unavailable.

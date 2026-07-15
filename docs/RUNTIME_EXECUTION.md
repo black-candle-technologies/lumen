@@ -94,3 +94,17 @@ Cancellation stops further model turns, revokes pending dispatch reservations, s
 Results are schema-validated, byte-bounded, and scanned for known secret values before persistence or model reuse. Binary or large artifacts are stored separately with content hashes and references. Diagnostic stderr remains distinct from user-facing structured output.
 
 Tool results never directly alter identity, policy, approvals, plugin state, or runtime configuration.
+
+## Extension Invocation
+
+Plugin invocation is just another action lifecycle, not a shortcut around it:
+
+1. The runtime loads the enabled immutable plugin version for the workspace.
+2. It computes effective grants and settings from persisted revisions.
+3. It persists a `plugin.invoke` action with plugin ID, version, component, runtime type, package digest, manifest digest, artifact digest, settings digest, grant-set digest, protocol version, and input fingerprint.
+4. Policy and approval are evaluated against that exact envelope.
+5. Dispatch rechecks the artifact digest and current plugin state before host entry.
+6. WASM or subprocess output is decoded, correlated to the original request, schema-validated, bounded, and redacted.
+7. Returned action proposals re-enter the same normalization, capability, approval, execution, and audit path as child actions attributed to the parent plugin action.
+
+Disabled, missing, tampered, quarantined, stale-grant, stale-setting, malformed, late, or broader-than-granted plugin effects fail closed. Material grant revocation cancels affected active invocations, and repeated counted plugin faults quarantine only the affected workspace/version unless an artifact digest mismatch requires global artifact quarantine.

@@ -26,6 +26,7 @@ The web UI/API should stay intentionally narrow:
 
 - Chat
 - Approvals
+- Plugin review
 - Audit log
 
 Lumen can expose web functionality, but the product should not depend on becoming a cloud-hosted automation platform.
@@ -76,9 +77,9 @@ The reason is practical: runtime state needs to be queryable, auditable, mutable
 
 ## Repository Status
 
-Milestones 1 and 2 are implemented. The repository includes strict local configuration, SQLite state and audit chaining, a loopback OpenAI-compatible model client, capability and one-shot approval enforcement, bounded workspace file reads and writes, supervised process execution, OS-keychain secret references, cancellation and resource quotas, authenticated HTTP/SSE APIs, and exact chat/approval/audit control surfaces.
+Milestones 1 and 2 are implemented. The Milestone 3 extension runtime is implemented except for the mandatory privileged Linux plugin-sandbox verification gate. The repository includes strict local configuration, SQLite state and audit chaining, a loopback OpenAI-compatible model client, capability and one-shot approval enforcement, bounded workspace file reads and writes, supervised process execution, OS-keychain secret references, cancellation and resource quotas, authenticated HTTP/SSE APIs, and exact chat/approval/plugin/audit control surfaces.
 
-Linux process actions require the complete bubblewrap profile. macOS uses a narrower reported `sandbox-exec` profile. The Tauri application is a command-free packaging shell with no filesystem, shell, process, or opener permissions. Extension loading, remote providers, external channels, scheduled jobs, browser automation, and learned skills remain intentionally unavailable until their roadmap milestones are implemented.
+Linux process actions require the complete bubblewrap profile. macOS uses a narrower reported `sandbox-exec` profile. The Tauri application is a command-free packaging shell with no filesystem, shell, process, or opener permissions. Local plugin packages can be staged, reviewed, approved for install, granted narrowly, enabled per workspace, and invoked through WASM components or supervised subprocesses with exact provenance and quarantine behavior. Remote providers, external channels, scheduled jobs, browser automation, public plugin marketplaces, automatic plugin updates, and learned skills remain intentionally unavailable until their roadmap milestones are implemented.
 
 ## License
 

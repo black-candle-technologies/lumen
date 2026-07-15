@@ -135,7 +135,9 @@ Built-in process actions run through a supervised subprocess boundary. The sandb
 
 On Linux, Lumen uses bubblewrap only from fixed system paths and requires the complete Milestone 2 profile to start. That profile creates user, mount, PID, IPC, UTS, cgroup, and network namespaces; drops Linux capabilities; clears the environment; exposes the executable and workspace read-only; creates private process, device, and temporary mounts; starts a new session; and requests parent-death cleanup. Network access remains unavailable inside the isolated network namespace.
 
-On macOS, Lumen uses the system `sandbox-exec` backend and reports its smaller filesystem, workspace-read-only, network, executable, and environment guarantee set. Other platforms currently report the sandbox as unavailable. Lumen does not claim seccomp or Landlock enforcement in Milestone 2. Future third-party WASM and subprocess extension boundaries belong to Milestone 3 and are not implemented yet.
+On macOS, Lumen uses the system `sandbox-exec` backend and reports its smaller filesystem, workspace-read-only, network, executable, and environment guarantee set. Other platforms currently report the sandbox as unavailable. Lumen does not claim seccomp or Landlock enforcement in the current implementation.
+
+Third-party extensions run outside the runtime process. WASM components are instantiated without WASI imports and are bounded by component validation, fuel, memory limits, deadlines, cancellation, and response-size checks. Supervised subprocess plugins run through the plugin sandbox profile with a minimal environment, digest recheck, one framed request/response exchange, nonce and request correlation, output bounds, deadlines, cancellation, and no ambient workspace, home, network, package-directory, or secret authority.
 
 Each action receives explicit limits for:
 
@@ -172,6 +174,6 @@ Lumen fails closed when it cannot authenticate a request, load policy, verify an
 
 ## Security Validation
 
-Security-sensitive code requires tests for deny-by-default behavior, scope intersection, approval mutation and replay, path canonicalization, secret redaction, audit continuity, crash recovery, and resource-limit enforcement. Milestone 2 includes end-to-end tests from model output through authenticated HTTP approval and executor dispatch, Linux profile tests, process-tree cancellation and timeout tests, exact rlimit tests on Linux, and desktop configuration contract tests.
+Security-sensitive code requires tests for deny-by-default behavior, scope intersection, approval mutation and replay, path canonicalization, secret redaction, audit continuity, crash recovery, and resource-limit enforcement. The current suite includes end-to-end tests from model output through authenticated HTTP approval and executor dispatch, extension staging and installation substitution tests, schema and protocol fuzz cases, WASM and subprocess host conformance tests, plugin artifact tamper quarantine, grant revocation cancellation, rolling health quarantine, side-by-side upgrades, Linux and macOS sandbox contract tests where available, process-tree cancellation and timeout tests, exact resource-limit tests on Linux-capable targets, and desktop configuration contract tests.
 
-Redirect and destination enforcement, plugin artifact changes, plugin revocation, and third-party extension containment remain required validation for later milestones where those features are introduced.
+The remaining Milestone 3 completion gate is privileged Linux plugin-sandbox verification in a Linux container or equivalent CI Linux target. The local macOS run proves the macOS sandbox path and platform-independent Linux profile construction tests, but it does not replace that Linux execution gate.

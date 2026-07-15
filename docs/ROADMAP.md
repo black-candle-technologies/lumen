@@ -34,11 +34,14 @@ Linux process execution requires the complete bubblewrap profile and fails close
 
 ## Milestone 3: Extension Runtime
 
-- Enable signed or locally reviewed plugin installation.
-- Ship the WASM component host and supervised subprocess protocol.
-- Add capability-grant and plugin-settings interfaces.
-- Add quarantine, side-by-side updates, provenance, and artifact verification.
-- Publish a small extension SDK only after the runtime contracts stabilize.
+- [x] Enable locally reviewed plugin staging, approval-bound installation, and immutable version records.
+- [x] Ship the WASM component host and supervised subprocess protocol.
+- [x] Add capability-grant and plugin-settings interfaces in SQL, API, and the web control surface.
+- [x] Add quarantine, side-by-side updates, provenance, and artifact verification.
+- [x] Publish the first extension SDK and shared host conformance fixtures.
+- [ ] Run the mandatory privileged Linux plugin-sandbox verification gate before declaring the milestone complete.
+
+The implemented slice supports reviewed local packages, exact package/manifest/artifact hashes, global and workspace grants, deterministic scoped settings, WASM-component execution, supervised subprocess execution, child action proposals through the normal approval lifecycle, authenticated plugin APIs, and plugin review controls. Docker is installed but not running in the current macOS environment, so the privileged Linux container gate remains outstanding.
 
 ## Milestone 4: Controlled Egress
 
