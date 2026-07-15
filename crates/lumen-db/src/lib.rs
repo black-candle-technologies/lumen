@@ -1,6 +1,7 @@
 //! SQLite persistence for Lumen runtime state.
 
 mod audit;
+mod egress;
 mod extensions;
 mod migrations;
 mod repositories;
@@ -10,6 +11,7 @@ use std::path::Path;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
+pub use egress::{ModelEndpointClass, ModelProviderRevision, WorkspaceModelEgressRevision};
 pub use extensions::{
     InstallResult, InstalledPluginVersion, PluginGrantRevision, PluginGrantScope,
     PluginSettingRevision, PluginSettingScope, PluginWorkspaceState, StagedPluginPackage,
@@ -78,6 +80,8 @@ pub enum RepositoryError {
     PluginGrantConflict,
     #[error("plugin setting revision conflicts with current state")]
     PluginSettingConflict,
+    #[error("egress policy conflicts with repository constraints")]
+    InvalidEgressPolicy,
 }
 
 pub(crate) fn timestamp_to_i64(
