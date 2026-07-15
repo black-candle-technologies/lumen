@@ -12,6 +12,7 @@ use axum::{
 use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::ApprovalId,
+    egress::DataClass,
     extension::{PluginId, PluginVersion, Sha256Digest},
     identity::{PrincipalId, WorkspaceId},
 };
@@ -100,6 +101,7 @@ async fn authenticate(
 #[serde(deny_unknown_fields)]
 struct CreateRunBody {
     prompt: String,
+    data_class: Option<DataClass>,
 }
 
 async fn create_run(
@@ -113,9 +115,17 @@ async fn create_run(
     if body.prompt.trim().is_empty() || body.prompt.len() > 256 * 1024 {
         return Err(ApiError::BadRequest("prompt is empty or too large".into()));
     }
+    if body.data_class == Some(DataClass::Secret) {
+        return Err(ApiError::BadRequest(
+            "secret data may not enter model context".into(),
+        ));
+    }
     let result = state
         .service
-        .create_run(CreateRunCommand::new(workspace_id, actor, body.prompt))
+        .create_run(
+            CreateRunCommand::new(workspace_id, actor, body.prompt)
+                .with_data_class(body.data_class.unwrap_or(DataClass::Workspace)),
+        )
         .await?;
     Ok((StatusCode::ACCEPTED, Json(result)))
 }

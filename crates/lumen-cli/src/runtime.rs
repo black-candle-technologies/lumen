@@ -607,7 +607,8 @@ impl RuntimeService for LocalRuntimeService {
                 RunContext::new(run_id, command.workspace_id(), command.actor().clone()),
                 command.prompt(),
                 service.budget,
-            );
+            )
+            .with_data_class(command.data_class());
             service.runs.lock().await.insert(
                 run_id,
                 StoredRun {

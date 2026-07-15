@@ -583,6 +583,31 @@ async fn model_input_from_run_state_is_workspace_classified() {
 }
 
 #[tokio::test]
+async fn model_input_from_run_state_can_be_public_classified() {
+    let model = FakeModel::new([ModelOutput::FinalText("done".to_owned())]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(run_context(), "hello", RunBudget::new(3, 2))
+        .with_data_class(DataClass::Public);
+
+    let outcome = orchestrator(&model, &executor, &approvals, &audit)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Completed {
+            text: "done".into()
+        }
+    );
+    let inputs = model.inputs();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].data_class(), DataClass::Public);
+}
+
+#[tokio::test]
 async fn terminal_run_outcome_is_sticky_and_does_not_repeat_work() {
     let model = FakeModel::new([ModelOutput::FinalText("done".to_owned())]);
     let executor = FakeExecutor::succeeding();

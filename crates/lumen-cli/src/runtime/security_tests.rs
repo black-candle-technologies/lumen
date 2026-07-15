@@ -18,12 +18,16 @@ use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
     capability::CapabilitySet,
-    egress::{DataClass, EndpointClass, ProviderId, select_model_provider},
+    egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
     identity::{PrincipalId, WorkspaceId},
+    model::{ModelFuture, ModelInput, ModelOutput, ModelPort},
     secret::SecretRefId,
 };
-use lumen_db::{Database, ModelEndpointClass, SecretReference, StagedPluginPackage};
+use lumen_db::{
+    Database, ModelEndpointClass, ModelProviderRevision, SecretReference, StagedPluginPackage,
+    WorkspaceModelEgressRevision,
+};
 use lumen_integrations::{
     extension_package::PackageStager,
     sandbox::{
@@ -43,7 +47,9 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use super::{LocalRuntimeService, PluginInvocationCommand, RedactingExecutor, now};
+use super::{
+    EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand, RedactingExecutor, now,
+};
 use crate::{
     config::Config,
     extension_runtime::{
@@ -53,6 +59,29 @@ use crate::{
 };
 
 const TOKEN: &str = "security-test-token";
+
+struct RecordingModel {
+    calls: AtomicUsize,
+}
+
+impl RecordingModel {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ModelPort for RecordingModel {
+    fn generate(&self, _input: ModelInput) -> ModelFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(ModelOutput::FinalText("allowed".into())) })
+    }
+}
 
 #[derive(Clone)]
 struct RecordingSandbox {
@@ -1030,6 +1059,64 @@ subject = "operator"
 
     assert!(stream.contains("remote egress policy denied every remote provider"));
     harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_class_input_is_allowed_through_public_remote_model_policy() {
+    let database = Database::connect_in_memory().await.expect("database");
+    let workspace_id = WorkspaceId::from_uuid(
+        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
+    );
+    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
+        .await
+        .expect("workspace");
+    database
+        .append_model_provider_revision(
+            &ModelProviderRevision::new(
+                provider_id.clone(),
+                1,
+                ModelEndpointClass::Remote,
+                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
+                "remote-model",
+                true,
+                0,
+                None,
+                [DataClass::Public],
+                TimestampMillis::new(1_000),
+            )
+            .expect("provider revision"),
+        )
+        .await
+        .expect("provider stored");
+    database
+        .append_workspace_model_egress_revision(
+            &WorkspaceModelEgressRevision::new(
+                workspace_id,
+                provider_id,
+                1,
+                [DataClass::Public],
+                TimestampMillis::new(1_100),
+            )
+            .expect("workspace policy"),
+        )
+        .await
+        .expect("workspace policy stored");
+    let inner = Arc::new(RecordingModel::new());
+    let model = EgressCheckedModel {
+        inner: inner.clone(),
+        database,
+        workspace_id,
+    };
+
+    let output = model
+        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Public))
+        .await
+        .expect("public request allowed");
+
+    assert_eq!(output, ModelOutput::FinalText("allowed".into()));
+    assert_eq!(inner.call_count(), 1);
 }
 
 async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage {

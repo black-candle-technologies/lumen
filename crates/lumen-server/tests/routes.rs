@@ -13,6 +13,7 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
+    egress::DataClass,
     identity::{PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
@@ -365,6 +366,26 @@ async fn run_creation_uses_authenticated_actor_and_workspace() {
     assert_eq!(commands[0].workspace_id(), workspace_id);
     assert_eq!(commands[0].actor().subject(), "operator");
     assert_eq!(commands[0].prompt(), "summarize notes");
+}
+
+#[tokio::test]
+async fn run_creation_accepts_explicit_data_class() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/runs"),
+            Body::from(r#"{"prompt":"publish release notes","data_class":"public"}"#),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let commands = service.run_commands.lock().expect("run commands");
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].data_class(), DataClass::Public);
 }
 
 #[tokio::test]

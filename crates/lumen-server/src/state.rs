@@ -9,6 +9,7 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
+    egress::DataClass,
     identity::{PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
@@ -475,6 +476,7 @@ pub struct CreateRunCommand {
     workspace_id: WorkspaceId,
     actor: PrincipalId,
     prompt: String,
+    data_class: DataClass,
 }
 
 impl CreateRunCommand {
@@ -483,7 +485,13 @@ impl CreateRunCommand {
             workspace_id,
             actor,
             prompt,
+            data_class: DataClass::Workspace,
         }
+    }
+
+    pub const fn with_data_class(mut self, data_class: DataClass) -> Self {
+        self.data_class = data_class;
+        self
     }
 
     pub const fn workspace_id(&self) -> WorkspaceId {
@@ -496,6 +504,10 @@ impl CreateRunCommand {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub const fn data_class(&self) -> DataClass {
+        self.data_class
     }
 }
 

@@ -12,6 +12,7 @@ use crate::{
     approval::{ApprovalId, ApprovalRequest, DispatchError, TimestampMillis, authorize_dispatch},
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     capability::{Capability, CapabilitySet, EffectiveCapabilities},
+    egress::DataClass,
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorPort},
     extension::{AttributedActionProposal, ExtensionProvenance},
     identity::{ComponentId, PrincipalId, WorkspaceId},
@@ -120,6 +121,7 @@ impl RunBudget {
 pub struct RunState {
     context: RunContext,
     messages: Vec<ModelMessage>,
+    data_class: DataClass,
     budget: RunBudget,
     model_turns: u32,
     actions: u32,
@@ -140,6 +142,7 @@ impl RunState {
                 ModelRole::User,
                 CanonicalValue::from(prompt.into()),
             )],
+            data_class: DataClass::Workspace,
             budget,
             model_turns: 0,
             actions: 0,
@@ -151,6 +154,11 @@ impl RunState {
             started_at: Instant::now(),
             captured_result_bytes: 0,
         }
+    }
+
+    pub const fn with_data_class(mut self, data_class: DataClass) -> Self {
+        self.data_class = data_class;
+        self
     }
 
     pub fn cancel(&mut self) {
@@ -303,7 +311,9 @@ impl<'a> RunOrchestrator<'a> {
                         .exhaust_budget(state, BudgetKind::ModelTurns, now)
                         .await;
                 }
-                let generation = self.model.generate(ModelInput::new(state.messages.clone()));
+                let generation = self.model.generate(
+                    ModelInput::new(state.messages.clone()).with_data_class(state.data_class),
+                );
                 let output = match self.wall_time_remaining(state) {
                     Some(remaining) => match tokio::time::timeout(remaining, generation).await {
                         Ok(output) => output?,
