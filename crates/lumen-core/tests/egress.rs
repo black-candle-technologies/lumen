@@ -1,0 +1,108 @@
+use lumen_core::{
+    action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
+    capability::{Capability, CapabilityName, ResourceScope},
+    egress::{DataClass, DestinationScope, ProviderEgressPolicy, ProviderId},
+    identity::{ComponentId, PrincipalId, WorkspaceId},
+};
+use uuid::Uuid;
+
+fn workspace_id() -> WorkspaceId {
+    WorkspaceId::from_uuid(
+        Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("valid UUID"),
+    )
+}
+
+fn action_id(value: &str) -> ActionId {
+    ActionId::from_uuid(Uuid::parse_str(value).expect("valid UUID"))
+}
+
+fn run_id() -> RunId {
+    RunId::from_uuid(Uuid::parse_str("f553a2c1-ee86-4c66-af7f-8e913a08ff17").expect("valid UUID"))
+}
+
+#[test]
+fn data_classes_are_ordered_by_egress_risk_and_secret_is_never_remote() {
+    assert!(DataClass::Workspace > DataClass::Public);
+    assert!(DataClass::Sensitive > DataClass::Workspace);
+    assert!(DataClass::Secret > DataClass::Sensitive);
+
+    assert!(DataClass::Public.may_leave_runtime());
+    assert!(DataClass::Workspace.may_leave_runtime());
+    assert!(DataClass::Sensitive.may_leave_runtime());
+    assert!(!DataClass::Secret.may_leave_runtime());
+}
+
+#[test]
+fn provider_policy_rejects_secret_data_class() {
+    let provider = ProviderId::parse("openai-compatible").expect("provider ID");
+
+    let policy =
+        ProviderEgressPolicy::new(provider.clone(), [DataClass::Public, DataClass::Workspace])
+            .expect("non-secret policy");
+    assert_eq!(policy.provider(), &provider);
+    assert!(policy.allows(DataClass::Public));
+    assert!(policy.allows(DataClass::Workspace));
+    assert!(!policy.allows(DataClass::Sensitive));
+
+    assert!(ProviderEgressPolicy::new(provider, [DataClass::Secret]).is_err());
+}
+
+#[test]
+fn destination_scopes_are_canonical_https_origins_or_paths() {
+    let origin = DestinationScope::parse("https://API.example.com").expect("origin");
+    assert_eq!(origin.as_str(), "https://api.example.com/");
+
+    let path = DestinationScope::parse("https://api.example.com/v1/chat").expect("path");
+    assert_eq!(path.as_str(), "https://api.example.com/v1/chat");
+
+    assert!(DestinationScope::parse("http://api.example.com").is_err());
+    assert!(DestinationScope::parse("https://api.example.com/#fragment").is_err());
+    assert!(DestinationScope::parse("https://api.example.com/?token=secret").is_err());
+}
+
+#[test]
+fn network_and_channel_capabilities_are_exactly_scoped() {
+    let api = ResourceScope::exact(
+        "destination",
+        DestinationScope::parse("https://api.example.com/v1")
+            .unwrap()
+            .as_str(),
+    )
+    .expect("destination scope");
+    let channel =
+        ResourceScope::exact("channel", "slack:T123:C456").expect("channel destination scope");
+
+    assert_eq!(CapabilityName::NetworkEgress.as_str(), "network.egress");
+    assert_eq!(CapabilityName::ChannelSend.as_str(), "channel.send");
+    assert_eq!(
+        CapabilityName::parse("network.egress"),
+        Some(CapabilityName::NetworkEgress)
+    );
+    assert_eq!(
+        CapabilityName::parse("channel.send"),
+        Some(CapabilityName::ChannelSend)
+    );
+
+    let first = ActionEnvelope::new(
+        action_id("63908e55-6719-48c4-b43b-95f52264703f"),
+        run_id(),
+        workspace_id(),
+        PrincipalId::new("local", "operator").unwrap(),
+        ComponentId::new("builtin.network").unwrap(),
+        ActionKind::new("network.request").unwrap(),
+        CanonicalValue::object([("url", CanonicalValue::from("https://api.example.com/v1"))]),
+        vec![Capability::new(CapabilityName::NetworkEgress, api.clone())],
+    );
+    let second = ActionEnvelope::new(
+        action_id("63908e55-6719-48c4-b43b-95f52264703f"),
+        run_id(),
+        workspace_id(),
+        PrincipalId::new("local", "operator").unwrap(),
+        ComponentId::new("builtin.network").unwrap(),
+        ActionKind::new("network.request").unwrap(),
+        CanonicalValue::object([("url", CanonicalValue::from("https://api.example.com/v1"))]),
+        vec![Capability::new(CapabilityName::ChannelSend, channel)],
+    );
+
+    assert_ne!(first.fingerprint(), second.fingerprint());
+}

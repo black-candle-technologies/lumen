@@ -4,6 +4,7 @@ pub mod action;
 pub mod approval;
 pub mod audit;
 pub mod capability;
+pub mod egress;
 pub mod executor;
 pub mod extension;
 pub mod identity;

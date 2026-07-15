@@ -17,10 +17,14 @@ pub enum CapabilityName {
     ProcessSpawn,
     #[serde(rename = "net.connect")]
     NetConnect,
+    #[serde(rename = "network.egress")]
+    NetworkEgress,
     #[serde(rename = "secret.use")]
     SecretUse,
     #[serde(rename = "message.send")]
     MessageSend,
+    #[serde(rename = "channel.send")]
+    ChannelSend,
     #[serde(rename = "schedule.create")]
     ScheduleCreate,
     #[serde(rename = "schedule.modify")]
@@ -51,8 +55,10 @@ impl CapabilityName {
             Self::FsDelete => "fs.delete",
             Self::ProcessSpawn => "process.spawn",
             Self::NetConnect => "net.connect",
+            Self::NetworkEgress => "network.egress",
             Self::SecretUse => "secret.use",
             Self::MessageSend => "message.send",
+            Self::ChannelSend => "channel.send",
             Self::ScheduleCreate => "schedule.create",
             Self::ScheduleModify => "schedule.modify",
             Self::PluginInstall => "plugin.install",
@@ -73,8 +79,10 @@ impl CapabilityName {
             "fs.delete" => Self::FsDelete,
             "process.spawn" => Self::ProcessSpawn,
             "net.connect" => Self::NetConnect,
+            "network.egress" => Self::NetworkEgress,
             "secret.use" => Self::SecretUse,
             "message.send" => Self::MessageSend,
+            "channel.send" => Self::ChannelSend,
             "schedule.create" => Self::ScheduleCreate,
             "schedule.modify" => Self::ScheduleModify,
             "plugin.install" => Self::PluginInstall,
