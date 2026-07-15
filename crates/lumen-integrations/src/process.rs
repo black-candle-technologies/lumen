@@ -10,6 +10,7 @@ use std::{
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue},
     capability::{Capability, CapabilityName, ResourceScope, WorkspacePath},
+    egress::DestinationScope,
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
     identity::{ComponentId, WorkspaceId},
     model::ActionProposal,
@@ -149,6 +150,30 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                         .map_err(|error| NormalizationError::new(error.to_string()))?,
                     normalized_arguments,
                     capabilities,
+                ))
+            }
+            "network.egress" => {
+                let parsed: NetworkEgressArguments = parse_arguments(&arguments)?;
+                let destination = DestinationScope::parse(parsed.url)
+                    .map_err(|error| NormalizationError::new(error.to_string()))?;
+                let method = normalize_http_method(&parsed.method)?;
+                Ok(ActionEnvelope::new(
+                    ActionId::new(),
+                    context.run_id(),
+                    context.workspace_id(),
+                    context.actor().clone(),
+                    self.component.clone(),
+                    ActionKind::new(kind)
+                        .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    CanonicalValue::object([
+                        ("method", CanonicalValue::from(method)),
+                        ("url", CanonicalValue::from(destination.as_str())),
+                    ]),
+                    vec![Capability::new(
+                        CapabilityName::NetworkEgress,
+                        ResourceScope::exact("destination", destination.as_str())
+                            .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    )],
                 ))
             }
             _ => Err(NormalizationError::new(format!(
@@ -333,12 +358,29 @@ struct ProcessArguments {
     secret_environment: BTreeMap<String, String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkEgressArguments {
+    url: String,
+    method: String,
+}
+
 fn parse_arguments<T: for<'de> Deserialize<'de>>(
     arguments: &CanonicalValue,
 ) -> Result<T, NormalizationError> {
     let encoded = serde_json::to_value(arguments)
         .map_err(|error| NormalizationError::new(error.to_string()))?;
     serde_json::from_value(encoded).map_err(|error| NormalizationError::new(error.to_string()))
+}
+
+fn normalize_http_method(value: &str) -> Result<&'static str, NormalizationError> {
+    match value {
+        "GET" | "get" => Ok("GET"),
+        "POST" | "post" => Ok("POST"),
+        _ => Err(NormalizationError::new(
+            "network egress method must be GET or POST",
+        )),
+    }
 }
 
 fn process_arguments_value(

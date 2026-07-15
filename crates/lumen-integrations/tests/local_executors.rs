@@ -72,6 +72,80 @@ fn filesystem_proposals_are_normalized_to_path_scoped_capabilities() {
 }
 
 #[test]
+fn network_egress_proposals_are_normalized_to_destination_scoped_capabilities() {
+    let context = run_context();
+    let normalizer =
+        BuiltinActionNormalizer::new(ComponentId::new("builtin.tools").expect("component ID"));
+
+    let action = normalizer
+        .normalize(
+            &context,
+            ActionProposal::new(
+                "network.egress",
+                lumen_core::action::CanonicalValue::object([
+                    (
+                        "url",
+                        lumen_core::action::CanonicalValue::from("https://api.example.com/v1"),
+                    ),
+                    ("method", lumen_core::action::CanonicalValue::from("get")),
+                ]),
+            ),
+        )
+        .expect("proposal normalizes");
+
+    assert_eq!(action.kind().as_str(), "network.egress");
+    assert_eq!(
+        action.arguments(),
+        &lumen_core::action::CanonicalValue::object([
+            ("method", lumen_core::action::CanonicalValue::from("GET")),
+            (
+                "url",
+                lumen_core::action::CanonicalValue::from("https://api.example.com/v1"),
+            ),
+        ])
+    );
+    assert_eq!(
+        action.required_capabilities(),
+        &[Capability::new(
+            CapabilityName::NetworkEgress,
+            ResourceScope::exact("destination", "https://api.example.com/v1")
+                .expect("destination scope"),
+        )]
+    );
+}
+
+#[test]
+fn network_egress_proposals_reject_ambiguous_destinations_and_methods() {
+    let context = run_context();
+    let normalizer =
+        BuiltinActionNormalizer::new(ComponentId::new("builtin.tools").expect("component ID"));
+
+    for (url, method) in [
+        ("http://api.example.com/v1", "GET"),
+        ("https://api.example.com/v1?token=leak", "GET"),
+        ("https://api.example.com/v1", "DELETE"),
+    ] {
+        let error = normalizer
+            .normalize(
+                &context,
+                ActionProposal::new(
+                    "network.egress",
+                    lumen_core::action::CanonicalValue::object([
+                        ("url", lumen_core::action::CanonicalValue::from(url)),
+                        ("method", lumen_core::action::CanonicalValue::from(method)),
+                    ]),
+                ),
+            )
+            .expect_err("ambiguous network egress proposal must fail");
+        assert!(
+            error.to_string().contains("destination")
+                || error.to_string().contains("method must be GET or POST"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn file_write_proposals_bind_trusted_before_and_after_snapshots() {
     let workspace = tempdir().expect("temporary workspace");
     std::fs::create_dir(workspace.path().join("notes")).expect("notes directory");
