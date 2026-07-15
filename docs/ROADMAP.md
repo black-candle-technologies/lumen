@@ -39,9 +39,9 @@ Linux process execution requires the complete bubblewrap profile and fails close
 - [x] Add capability-grant and plugin-settings interfaces in SQL, API, and the web control surface.
 - [x] Add quarantine, side-by-side updates, provenance, and artifact verification.
 - [x] Publish the first extension SDK and shared host conformance fixtures.
-- [ ] Run the mandatory privileged Linux plugin-sandbox verification gate before declaring the milestone complete.
+- [x] Run the mandatory privileged Linux plugin-sandbox verification gate before declaring the milestone complete.
 
-The implemented slice supports reviewed local packages, exact package/manifest/artifact hashes, global and workspace grants, deterministic scoped settings, WASM-component execution, supervised subprocess execution, child action proposals through the normal approval lifecycle, authenticated plugin APIs, and plugin review controls. Docker is installed but not running in the current macOS environment, so the privileged Linux container gate remains outstanding.
+The implemented slice supports reviewed local packages, exact package/manifest/artifact hashes, global and workspace grants, deterministic scoped settings, WASM-component execution, supervised subprocess execution, child action proposals through the normal approval lifecycle, authenticated plugin APIs, plugin review controls, and privileged Linux plugin-sandbox verification in GitHub Actions run `29381403861`.
 
 ## Milestone 4: Controlled Egress
 

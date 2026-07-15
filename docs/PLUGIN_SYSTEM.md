@@ -118,6 +118,4 @@ Skill bundles contain versioned instructions and supporting resources. Skill con
 
 ## Current Boundary
 
-The current vertical slice supports local package staging, review, approval-bound installation, immutable versions, WASM-component execution, supervised subprocess execution, global and workspace grants, deterministic scoped settings, runtime-owned audit provenance, and authenticated plugin review APIs. It does not yet support public marketplaces, automatic updates, remote signature trust, plugin-supplied UI, external channel adapters, scheduled-job plugins, or remote network egress.
-
-Milestone completion still requires the privileged Linux plugin-sandbox gate in a Linux container or equivalent CI Linux target. Until that gate passes, Linux subprocess containment should be treated as implemented but not release-complete.
+The current vertical slice supports local package staging, review, approval-bound installation, immutable versions, WASM-component execution, supervised subprocess execution, global and workspace grants, deterministic scoped settings, runtime-owned audit provenance, authenticated plugin review APIs, and privileged Linux plugin-sandbox verification through the repository CI gate. It does not yet support public marketplaces, automatic updates, remote signature trust, plugin-supplied UI, external channel adapters, scheduled-job plugins, or remote network egress.

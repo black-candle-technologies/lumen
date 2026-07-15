@@ -185,7 +185,7 @@ docs/
 - [x] Run `cargo clippy --workspace --all-targets -- -D warnings`.
 - [x] Run `CARGO_INCREMENTAL=0 cargo test --workspace`.
 - [x] Run SDK documentation and both host conformance fixtures.
-- [ ] Run Linux plugin-sandbox tests in a privileged Linux container or equivalent CI-compatible Linux target; failure to run or pass this mandatory gate blocks milestone completion.
+- [x] Run Linux plugin-sandbox tests in a privileged Linux container or equivalent CI-compatible Linux target; failure to run or pass this mandatory gate blocks milestone completion.
 - [x] Run `pnpm check:web`, frontend unit tests, production builds, and Playwright desktop/mobile tests.
 - [x] Inspect rendered plugin and approval UI at desktop and mobile sizes and validate Tauri configuration.
 - [x] Update Roadmap Milestone 3 only for behavior proven by the suite and reconcile all extension/security documentation.
@@ -194,8 +194,8 @@ docs/
 - [x] Push `feat/milestone-3-extension-runtime`.
 - [x] Confirm the worktree is clean and verify the remote ref matches local HEAD after push.
 
-Verification note: `CARGO_INCREMENTAL=0 cargo test --workspace` covered SDK doc tests, host conformance tests, macOS plugin-sandbox execution tests, Linux sandbox construction/unit tests, route tests, Tauri security configuration, and the full runtime security suite. The mandatory privileged Linux plugin-sandbox execution gate was not run in this macOS environment because Docker is installed but the daemon socket is unavailable.
+Verification note: `CARGO_INCREMENTAL=0 cargo test --workspace` covered SDK doc tests, host conformance tests, macOS plugin-sandbox execution tests, Linux sandbox construction/unit tests, route tests, Tauri security configuration, and the full runtime security suite. The mandatory privileged Linux plugin-sandbox execution gate passed in GitHub Actions run `29381403861` through `.github/workflows/milestone3-linux-sandbox.yml`.
 
-Linux gate attempt: Docker Desktop was started on this macOS host and reported a Linux/aarch64 daemon. A privileged `rust:slim` container installed `bubblewrap` and began compiling the Linux integration test graph, but Docker Desktop failed before tests could execute with containerd content and metadata `input/output error` failures while the system volume had only about 202 MiB free. After clearing cache-only data to bring the system volume to about 4.9 GiB free and restarting Docker Desktop, the Docker API still returned HTTP 500 for `version`, `ps`, and `images`. The remaining gate requires a healthy Docker Desktop reset or an equivalent CI Linux target; do not treat the macOS attempt as passing the Linux plugin-sandbox execution requirement.
+Linux gate history: Docker Desktop was started on this macOS host and reported a Linux/aarch64 daemon. A privileged `rust:slim` container installed `bubblewrap` and began compiling the Linux integration test graph, but Docker Desktop failed before tests could execute with containerd content and metadata `input/output error` failures while the system volume had only about 202 MiB free. After clearing cache-only data to bring the system volume to about 4.9 GiB free and restarting Docker Desktop, the Docker API still returned HTTP 500 for `version`, `ps`, and `images`. The release gate was completed instead by the GitHub Actions Linux workflow.
 
-Lean Linux gate command: `lumen-integrations` now supports a sandbox-only build with `--no-default-features`, leaving model-client, native-secret, and WASM-host dependencies out of the privileged Linux check. On a healthy Linux target, run `scripts/verify-linux-plugin-sandbox.sh`; the same command is wired into `.github/workflows/milestone3-linux-sandbox.yml`.
+Lean Linux gate command: `lumen-integrations` now supports a sandbox-only build with `--no-default-features`, leaving model-client, native-secret, and WASM-host dependencies out of the privileged Linux check. On a healthy Linux target, run `scripts/verify-linux-plugin-sandbox.sh`; the same command is wired into `.github/workflows/milestone3-linux-sandbox.yml` and passed in run `29381403861`.
