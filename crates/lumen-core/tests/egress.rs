@@ -1,9 +1,13 @@
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
     capability::{Capability, CapabilityName, ResourceScope},
-    egress::{DataClass, DestinationScope, ProviderEgressPolicy, ProviderId},
+    egress::{
+        DataClass, DestinationScope, EndpointClass, ProviderEgressPolicy, ProviderId,
+        ProviderRoute, RoutingDecision, RoutingFailure, select_model_provider,
+    },
     identity::{ComponentId, PrincipalId, WorkspaceId},
 };
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 fn workspace_id() -> WorkspaceId {
@@ -18,6 +22,10 @@ fn action_id(value: &str) -> ActionId {
 
 fn run_id() -> RunId {
     RunId::from_uuid(Uuid::parse_str("f553a2c1-ee86-4c66-af7f-8e913a08ff17").expect("valid UUID"))
+}
+
+fn classes(values: impl IntoIterator<Item = DataClass>) -> BTreeSet<DataClass> {
+    values.into_iter().collect()
 }
 
 #[test]
@@ -105,4 +113,124 @@ fn network_and_channel_capabilities_are_exactly_scoped() {
     );
 
     assert_ne!(first.fingerprint(), second.fingerprint());
+}
+
+#[test]
+fn routing_prefers_enabled_local_providers_without_egress() {
+    let local = ProviderRoute::new(
+        ProviderId::parse("local-llama").unwrap(),
+        EndpointClass::Local,
+        true,
+        [
+            DataClass::Public,
+            DataClass::Workspace,
+            DataClass::Sensitive,
+        ],
+        None,
+        10,
+    )
+    .unwrap();
+    let remote = ProviderRoute::new(
+        ProviderId::parse("remote-compatible").unwrap(),
+        EndpointClass::Remote,
+        true,
+        [DataClass::Public],
+        Some(classes([DataClass::Public])),
+        1,
+    )
+    .unwrap();
+
+    let decision = select_model_provider(DataClass::Public, [remote, local]).unwrap();
+
+    assert_eq!(decision.provider().as_str(), "local-llama");
+    assert!(!decision.egress_occurred());
+    assert_eq!(
+        decision,
+        RoutingDecision::local(ProviderId::parse("local-llama").unwrap())
+    );
+}
+
+#[test]
+fn routing_denies_remote_without_workspace_policy() {
+    let remote = ProviderRoute::new(
+        ProviderId::parse("remote-compatible").unwrap(),
+        EndpointClass::Remote,
+        true,
+        [DataClass::Public],
+        None,
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(
+        select_model_provider(DataClass::Public, [remote]).unwrap_err(),
+        RoutingFailure::RemoteEgressDenied
+    );
+}
+
+#[test]
+fn routing_requires_provider_and_workspace_policy_intersection() {
+    let denied = ProviderRoute::new(
+        ProviderId::parse("remote-compatible").unwrap(),
+        EndpointClass::Remote,
+        true,
+        [DataClass::Public],
+        Some(classes([DataClass::Workspace])),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        select_model_provider(DataClass::Public, [denied]).unwrap_err(),
+        RoutingFailure::RemoteEgressDenied
+    );
+
+    let allowed = ProviderRoute::new(
+        ProviderId::parse("remote-compatible").unwrap(),
+        EndpointClass::Remote,
+        true,
+        [DataClass::Public, DataClass::Workspace],
+        Some(classes([DataClass::Workspace])),
+        1,
+    )
+    .unwrap();
+    let decision = select_model_provider(DataClass::Workspace, [allowed]).unwrap();
+
+    assert_eq!(decision.provider().as_str(), "remote-compatible");
+    assert!(decision.egress_occurred());
+}
+
+#[test]
+fn routing_never_sends_secret_or_uses_disabled_provider() {
+    let disabled = ProviderRoute::new(
+        ProviderId::parse("remote-compatible").unwrap(),
+        EndpointClass::Remote,
+        false,
+        [DataClass::Public],
+        Some(classes([DataClass::Public])),
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(
+        select_model_provider(DataClass::Public, [disabled]).unwrap_err(),
+        RoutingFailure::NoEligibleProvider
+    );
+
+    let secret_route = ProviderRoute::new(
+        ProviderId::parse("local-llama").unwrap(),
+        EndpointClass::Local,
+        true,
+        [
+            DataClass::Public,
+            DataClass::Workspace,
+            DataClass::Sensitive,
+        ],
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        select_model_provider(DataClass::Secret, [secret_route]).unwrap_err(),
+        RoutingFailure::SecretDataClass
+    );
 }
