@@ -13,7 +13,7 @@ use lumen_core::{
     },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
-    egress::{DataClass, DestinationScope, ProviderId},
+    egress::{DataClass, DestinationScope, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
     extension::{PluginComponentId, PluginId, PluginVersion},
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort},
@@ -64,6 +64,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct LocalRuntimeService {
     model: Arc<dyn ModelPort>,
+    enforce_model_egress_policy: bool,
     normalizer: Arc<dyn ActionNormalizer>,
     executor: Arc<dyn ExecutorPort>,
     approvals: Arc<ApprovalRegistry>,
@@ -223,6 +224,7 @@ impl LocalRuntimeService {
         let ambient_capabilities = CapabilitySet::new(grants);
         Ok(Self {
             model: Arc::new(model),
+            enforce_model_egress_policy: config.model.allow_remote,
             normalizer: Arc::new(normalizer),
             executor: Arc::new(executor),
             approvals,
@@ -289,8 +291,20 @@ impl LocalRuntimeService {
             .model_override
             .clone()
             .unwrap_or_else(|| Arc::clone(&self.model));
+        let checked_model = if stored.model_override.is_none() && self.enforce_model_egress_policy {
+            Some(EgressCheckedModel {
+                inner: Arc::clone(&selected_model),
+                database: self.database.clone(),
+                workspace_id: stored.workspace_id,
+            })
+        } else {
+            None
+        };
+        let model_inner = checked_model
+            .as_ref()
+            .map_or(selected_model.as_ref(), |model| model as &dyn ModelPort);
         let model = CancellableModel {
-            inner: selected_model.as_ref(),
+            inner: model_inner,
             cancellation: cancellation.clone(),
         };
         let orchestrator = RunOrchestrator::new(
@@ -1316,6 +1330,27 @@ struct StoredRun {
     state: RunState,
     model_override: Option<Arc<dyn ModelPort>>,
     capabilities_override: Option<EffectiveCapabilities>,
+}
+
+struct EgressCheckedModel {
+    inner: Arc<dyn ModelPort>,
+    database: Database,
+    workspace_id: lumen_core::identity::WorkspaceId,
+}
+
+impl ModelPort for EgressCheckedModel {
+    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
+        Box::pin(async move {
+            let routes = self
+                .database
+                .model_provider_routes(self.workspace_id)
+                .await
+                .map_err(|error| ModelError::new(format!("model egress policy failed: {error}")))?;
+            select_model_provider(input.data_class(), routes)
+                .map_err(|error| ModelError::new(error.to_string()))?;
+            self.inner.generate(input).await
+        })
+    }
 }
 
 struct RoutingNormalizer {

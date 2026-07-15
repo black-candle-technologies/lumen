@@ -3,7 +3,7 @@ use std::{future::Future, pin::Pin};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::action::CanonicalValue;
+use crate::{action::CanonicalValue, egress::DataClass};
 
 pub type ModelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ModelOutput, ModelError>> + Send + 'a>>;
@@ -15,15 +15,28 @@ pub trait ModelPort: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInput {
     messages: Vec<ModelMessage>,
+    data_class: DataClass,
 }
 
 impl ModelInput {
     pub fn new(messages: Vec<ModelMessage>) -> Self {
-        Self { messages }
+        Self {
+            messages,
+            data_class: DataClass::Workspace,
+        }
+    }
+
+    pub fn with_data_class(mut self, data_class: DataClass) -> Self {
+        self.data_class = data_class;
+        self
     }
 
     pub fn messages(&self) -> &[ModelMessage] {
         &self.messages
+    }
+
+    pub const fn data_class(&self) -> DataClass {
+        self.data_class
     }
 }
 

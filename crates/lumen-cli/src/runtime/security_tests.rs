@@ -943,6 +943,95 @@ subject = "operator"
     assert!(decision.egress_occurred());
 }
 
+#[tokio::test]
+async fn workspace_class_run_is_denied_before_public_only_remote_model_request() {
+    let directory = tempfile::tempdir().expect("temporary runtime");
+    let workspace = directory.path().join("workspace");
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&workspace).expect("workspace directory");
+    std::fs::create_dir(&runtime).expect("runtime directory");
+    let config = Config::parse(&format!(
+        r#"
+[database]
+path = "ignored.sqlite3"
+
+[model]
+endpoint = "https://models.example.com/v1/"
+model = "remote-model"
+allow_remote = true
+streaming = false
+timeout_seconds = 1
+remote_provider = {{ id = "openai-compatible", allowed_data_classes = ["public"] }}
+
+[runtime]
+data_directory = "{}"
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "{}"
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+        runtime.display(),
+        workspace.display()
+    ))
+    .expect("remote runtime config");
+    let database = Database::connect_in_memory().await.expect("database");
+    database
+        .bootstrap_workspace(
+            config.workspace_id(),
+            &config.workspace.name,
+            &config.bootstrap_principal(),
+            now(),
+        )
+        .await
+        .expect("workspace bootstrap");
+    let events = EventBroker::new(128);
+    let service = Arc::new(
+        LocalRuntimeService::build_with_secret_store(
+            &config,
+            database.clone(),
+            events.clone(),
+            Arc::new(RecordingSandbox::new()),
+            vec![TOKEN.to_owned()],
+            Arc::new(InMemorySecretStore::new()),
+        )
+        .await
+        .expect("runtime builds"),
+    );
+    let state = ApiState::new(
+        service.clone(),
+        events,
+        TOKEN,
+        config.bootstrap_principal(),
+        BTreeSet::from([config.workspace_id()]),
+        SandboxCapabilityReport::new(
+            "test",
+            "kernel_enforced",
+            ["filesystem_isolation", "network_isolation"],
+            None,
+        ),
+    )
+    .expect("API state");
+    let harness = Harness {
+        _directory: directory,
+        app: router(state),
+        service,
+        database,
+        sandbox: RecordingSandbox::new(),
+        workspace_id: config.workspace_id(),
+    };
+
+    let run_id = harness.create_run("summarize workspace notes").await;
+    let stream = harness.sse_until(&run_id, "run.failed").await;
+
+    assert!(stream.contains("remote egress policy denied every remote provider"));
+    harness.service.shutdown().await;
+}
+
 async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage {
     let staged = stage_subprocess_fixture(harness).await;
     let plugin_id = staged.manifest().id().to_string();

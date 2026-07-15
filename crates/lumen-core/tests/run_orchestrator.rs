@@ -15,6 +15,7 @@ use lumen_core::{
         Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope,
         WorkspacePath,
     },
+    egress::DataClass,
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
     extension::{
         AttributedActionProposal, ExtensionProvenance, PluginComponentId, PluginId, PluginRuntime,
@@ -70,6 +71,7 @@ fn proposal(kind: &str) -> ModelOutput {
 
 struct FakeModel {
     outputs: Mutex<VecDeque<Result<ModelOutput, ModelError>>>,
+    inputs: Mutex<Vec<ModelInput>>,
     calls: AtomicUsize,
 }
 
@@ -77,6 +79,7 @@ impl FakeModel {
     fn new(outputs: impl IntoIterator<Item = ModelOutput>) -> Self {
         Self {
             outputs: Mutex::new(outputs.into_iter().map(Ok).collect()),
+            inputs: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         }
     }
@@ -84,11 +87,16 @@ impl FakeModel {
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    fn inputs(&self) -> Vec<ModelInput> {
+        self.inputs.lock().expect("model input lock").clone()
+    }
 }
 
 impl ModelPort for FakeModel {
-    fn generate(&self, _input: ModelInput) -> ModelFuture<'_> {
+    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inputs.lock().expect("model input lock").push(input);
         Box::pin(async move {
             self.outputs
                 .lock()
@@ -548,6 +556,30 @@ async fn text_completion_finishes_without_executing_an_action() {
         audit.events(),
         vec![AuditEventKind::RunCreated, AuditEventKind::RunCompleted]
     );
+}
+
+#[tokio::test]
+async fn model_input_from_run_state_is_workspace_classified() {
+    let model = FakeModel::new([ModelOutput::FinalText("done".to_owned())]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(run_context(), "hello", RunBudget::new(3, 2));
+
+    let outcome = orchestrator(&model, &executor, &approvals, &audit)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Completed {
+            text: "done".into()
+        }
+    );
+    let inputs = model.inputs();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].data_class(), DataClass::Workspace);
 }
 
 #[tokio::test]
