@@ -570,6 +570,37 @@ async fn crash_recovery_marks_reserved_execution_unknown_without_retrying() {
     assert!(second_recovery.is_empty());
 }
 
+#[tokio::test]
+async fn policy_denied_actions_transition_out_of_normalized_state() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let action = action();
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+
+    database
+        .mark_action_denied(action.id(), TimestampMillis::new(1_100))
+        .await
+        .expect("action marked denied");
+    let action_state: String = sqlx::query_scalar("SELECT state FROM actions WHERE id = ?")
+        .bind(action.id().to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("action state");
+    assert_eq!(action_state, "denied");
+    assert!(matches!(
+        database
+            .mark_action_denied(action.id(), TimestampMillis::new(1_200))
+            .await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_consumption_and_execution_reservation_are_atomic() {
     let directory = tempdir().expect("temporary directory created");

@@ -296,6 +296,15 @@ impl ActionPort for NoopActions {
     ) -> ActionFuture<'a> {
         Box::pin(async { Ok(()) })
     }
+
+    fn deny<'a>(
+        &'a self,
+        _action: &'a ActionEnvelope,
+        _reason: &'a lumen_core::policy::DenialReason,
+        _now: TimestampMillis,
+    ) -> ActionFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Default)]
@@ -308,6 +317,15 @@ impl ActionPort for CountingActions {
         _now: TimestampMillis,
     ) -> ActionFuture<'a> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn deny<'a>(
+        &'a self,
+        _action: &'a ActionEnvelope,
+        _reason: &'a lumen_core::policy::DenialReason,
+        _now: TimestampMillis,
+    ) -> ActionFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -325,6 +343,15 @@ impl ActionPort for RecordingActions {
             .lock()
             .expect("recorded actions lock")
             .push(action.clone());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn deny<'a>(
+        &'a self,
+        _action: &'a ActionEnvelope,
+        _reason: &'a lumen_core::policy::DenialReason,
+        _now: TimestampMillis,
+    ) -> ActionFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 }

@@ -787,6 +787,23 @@ impl Database {
         transaction.commit().await?;
         Ok(())
     }
+
+    pub async fn mark_action_denied(
+        &self,
+        action_id: ActionId,
+        _denied_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE actions SET state = 'denied' WHERE id = ? AND state = 'normalized'",
+        )
+        .bind(action_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        Ok(())
+    }
 }
 
 fn secret_reference_from_row(

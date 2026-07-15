@@ -50,6 +50,13 @@ pub trait AuditPort: Send + Sync {
 
 pub trait ActionPort: Send + Sync {
     fn persist<'a>(&'a self, action: &'a ActionEnvelope, now: TimestampMillis) -> ActionFuture<'a>;
+
+    fn deny<'a>(
+        &'a self,
+        action: &'a ActionEnvelope,
+        reason: &'a DenialReason,
+        now: TimestampMillis,
+    ) -> ActionFuture<'a>;
 }
 
 #[derive(Debug)]
@@ -386,6 +393,7 @@ impl<'a> RunOrchestrator<'a> {
                     let decision = self.policy.evaluate(&action, &evaluation_capabilities);
                     match &decision {
                         PolicyDecision::Deny(reason) => {
+                            self.actions.deny(&action, reason, now).await?;
                             self.audit(
                                 state,
                                 AuditEventKind::PolicyDenied,

@@ -2049,6 +2049,20 @@ impl ActionPort for DatabaseActions {
                 .map_err(|error| ActionPortError::new(error.to_string()))
         })
     }
+
+    fn deny<'a>(
+        &'a self,
+        action: &'a ActionEnvelope,
+        _reason: &'a lumen_core::policy::DenialReason,
+        now: TimestampMillis,
+    ) -> ActionFuture<'a> {
+        Box::pin(async move {
+            self.0
+                .mark_action_denied(action.id(), now)
+                .await
+                .map_err(|error| ActionPortError::new(error.to_string()))
+        })
+    }
 }
 
 impl AuditPort for DatabaseAudit {
