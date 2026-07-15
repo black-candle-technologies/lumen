@@ -1,4 +1,6 @@
-use lumen_integrations::secrets::{InMemorySecretStore, OsKeyringSecretStore, SecretStore};
+#[cfg(feature = "native-secrets")]
+use lumen_integrations::secrets::OsKeyringSecretStore;
+use lumen_integrations::secrets::{InMemorySecretStore, SecretStore};
 
 #[tokio::test]
 async fn in_memory_secret_store_contract_covers_put_resolve_and_delete() {
@@ -26,6 +28,7 @@ async fn unavailable_secret_store_fails_closed_for_every_operation() {
 }
 
 #[test]
+#[cfg(feature = "native-secrets")]
 fn os_keyring_adapter_rejects_invalid_service_names() {
     assert!(OsKeyringSecretStore::new("").is_err());
     assert!(OsKeyringSecretStore::new(" dev.lumen.runtime ").is_err());

@@ -13,10 +13,12 @@ pub trait SecretStore: Send + Sync {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "native-secrets")]
 pub struct OsKeyringSecretStore {
     service: String,
 }
 
+#[cfg(feature = "native-secrets")]
 impl OsKeyringSecretStore {
     pub fn new(service: impl Into<String>) -> Result<Self, SecretStoreError> {
         let service = service.into();
@@ -25,6 +27,7 @@ impl OsKeyringSecretStore {
     }
 }
 
+#[cfg(feature = "native-secrets")]
 impl SecretStore for OsKeyringSecretStore {
     fn put<'a>(&'a self, account: &'a str, value: Vec<u8>) -> SecretStoreFuture<'a, ()> {
         let validated = validate_identifier("account", account, 512);
@@ -151,6 +154,7 @@ pub enum SecretStoreError {
 }
 
 impl SecretStoreError {
+    #[cfg(feature = "native-secrets")]
     fn backend(error: impl std::fmt::Display) -> Self {
         Self::Backend(error.to_string())
     }

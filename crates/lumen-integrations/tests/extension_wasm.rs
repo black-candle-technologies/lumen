@@ -1,3 +1,5 @@
+#![cfg(feature = "wasm-host")]
+
 use std::sync::Arc;
 
 use lumen_core::{

@@ -1,3 +1,5 @@
+#![cfg(feature = "model-client")]
+
 use std::time::Duration;
 
 use lumen_core::{
