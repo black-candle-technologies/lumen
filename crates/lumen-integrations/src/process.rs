@@ -26,6 +26,8 @@ use crate::sandbox::{
     MonitoredCommand, ResourceLimits, SandboxBackend, SandboxError, SandboxRequest, SandboxStrength,
 };
 
+const NETWORK_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+
 pub struct BuiltinActionNormalizer {
     component: ComponentId,
     filesystem: Option<WorkspaceReader>,
@@ -290,10 +292,80 @@ impl BuiltinExecutor {
                     Err(error) => Ok(ExecutionOutcome::Failed(error.to_string())),
                 }
             }
+            "network.egress" => self.execute_network_egress(action, cancellation).await,
             kind => Err(ExecutorError::new(format!(
                 "unsupported authorized action: {kind}"
             ))),
         }
+    }
+
+    #[cfg(feature = "model-client")]
+    async fn execute_network_egress(
+        &self,
+        action: &ActionEnvelope,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        let parsed: NetworkEgressArguments = parse_arguments(action.arguments())
+            .map_err(|error| ExecutorError::new(error.to_string()))?;
+        let method = normalize_http_method(&parsed.method)
+            .map_err(|error| ExecutorError::new(error.to_string()))?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(|error| ExecutorError::new(error.to_string()))?;
+        let request = match method {
+            "GET" => client.get(&parsed.url),
+            "POST" => client.post(&parsed.url),
+            _ => unreachable!("normalize_http_method returned an unsupported method"),
+        };
+        let response = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(ExecutionOutcome::Cancelled),
+            result = request.send() => result,
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return Ok(ExecutionOutcome::Failed(error.to_string())),
+        };
+        if response.status().is_redirection() {
+            return Ok(ExecutionOutcome::Failed(
+                "network redirect denied".to_owned(),
+            ));
+        }
+        let status = response.status().as_u16();
+        let body = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(ExecutionOutcome::Cancelled),
+            result = response.bytes() => result,
+        };
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => return Ok(ExecutionOutcome::Failed(error.to_string())),
+        };
+        if body.len() > NETWORK_RESPONSE_LIMIT_BYTES {
+            return Ok(ExecutionOutcome::Failed(
+                "network response byte limit exceeded".to_owned(),
+            ));
+        }
+        let bytes = i64::try_from(body.len()).unwrap_or(i64::MAX);
+        let body = String::from_utf8_lossy(&body).into_owned();
+        Ok(ExecutionOutcome::Succeeded(CanonicalValue::object([
+            ("status", CanonicalValue::from(i64::from(status))),
+            ("body", CanonicalValue::from(body)),
+            ("bytes", CanonicalValue::from(bytes)),
+        ])))
+    }
+
+    #[cfg(not(feature = "model-client"))]
+    async fn execute_network_egress(
+        &self,
+        _action: &ActionEnvelope,
+        _cancellation: CancellationToken,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        Ok(ExecutionOutcome::Failed(
+            "network egress is unavailable for this runtime".to_owned(),
+        ))
     }
 }
 
@@ -605,4 +677,162 @@ pub enum ProcessError {
     InvalidTimeout,
     #[error("output limit must be greater than zero")]
     InvalidOutputLimit,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use lumen_core::{
+        action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
+        capability::{Capability, CapabilityName, ResourceScope},
+        identity::{ComponentId, PrincipalId, WorkspaceId},
+    };
+    use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    use crate::sandbox::{SandboxFuture, SandboxOutput, SandboxReport};
+
+    use super::*;
+
+    struct NoopSandbox;
+
+    impl SandboxBackend for NoopSandbox {
+        fn report(&self) -> SandboxReport {
+            SandboxReport::new("test", SandboxStrength::KernelEnforced, None)
+        }
+
+        fn execute(&self, _request: SandboxRequest) -> SandboxFuture<'_> {
+            Box::pin(async { Ok(SandboxOutput::new(Some(0), Vec::new(), Vec::new())) })
+        }
+    }
+
+    fn executor(workspace: &std::path::Path) -> BuiltinExecutor {
+        let filesystem =
+            WorkspaceReader::with_limits(workspace, 1024, 1024).expect("workspace reader");
+        let process = ProcessExecutor::new(
+            workspace,
+            Vec::new(),
+            BTreeSet::new(),
+            Duration::from_secs(1),
+            1024,
+            ResourceLimits::new(1, 1024 * 1024, 1024, 16, 16).expect("resource limits"),
+            Arc::new(NoopSandbox),
+        )
+        .expect("process executor");
+        BuiltinExecutor::new(filesystem, process)
+    }
+
+    fn network_action(url: String) -> ActionEnvelope {
+        ActionEnvelope::new(
+            ActionId::new(),
+            RunId::new(),
+            WorkspaceId::new(),
+            PrincipalId::new("local", "operator").expect("principal"),
+            ComponentId::new("builtin.tools").expect("component"),
+            ActionKind::new("network.egress").expect("kind"),
+            CanonicalValue::object([
+                ("method", CanonicalValue::from("GET")),
+                ("url", CanonicalValue::from(url.clone())),
+            ]),
+            vec![Capability::new(
+                CapabilityName::NetworkEgress,
+                ResourceScope::exact("destination", url).expect("destination scope"),
+            )],
+        )
+    }
+
+    #[tokio::test]
+    async fn network_egress_dispatches_get_without_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let workspace = tempdir().expect("workspace");
+        let executor = executor(workspace.path());
+
+        let outcome = executor
+            .dispatch(
+                &network_action(format!("{}/v1/status", server.uri())),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("network dispatch");
+
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::Succeeded(CanonicalValue::object([
+                ("status", CanonicalValue::from(200_i64)),
+                ("body", CanonicalValue::from("ok")),
+                ("bytes", CanonicalValue::from(2_i64)),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn network_egress_denies_redirect_responses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/target", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/target"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("followed"))
+            .mount(&server)
+            .await;
+        let workspace = tempdir().expect("workspace");
+        let executor = executor(workspace.path());
+
+        let outcome = executor
+            .dispatch(
+                &network_action(format!("{}/redirect", server.uri())),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("network dispatch");
+
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::Failed("network redirect denied".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn network_egress_enforces_response_byte_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/large"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("x".repeat(NETWORK_RESPONSE_LIMIT_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+        let workspace = tempdir().expect("workspace");
+        let executor = executor(workspace.path());
+
+        let outcome = executor
+            .dispatch(
+                &network_action(format!("{}/large", server.uri())),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("network dispatch");
+
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::Failed("network response byte limit exceeded".to_owned())
+        );
+    }
 }
