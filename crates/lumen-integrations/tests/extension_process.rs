@@ -103,13 +103,23 @@ fn digest_file(path: &Path) -> Sha256Digest {
     .unwrap()
 }
 
-fn sdk_subprocess_fixture() -> PathBuf {
-    std::env::current_exe()
+fn sdk_subprocess_fixture() -> (TempDir, PathBuf) {
+    let source = std::env::current_exe()
         .unwrap()
         .parent()
         .and_then(Path::parent)
         .unwrap()
-        .join("examples/subprocess_tool")
+        .join("examples/subprocess_tool");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("subprocess_tool");
+    std::fs::copy(&source, &path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = path.canonicalize().unwrap();
+    (directory, path)
 }
 
 fn correlated_result(sandbox_request: &SandboxRequest) -> SandboxOutput {
@@ -484,7 +494,7 @@ async fn system_plugin_profile_denies_workspace_reads_writes_and_environment() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn system_host_executes_the_sdk_subprocess_fixture() {
-    let executable = sdk_subprocess_fixture();
+    let (_directory, executable) = sdk_subprocess_fixture();
     assert!(
         executable.is_file(),
         "SDK subprocess fixture was not built at {}",
@@ -512,7 +522,7 @@ async fn system_host_executes_the_sdk_subprocess_fixture() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn sdk_fixture_has_no_ambient_files_environment_network_or_process_execution() {
-    let executable = sdk_subprocess_fixture();
+    let (_directory, executable) = sdk_subprocess_fixture();
     assert!(executable.is_file());
     let private = tempfile::tempdir().unwrap();
     let read_path = private.path().join("private.txt");
@@ -560,7 +570,7 @@ async fn sdk_fixture_has_no_ambient_files_environment_network_or_process_executi
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn system_host_terminates_deadline_cancellation_and_cpu_exhaustion() {
-    let executable = sdk_subprocess_fixture();
+    let (_directory, executable) = sdk_subprocess_fixture();
     assert!(executable.is_file());
     let forever = |id: &str| {
         InvocationRequest::new(
