@@ -20,6 +20,8 @@ These documents are the authoritative design baseline for Lumen. When a roadmap 
 - [Repository Map](REPOSITORY.md): current crate ownership, dependency direction, and verification areas
 - [Roadmap](ROADMAP.md): security-complete product milestones
 - [Implementation Plan](IMPLEMENTATION_PLAN.md): ordered work for the first local runtime kernel
+- [Milestone 4 Design](MILESTONE_4_DESIGN.md): controlled egress scope, policy, provider, network, and channel boundaries
+- [Milestone 4 Implementation Plan](MILESTONE_4_IMPLEMENTATION_PLAN.md): ordered work for remote providers, network egress, channels, and verification
 
 ## Decision Priority
 

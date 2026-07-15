@@ -85,10 +85,18 @@ impl Config {
         if !self.server.bind.ip().is_loopback() {
             return Err(ConfigError::NonLoopbackBind(self.server.bind.ip()));
         }
-        if self.model.allow_remote {
-            return Err(ConfigError::RemoteModelUnsupported);
+        let endpoint_class = classify_model_endpoint(&self.model.endpoint)?;
+        if endpoint_class == ModelEndpointClass::Remote {
+            if !self.model.allow_remote {
+                return Err(ConfigError::RemoteModelDenied);
+            }
+            let provider = self
+                .model
+                .remote_provider
+                .as_ref()
+                .ok_or(ConfigError::RemoteModelPolicyRequired)?;
+            validate_remote_provider(provider)?;
         }
-        validate_model_endpoint(&self.model.endpoint)?;
         if self.model.model.trim().is_empty() {
             return Err(ConfigError::InvalidModel);
         }
@@ -139,7 +147,7 @@ fn resolve_relative(path: &mut PathBuf, base: &Path) {
     }
 }
 
-fn validate_model_endpoint(value: &str) -> Result<(), ConfigError> {
+fn classify_model_endpoint(value: &str) -> Result<ModelEndpointClass, ConfigError> {
     let url = Url::parse(value).map_err(|_| ConfigError::InvalidModelEndpoint)?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
@@ -155,9 +163,34 @@ fn validate_model_endpoint(value: &str) -> Result<(), ConfigError> {
         Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
     };
     if !loopback {
-        return Err(ConfigError::RemoteModelDenied);
+        return Ok(ModelEndpointClass::Remote);
+    }
+    Ok(ModelEndpointClass::Local)
+}
+
+fn validate_remote_provider(provider: &RemoteModelProviderConfig) -> Result<(), ConfigError> {
+    if provider.id.is_empty()
+        || provider.id.len() > 128
+        || provider.id.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ':' | '/'))
+        })
+    {
+        return Err(ConfigError::InvalidRemoteProvider);
+    }
+    if provider.allowed_data_classes.is_empty()
+        || provider
+            .allowed_data_classes
+            .contains(&RemoteDataClass::Secret)
+    {
+        return Err(ConfigError::InvalidRemoteDataClass);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelEndpointClass {
+    Local,
+    Remote,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -200,6 +233,7 @@ pub struct ModelConfig {
     pub endpoint: String,
     pub model: String,
     pub allow_remote: bool,
+    pub remote_provider: Option<RemoteModelProviderConfig>,
     pub streaming: bool,
     pub timeout_seconds: u64,
     pub max_response_bytes: usize,
@@ -211,11 +245,28 @@ impl Default for ModelConfig {
             endpoint: String::new(),
             model: String::new(),
             allow_remote: false,
+            remote_provider: None,
             streaming: true,
             timeout_seconds: 120,
             max_response_bytes: 4 * 1024 * 1024,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteModelProviderConfig {
+    pub id: String,
+    pub allowed_data_classes: BTreeSet<RemoteDataClass>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteDataClass {
+    Public,
+    Workspace,
+    Sensitive,
+    Secret,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -321,8 +372,12 @@ pub enum ConfigError {
     NonLoopbackBind(IpAddr),
     #[error("remote model endpoints are disabled")]
     RemoteModelDenied,
-    #[error("remote model support is outside Milestone 1")]
-    RemoteModelUnsupported,
+    #[error("remote model endpoint requires explicit provider policy")]
+    RemoteModelPolicyRequired,
+    #[error("remote model provider is invalid")]
+    InvalidRemoteProvider,
+    #[error("remote model data class policy is invalid")]
+    InvalidRemoteDataClass,
     #[error("model endpoint is invalid")]
     InvalidModelEndpoint,
     #[error("model name must be non-empty")]

@@ -98,6 +98,55 @@ fn remote_model_endpoint_is_rejected_by_default() {
 }
 
 #[test]
+fn allow_remote_requires_explicit_provider_policy() {
+    let config = MINIMAL_CONFIG
+        .replace("127.0.0.1:8080", "models.example.com")
+        .replace("[model]", "[model]\nallow_remote = true");
+
+    let error = Config::parse(&config).expect_err("remote policy must be explicit");
+
+    assert_eq!(error, ConfigError::RemoteModelPolicyRequired);
+}
+
+#[test]
+fn remote_model_endpoint_is_allowed_with_public_provider_policy() {
+    let config = MINIMAL_CONFIG
+        .replace("127.0.0.1:8080", "models.example.com")
+        .replace(
+            "model = \"local-model\"",
+            r#"model = "local-model"
+allow_remote = true
+remote_provider = { id = "openai-compatible", allowed_data_classes = ["public"] }"#,
+        );
+
+    let config = Config::parse(&config).expect("explicit public remote provider parses");
+
+    let provider = config
+        .model
+        .remote_provider
+        .as_ref()
+        .expect("remote provider policy");
+    assert_eq!(provider.id, "openai-compatible");
+    assert_eq!(provider.allowed_data_classes.len(), 1);
+}
+
+#[test]
+fn secret_data_class_is_never_allowed_for_remote_models() {
+    let config = MINIMAL_CONFIG
+        .replace("127.0.0.1:8080", "models.example.com")
+        .replace(
+            "model = \"local-model\"",
+            r#"model = "local-model"
+allow_remote = true
+remote_provider = { id = "openai-compatible", allowed_data_classes = ["public", "secret"] }"#,
+        );
+
+    let error = Config::parse(&config).expect_err("secret egress must fail");
+
+    assert_eq!(error, ConfigError::InvalidRemoteDataClass);
+}
+
+#[test]
 fn required_sandbox_strength_must_be_available() {
     let config = Config::parse(MINIMAL_CONFIG).expect("config parses");
     let report = SandboxReport::new(

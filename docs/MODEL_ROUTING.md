@@ -63,6 +63,8 @@ Loopback endpoints are authenticated when the runner supports it and constrained
 
 Remote providers must be enabled explicitly. Configuration shows what endpoint receives data, and provider credentials are secret references. Enabling a provider does not grant it access to every workspace. Remote-provider errors never trigger an unconfigured fallback.
 
+During Milestone 4, boot configuration may describe one remote OpenAI-compatible provider only when the endpoint is marked `allow_remote = true` and the provider policy names an ID plus non-secret allowed data classes. Runtime-mutable provider state, workspace exceptions, credentials, health, priority, and audit-relevant routing revisions belong in SQL.
+
 ## Model Capability Variance
 
 The runtime does not rely on prompt compliance for security. Provider capability discovery affects usability only. Models with weak structured-output support may be restricted to text or low-risk tools, but they cannot obtain a weaker enforcement path.
