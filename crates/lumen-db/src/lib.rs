@@ -11,7 +11,9 @@ use std::path::Path;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
-pub use egress::{ModelEndpointClass, ModelProviderRevision, WorkspaceModelEgressRevision};
+pub use egress::{
+    DestinationRevision, ModelEndpointClass, ModelProviderRevision, WorkspaceModelEgressRevision,
+};
 pub use extensions::{
     InstallResult, InstalledPluginVersion, PluginGrantRevision, PluginGrantScope,
     PluginSettingRevision, PluginSettingScope, PluginWorkspaceState, StagedPluginPackage,

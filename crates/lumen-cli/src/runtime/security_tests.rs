@@ -17,7 +17,7 @@ use lumen_core::audit::AuditEventKind;
 use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
-    capability::CapabilitySet,
+    capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
     identity::{PrincipalId, WorkspaceId},
@@ -25,8 +25,8 @@ use lumen_core::{
     secret::SecretRefId,
 };
 use lumen_db::{
-    Database, ModelEndpointClass, ModelProviderRevision, SecretReference, StagedPluginPackage,
-    WorkspaceModelEgressRevision,
+    Database, DestinationRevision, ModelEndpointClass, ModelProviderRevision, SecretReference,
+    StagedPluginPackage, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     extension_package::PackageStager,
@@ -1137,6 +1137,73 @@ async fn public_class_input_is_allowed_through_public_remote_model_policy() {
             ("provider_id", CanonicalValue::from("openai-compatible")),
         ])
     );
+}
+
+#[tokio::test]
+async fn enabled_network_destinations_are_loaded_as_runtime_capabilities() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let destination = DestinationScope::parse("https://api.example.com/v1").unwrap();
+    harness
+        .database
+        .append_destination_revision(
+            &DestinationRevision::new(
+                destination.clone(),
+                1,
+                true,
+                [DataClass::Public],
+                TimestampMillis::new(1_000),
+            )
+            .expect("destination revision"),
+        )
+        .await
+        .expect("destination stored");
+    let service = LocalRuntimeService::build_with_secret_store(
+        &Config::parse(&format!(
+            r#"
+[database]
+path = "ignored.sqlite3"
+
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = false
+
+[runtime]
+data_directory = "{}"
+
+[process]
+allowed_programs = ["/bin/echo"]
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "{}"
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+            model.uri(),
+            harness._directory.path().join("runtime").display(),
+            harness._directory.path().join("workspace").display()
+        ))
+        .expect("runtime config"),
+        harness.database.clone(),
+        EventBroker::new(128),
+        Arc::new(harness.sandbox.clone()),
+        vec![TOKEN.to_owned()],
+        Arc::new(InMemorySecretStore::new()),
+    )
+    .await
+    .expect("runtime builds");
+
+    assert!(service.ambient_capabilities.allows(&Capability::new(
+        CapabilityName::NetworkEgress,
+        ResourceScope::exact("destination", destination.as_str()).expect("destination scope"),
+    )));
+    service.shutdown().await;
+    harness.service.shutdown().await;
 }
 
 #[tokio::test]

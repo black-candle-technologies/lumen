@@ -128,6 +128,7 @@ impl LocalRuntimeService {
         let secret_references = database
             .list_secret_references(config.workspace_id())
             .await?;
+        let network_egress_capabilities = database.enabled_network_egress_capabilities().await?;
         let resource_limits = ResourceLimits::new(
             config.process.max_cpu_seconds,
             config.process.max_address_space_bytes,
@@ -221,6 +222,7 @@ impl LocalRuntimeService {
                     .map_err(|error| CliError::Runtime(error.to_string()))?,
             ));
         }
+        grants.extend(network_egress_capabilities);
         let ambient_capabilities = CapabilitySet::new(grants);
         Ok(Self {
             model: Arc::new(model),

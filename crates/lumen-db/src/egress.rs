@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use lumen_core::{
     approval::TimestampMillis,
+    capability::{Capability, CapabilityName, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, ProviderRoute},
     identity::WorkspaceId,
     secret::SecretRefId,
@@ -178,6 +179,60 @@ impl WorkspaceModelEgressRevision {
 
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub const fn created_at(&self) -> TimestampMillis {
+        self.created_at
+    }
+
+    pub fn allows(&self, data_class: DataClass) -> bool {
+        self.allowed_data_classes.contains(&data_class)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestinationRevision {
+    destination: DestinationScope,
+    revision: u64,
+    enabled: bool,
+    allowed_data_classes: BTreeSet<DataClass>,
+    created_at: TimestampMillis,
+}
+
+impl DestinationRevision {
+    pub fn new(
+        destination: DestinationScope,
+        revision: u64,
+        enabled: bool,
+        allowed_data_classes: impl IntoIterator<Item = DataClass>,
+        created_at: TimestampMillis,
+    ) -> Result<Self, RepositoryError> {
+        let allowed_data_classes = allowed_data_classes.into_iter().collect::<BTreeSet<_>>();
+        if revision == 0
+            || allowed_data_classes.is_empty()
+            || allowed_data_classes.contains(&DataClass::Secret)
+        {
+            return Err(RepositoryError::InvalidEgressPolicy);
+        }
+        Ok(Self {
+            destination,
+            revision,
+            enabled,
+            allowed_data_classes,
+            created_at,
+        })
+    }
+
+    pub const fn destination(&self) -> &DestinationScope {
+        &self.destination
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
     }
 
     pub const fn created_at(&self) -> TimestampMillis {
@@ -396,6 +451,92 @@ impl Database {
             )
         })
         .transpose()
+    }
+
+    pub async fn append_destination_revision(
+        &self,
+        revision: &DestinationRevision,
+    ) -> Result<(), RepositoryError> {
+        let revision_number =
+            i64::try_from(revision.revision).map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+        let created_at = timestamp_to_i64(revision.created_at)?;
+        sqlx::query(
+            "INSERT INTO egress_destinations (
+                destination, revision, enabled, allowed_data_classes_json, created_at
+             ) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(revision.destination.as_str())
+        .bind(revision_number)
+        .bind(if revision.enabled { 1_i64 } else { 0_i64 })
+        .bind(serde_json::to_string(&revision.allowed_data_classes)?)
+        .bind(created_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn latest_destination_revision(
+        &self,
+        destination: DestinationScope,
+    ) -> Result<Option<DestinationRevision>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT revision, enabled, allowed_data_classes_json, created_at
+             FROM egress_destinations
+             WHERE destination = ?
+             ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(destination.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            DestinationRevision::new(
+                destination.clone(),
+                u64::try_from(row.try_get::<i64, _>("revision")?)
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                row.try_get::<i64, _>("enabled")? == 1,
+                serde_json::from_str::<BTreeSet<DataClass>>(
+                    &row.try_get::<String, _>("allowed_data_classes_json")?,
+                )?,
+                TimestampMillis::new(
+                    u64::try_from(row.try_get::<i64, _>("created_at")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                ),
+            )
+        })
+        .transpose()
+    }
+
+    pub async fn enabled_network_egress_capabilities(
+        &self,
+    ) -> Result<Vec<Capability>, RepositoryError> {
+        let rows = sqlx::query(
+            "WITH latest_destinations AS (
+                SELECT destination, MAX(revision) AS revision
+                FROM egress_destinations
+                GROUP BY destination
+             )
+             SELECT destination.destination
+             FROM latest_destinations latest
+             JOIN egress_destinations destination
+               ON destination.destination = latest.destination
+              AND destination.revision = latest.revision
+             WHERE destination.enabled = 1
+             ORDER BY destination.destination ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let destination = DestinationScope::parse(row.try_get::<String, _>("destination")?)
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+                Ok(Capability::new(
+                    CapabilityName::NetworkEgress,
+                    ResourceScope::exact("destination", destination.as_str())
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                ))
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]

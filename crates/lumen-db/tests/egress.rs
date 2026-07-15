@@ -1,5 +1,6 @@
 use lumen_core::{
     approval::TimestampMillis,
+    capability::{Capability, CapabilityName, ResourceScope},
     egress::{
         DataClass, DestinationScope, EndpointClass, ProviderId, RoutingFailure,
         select_model_provider,
@@ -8,7 +9,7 @@ use lumen_core::{
     secret::SecretRefId,
 };
 use lumen_db::{
-    Database, ModelEndpointClass, ModelProviderRevision, RepositoryError,
+    Database, DestinationRevision, ModelEndpointClass, ModelProviderRevision, RepositoryError,
     WorkspaceModelEgressRevision,
 };
 use sqlx::Row;
@@ -361,4 +362,110 @@ async fn disabled_provider_routes_are_loaded_but_not_eligible() {
     assert!(!routes[0].enabled());
     let error = select_model_provider(DataClass::Public, routes).expect_err("disabled");
     assert_eq!(error, RoutingFailure::NoEligibleProvider);
+}
+
+#[tokio::test]
+async fn destination_revisions_are_append_only_and_load_latest_policy() {
+    let database = database().await;
+    let destination = DestinationScope::parse("https://api.example.com/v1").unwrap();
+    let first = DestinationRevision::new(
+        destination.clone(),
+        1,
+        true,
+        [DataClass::Public],
+        TimestampMillis::new(1_000),
+    )
+    .expect("destination revision");
+    database
+        .append_destination_revision(&first)
+        .await
+        .expect("destination stored");
+    assert_eq!(
+        database
+            .latest_destination_revision(destination.clone())
+            .await
+            .expect("destination loaded"),
+        Some(first)
+    );
+
+    let second = DestinationRevision::new(
+        destination.clone(),
+        2,
+        false,
+        [DataClass::Public, DataClass::Workspace],
+        TimestampMillis::new(2_000),
+    )
+    .expect("destination revision");
+    database
+        .append_destination_revision(&second)
+        .await
+        .expect("second destination stored");
+
+    assert_eq!(
+        database
+            .latest_destination_revision(destination)
+            .await
+            .expect("destination loaded"),
+        Some(second)
+    );
+}
+
+#[tokio::test]
+async fn enabled_destinations_load_as_exact_network_egress_capabilities() {
+    let database = database().await;
+    let enabled = DestinationScope::parse("https://api.example.com/v1").unwrap();
+    let disabled = DestinationScope::parse("https://blocked.example.com/").unwrap();
+    database
+        .append_destination_revision(
+            &DestinationRevision::new(
+                enabled.clone(),
+                1,
+                true,
+                [DataClass::Public],
+                TimestampMillis::new(1_000),
+            )
+            .expect("enabled destination"),
+        )
+        .await
+        .expect("enabled stored");
+    database
+        .append_destination_revision(
+            &DestinationRevision::new(
+                disabled.clone(),
+                1,
+                false,
+                [DataClass::Public],
+                TimestampMillis::new(1_000),
+            )
+            .expect("disabled destination"),
+        )
+        .await
+        .expect("disabled stored");
+
+    let capabilities = database
+        .enabled_network_egress_capabilities()
+        .await
+        .expect("capabilities loaded");
+
+    assert_eq!(
+        capabilities,
+        vec![Capability::new(
+            CapabilityName::NetworkEgress,
+            ResourceScope::exact("destination", enabled.as_str()).expect("destination scope"),
+        )]
+    );
+}
+
+#[test]
+fn destination_revisions_reject_secret_data_class() {
+    let error = DestinationRevision::new(
+        DestinationScope::parse("https://api.example.com/v1").unwrap(),
+        1,
+        true,
+        [DataClass::Secret],
+        TimestampMillis::new(1_000),
+    )
+    .expect_err("secret destination policy must fail");
+
+    assert!(matches!(error, RepositoryError::InvalidEgressPolicy));
 }
