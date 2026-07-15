@@ -9,7 +9,7 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
-    egress::DataClass,
+    egress::{DataClass, DestinationScope},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
@@ -48,6 +48,14 @@ pub trait RuntimeService: Send + Sync {
         &self,
         command: ChannelMappingCommand,
     ) -> ServiceFuture<'_, ChannelMappingReview>;
+    fn list_destination_policies(
+        &self,
+        query: DestinationPolicyQuery,
+    ) -> ServiceFuture<'_, Vec<DestinationPolicyReview>>;
+    fn update_destination_policy(
+        &self,
+        command: DestinationPolicyCommand,
+    ) -> ServiceFuture<'_, DestinationPolicyReview>;
 }
 
 #[derive(Clone)]
@@ -575,6 +583,103 @@ impl ChannelMappingReview {
             allowed,
             created_at,
             updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestinationPolicyQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl DestinationPolicyQuery {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestinationPolicyCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    destination: DestinationScope,
+    enabled: bool,
+    allowed_data_classes: Vec<DataClass>,
+}
+
+impl DestinationPolicyCommand {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        destination: DestinationScope,
+        enabled: bool,
+        allowed_data_classes: Vec<DataClass>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            destination,
+            enabled,
+            allowed_data_classes,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn destination(&self) -> &DestinationScope {
+        &self.destination
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn allowed_data_classes(&self) -> &[DataClass] {
+        &self.allowed_data_classes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DestinationPolicyReview {
+    destination: String,
+    revision: u64,
+    enabled: bool,
+    allowed_data_classes: Vec<DataClass>,
+    created_at: TimestampMillis,
+}
+
+impl DestinationPolicyReview {
+    pub fn new(
+        destination: DestinationScope,
+        revision: u64,
+        enabled: bool,
+        allowed_data_classes: Vec<DataClass>,
+        created_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            destination: destination.as_str().to_owned(),
+            revision,
+            enabled,
+            allowed_data_classes,
+            created_at,
         }
     }
 }

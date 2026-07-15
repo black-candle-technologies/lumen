@@ -463,6 +463,13 @@ async fn enabled_destinations_load_as_exact_network_egress_capabilities() {
             ResourceScope::exact("destination", enabled.as_str()).expect("destination scope"),
         )]
     );
+    let latest = database
+        .list_latest_destination_revisions()
+        .await
+        .expect("latest destinations");
+    assert_eq!(latest.len(), 2);
+    assert_eq!(latest[0].destination(), &enabled);
+    assert_eq!(latest[1].destination(), &disabled);
 }
 
 #[test]

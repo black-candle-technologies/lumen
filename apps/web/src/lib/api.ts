@@ -120,6 +120,22 @@ export type ChannelMappingUpdate = {
 	allowed: boolean;
 };
 
+export type DataClass = 'public' | 'workspace' | 'sensitive';
+
+export type DestinationPolicy = {
+	destination: string;
+	revision: number;
+	enabled: boolean;
+	allowed_data_classes: DataClass[];
+	created_at: number;
+};
+
+export type DestinationPolicyUpdate = {
+	destination: string;
+	enabled: boolean;
+	allowed_data_classes: DataClass[];
+};
+
 export class ApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -193,6 +209,17 @@ export class ApiClient {
 
 	async updateChannelMapping(request: ChannelMappingUpdate): Promise<ChannelMapping> {
 		return this.request('egress/channels', { method: 'POST', body: JSON.stringify(request) });
+	}
+
+	async listDestinationPolicies(): Promise<DestinationPolicy[]> {
+		const response = await this.request<{ destinations: DestinationPolicy[] }>(
+			'egress/destinations'
+		);
+		return response.destinations;
+	}
+
+	async updateDestinationPolicy(request: DestinationPolicyUpdate): Promise<DestinationPolicy> {
+		return this.request('egress/destinations', { method: 'POST', body: JSON.stringify(request) });
 	}
 
 	async streamRunEvents(

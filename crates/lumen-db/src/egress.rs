@@ -563,6 +563,50 @@ impl Database {
         .transpose()
     }
 
+    pub async fn list_latest_destination_revisions(
+        &self,
+    ) -> Result<Vec<DestinationRevision>, RepositoryError> {
+        let rows = sqlx::query(
+            "WITH latest_destinations AS (
+                SELECT destination, MAX(revision) AS revision
+                FROM egress_destinations
+                GROUP BY destination
+             )
+             SELECT
+                destination.destination,
+                destination.revision,
+                destination.enabled,
+                destination.allowed_data_classes_json,
+                destination.created_at
+             FROM latest_destinations latest
+             JOIN egress_destinations destination
+               ON destination.destination = latest.destination
+              AND destination.revision = latest.revision
+             ORDER BY destination.destination ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                DestinationRevision::new(
+                    DestinationScope::parse(row.try_get::<String, _>("destination")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    u64::try_from(row.try_get::<i64, _>("revision")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    row.try_get::<i64, _>("enabled")? == 1,
+                    serde_json::from_str::<BTreeSet<DataClass>>(
+                        &row.try_get::<String, _>("allowed_data_classes_json")?,
+                    )?,
+                    TimestampMillis::new(
+                        u64::try_from(row.try_get::<i64, _>("created_at")?)
+                            .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    ),
+                )
+            })
+            .collect()
+    }
+
     pub async fn enabled_network_egress_capabilities(
         &self,
     ) -> Result<Vec<Capability>, RepositoryError> {

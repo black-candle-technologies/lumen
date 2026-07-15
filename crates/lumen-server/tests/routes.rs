@@ -13,7 +13,7 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
-    egress::DataClass,
+    egress::{DataClass, DestinationScope},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
@@ -21,10 +21,11 @@ use lumen_server::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
     ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand,
     ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview, CreateRunCommand,
-    EventBroker, PluginActionCommand, PluginActionRequested, PluginComponentReview,
-    PluginDetailsQuery, PluginFailureReview, PluginReviewQuery, PluginSettingReview,
-    PluginVersionDetails, PrincipalSummary, RunCancellation, RunCreated, RuntimeService,
-    SandboxCapabilityReport, ServiceError, ServiceFuture, StagedPluginReview, router,
+    DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview, EventBroker,
+    PluginActionCommand, PluginActionRequested, PluginComponentReview, PluginDetailsQuery,
+    PluginFailureReview, PluginReviewQuery, PluginSettingReview, PluginVersionDetails,
+    PrincipalSummary, RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport,
+    ServiceError, ServiceFuture, StagedPluginReview, router,
 };
 use tower::ServiceExt;
 
@@ -45,6 +46,9 @@ struct FakeService {
     channel_mapping_queries: Mutex<Vec<ChannelMappingQuery>>,
     channel_mapping_commands: Mutex<Vec<ChannelMappingCommand>>,
     channel_mapping_reviews: Mutex<Vec<ChannelMappingReview>>,
+    destination_policy_queries: Mutex<Vec<DestinationPolicyQuery>>,
+    destination_policy_commands: Mutex<Vec<DestinationPolicyCommand>>,
+    destination_policy_reviews: Mutex<Vec<DestinationPolicyReview>>,
 }
 
 impl RuntimeService for FakeService {
@@ -239,6 +243,41 @@ impl RuntimeService for FakeService {
             ))
         })
     }
+
+    fn list_destination_policies(
+        &self,
+        query: DestinationPolicyQuery,
+    ) -> ServiceFuture<'_, Vec<DestinationPolicyReview>> {
+        self.destination_policy_queries
+            .lock()
+            .expect("destination policy queries")
+            .push(query);
+        let reviews = self
+            .destination_policy_reviews
+            .lock()
+            .expect("destination policy reviews")
+            .clone();
+        Box::pin(async move { Ok(reviews) })
+    }
+
+    fn update_destination_policy(
+        &self,
+        command: DestinationPolicyCommand,
+    ) -> ServiceFuture<'_, DestinationPolicyReview> {
+        self.destination_policy_commands
+            .lock()
+            .expect("destination policy commands")
+            .push(command.clone());
+        Box::pin(async move {
+            Ok(DestinationPolicyReview::new(
+                command.destination().clone(),
+                2,
+                command.enabled(),
+                command.allowed_data_classes().to_vec(),
+                TimestampMillis::new(2_000),
+            ))
+        })
+    }
 }
 
 fn test_app(workspace_id: WorkspaceId) -> (axum::Router, Arc<FakeService>, EventBroker) {
@@ -388,6 +427,111 @@ async fn channel_mapping_updates_are_validated_and_forwarded() {
                     "lumen_provider":"local",
                     "lumen_subject":"alice",
                     "allowed":true
+                }"#,
+            ),
+        ))
+        .await
+        .expect("bad response");
+    assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn destination_policy_review_is_authenticated_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    service
+        .destination_policy_reviews
+        .lock()
+        .expect("destination policy reviews")
+        .push(DestinationPolicyReview::new(
+            DestinationScope::parse("https://api.example.com/v1").expect("destination"),
+            1,
+            true,
+            vec![DataClass::Public, DataClass::Workspace],
+            TimestampMillis::new(1_000),
+        ));
+
+    let response = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/egress/destinations"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["destinations"][0]["destination"],
+        "https://api.example.com/v1"
+    );
+    assert_eq!(body["destinations"][0]["revision"], 1);
+    assert_eq!(body["destinations"][0]["enabled"], true);
+    assert_eq!(
+        body["destinations"][0]["allowed_data_classes"],
+        serde_json::json!(["public", "workspace"])
+    );
+    let queries = service
+        .destination_policy_queries
+        .lock()
+        .expect("destination policy queries");
+    assert_eq!(queries[0].workspace_id(), workspace_id);
+    assert_eq!(queries[0].actor().subject(), "operator");
+}
+
+#[tokio::test]
+async fn destination_policy_updates_are_validated_and_forwarded() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/egress/destinations"),
+            Body::from(
+                r#"{
+                    "destination":"https://api.example.com/v1",
+                    "enabled":false,
+                    "allowed_data_classes":["public","workspace"]
+                }"#,
+            ),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["destination"], "https://api.example.com/v1");
+    assert_eq!(body["enabled"], false);
+    {
+        let commands = service
+            .destination_policy_commands
+            .lock()
+            .expect("destination policy commands");
+        assert_eq!(commands[0].workspace_id(), workspace_id);
+        assert_eq!(commands[0].actor().subject(), "operator");
+        assert_eq!(
+            commands[0].destination().as_str(),
+            "https://api.example.com/v1"
+        );
+        assert!(!commands[0].enabled());
+        assert_eq!(
+            commands[0].allowed_data_classes(),
+            &[DataClass::Public, DataClass::Workspace]
+        );
+    }
+
+    let bad_response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/egress/destinations"),
+            Body::from(
+                r#"{
+                    "destination":"https://api.example.com/v1",
+                    "enabled":true,
+                    "allowed_data_classes":["secret"]
                 }"#,
             ),
         ))

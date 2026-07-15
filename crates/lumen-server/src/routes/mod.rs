@@ -12,7 +12,7 @@ use axum::{
 use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::ApprovalId,
-    egress::DataClass,
+    egress::{DataClass, DestinationScope},
     extension::{PluginId, PluginVersion, Sha256Digest},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
 };
@@ -22,7 +22,8 @@ use uuid::Uuid;
 use crate::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
     CancelRunCommand, ChannelMappingCommand, ChannelMappingQuery, CreateRunCommand,
-    PluginActionCommand, PluginDetailsQuery, PluginReviewQuery, ServiceError,
+    DestinationPolicyCommand, DestinationPolicyQuery, PluginActionCommand, PluginDetailsQuery,
+    PluginReviewQuery, ServiceError,
 };
 
 pub fn router(state: ApiState) -> Router {
@@ -64,6 +65,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/v1/workspaces/{workspace_id}/egress/channels",
             get(list_channel_mappings).post(update_channel_mapping),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/egress/destinations",
+            get(list_destination_policies).post(update_destination_policy),
         )
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
@@ -146,6 +151,65 @@ async fn update_channel_mapping(
         ))
         .await?;
     Ok(Json(mapping))
+}
+
+#[derive(Serialize)]
+struct DestinationPoliciesResponse {
+    destinations: Vec<crate::DestinationPolicyReview>,
+}
+
+async fn list_destination_policies(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<DestinationPoliciesResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let destinations = state
+        .service
+        .list_destination_policies(DestinationPolicyQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(DestinationPoliciesResponse { destinations }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestinationPolicyBody {
+    destination: String,
+    enabled: bool,
+    allowed_data_classes: Vec<DataClass>,
+}
+
+async fn update_destination_policy(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    body: Result<Json<DestinationPolicyBody>, JsonRejection>,
+) -> Result<Json<crate::DestinationPolicyReview>, ApiError> {
+    let Json(body) =
+        body.map_err(|_| ApiError::BadRequest("invalid destination policy body".into()))?;
+    if body.allowed_data_classes.is_empty()
+        || body.allowed_data_classes.contains(&DataClass::Secret)
+    {
+        return Err(ApiError::BadRequest(
+            "destination policy data classes are invalid".into(),
+        ));
+    }
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let destination = DestinationScope::parse(body.destination)
+        .map_err(|_| ApiError::BadRequest("invalid destination scope".into()))?;
+    let policy = state
+        .service
+        .update_destination_policy(DestinationPolicyCommand::new(
+            workspace_id,
+            actor,
+            destination,
+            body.enabled,
+            body.allowed_data_classes,
+        ))
+        .await?;
+    Ok(Json(policy))
 }
 
 async fn authenticate(

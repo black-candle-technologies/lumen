@@ -206,6 +206,45 @@ test.beforeEach(async ({ page }) => {
 			}
 		});
 	});
+	await page.route('**/api/v1/workspaces/*/egress/destinations', async (route) => {
+		if (route.request().method() === 'POST') {
+			expect(route.request().postDataJSON()).toMatchObject({
+				destination: 'https://api.example.com/v1',
+				enabled: false,
+				allowed_data_classes: ['public', 'workspace']
+			});
+			await route.fulfill({
+				json: {
+					destination: 'https://api.example.com/v1',
+					revision: 2,
+					enabled: false,
+					allowed_data_classes: ['public', 'workspace'],
+					created_at: 31
+				}
+			});
+			return;
+		}
+		await route.fulfill({
+			json: {
+				destinations: [
+					{
+						destination: 'https://api.example.com/v1',
+						revision: 1,
+						enabled: true,
+						allowed_data_classes: ['public', 'workspace'],
+						created_at: 30
+					},
+					{
+						destination: 'https://hooks.example.com/',
+						revision: 4,
+						enabled: false,
+						allowed_data_classes: ['public'],
+						created_at: 28
+					}
+				]
+			}
+		});
+	});
 });
 
 test('streams a local chat result and can request cancellation', async ({ page }, testInfo) => {
@@ -316,11 +355,16 @@ test('shows egress channel controls and updates allowlisting', async ({ page }, 
 	await page.goto('/egress');
 
 	await expect(page.getByRole('heading', { name: 'Egress' })).toBeVisible();
+	await expect(page.getByText('https://api.example.com/v1')).toBeVisible();
+	await expect(page.getByText('public, workspace')).toBeVisible();
+	await expect(page.getByText('https://hooks.example.com/')).toBeVisible();
 	await expect(page.getByText('slack:T123:C456')).toBeVisible();
 	await expect(page.getByText('local/operator')).toBeVisible();
 	await expect(page.getByText('discord:guild-1:ops')).toBeVisible();
 	await expect(page.getByText('browser-secret-must-not-render')).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: 'Disable destination https://api.example.com/v1' }).click();
+	await expect(page.getByText('Disabled https://api.example.com/v1')).toBeVisible();
 	await page.getByRole('button', { name: 'Disable slack T123 C456' }).click();
 	await expect(page.getByText('Disabled slack:T123:C456')).toBeVisible();
 	await page.screenshot({ path: testInfo.outputPath('egress.png') });

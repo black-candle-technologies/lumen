@@ -202,4 +202,60 @@ describe('ApiClient', () => {
 		expect(updated.allowed).toBe(true);
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
+
+	it('lists and updates destination egress policies through workspace-scoped endpoints', async () => {
+		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (init?.method === 'POST') {
+				expect(url).toBe(
+					'http://127.0.0.1:3210/api/v1/workspaces/26db5a31-94f0-4e92-a9c9-4cdf19d71c31/egress/destinations'
+				);
+				expect(JSON.parse(String(init.body))).toEqual({
+					destination: 'https://api.example.com/v1',
+					enabled: false,
+					allowed_data_classes: ['public', 'workspace']
+				});
+				return new Response(
+					JSON.stringify({
+						destination: 'https://api.example.com/v1',
+						revision: 2,
+						enabled: false,
+						allowed_data_classes: ['public', 'workspace'],
+						created_at: 30
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } }
+				);
+			}
+			expect(url).toBe(
+				'http://127.0.0.1:3210/api/v1/workspaces/26db5a31-94f0-4e92-a9c9-4cdf19d71c31/egress/destinations'
+			);
+			return new Response(
+				JSON.stringify({
+					destinations: [
+						{
+							destination: 'https://api.example.com/v1',
+							revision: 1,
+							enabled: true,
+							allowed_data_classes: ['public', 'workspace'],
+							created_at: 10
+						}
+					]
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			);
+		});
+		const client = new ApiClient(settings, fetchMock as typeof fetch);
+
+		const destinations = await client.listDestinationPolicies();
+		const updated = await client.updateDestinationPolicy({
+			destination: 'https://api.example.com/v1',
+			enabled: false,
+			allowed_data_classes: ['public', 'workspace']
+		});
+
+		expect(destinations[0].enabled).toBe(true);
+		expect(updated.enabled).toBe(false);
+		expect(updated.revision).toBe(2);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
 });

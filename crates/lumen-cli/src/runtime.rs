@@ -26,7 +26,7 @@ use lumen_core::{
     secret::SecretRefId,
 };
 use lumen_db::{
-    ChannelIdentityMapping, Database, DispatchReservation, ModelEndpointClass,
+    ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, ModelEndpointClass,
     ModelProviderRevision, PluginGrantScope, PluginSettingScope, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
@@ -42,7 +42,8 @@ use lumen_integrations::{
 use lumen_server::{
     ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
     ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand, ChannelMappingCommand,
-    ChannelMappingQuery, ChannelMappingReview, CreateRunCommand, EventBroker, PluginActionCommand,
+    ChannelMappingQuery, ChannelMappingReview, CreateRunCommand, DestinationPolicyCommand,
+    DestinationPolicyQuery, DestinationPolicyReview, EventBroker, PluginActionCommand,
     PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
     PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
     RunCancellation, RunCreated, RuntimeService, ServiceError, ServiceFuture, StagedPluginReview,
@@ -1043,6 +1044,48 @@ impl RuntimeService for LocalRuntimeService {
             channel_mapping_review(mapping)
         })
     }
+
+    fn list_destination_policies(
+        &self,
+        _query: DestinationPolicyQuery,
+    ) -> ServiceFuture<'_, Vec<DestinationPolicyReview>> {
+        Box::pin(async move {
+            self.database
+                .list_latest_destination_revisions()
+                .await
+                .map_err(repository_service_error)?
+                .into_iter()
+                .map(destination_policy_review)
+                .collect()
+        })
+    }
+
+    fn update_destination_policy(
+        &self,
+        command: DestinationPolicyCommand,
+    ) -> ServiceFuture<'_, DestinationPolicyReview> {
+        Box::pin(async move {
+            let latest = self
+                .database
+                .latest_destination_revision(command.destination().clone())
+                .await
+                .map_err(repository_service_error)?;
+            let revision = latest.as_ref().map_or(1, |current| current.revision() + 1);
+            let policy = DestinationRevision::new(
+                command.destination().clone(),
+                revision,
+                command.enabled(),
+                command.allowed_data_classes().iter().copied(),
+                now(),
+            )
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            self.database
+                .append_destination_revision(&policy)
+                .await
+                .map_err(repository_service_error)?;
+            destination_policy_review(policy)
+        })
+    }
 }
 
 fn channel_mapping_review(
@@ -1055,6 +1098,26 @@ fn channel_mapping_review(
         mapping.allowed(),
         mapping.created_at(),
         mapping.updated_at(),
+    ))
+}
+
+fn destination_policy_review(
+    revision: DestinationRevision,
+) -> Result<DestinationPolicyReview, ServiceError> {
+    let allowed_data_classes = [
+        DataClass::Public,
+        DataClass::Workspace,
+        DataClass::Sensitive,
+    ]
+    .into_iter()
+    .filter(|data_class| revision.allows(*data_class))
+    .collect();
+    Ok(DestinationPolicyReview::new(
+        revision.destination().clone(),
+        revision.revision(),
+        revision.enabled(),
+        allowed_data_classes,
+        revision.created_at(),
     ))
 }
 
