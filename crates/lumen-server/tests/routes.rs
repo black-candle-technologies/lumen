@@ -13,7 +13,7 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
-    egress::{DataClass, DestinationScope},
+    egress::{DataClass, DestinationScope, EndpointClass, ProviderId},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
@@ -24,8 +24,9 @@ use lumen_server::{
     DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview, EventBroker,
     PluginActionCommand, PluginActionRequested, PluginComponentReview, PluginDetailsQuery,
     PluginFailureReview, PluginReviewQuery, PluginSettingReview, PluginVersionDetails,
-    PrincipalSummary, RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport,
-    ServiceError, ServiceFuture, StagedPluginReview, router,
+    PrincipalSummary, ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview,
+    RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceError,
+    ServiceFuture, StagedPluginReview, WorkspaceModelPolicyReview, router,
 };
 use tower::ServiceExt;
 
@@ -49,6 +50,9 @@ struct FakeService {
     destination_policy_queries: Mutex<Vec<DestinationPolicyQuery>>,
     destination_policy_commands: Mutex<Vec<DestinationPolicyCommand>>,
     destination_policy_reviews: Mutex<Vec<DestinationPolicyReview>>,
+    provider_policy_queries: Mutex<Vec<ProviderPolicyQuery>>,
+    provider_policy_commands: Mutex<Vec<ProviderPolicyCommand>>,
+    provider_policy_reviews: Mutex<Vec<ProviderPolicyReview>>,
 }
 
 impl RuntimeService for FakeService {
@@ -275,6 +279,55 @@ impl RuntimeService for FakeService {
                 command.enabled(),
                 command.allowed_data_classes().to_vec(),
                 TimestampMillis::new(2_000),
+            ))
+        })
+    }
+
+    fn list_provider_policies(
+        &self,
+        query: ProviderPolicyQuery,
+    ) -> ServiceFuture<'_, Vec<ProviderPolicyReview>> {
+        self.provider_policy_queries
+            .lock()
+            .expect("provider policy queries")
+            .push(query);
+        let reviews = self
+            .provider_policy_reviews
+            .lock()
+            .expect("provider policy reviews")
+            .clone();
+        Box::pin(async move { Ok(reviews) })
+    }
+
+    fn update_provider_policy(
+        &self,
+        command: ProviderPolicyCommand,
+    ) -> ServiceFuture<'_, ProviderPolicyReview> {
+        self.provider_policy_commands
+            .lock()
+            .expect("provider policy commands")
+            .push(command.clone());
+        Box::pin(async move {
+            Ok(ProviderPolicyReview::new(
+                command.provider_id().clone(),
+                3,
+                EndpointClass::Remote,
+                DestinationScope::parse("https://api.openai.example/v1").expect("destination"),
+                "gpt-test",
+                command.enabled(),
+                20,
+                true,
+                vec![
+                    DataClass::Public,
+                    DataClass::Workspace,
+                    DataClass::Sensitive,
+                ],
+                Some(WorkspaceModelPolicyReview::new(
+                    2,
+                    command.workspace_allowed_data_classes().to_vec(),
+                    TimestampMillis::new(2_000),
+                )),
+                TimestampMillis::new(1_000),
             ))
         })
     }
@@ -538,6 +591,141 @@ async fn destination_policy_updates_are_validated_and_forwarded() {
         .await
         .expect("bad response");
     assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn provider_policy_review_is_authenticated_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    service
+        .provider_policy_reviews
+        .lock()
+        .expect("provider reviews")
+        .push(ProviderPolicyReview::new(
+            ProviderId::parse("openai-compatible").expect("provider"),
+            2,
+            EndpointClass::Remote,
+            DestinationScope::parse("https://api.openai.example/v1").expect("destination"),
+            "gpt-test",
+            true,
+            20,
+            true,
+            vec![DataClass::Public, DataClass::Workspace],
+            Some(WorkspaceModelPolicyReview::new(
+                1,
+                vec![DataClass::Public],
+                TimestampMillis::new(1_500),
+            )),
+            TimestampMillis::new(1_000),
+        ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/workspaces/{workspace_id}/egress/providers"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["providers"][0]["provider_id"], "openai-compatible");
+    assert_eq!(body["providers"][0]["endpoint_class"], "remote");
+    assert_eq!(body["providers"][0]["credential_configured"], true);
+    assert!(body["providers"][0].get("credential_secret_ref").is_none());
+    assert_eq!(
+        body["providers"][0]["allowed_data_classes"],
+        serde_json::json!(["public", "workspace"])
+    );
+    assert_eq!(
+        body["providers"][0]["workspace_policy"]["allowed_data_classes"],
+        serde_json::json!(["public"])
+    );
+    let queries = service
+        .provider_policy_queries
+        .lock()
+        .expect("provider queries");
+    assert_eq!(queries[0].workspace_id(), workspace_id);
+    assert_eq!(
+        queries[0].actor(),
+        &PrincipalId::new("local", "operator").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn provider_policy_updates_validate_data_classes_and_forward() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/workspaces/{workspace_id}/egress/providers"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "provider_id":"openai-compatible",
+                        "enabled":true,
+                        "workspace_allowed_data_classes":["public","workspace"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["provider_id"], "openai-compatible");
+    assert_eq!(
+        body["workspace_policy"]["allowed_data_classes"],
+        serde_json::json!(["public", "workspace"])
+    );
+    {
+        let commands = service
+            .provider_policy_commands
+            .lock()
+            .expect("provider commands");
+        assert_eq!(commands[0].workspace_id(), workspace_id);
+        assert_eq!(commands[0].provider_id().as_str(), "openai-compatible");
+        assert!(commands[0].enabled());
+        assert_eq!(
+            commands[0].workspace_allowed_data_classes(),
+            &[DataClass::Public, DataClass::Workspace]
+        );
+    }
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/workspaces/{workspace_id}/egress/providers"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "provider_id":"openai-compatible",
+                        "enabled":true,
+                        "workspace_allowed_data_classes":["secret"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 }
 
 fn request(method: &str, uri: String, body: Body) -> Request<Body> {

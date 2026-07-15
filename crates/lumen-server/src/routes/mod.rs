@@ -12,7 +12,7 @@ use axum::{
 use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::ApprovalId,
-    egress::{DataClass, DestinationScope},
+    egress::{DataClass, DestinationScope, ProviderId},
     extension::{PluginId, PluginVersion, Sha256Digest},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
 };
@@ -23,7 +23,7 @@ use crate::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
     CancelRunCommand, ChannelMappingCommand, ChannelMappingQuery, CreateRunCommand,
     DestinationPolicyCommand, DestinationPolicyQuery, PluginActionCommand, PluginDetailsQuery,
-    PluginReviewQuery, ServiceError,
+    PluginReviewQuery, ProviderPolicyCommand, ProviderPolicyQuery, ServiceError,
 };
 
 pub fn router(state: ApiState) -> Router {
@@ -69,6 +69,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/v1/workspaces/{workspace_id}/egress/destinations",
             get(list_destination_policies).post(update_destination_policy),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/egress/providers",
+            get(list_provider_policies).post(update_provider_policy),
         )
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
@@ -207,6 +211,67 @@ async fn update_destination_policy(
             destination,
             body.enabled,
             body.allowed_data_classes,
+        ))
+        .await?;
+    Ok(Json(policy))
+}
+
+#[derive(Serialize)]
+struct ProviderPoliciesResponse {
+    providers: Vec<crate::ProviderPolicyReview>,
+}
+
+async fn list_provider_policies(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<ProviderPoliciesResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let providers = state
+        .service
+        .list_provider_policies(ProviderPolicyQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(ProviderPoliciesResponse { providers }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPolicyBody {
+    provider_id: String,
+    enabled: bool,
+    workspace_allowed_data_classes: Vec<DataClass>,
+}
+
+async fn update_provider_policy(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    body: Result<Json<ProviderPolicyBody>, JsonRejection>,
+) -> Result<Json<crate::ProviderPolicyReview>, ApiError> {
+    let Json(body) =
+        body.map_err(|_| ApiError::BadRequest("invalid provider policy body".into()))?;
+    if body.workspace_allowed_data_classes.is_empty()
+        || body
+            .workspace_allowed_data_classes
+            .contains(&DataClass::Secret)
+    {
+        return Err(ApiError::BadRequest(
+            "provider policy data classes are invalid".into(),
+        ));
+    }
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let provider_id = ProviderId::parse(body.provider_id)
+        .map_err(|_| ApiError::BadRequest("invalid provider id".into()))?;
+    let policy = state
+        .service
+        .update_provider_policy(ProviderPolicyCommand::new(
+            workspace_id,
+            actor,
+            provider_id,
+            body.enabled,
+            body.workspace_allowed_data_classes,
         ))
         .await?;
     Ok(Json(policy))

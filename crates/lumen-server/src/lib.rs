@@ -13,6 +13,7 @@ pub use state::{
     CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview,
     PluginActionCommand, PluginActionRequested, PluginComponentReview, PluginDetailsQuery,
     PluginFailureReview, PluginReviewQuery, PluginSettingReview, PluginVersionDetails,
-    PrincipalSummary, RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport,
-    ServiceError, ServiceFuture, StagedPluginReview,
+    PrincipalSummary, ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview,
+    RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceError,
+    ServiceFuture, StagedPluginReview, WorkspaceModelPolicyReview,
 };

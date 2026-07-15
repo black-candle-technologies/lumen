@@ -245,6 +245,71 @@ test.beforeEach(async ({ page }) => {
 			}
 		});
 	});
+	await page.route('**/api/v1/workspaces/*/egress/providers', async (route) => {
+		if (route.request().method() === 'POST') {
+			expect(route.request().postDataJSON()).toMatchObject({
+				provider_id: 'openai-compatible',
+				enabled: false,
+				workspace_allowed_data_classes: ['public', 'workspace']
+			});
+			await route.fulfill({
+				json: {
+					provider_id: 'openai-compatible',
+					revision: 3,
+					endpoint_class: 'remote',
+					endpoint: 'https://api.openai.example/v1',
+					model: 'gpt-test',
+					enabled: false,
+					priority: 20,
+					credential_configured: true,
+					allowed_data_classes: ['public', 'workspace', 'sensitive'],
+					workspace_policy: {
+						revision: 2,
+						allowed_data_classes: ['public', 'workspace'],
+						created_at: 32
+					},
+					created_at: 32
+				}
+			});
+			return;
+		}
+		await route.fulfill({
+			json: {
+				providers: [
+					{
+						provider_id: 'local-llama',
+						revision: 1,
+						endpoint_class: 'local',
+						endpoint: 'https://localhost:8080/v1',
+						model: 'llama-local',
+						enabled: true,
+						priority: 0,
+						credential_configured: false,
+						allowed_data_classes: ['public', 'workspace', 'sensitive'],
+						workspace_policy: null,
+						created_at: 20
+					},
+					{
+						provider_id: 'openai-compatible',
+						revision: 2,
+						endpoint_class: 'remote',
+						endpoint: 'https://api.openai.example/v1',
+						model: 'gpt-test',
+						enabled: true,
+						priority: 20,
+						credential_configured: true,
+						allowed_data_classes: ['public', 'workspace', 'sensitive'],
+						workspace_policy: {
+							revision: 1,
+							allowed_data_classes: ['public', 'workspace'],
+							created_at: 30
+						},
+						created_at: 30
+					}
+				]
+			}
+		});
+	});
 });
 
 test('streams a local chat result and can request cancellation', async ({ page }, testInfo) => {
@@ -355,14 +420,22 @@ test('shows egress channel controls and updates allowlisting', async ({ page }, 
 	await page.goto('/egress');
 
 	await expect(page.getByRole('heading', { name: 'Egress' })).toBeVisible();
+	await expect(page.getByText('openai-compatible')).toBeVisible();
+	await expect(page.getByText('remote')).toBeVisible();
+	await expect(page.getByText('gpt-test')).toBeVisible();
+	await expect(page.getByText('credential configured')).toBeVisible();
+	await expect(page.getByText('local-llama')).toBeVisible();
 	await expect(page.getByText('https://api.example.com/v1')).toBeVisible();
-	await expect(page.getByText('public, workspace')).toBeVisible();
+	await expect(page.getByLabel('Destination egress policies').getByText('public, workspace')).toBeVisible();
 	await expect(page.getByText('https://hooks.example.com/')).toBeVisible();
 	await expect(page.getByText('slack:T123:C456')).toBeVisible();
 	await expect(page.getByText('local/operator')).toBeVisible();
 	await expect(page.getByText('discord:guild-1:ops')).toBeVisible();
 	await expect(page.getByText('browser-secret-must-not-render')).toHaveCount(0);
+	await expect(page.getByText('secret-ref-openai')).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: 'Disable provider openai-compatible' }).click();
+	await expect(page.getByText('Disabled provider openai-compatible')).toBeVisible();
 	await page.getByRole('button', { name: 'Disable destination https://api.example.com/v1' }).click();
 	await expect(page.getByText('Disabled https://api.example.com/v1')).toBeVisible();
 	await page.getByRole('button', { name: 'Disable slack T123 C456' }).click();

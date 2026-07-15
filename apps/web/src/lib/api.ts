@@ -136,6 +136,30 @@ export type DestinationPolicyUpdate = {
 	allowed_data_classes: DataClass[];
 };
 
+export type ProviderPolicy = {
+	provider_id: string;
+	revision: number;
+	endpoint_class: 'local' | 'remote';
+	endpoint: string;
+	model: string;
+	enabled: boolean;
+	priority: number;
+	credential_configured: boolean;
+	allowed_data_classes: DataClass[];
+	workspace_policy: null | {
+		revision: number;
+		allowed_data_classes: DataClass[];
+		created_at: number;
+	};
+	created_at: number;
+};
+
+export type ProviderPolicyUpdate = {
+	provider_id: string;
+	enabled: boolean;
+	workspace_allowed_data_classes: DataClass[];
+};
+
 export class ApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -220,6 +244,15 @@ export class ApiClient {
 
 	async updateDestinationPolicy(request: DestinationPolicyUpdate): Promise<DestinationPolicy> {
 		return this.request('egress/destinations', { method: 'POST', body: JSON.stringify(request) });
+	}
+
+	async listProviderPolicies(): Promise<ProviderPolicy[]> {
+		const response = await this.request<{ providers: ProviderPolicy[] }>('egress/providers');
+		return response.providers;
+	}
+
+	async updateProviderPolicy(request: ProviderPolicyUpdate): Promise<ProviderPolicy> {
+		return this.request('egress/providers', { method: 'POST', body: JSON.stringify(request) });
 	}
 
 	async streamRunEvents(

@@ -46,7 +46,8 @@ use lumen_server::{
     DestinationPolicyQuery, DestinationPolicyReview, EventBroker, PluginActionCommand,
     PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
     PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
-    RunCancellation, RunCreated, RuntimeService, ServiceError, ServiceFuture, StagedPluginReview,
+    ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated,
+    RuntimeService, ServiceError, ServiceFuture, StagedPluginReview, WorkspaceModelPolicyReview,
 };
 use sqlx::Row;
 use tokio::sync::Mutex;
@@ -1086,6 +1087,88 @@ impl RuntimeService for LocalRuntimeService {
             destination_policy_review(policy)
         })
     }
+
+    fn list_provider_policies(
+        &self,
+        query: ProviderPolicyQuery,
+    ) -> ServiceFuture<'_, Vec<ProviderPolicyReview>> {
+        Box::pin(async move {
+            let workspace_policies = self
+                .database
+                .list_latest_workspace_model_egress_revisions(query.workspace_id())
+                .await
+                .map_err(repository_service_error)?
+                .into_iter()
+                .map(|policy| (policy.provider_id().clone(), policy))
+                .collect::<BTreeMap<_, _>>();
+            self.database
+                .list_latest_model_provider_revisions()
+                .await
+                .map_err(repository_service_error)?
+                .into_iter()
+                .map(|provider| {
+                    let workspace_policy = workspace_policies.get(provider.provider_id());
+                    provider_policy_review(provider, workspace_policy)
+                })
+                .collect()
+        })
+    }
+
+    fn update_provider_policy(
+        &self,
+        command: ProviderPolicyCommand,
+    ) -> ServiceFuture<'_, ProviderPolicyReview> {
+        Box::pin(async move {
+            let provider = self
+                .database
+                .latest_model_provider_revision(command.provider_id().clone())
+                .await
+                .map_err(repository_service_error)?
+                .ok_or(ServiceError::NotFound)?;
+            let provider_revision = ModelProviderRevision::new(
+                command.provider_id().clone(),
+                provider.revision() + 1,
+                provider.endpoint_class(),
+                provider.endpoint().clone(),
+                provider.model(),
+                command.enabled(),
+                provider.priority(),
+                provider.credential_secret_ref(),
+                provider.allowed_data_classes().iter().copied(),
+                now(),
+            )
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            self.database
+                .append_model_provider_revision(&provider_revision)
+                .await
+                .map_err(repository_service_error)?;
+
+            let workspace_revision = self
+                .database
+                .latest_workspace_model_egress_revision(
+                    command.workspace_id(),
+                    command.provider_id().clone(),
+                )
+                .await
+                .map_err(repository_service_error)?
+                .as_ref()
+                .map_or(1, |current| current.revision() + 1);
+            let workspace_policy = WorkspaceModelEgressRevision::new(
+                command.workspace_id(),
+                command.provider_id().clone(),
+                workspace_revision,
+                command.workspace_allowed_data_classes().iter().copied(),
+                now(),
+            )
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            self.database
+                .append_workspace_model_egress_revision(&workspace_policy)
+                .await
+                .map_err(repository_service_error)?;
+
+            provider_policy_review(provider_revision, Some(&workspace_policy))
+        })
+    }
 }
 
 fn channel_mapping_review(
@@ -1119,6 +1202,50 @@ fn destination_policy_review(
         allowed_data_classes,
         revision.created_at(),
     ))
+}
+
+fn provider_policy_review(
+    provider: ModelProviderRevision,
+    workspace_policy: Option<&WorkspaceModelEgressRevision>,
+) -> Result<ProviderPolicyReview, ServiceError> {
+    let allowed_data_classes = ordered_data_classes()
+        .into_iter()
+        .filter(|data_class| provider.allows(*data_class))
+        .collect();
+    let workspace_policy = workspace_policy.map(|policy| {
+        WorkspaceModelPolicyReview::new(
+            policy.revision(),
+            ordered_data_classes()
+                .into_iter()
+                .filter(|data_class| policy.allows(*data_class))
+                .collect(),
+            policy.created_at(),
+        )
+    });
+    Ok(ProviderPolicyReview::new(
+        provider.provider_id().clone(),
+        provider.revision(),
+        match provider.endpoint_class() {
+            ModelEndpointClass::Local => lumen_core::egress::EndpointClass::Local,
+            ModelEndpointClass::Remote => lumen_core::egress::EndpointClass::Remote,
+        },
+        provider.endpoint().clone(),
+        provider.model(),
+        provider.enabled(),
+        provider.priority(),
+        provider.credential_secret_ref().is_some(),
+        allowed_data_classes,
+        workspace_policy,
+        provider.created_at(),
+    ))
+}
+
+fn ordered_data_classes() -> [DataClass; 3] {
+    [
+        DataClass::Public,
+        DataClass::Workspace,
+        DataClass::Sensitive,
+    ]
 }
 
 fn capability_review(capability: &Capability) -> Result<CanonicalValue, ServiceError> {

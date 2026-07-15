@@ -134,6 +134,10 @@ impl ModelProviderRevision {
     pub fn allows(&self, data_class: DataClass) -> bool {
         self.allowed_data_classes.contains(&data_class)
     }
+
+    pub fn allowed_data_classes(&self) -> &BTreeSet<DataClass> {
+        &self.allowed_data_classes
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +191,10 @@ impl WorkspaceModelEgressRevision {
 
     pub fn allows(&self, data_class: DataClass) -> bool {
         self.allowed_data_classes.contains(&data_class)
+    }
+
+    pub fn allowed_data_classes(&self) -> &BTreeSet<DataClass> {
+        &self.allowed_data_classes
     }
 }
 
@@ -386,6 +394,69 @@ impl Database {
         .transpose()
     }
 
+    pub async fn list_latest_model_provider_revisions(
+        &self,
+    ) -> Result<Vec<ModelProviderRevision>, RepositoryError> {
+        let rows = sqlx::query(
+            "WITH latest_providers AS (
+                SELECT provider_id, MAX(revision) AS revision
+                FROM egress_model_provider_revisions
+                GROUP BY provider_id
+             )
+             SELECT
+                provider.provider_id,
+                provider.revision,
+                provider.endpoint_class,
+                provider.endpoint_url,
+                provider.model,
+                provider.enabled,
+                provider.priority,
+                provider.credential_secret_ref,
+                provider.allowed_data_classes_json,
+                provider.created_at
+             FROM latest_providers latest
+             JOIN egress_model_provider_revisions provider
+               ON provider.provider_id = latest.provider_id
+              AND provider.revision = latest.revision
+             ORDER BY provider.priority ASC, provider.provider_id ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let provider_id = ProviderId::parse(row.try_get::<String, _>("provider_id")?)
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+                let endpoint = DestinationScope::parse(row.try_get::<String, _>("endpoint_url")?)
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+                let credential = row
+                    .try_get::<Option<String>, _>("credential_secret_ref")?
+                    .map(|value| SecretRefId::parse(&value))
+                    .transpose()
+                    .map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+                Self::model_provider_revision_from_parts(
+                    provider_id,
+                    u64::try_from(row.try_get::<i64, _>("revision")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    ModelEndpointClass::parse(&row.try_get::<String, _>("endpoint_class")?)?,
+                    endpoint,
+                    row.try_get::<String, _>("model")?,
+                    row.try_get::<i64, _>("enabled")? == 1,
+                    u32::try_from(row.try_get::<i64, _>("priority")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    credential,
+                    serde_json::from_str::<BTreeSet<DataClass>>(
+                        &row.try_get::<String, _>("allowed_data_classes_json")?,
+                    )?,
+                    TimestampMillis::new(
+                        u64::try_from(row.try_get::<i64, _>("created_at")?)
+                            .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    ),
+                )
+            })
+            .collect()
+    }
+
     pub async fn model_provider_routes(
         &self,
         workspace_id: WorkspaceId,
@@ -508,6 +579,54 @@ impl Database {
             )
         })
         .transpose()
+    }
+
+    pub async fn list_latest_workspace_model_egress_revisions(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<WorkspaceModelEgressRevision>, RepositoryError> {
+        let rows = sqlx::query(
+            "WITH latest_workspace_policies AS (
+                SELECT provider_id, MAX(revision) AS revision
+                FROM egress_workspace_model_policies
+                WHERE workspace_id = ?
+                GROUP BY provider_id
+             )
+             SELECT
+                policy.provider_id,
+                policy.revision,
+                policy.allowed_data_classes_json,
+                policy.created_at
+             FROM latest_workspace_policies latest
+             JOIN egress_workspace_model_policies policy
+               ON policy.provider_id = latest.provider_id
+              AND policy.revision = latest.revision
+             WHERE policy.workspace_id = ?
+             ORDER BY policy.provider_id ASC",
+        )
+        .bind(workspace_id.to_string())
+        .bind(workspace_id.to_string())
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                WorkspaceModelEgressRevision::new(
+                    workspace_id,
+                    ProviderId::parse(row.try_get::<String, _>("provider_id")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    u64::try_from(row.try_get::<i64, _>("revision")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    serde_json::from_str::<BTreeSet<DataClass>>(
+                        &row.try_get::<String, _>("allowed_data_classes_json")?,
+                    )?,
+                    TimestampMillis::new(
+                        u64::try_from(row.try_get::<i64, _>("created_at")?)
+                            .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                    ),
+                )
+            })
+            .collect()
     }
 
     pub async fn append_destination_revision(

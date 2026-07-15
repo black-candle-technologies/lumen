@@ -258,4 +258,81 @@ describe('ApiClient', () => {
 		expect(updated.revision).toBe(2);
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
+
+	it('lists and updates provider egress policies without exposing secret references', async () => {
+		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (init?.method === 'POST') {
+				expect(url).toBe(
+					'http://127.0.0.1:3210/api/v1/workspaces/26db5a31-94f0-4e92-a9c9-4cdf19d71c31/egress/providers'
+				);
+				expect(JSON.parse(String(init.body))).toEqual({
+					provider_id: 'openai-compatible',
+					enabled: false,
+					workspace_allowed_data_classes: ['public']
+				});
+				return new Response(
+					JSON.stringify({
+						provider_id: 'openai-compatible',
+						revision: 3,
+						endpoint_class: 'remote',
+						endpoint: 'https://api.openai.example/v1',
+						model: 'gpt-test',
+						enabled: false,
+						priority: 20,
+						credential_configured: true,
+						allowed_data_classes: ['public', 'workspace'],
+						workspace_policy: {
+							revision: 2,
+							allowed_data_classes: ['public'],
+							created_at: 30
+						},
+						created_at: 30
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } }
+				);
+			}
+			expect(url).toBe(
+				'http://127.0.0.1:3210/api/v1/workspaces/26db5a31-94f0-4e92-a9c9-4cdf19d71c31/egress/providers'
+			);
+			return new Response(
+				JSON.stringify({
+					providers: [
+						{
+							provider_id: 'openai-compatible',
+							revision: 2,
+							endpoint_class: 'remote',
+							endpoint: 'https://api.openai.example/v1',
+							model: 'gpt-test',
+							enabled: true,
+							priority: 20,
+							credential_configured: true,
+							allowed_data_classes: ['public', 'workspace'],
+							workspace_policy: {
+								revision: 1,
+								allowed_data_classes: ['public', 'workspace'],
+								created_at: 10
+							},
+							created_at: 10
+						}
+					]
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			);
+		});
+		const client = new ApiClient(settings, fetchMock as typeof fetch);
+
+		const providers = await client.listProviderPolicies();
+		const updated = await client.updateProviderPolicy({
+			provider_id: 'openai-compatible',
+			enabled: false,
+			workspace_allowed_data_classes: ['public']
+		});
+
+		expect(providers[0].credential_configured).toBe(true);
+		expect('credential_secret_ref' in providers[0]).toBe(false);
+		expect(updated.enabled).toBe(false);
+		expect(updated.workspace_policy?.allowed_data_classes).toEqual(['public']);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
 });

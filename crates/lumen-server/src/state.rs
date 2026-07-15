@@ -9,7 +9,7 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
-    egress::{DataClass, DestinationScope},
+    egress::{DataClass, DestinationScope, EndpointClass, ProviderId},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
@@ -56,6 +56,14 @@ pub trait RuntimeService: Send + Sync {
         &self,
         command: DestinationPolicyCommand,
     ) -> ServiceFuture<'_, DestinationPolicyReview>;
+    fn list_provider_policies(
+        &self,
+        query: ProviderPolicyQuery,
+    ) -> ServiceFuture<'_, Vec<ProviderPolicyReview>>;
+    fn update_provider_policy(
+        &self,
+        command: ProviderPolicyCommand,
+    ) -> ServiceFuture<'_, ProviderPolicyReview>;
 }
 
 #[derive(Clone)]
@@ -679,6 +687,143 @@ impl DestinationPolicyReview {
             revision,
             enabled,
             allowed_data_classes,
+            created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderPolicyQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl ProviderPolicyQuery {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderPolicyCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    provider_id: ProviderId,
+    enabled: bool,
+    workspace_allowed_data_classes: Vec<DataClass>,
+}
+
+impl ProviderPolicyCommand {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        provider_id: ProviderId,
+        enabled: bool,
+        workspace_allowed_data_classes: Vec<DataClass>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            provider_id,
+            enabled,
+            workspace_allowed_data_classes,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn workspace_allowed_data_classes(&self) -> &[DataClass] {
+        &self.workspace_allowed_data_classes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkspaceModelPolicyReview {
+    revision: u64,
+    allowed_data_classes: Vec<DataClass>,
+    created_at: TimestampMillis,
+}
+
+impl WorkspaceModelPolicyReview {
+    pub fn new(
+        revision: u64,
+        allowed_data_classes: Vec<DataClass>,
+        created_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            revision,
+            allowed_data_classes,
+            created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderPolicyReview {
+    provider_id: String,
+    revision: u64,
+    endpoint_class: EndpointClass,
+    endpoint: String,
+    model: String,
+    enabled: bool,
+    priority: u32,
+    credential_configured: bool,
+    allowed_data_classes: Vec<DataClass>,
+    workspace_policy: Option<WorkspaceModelPolicyReview>,
+    created_at: TimestampMillis,
+}
+
+impl ProviderPolicyReview {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider_id: ProviderId,
+        revision: u64,
+        endpoint_class: EndpointClass,
+        endpoint: DestinationScope,
+        model: impl Into<String>,
+        enabled: bool,
+        priority: u32,
+        credential_configured: bool,
+        allowed_data_classes: Vec<DataClass>,
+        workspace_policy: Option<WorkspaceModelPolicyReview>,
+        created_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.as_str().to_owned(),
+            revision,
+            endpoint_class,
+            endpoint: endpoint.as_str().to_owned(),
+            model: model.into(),
+            enabled,
+            priority,
+            credential_configured,
+            allowed_data_classes,
+            workspace_policy,
             created_at,
         }
     }

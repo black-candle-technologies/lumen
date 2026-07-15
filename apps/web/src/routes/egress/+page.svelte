@@ -3,9 +3,17 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import ShieldOff from '@lucide/svelte/icons/shield-off';
-	import { ApiClient, ApiError, type ChannelMapping, type DestinationPolicy } from '$lib/api';
+	import {
+		ApiClient,
+		ApiError,
+		type ChannelMapping,
+		type DataClass,
+		type DestinationPolicy,
+		type ProviderPolicy
+	} from '$lib/api';
 	import { connection, isConfigured } from '$lib/connection';
 
+	let providers = $state<ProviderPolicy[]>([]);
 	let destinations = $state<DestinationPolicy[]>([]);
 	let mappings = $state<ChannelMapping[]>([]);
 	let loading = $state(true);
@@ -20,7 +28,8 @@
 		loading = true;
 		try {
 			const client = new ApiClient($connection);
-			[destinations, mappings] = await Promise.all([
+			[providers, destinations, mappings] = await Promise.all([
+				client.listProviderPolicies(),
 				client.listDestinationPolicies(),
 				client.listChannelMappings()
 			]);
@@ -44,6 +53,35 @@
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Destination policy update failed.';
+		} finally { busyKey = ''; }
+	}
+
+	async function setProviderEnabled(policy: ProviderPolicy, enabled: boolean) {
+		await updateProvider(policy, enabled, workspaceClasses(policy));
+	}
+
+	async function setProviderClass(policy: ProviderPolicy, dataClass: DataClass, allowed: boolean) {
+		const current = workspaceClasses(policy);
+		const next = allowed
+			? Array.from(new Set([...current, dataClass]))
+			: current.filter((value) => value !== dataClass);
+		await updateProvider(policy, policy.enabled, orderedClasses(next));
+	}
+
+	async function updateProvider(policy: ProviderPolicy, enabled: boolean, allowedClasses: DataClass[]) {
+		const key = `provider:${policy.provider_id}`;
+		busyKey = key;
+		try {
+			const updated = await new ApiClient($connection).updateProviderPolicy({
+				provider_id: policy.provider_id,
+				enabled,
+				workspace_allowed_data_classes: allowedClasses
+			});
+			providers = providers.map((current) => current.provider_id === policy.provider_id ? updated : current);
+			notice = `${enabled ? 'Enabled' : 'Disabled'} provider ${updated.provider_id}`;
+			error = '';
+		} catch (cause) {
+			error = cause instanceof ApiError ? cause.message : 'Provider policy update failed.';
 		} finally { busyKey = ''; }
 	}
 
@@ -76,14 +114,26 @@
 		return `${mapping.provider}:${mapping.external_workspace_id}:${mapping.channel_id}`;
 	}
 
-	function classList(policy: DestinationPolicy): string {
+	function classList(policy: DestinationPolicy | ProviderPolicy): string {
 		return policy.allowed_data_classes.join(', ');
+	}
+
+	function workspaceClasses(policy: ProviderPolicy): DataClass[] {
+		return policy.workspace_policy?.allowed_data_classes ?? policy.allowed_data_classes;
+	}
+
+	function workspaceClassList(policy: ProviderPolicy): string {
+		return workspaceClasses(policy).join(', ');
+	}
+
+	function orderedClasses(classes: DataClass[]): DataClass[] {
+		return (['public', 'workspace', 'sensitive'] as DataClass[]).filter((dataClass) => classes.includes(dataClass));
 	}
 </script>
 
 <section class="page egress-page">
 	<header class="page-heading">
-		<div><h1>Egress</h1><p>{destinations.length} destinations, {mappings.length} channel identities</p></div>
+		<div><h1>Egress</h1><p>{providers.length} providers, {destinations.length} destinations, {mappings.length} channel identities</p></div>
 		<button class="icon-button" type="button" aria-label="Refresh egress controls" title="Refresh" onclick={load} disabled={loading}><RefreshCw size={17} /></button>
 	</header>
 	{#if error}<div class="notice error">{error}</div>{/if}
@@ -91,9 +141,61 @@
 
 	{#if loading}
 		<div class="empty">Loading egress controls...</div>
-	{:else if destinations.length === 0 && mappings.length === 0}
+	{:else if providers.length === 0 && destinations.length === 0 && mappings.length === 0}
 		<div class="empty">No egress policies.</div>
 	{:else}
+		<section class="egress-section">
+			<h2>Providers</h2>
+			{#if providers.length === 0}
+				<div class="subtle-empty">No provider policies.</div>
+			{:else}
+				<div class="egress-table" role="table" aria-label="Provider egress policies">
+					<div class="egress-header provider-header" role="row"><span>Provider</span><span>Endpoint</span><span>Workspace classes</span><span>Status</span><span></span></div>
+					{#each providers as policy (policy.provider_id)}
+						<div class="egress-row provider-row" role="row">
+							<div>
+								<span class="field-label">Provider</span>
+								<code>{policy.provider_id}</code>
+								<span class="micro">{policy.endpoint_class} · {policy.model} · priority {policy.priority}</span>
+								{#if policy.credential_configured}<span class="micro">credential configured</span>{/if}
+							</div>
+							<div>
+								<span class="field-label">Endpoint</span>
+								<code>{policy.endpoint}</code>
+							</div>
+							<div>
+								<span class="field-label">Workspace classes</span>
+								<code>{workspaceClassList(policy)}</code>
+								<div class="class-toggles" aria-label={`Workspace data classes for provider ${policy.provider_id}`}>
+									{#each (['public', 'workspace', 'sensitive'] as DataClass[]) as dataClass}
+										<label>
+											<input
+												type="checkbox"
+												checked={workspaceClasses(policy).includes(dataClass)}
+												disabled={busyKey === `provider:${policy.provider_id}`}
+												onchange={(event) => setProviderClass(policy, dataClass, event.currentTarget.checked)}
+											/>
+											<span>{dataClass}</span>
+										</label>
+									{/each}
+								</div>
+							</div>
+							<div>
+								<span class:allowed={policy.enabled} class="egress-status">{policy.enabled ? 'enabled' : 'disabled'}</span>
+							</div>
+							<div class="egress-actions">
+								{#if policy.enabled}
+									<button class="icon-button" type="button" aria-label={`Disable provider ${policy.provider_id}`} title="Disable provider" onclick={() => setProviderEnabled(policy, false)} disabled={busyKey === `provider:${policy.provider_id}`}><ShieldOff size={17} /></button>
+								{:else}
+									<button class="icon-button" type="button" aria-label={`Enable provider ${policy.provider_id}`} title="Enable provider" onclick={() => setProviderEnabled(policy, true)} disabled={busyKey === `provider:${policy.provider_id}`}><ShieldCheck size={17} /></button>
+								{/if}
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</section>
+
 		<section class="egress-section">
 			<h2>Destinations</h2>
 			{#if destinations.length === 0}
@@ -180,9 +282,14 @@
 	.egress-row { font-size: 12px; }
 	.egress-row > div { min-width: 0; display: grid; gap: 4px; }
 	.egress-row code { overflow-wrap: anywhere; word-break: break-word; font-size: 11px; }
+	.micro { display: block; color: #73786f; font-size: 11px; }
 	.egress-status { width: max-content; border-radius: 4px; padding: 3px 6px; background: #f1e6d5; color: #865a1c; font-size: 11px; font-weight: 700; }
 	.egress-status.allowed { background: #e0eee5; color: #276344; }
 	.egress-actions { justify-items: end; }
+	.provider-header, .provider-row { grid-template-columns: minmax(150px, 0.9fr) minmax(190px, 1.2fr) minmax(180px, 1fr) 96px 42px; }
+	.class-toggles { display: flex; flex-wrap: wrap; gap: 5px; }
+	.class-toggles label { display: inline-flex; align-items: center; gap: 4px; color: #555b53; font-size: 11px; }
+	.class-toggles input { width: 13px; height: 13px; margin: 0; }
 	.empty { padding: 48px 20px; border: 1px solid #dfe3dc; border-radius: 6px; background: #fff; color: #777d75; text-align: center; font-size: 13px; }
 	@media (max-width: 760px) {
 		.egress-page { padding-left: 0; padding-right: 0; }
