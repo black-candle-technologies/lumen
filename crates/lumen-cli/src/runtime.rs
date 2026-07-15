@@ -295,6 +295,7 @@ impl LocalRuntimeService {
             Some(EgressCheckedModel {
                 inner: Arc::clone(&selected_model),
                 database: self.database.clone(),
+                audit: DatabaseAudit(self.database.clone()),
                 workspace_id: stored.workspace_id,
             })
         } else {
@@ -1336,21 +1337,94 @@ struct StoredRun {
 struct EgressCheckedModel {
     inner: Arc<dyn ModelPort>,
     database: Database,
+    audit: DatabaseAudit,
     workspace_id: lumen_core::identity::WorkspaceId,
 }
 
 impl ModelPort for EgressCheckedModel {
     fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
         Box::pin(async move {
+            let data_class = input.data_class();
             let routes = self
                 .database
                 .model_provider_routes(self.workspace_id)
                 .await
                 .map_err(|error| ModelError::new(format!("model egress policy failed: {error}")))?;
-            select_model_provider(input.data_class(), routes)
-                .map_err(|error| ModelError::new(error.to_string()))?;
+            let decision = match select_model_provider(data_class, routes) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.audit_model_egress_denied(data_class, error.to_string())
+                        .await?;
+                    return Err(ModelError::new(error.to_string()));
+                }
+            };
+            self.audit_model_egress_success(data_class, &decision)
+                .await?;
             self.inner.generate(input).await
         })
+    }
+}
+
+impl EgressCheckedModel {
+    async fn audit_model_egress_success(
+        &self,
+        data_class: DataClass,
+        decision: &lumen_core::egress::RoutingDecision,
+    ) -> Result<(), ModelError> {
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                now(),
+                AuditEventKind::ModelEgress,
+                AuditOutcome::Success,
+                Some(self.workspace_id),
+                CanonicalValue::object([
+                    ("data_class", CanonicalValue::from(data_class.as_str())),
+                    (
+                        "egress_occurred",
+                        CanonicalValue::from(decision.egress_occurred()),
+                    ),
+                    (
+                        "endpoint_class",
+                        CanonicalValue::from(endpoint_class_name(decision.endpoint_class())),
+                    ),
+                    (
+                        "provider_id",
+                        CanonicalValue::from(decision.provider().as_str().to_owned()),
+                    ),
+                ]),
+            ))
+            .await
+            .map_err(|error| ModelError::new(format!("model egress audit failed: {error}")))
+    }
+
+    async fn audit_model_egress_denied(
+        &self,
+        data_class: DataClass,
+        failure: String,
+    ) -> Result<(), ModelError> {
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                now(),
+                AuditEventKind::ModelEgress,
+                AuditOutcome::Denied,
+                Some(self.workspace_id),
+                CanonicalValue::object([
+                    ("data_class", CanonicalValue::from(data_class.as_str())),
+                    ("egress_occurred", CanonicalValue::from(false)),
+                    ("failure", CanonicalValue::from(failure)),
+                ]),
+            ))
+            .await
+            .map_err(|error| ModelError::new(format!("model egress audit failed: {error}")))
+    }
+}
+
+const fn endpoint_class_name(endpoint_class: lumen_core::egress::EndpointClass) -> &'static str {
+    match endpoint_class {
+        lumen_core::egress::EndpointClass::Local => "local",
+        lumen_core::egress::EndpointClass::Remote => "remote",
     }
 }
 

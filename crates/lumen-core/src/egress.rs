@@ -24,6 +24,15 @@ impl DataClass {
     pub const fn may_leave_runtime(self) -> bool {
         !matches!(self, Self::Secret)
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Workspace => "workspace",
+            Self::Sensitive => "sensitive",
+            Self::Secret => "secret",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

@@ -1106,7 +1106,8 @@ async fn public_class_input_is_allowed_through_public_remote_model_policy() {
     let inner = Arc::new(RecordingModel::new());
     let model = EgressCheckedModel {
         inner: inner.clone(),
-        database,
+        database: database.clone(),
+        audit: super::DatabaseAudit(database.clone()),
         workspace_id,
     };
 
@@ -1117,6 +1118,92 @@ async fn public_class_input_is_allowed_through_public_remote_model_policy() {
 
     assert_eq!(output, ModelOutput::FinalText("allowed".into()));
     assert_eq!(inner.call_count(), 1);
+    let records = database
+        .list_audit_records(workspace_id, 0, 10)
+        .await
+        .expect("audit records");
+    let event = records
+        .iter()
+        .map(|record| record.event())
+        .find(|event| event.kind() == AuditEventKind::ModelEgress)
+        .expect("model egress audit");
+    assert_eq!(event.outcome(), lumen_core::audit::AuditOutcome::Success);
+    assert_eq!(
+        event.payload(),
+        &CanonicalValue::object([
+            ("data_class", CanonicalValue::from("public")),
+            ("egress_occurred", CanonicalValue::from(true)),
+            ("endpoint_class", CanonicalValue::from("remote")),
+            ("provider_id", CanonicalValue::from("openai-compatible")),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn denied_model_egress_is_audited_before_inner_model_call() {
+    let database = Database::connect_in_memory().await.expect("database");
+    let workspace_id = WorkspaceId::from_uuid(
+        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
+    );
+    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
+        .await
+        .expect("workspace");
+    database
+        .append_model_provider_revision(
+            &ModelProviderRevision::new(
+                provider_id,
+                1,
+                ModelEndpointClass::Remote,
+                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
+                "remote-model",
+                true,
+                0,
+                None,
+                [DataClass::Public],
+                TimestampMillis::new(1_000),
+            )
+            .expect("provider revision"),
+        )
+        .await
+        .expect("provider stored");
+    let inner = Arc::new(RecordingModel::new());
+    let model = EgressCheckedModel {
+        inner: inner.clone(),
+        database: database.clone(),
+        audit: super::DatabaseAudit(database.clone()),
+        workspace_id,
+    };
+
+    let error = model
+        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Workspace))
+        .await
+        .expect_err("workspace request denied");
+
+    assert_eq!(
+        error.message(),
+        "remote egress policy denied every remote provider"
+    );
+    assert_eq!(inner.call_count(), 0);
+    let records = database
+        .list_audit_records(workspace_id, 0, 10)
+        .await
+        .expect("audit records");
+    let event = records
+        .iter()
+        .map(|record| record.event())
+        .find(|event| event.kind() == AuditEventKind::ModelEgress)
+        .expect("model egress audit");
+    assert_eq!(event.outcome(), lumen_core::audit::AuditOutcome::Denied);
+    assert_eq!(
+        event.payload(),
+        &CanonicalValue::object([
+            ("data_class", CanonicalValue::from("workspace")),
+            ("egress_occurred", CanonicalValue::from(false)),
+            ("failure", CanonicalValue::from(error.message())),
+        ])
+    );
 }
 
 async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage {
