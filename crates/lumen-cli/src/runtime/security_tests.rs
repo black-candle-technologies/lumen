@@ -1511,6 +1511,172 @@ async fn denied_model_egress_is_audited_before_inner_model_call() {
     );
 }
 
+#[tokio::test]
+async fn disabled_remote_provider_is_denied_before_inner_model_call() {
+    let database = Database::connect_in_memory().await.expect("database");
+    let workspace_id = WorkspaceId::from_uuid(
+        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
+    );
+    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
+        .await
+        .expect("workspace");
+    database
+        .append_model_provider_revision(
+            &ModelProviderRevision::new(
+                provider_id.clone(),
+                1,
+                ModelEndpointClass::Remote,
+                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
+                "remote-model",
+                false,
+                0,
+                None,
+                [DataClass::Public],
+                TimestampMillis::new(1_000),
+            )
+            .expect("provider revision"),
+        )
+        .await
+        .expect("provider stored");
+    database
+        .append_workspace_model_egress_revision(
+            &WorkspaceModelEgressRevision::new(
+                workspace_id,
+                provider_id,
+                1,
+                [DataClass::Public],
+                TimestampMillis::new(1_100),
+            )
+            .expect("workspace policy"),
+        )
+        .await
+        .expect("workspace policy stored");
+    let inner = Arc::new(RecordingModel::new());
+    let model = EgressCheckedModel {
+        inner: inner.clone(),
+        database: database.clone(),
+        audit: super::DatabaseAudit(database.clone()),
+        workspace_id,
+    };
+
+    let error = model
+        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Public))
+        .await
+        .expect_err("disabled provider denied");
+
+    assert_eq!(error.message(), "no eligible model provider is configured");
+    assert_eq!(inner.call_count(), 0);
+    assert_model_egress_denied_audit(&database, workspace_id, DataClass::Public, error.message())
+        .await;
+}
+
+#[tokio::test]
+async fn revoked_workspace_model_policy_is_denied_before_inner_model_call() {
+    let database = Database::connect_in_memory().await.expect("database");
+    let workspace_id = WorkspaceId::from_uuid(
+        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
+    );
+    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
+        .await
+        .expect("workspace");
+    database
+        .append_model_provider_revision(
+            &ModelProviderRevision::new(
+                provider_id.clone(),
+                1,
+                ModelEndpointClass::Remote,
+                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
+                "remote-model",
+                true,
+                0,
+                None,
+                [DataClass::Public, DataClass::Workspace],
+                TimestampMillis::new(1_000),
+            )
+            .expect("provider revision"),
+        )
+        .await
+        .expect("provider stored");
+    for revision in [
+        WorkspaceModelEgressRevision::new(
+            workspace_id,
+            provider_id.clone(),
+            1,
+            [DataClass::Public, DataClass::Workspace],
+            TimestampMillis::new(1_100),
+        )
+        .expect("workspace policy"),
+        WorkspaceModelEgressRevision::new(
+            workspace_id,
+            provider_id,
+            2,
+            [DataClass::Public],
+            TimestampMillis::new(1_200),
+        )
+        .expect("workspace policy"),
+    ] {
+        database
+            .append_workspace_model_egress_revision(&revision)
+            .await
+            .expect("workspace policy stored");
+    }
+    let inner = Arc::new(RecordingModel::new());
+    let model = EgressCheckedModel {
+        inner: inner.clone(),
+        database: database.clone(),
+        audit: super::DatabaseAudit(database.clone()),
+        workspace_id,
+    };
+
+    let error = model
+        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Workspace))
+        .await
+        .expect_err("revoked workspace policy denied");
+
+    assert_eq!(
+        error.message(),
+        "remote egress policy denied every remote provider"
+    );
+    assert_eq!(inner.call_count(), 0);
+    assert_model_egress_denied_audit(
+        &database,
+        workspace_id,
+        DataClass::Workspace,
+        error.message(),
+    )
+    .await;
+}
+
+async fn assert_model_egress_denied_audit(
+    database: &Database,
+    workspace_id: WorkspaceId,
+    data_class: DataClass,
+    failure: &str,
+) {
+    let records = database
+        .list_audit_records(workspace_id, 0, 10)
+        .await
+        .expect("audit records");
+    let event = records
+        .iter()
+        .map(|record| record.event())
+        .find(|event| event.kind() == AuditEventKind::ModelEgress)
+        .expect("model egress audit");
+    assert_eq!(event.outcome(), lumen_core::audit::AuditOutcome::Denied);
+    assert_eq!(
+        event.payload(),
+        &CanonicalValue::object([
+            ("data_class", CanonicalValue::from(data_class.as_str())),
+            ("egress_occurred", CanonicalValue::from(false)),
+            ("failure", CanonicalValue::from(failure)),
+        ])
+    );
+}
+
 async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage {
     let staged = stage_subprocess_fixture(harness).await;
     let plugin_id = staged.manifest().id().to_string();
