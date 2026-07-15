@@ -1,0 +1,44 @@
+name: Milestone 3 Linux Sandbox
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/milestone3-linux-sandbox.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/lumen-core/**"
+      - "crates/lumen-extension-sdk/**"
+      - "crates/lumen-integrations/**"
+      - "scripts/verify-linux-plugin-sandbox.sh"
+  push:
+    branches:
+      - "feat/milestone-3-extension-runtime"
+    paths:
+      - ".github/workflows/milestone3-linux-sandbox.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/lumen-core/**"
+      - "crates/lumen-extension-sdk/**"
+      - "crates/lumen-integrations/**"
+      - "scripts/verify-linux-plugin-sandbox.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-plugin-sandbox:
+    name: Linux plugin sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+
+      - name: Verify Linux plugin sandbox
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: scripts/verify-linux-plugin-sandbox.sh
