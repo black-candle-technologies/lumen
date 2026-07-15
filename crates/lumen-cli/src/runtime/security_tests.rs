@@ -18,11 +18,12 @@ use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
     capability::CapabilitySet,
+    egress::{DataClass, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
     identity::{PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
-use lumen_db::{Database, SecretReference, StagedPluginPackage};
+use lumen_db::{Database, ModelEndpointClass, SecretReference, StagedPluginPackage};
 use lumen_integrations::{
     extension_package::PackageStager,
     sandbox::{
@@ -842,6 +843,104 @@ async fn request_admin_action(
         .await
         .expect("request action")
         .to_string()
+}
+
+#[tokio::test]
+async fn explicit_remote_model_config_bootstraps_egress_policy() {
+    let directory = tempfile::tempdir().expect("temporary runtime");
+    let workspace = directory.path().join("workspace");
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&workspace).expect("workspace directory");
+    std::fs::create_dir(&runtime).expect("runtime directory");
+    let config = Config::parse(&format!(
+        r#"
+[database]
+path = "ignored.sqlite3"
+
+[model]
+endpoint = "https://models.example.com/v1/"
+model = "remote-model"
+allow_remote = true
+streaming = false
+remote_provider = {{ id = "openai-compatible", allowed_data_classes = ["public"] }}
+
+[runtime]
+data_directory = "{}"
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "{}"
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+        runtime.display(),
+        workspace.display()
+    ))
+    .expect("remote runtime config");
+    let database = Database::connect_in_memory().await.expect("database");
+    database
+        .bootstrap_workspace(
+            config.workspace_id(),
+            &config.workspace.name,
+            &config.bootstrap_principal(),
+            now(),
+        )
+        .await
+        .expect("workspace bootstrap");
+    let events = EventBroker::new(128);
+
+    let service = LocalRuntimeService::build_with_secret_store(
+        &config,
+        database.clone(),
+        events,
+        Arc::new(RecordingSandbox::new()),
+        vec![TOKEN.to_owned()],
+        Arc::new(InMemorySecretStore::new()),
+    )
+    .await
+    .expect("remote runtime builds with explicit policy");
+    service.shutdown().await;
+    let service = LocalRuntimeService::build_with_secret_store(
+        &config,
+        database.clone(),
+        EventBroker::new(128),
+        Arc::new(RecordingSandbox::new()),
+        vec![TOKEN.to_owned()],
+        Arc::new(InMemorySecretStore::new()),
+    )
+    .await
+    .expect("remote runtime bootstrap is idempotent");
+    service.shutdown().await;
+
+    let provider_id = ProviderId::parse("openai-compatible").expect("provider ID");
+    let provider = database
+        .latest_model_provider_revision(provider_id.clone())
+        .await
+        .expect("provider query")
+        .expect("provider persisted");
+    assert_eq!(provider.endpoint_class(), ModelEndpointClass::Remote);
+    assert!(provider.enabled());
+    assert!(provider.allows(DataClass::Public));
+    assert!(!provider.allows(DataClass::Workspace));
+
+    let workspace_policy = database
+        .latest_workspace_model_egress_revision(config.workspace_id(), provider_id.clone())
+        .await
+        .expect("workspace policy query")
+        .expect("workspace policy persisted");
+    assert!(workspace_policy.allows(DataClass::Public));
+
+    let routes = database
+        .model_provider_routes(config.workspace_id())
+        .await
+        .expect("routes load");
+    let decision = select_model_provider(DataClass::Public, routes).expect("public remote route");
+    assert_eq!(decision.provider(), &provider_id);
+    assert_eq!(decision.endpoint_class(), EndpointClass::Remote);
+    assert!(decision.egress_occurred());
 }
 
 async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage {

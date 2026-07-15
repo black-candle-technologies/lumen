@@ -13,6 +13,7 @@ use lumen_core::{
     },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
+    egress::{DataClass, DestinationScope, ProviderId},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
     extension::{PluginComponentId, PluginId, PluginVersion},
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort},
@@ -24,7 +25,10 @@ use lumen_core::{
     },
     secret::SecretRefId,
 };
-use lumen_db::{Database, DispatchReservation, PluginGrantScope, PluginSettingScope};
+use lumen_db::{
+    Database, DispatchReservation, ModelEndpointClass, ModelProviderRevision, PluginGrantScope,
+    PluginSettingScope, WorkspaceModelEgressRevision,
+};
 use lumen_integrations::{
     filesystem::WorkspaceReader,
     openai_compatible::{EndpointPolicy, OpenAiCompatibleClient, OpenAiCompatibleConfig},
@@ -52,7 +56,10 @@ use crate::extension_runtime::{
     action_proposal, admin_capabilities, invocation_capability, is_extension_action,
     prepare_invocation,
 };
-use crate::{CliError, config::Config};
+use crate::{
+    CliError,
+    config::{Config, RemoteDataClass},
+};
 
 #[derive(Clone)]
 pub(crate) struct LocalRuntimeService {
@@ -99,10 +106,16 @@ impl LocalRuntimeService {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
         std::fs::create_dir_all(&config.runtime.data_directory)?;
         let data_root = std::fs::canonicalize(&config.runtime.data_directory)?;
+        bootstrap_configured_remote_model_provider(config, &database).await?;
+        let endpoint_policy = if config.model.allow_remote {
+            EndpointPolicy::AllowRemote
+        } else {
+            EndpointPolicy::LoopbackOnly
+        };
         let model_config = OpenAiCompatibleConfig::new(
             &config.model.endpoint,
             &config.model.model,
-            EndpointPolicy::LoopbackOnly,
+            endpoint_policy,
         )
         .map_err(|error| CliError::Runtime(error.to_string()))?
         .with_streaming(config.model.streaming)
@@ -495,6 +508,74 @@ impl LocalRuntimeService {
             CapabilitySet::new(run_capabilities),
         )
         .await
+    }
+}
+
+async fn bootstrap_configured_remote_model_provider(
+    config: &Config,
+    database: &Database,
+) -> Result<(), CliError> {
+    let Some(provider) = &config.model.remote_provider else {
+        return Ok(());
+    };
+    let provider_id =
+        ProviderId::parse(&provider.id).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let provider_exists = database
+        .latest_model_provider_revision(provider_id.clone())
+        .await?
+        .is_some();
+    let workspace_policy_exists = database
+        .latest_workspace_model_egress_revision(config.workspace_id(), provider_id.clone())
+        .await?
+        .is_some();
+    let allowed_data_classes = provider
+        .allowed_data_classes
+        .iter()
+        .copied()
+        .map(remote_data_class)
+        .collect::<Vec<_>>();
+    let created_at = now();
+    if !provider_exists {
+        let provider_revision = ModelProviderRevision::new(
+            provider_id.clone(),
+            1,
+            ModelEndpointClass::Remote,
+            DestinationScope::parse(&config.model.endpoint)
+                .map_err(|error| CliError::Runtime(error.to_string()))?,
+            config.model.model.clone(),
+            true,
+            0,
+            None,
+            allowed_data_classes.clone(),
+            created_at,
+        )
+        .map_err(CliError::Repository)?;
+        database
+            .append_model_provider_revision(&provider_revision)
+            .await?;
+    }
+    if !workspace_policy_exists {
+        let workspace_revision = WorkspaceModelEgressRevision::new(
+            config.workspace_id(),
+            provider_id,
+            1,
+            allowed_data_classes,
+            created_at,
+        )
+        .map_err(CliError::Repository)?;
+        database
+            .append_workspace_model_egress_revision(&workspace_revision)
+            .await?;
+    }
+    Ok(())
+}
+
+const fn remote_data_class(value: RemoteDataClass) -> DataClass {
+    match value {
+        RemoteDataClass::Public => DataClass::Public,
+        RemoteDataClass::Workspace => DataClass::Workspace,
+        RemoteDataClass::Sensitive => DataClass::Sensitive,
+        RemoteDataClass::Secret => DataClass::Secret,
     }
 }
 
