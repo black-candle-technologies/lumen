@@ -78,7 +78,9 @@
 				workspace_allowed_data_classes: allowedClasses
 			});
 			providers = providers.map((current) => current.provider_id === policy.provider_id ? updated : current);
-			notice = `${enabled ? 'Enabled' : 'Disabled'} provider ${updated.provider_id}`;
+			notice = updated.state === 'approval_requested'
+				? `Approval requested for provider ${updated.provider_id}`
+				: `${enabled ? 'Enabled' : 'Disabled'} provider ${updated.provider_id}`;
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Provider policy update failed.';

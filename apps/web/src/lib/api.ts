@@ -152,6 +152,8 @@ export type ProviderPolicy = {
 		created_at: number;
 	};
 	created_at: number;
+	state?: 'approval_requested';
+	approval_run_id?: string;
 };
 
 export type ProviderPolicyUpdate = {

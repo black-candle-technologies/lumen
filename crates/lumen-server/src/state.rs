@@ -796,6 +796,10 @@ pub struct ProviderPolicyReview {
     allowed_data_classes: Vec<DataClass>,
     workspace_policy: Option<WorkspaceModelPolicyReview>,
     created_at: TimestampMillis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_run_id: Option<RunId>,
 }
 
 impl ProviderPolicyReview {
@@ -825,7 +829,15 @@ impl ProviderPolicyReview {
             allowed_data_classes,
             workspace_policy,
             created_at,
+            state: None,
+            approval_run_id: None,
         }
+    }
+
+    pub const fn with_approval_requested(mut self, run_id: RunId) -> Self {
+        self.state = Some("approval_requested");
+        self.approval_run_id = Some(run_id);
+        self
     }
 }
 

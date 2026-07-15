@@ -10,7 +10,7 @@ use std::{
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue},
     capability::{Capability, CapabilityName, ResourceScope, WorkspacePath},
-    egress::DestinationScope,
+    egress::{DataClass, DestinationScope, ProviderId},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
     identity::{ComponentId, WorkspaceId},
     model::ActionProposal,
@@ -174,6 +174,40 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                     vec![Capability::new(
                         CapabilityName::NetworkEgress,
                         ResourceScope::exact("destination", destination.as_str())
+                            .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    )],
+                ))
+            }
+            "egress.provider.policy.update" => {
+                let parsed: ProviderPolicyUpdateArguments = parse_arguments(&arguments)?;
+                let provider_id = ProviderId::parse(parsed.provider_id)
+                    .map_err(|error| NormalizationError::new(error.to_string()))?;
+                let allowed_data_classes =
+                    normalize_data_classes(parsed.workspace_allowed_data_classes)?;
+                Ok(ActionEnvelope::new(
+                    ActionId::new(),
+                    context.run_id(),
+                    context.workspace_id(),
+                    context.actor().clone(),
+                    self.component.clone(),
+                    ActionKind::new(kind)
+                        .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    CanonicalValue::object([
+                        ("provider_id", CanonicalValue::from(provider_id.as_str())),
+                        ("enabled", CanonicalValue::from(parsed.enabled)),
+                        (
+                            "workspace_allowed_data_classes",
+                            CanonicalValue::Array(
+                                allowed_data_classes
+                                    .iter()
+                                    .map(|data_class| CanonicalValue::from(data_class.as_str()))
+                                    .collect(),
+                            ),
+                        ),
+                    ]),
+                    vec![Capability::new(
+                        CapabilityName::PolicyModify,
+                        ResourceScope::exact("egress_provider", provider_id.as_str())
                             .map_err(|error| NormalizationError::new(error.to_string()))?,
                     )],
                 ))
@@ -437,12 +471,42 @@ struct NetworkEgressArguments {
     method: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPolicyUpdateArguments {
+    provider_id: String,
+    enabled: bool,
+    workspace_allowed_data_classes: Vec<DataClass>,
+}
+
 fn parse_arguments<T: for<'de> Deserialize<'de>>(
     arguments: &CanonicalValue,
 ) -> Result<T, NormalizationError> {
     let encoded = serde_json::to_value(arguments)
         .map_err(|error| NormalizationError::new(error.to_string()))?;
     serde_json::from_value(encoded).map_err(|error| NormalizationError::new(error.to_string()))
+}
+
+fn normalize_data_classes(classes: Vec<DataClass>) -> Result<Vec<DataClass>, NormalizationError> {
+    if classes.contains(&DataClass::Secret) {
+        return Err(NormalizationError::new(
+            "secret data class cannot be enabled for provider egress",
+        ));
+    }
+    let normalized = [
+        DataClass::Public,
+        DataClass::Workspace,
+        DataClass::Sensitive,
+    ]
+    .into_iter()
+    .filter(|data_class| classes.contains(data_class))
+    .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        return Err(NormalizationError::new(
+            "provider policy requires at least one data class",
+        ));
+    }
+    Ok(normalized)
 }
 
 fn normalize_http_method(value: &str) -> Result<&'static str, NormalizationError> {

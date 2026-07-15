@@ -1282,6 +1282,118 @@ subject = "operator"
 }
 
 #[tokio::test]
+async fn sensitive_provider_policy_expansion_requires_approval_before_mutation() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
+    harness
+        .database
+        .append_model_provider_revision(
+            &ModelProviderRevision::new(
+                provider_id.clone(),
+                1,
+                ModelEndpointClass::Remote,
+                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
+                "remote-model",
+                true,
+                0,
+                None,
+                [
+                    DataClass::Public,
+                    DataClass::Workspace,
+                    DataClass::Sensitive,
+                ],
+                TimestampMillis::new(1_000),
+            )
+            .expect("provider revision"),
+        )
+        .await
+        .expect("provider stored");
+    harness
+        .database
+        .append_workspace_model_egress_revision(
+            &WorkspaceModelEgressRevision::new(
+                harness.workspace_id,
+                provider_id.clone(),
+                1,
+                [DataClass::Public, DataClass::Workspace],
+                TimestampMillis::new(1_100),
+            )
+            .expect("workspace policy"),
+        )
+        .await
+        .expect("workspace policy stored");
+
+    let response = harness
+        .request(
+            "POST",
+            "egress/providers",
+            &serde_json::json!({
+                "provider_id": provider_id.as_str(),
+                "enabled": true,
+                "workspace_allowed_data_classes": ["public", "workspace", "sensitive"]
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("provider body")
+        .to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("provider JSON");
+    assert_eq!(body["state"], "approval_requested");
+    assert!(body["approval_run_id"].as_str().is_some());
+
+    let before_approval = harness
+        .database
+        .latest_workspace_model_egress_revision(harness.workspace_id, provider_id.clone())
+        .await
+        .expect("workspace policy")
+        .expect("workspace policy exists");
+    assert!(before_approval.allows(DataClass::Public));
+    assert!(before_approval.allows(DataClass::Workspace));
+    assert!(!before_approval.allows(DataClass::Sensitive));
+
+    let approval_id = harness.pending_approval_id().await;
+    let approval_response = harness.request("GET", "approvals", "").await;
+    let approval_body = String::from_utf8_lossy(
+        &approval_response
+            .into_body()
+            .collect()
+            .await
+            .expect("approval body")
+            .to_bytes(),
+    )
+    .into_owned();
+    assert!(approval_body.contains("egress.provider.policy.update"));
+    assert!(approval_body.contains("sensitive"));
+
+    let grant_response = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(grant_response.status(), StatusCode::OK);
+    harness
+        .wait_for_audit(AuditEventKind::ExecutionSucceeded)
+        .await;
+
+    let after_approval = harness
+        .database
+        .latest_workspace_model_egress_revision(harness.workspace_id, provider_id)
+        .await
+        .expect("workspace policy")
+        .expect("workspace policy exists");
+    assert!(after_approval.allows(DataClass::Sensitive));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn denied_model_egress_is_audited_before_inner_model_call() {
     let database = Database::connect_in_memory().await.expect("database");
     let workspace_id = WorkspaceId::from_uuid(
