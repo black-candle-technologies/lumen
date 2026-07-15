@@ -20,13 +20,13 @@ use lumen_core::{
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
-    identity::{PrincipalId, WorkspaceId},
+    identity::{ChannelDestination, ExternalChannelIdentity, PrincipalId, WorkspaceId},
     model::{ModelFuture, ModelInput, ModelOutput, ModelPort},
     secret::SecretRefId,
 };
 use lumen_db::{
-    Database, DestinationRevision, ModelEndpointClass, ModelProviderRevision, SecretReference,
-    StagedPluginPackage, WorkspaceModelEgressRevision,
+    ChannelIdentityMapping, Database, DestinationRevision, ModelEndpointClass,
+    ModelProviderRevision, SecretReference, StagedPluginPackage, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     extension_package::PackageStager,
@@ -1201,6 +1201,81 @@ subject = "operator"
     assert!(service.ambient_capabilities.allows(&Capability::new(
         CapabilityName::NetworkEgress,
         ResourceScope::exact("destination", destination.as_str()).expect("destination scope"),
+    )));
+    service.shutdown().await;
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn allowed_channel_mappings_are_loaded_as_runtime_capabilities() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let external =
+        ExternalChannelIdentity::new("slack", "T123", "C456", "U789").expect("external identity");
+    harness
+        .database
+        .upsert_channel_identity_mapping(
+            &ChannelIdentityMapping::new(
+                external.clone(),
+                PrincipalId::new("local", "operator").expect("principal"),
+                harness.workspace_id,
+                true,
+                TimestampMillis::new(1_000),
+                TimestampMillis::new(1_000),
+            )
+            .expect("channel mapping"),
+        )
+        .await
+        .expect("channel mapping stored");
+    let service = LocalRuntimeService::build_with_secret_store(
+        &Config::parse(&format!(
+            r#"
+[database]
+path = "ignored.sqlite3"
+
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = false
+
+[runtime]
+data_directory = "{}"
+
+[process]
+allowed_programs = ["/bin/echo"]
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "{}"
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+            model.uri(),
+            harness._directory.path().join("runtime").display(),
+            harness._directory.path().join("workspace").display()
+        ))
+        .expect("runtime config"),
+        harness.database.clone(),
+        EventBroker::new(128),
+        Arc::new(harness.sandbox.clone()),
+        vec![TOKEN.to_owned()],
+        Arc::new(InMemorySecretStore::new()),
+    )
+    .await
+    .expect("runtime builds");
+    let destination = ChannelDestination::new(
+        external.provider(),
+        external.external_workspace_id(),
+        external.channel_id(),
+    )
+    .expect("channel destination");
+
+    assert!(service.ambient_capabilities.allows(&Capability::new(
+        CapabilityName::ChannelSend,
+        ResourceScope::exact("channel", destination.as_scope_value()).expect("channel scope"),
     )));
     service.shutdown().await;
     harness.service.shutdown().await;

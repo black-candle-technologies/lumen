@@ -12,7 +12,8 @@ use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
 pub use egress::{
-    DestinationRevision, ModelEndpointClass, ModelProviderRevision, WorkspaceModelEgressRevision,
+    ChannelIdentityMapping, DestinationRevision, ModelEndpointClass, ModelProviderRevision,
+    WorkspaceModelEgressRevision,
 };
 pub use extensions::{
     InstallResult, InstalledPluginVersion, PluginGrantRevision, PluginGrantScope,

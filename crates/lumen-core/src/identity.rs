@@ -41,6 +41,93 @@ macro_rules! uuid_id {
 uuid_id!(WorkspaceId);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ExternalChannelIdentity {
+    provider: String,
+    external_workspace_id: String,
+    channel_id: String,
+    external_user_id: String,
+}
+
+impl ExternalChannelIdentity {
+    pub fn new(
+        provider: impl Into<String>,
+        external_workspace_id: impl Into<String>,
+        channel_id: impl Into<String>,
+        external_user_id: impl Into<String>,
+    ) -> Result<Self, IdentityError> {
+        Ok(Self {
+            provider: validate_channel_part("provider", provider.into())?,
+            external_workspace_id: validate_channel_part(
+                "external_workspace_id",
+                external_workspace_id.into(),
+            )?,
+            channel_id: validate_channel_part("channel_id", channel_id.into())?,
+            external_user_id: validate_channel_part("external_user_id", external_user_id.into())?,
+        })
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn external_workspace_id(&self) -> &str {
+        &self.external_workspace_id
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    pub fn external_user_id(&self) -> &str {
+        &self.external_user_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ChannelDestination {
+    provider: String,
+    external_workspace_id: String,
+    channel_id: String,
+    scope_value: String,
+}
+
+impl ChannelDestination {
+    pub fn new(
+        provider: impl Into<String>,
+        external_workspace_id: impl Into<String>,
+        channel_id: impl Into<String>,
+    ) -> Result<Self, IdentityError> {
+        let provider = validate_channel_part("provider", provider.into())?;
+        let external_workspace_id =
+            validate_channel_part("external_workspace_id", external_workspace_id.into())?;
+        let channel_id = validate_channel_part("channel_id", channel_id.into())?;
+        let scope_value = format!("{provider}:{external_workspace_id}:{channel_id}");
+        Ok(Self {
+            provider,
+            external_workspace_id,
+            channel_id,
+            scope_value,
+        })
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn external_workspace_id(&self) -> &str {
+        &self.external_workspace_id
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    pub fn as_scope_value(&self) -> &str {
+        &self.scope_value
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct PrincipalId {
     provider: String,
     subject: String,
@@ -94,6 +181,8 @@ impl ComponentId {
 pub enum IdentityError {
     #[error("identity {field} must be non-empty, bounded, and free of control characters")]
     InvalidPart { field: &'static str },
+    #[error("channel identity {field} must be non-empty, bounded, and scope-safe")]
+    InvalidChannelPart { field: &'static str },
     #[error("component ID must use lowercase ASCII letters, digits, dots, underscores, or hyphens")]
     InvalidComponentId,
 }
@@ -105,6 +194,20 @@ fn validate_identifier_part(field: &'static str, value: String) -> Result<String
         || value.chars().any(char::is_control)
     {
         return Err(IdentityError::InvalidPart { field });
+    }
+
+    Ok(value)
+}
+
+fn validate_channel_part(field: &'static str, value: String) -> Result<String, IdentityError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.trim() != value
+        || value
+            .chars()
+            .any(|character| character.is_control() || character == ':' || character == '/')
+    {
+        return Err(IdentityError::InvalidChannelPart { field });
     }
 
     Ok(value)

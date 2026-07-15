@@ -4,7 +4,7 @@ use lumen_core::{
     approval::TimestampMillis,
     capability::{Capability, CapabilityName, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, ProviderRoute},
-    identity::WorkspaceId,
+    identity::{ChannelDestination, ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
 use sqlx::Row;
@@ -241,6 +241,63 @@ impl DestinationRevision {
 
     pub fn allows(&self, data_class: DataClass) -> bool {
         self.allowed_data_classes.contains(&data_class)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelIdentityMapping {
+    external: ExternalChannelIdentity,
+    principal: PrincipalId,
+    workspace_id: WorkspaceId,
+    allowed: bool,
+    created_at: TimestampMillis,
+    updated_at: TimestampMillis,
+}
+
+impl ChannelIdentityMapping {
+    pub fn new(
+        external: ExternalChannelIdentity,
+        principal: PrincipalId,
+        workspace_id: WorkspaceId,
+        allowed: bool,
+        created_at: TimestampMillis,
+        updated_at: TimestampMillis,
+    ) -> Result<Self, RepositoryError> {
+        if updated_at.as_u64() < created_at.as_u64() {
+            return Err(RepositoryError::InvalidEgressPolicy);
+        }
+        Ok(Self {
+            external,
+            principal,
+            workspace_id,
+            allowed,
+            created_at,
+            updated_at,
+        })
+    }
+
+    pub const fn external(&self) -> &ExternalChannelIdentity {
+        &self.external
+    }
+
+    pub const fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn allowed(&self) -> bool {
+        self.allowed
+    }
+
+    pub const fn created_at(&self) -> TimestampMillis {
+        self.created_at
+    }
+
+    pub const fn updated_at(&self) -> TimestampMillis {
+        self.updated_at
     }
 }
 
@@ -533,6 +590,119 @@ impl Database {
                 Ok(Capability::new(
                     CapabilityName::NetworkEgress,
                     ResourceScope::exact("destination", destination.as_str())
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn upsert_channel_identity_mapping(
+        &self,
+        mapping: &ChannelIdentityMapping,
+    ) -> Result<(), RepositoryError> {
+        let created_at = timestamp_to_i64(mapping.created_at)?;
+        let updated_at = timestamp_to_i64(mapping.updated_at)?;
+        sqlx::query(
+            "INSERT INTO egress_channel_mappings (
+                provider, external_workspace_id, channel_id, external_user_id,
+                lumen_provider, lumen_subject, workspace_id, allowed, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(provider, external_workspace_id, channel_id, external_user_id)
+             DO UPDATE SET
+                lumen_provider = excluded.lumen_provider,
+                lumen_subject = excluded.lumen_subject,
+                workspace_id = excluded.workspace_id,
+                allowed = excluded.allowed,
+                updated_at = excluded.updated_at",
+        )
+        .bind(mapping.external.provider())
+        .bind(mapping.external.external_workspace_id())
+        .bind(mapping.external.channel_id())
+        .bind(mapping.external.external_user_id())
+        .bind(mapping.principal.provider())
+        .bind(mapping.principal.subject())
+        .bind(mapping.workspace_id.to_string())
+        .bind(if mapping.allowed { 1_i64 } else { 0_i64 })
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn resolve_external_channel_identity(
+        &self,
+        external: &ExternalChannelIdentity,
+    ) -> Result<Option<ChannelIdentityMapping>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT
+                lumen_provider, lumen_subject, workspace_id, allowed, created_at, updated_at
+             FROM egress_channel_mappings
+             WHERE provider = ?
+               AND external_workspace_id = ?
+               AND channel_id = ?
+               AND external_user_id = ?
+               AND allowed = 1",
+        )
+        .bind(external.provider())
+        .bind(external.external_workspace_id())
+        .bind(external.channel_id())
+        .bind(external.external_user_id())
+        .fetch_optional(self.pool())
+        .await?;
+
+        row.map(|row| {
+            ChannelIdentityMapping::new(
+                external.clone(),
+                PrincipalId::new(
+                    row.try_get::<String, _>("lumen_provider")?,
+                    row.try_get::<String, _>("lumen_subject")?,
+                )
+                .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                WorkspaceId::from_uuid(
+                    row.try_get::<String, _>("workspace_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                ),
+                row.try_get::<i64, _>("allowed")? == 1,
+                TimestampMillis::new(
+                    u64::try_from(row.try_get::<i64, _>("created_at")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                ),
+                TimestampMillis::new(
+                    u64::try_from(row.try_get::<i64, _>("updated_at")?)
+                        .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
+                ),
+            )
+        })
+        .transpose()
+    }
+
+    pub async fn allowed_channel_send_capabilities(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<Capability>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT provider, external_workspace_id, channel_id
+             FROM egress_channel_mappings
+             WHERE workspace_id = ? AND allowed = 1
+             ORDER BY provider ASC, external_workspace_id ASC, channel_id ASC",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let destination = ChannelDestination::new(
+                    row.try_get::<String, _>("provider")?,
+                    row.try_get::<String, _>("external_workspace_id")?,
+                    row.try_get::<String, _>("channel_id")?,
+                )
+                .map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+                Ok(Capability::new(
+                    CapabilityName::ChannelSend,
+                    ResourceScope::exact("channel", destination.as_scope_value())
                         .map_err(|_| RepositoryError::InvalidEgressPolicy)?,
                 ))
             })

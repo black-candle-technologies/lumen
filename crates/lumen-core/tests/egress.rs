@@ -5,7 +5,9 @@ use lumen_core::{
         DataClass, DestinationScope, EndpointClass, ProviderEgressPolicy, ProviderId,
         ProviderRoute, RoutingDecision, RoutingFailure, select_model_provider,
     },
-    identity::{ComponentId, PrincipalId, WorkspaceId},
+    identity::{
+        ChannelDestination, ComponentId, ExternalChannelIdentity, PrincipalId, WorkspaceId,
+    },
 };
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -113,6 +115,35 @@ fn network_and_channel_capabilities_are_exactly_scoped() {
     );
 
     assert_ne!(first.fingerprint(), second.fingerprint());
+}
+
+#[test]
+fn external_channel_identity_is_canonical_and_channel_scoped() {
+    let identity =
+        ExternalChannelIdentity::new("slack", "T123", "C456", "U789").expect("external identity");
+    let destination = ChannelDestination::new(
+        identity.provider(),
+        identity.external_workspace_id(),
+        identity.channel_id(),
+    )
+    .expect("channel destination");
+
+    assert_eq!(identity.provider(), "slack");
+    assert_eq!(identity.external_workspace_id(), "T123");
+    assert_eq!(identity.channel_id(), "C456");
+    assert_eq!(identity.external_user_id(), "U789");
+    assert_eq!(destination.as_scope_value(), "slack:T123:C456");
+    assert_eq!(
+        ResourceScope::exact("channel", destination.as_scope_value()).expect("scope"),
+        ResourceScope::Exact {
+            resource_type: "channel".to_owned(),
+            value: "slack:T123:C456".to_owned(),
+        }
+    );
+
+    assert!(ExternalChannelIdentity::new("slack", " T123", "C456", "U789").is_err());
+    assert!(ExternalChannelIdentity::new("slack", "T123", "C456", "U\n789").is_err());
+    assert!(ChannelDestination::new("slack", "T123", "").is_err());
 }
 
 #[test]

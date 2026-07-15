@@ -5,12 +5,12 @@ use lumen_core::{
         DataClass, DestinationScope, EndpointClass, ProviderId, RoutingFailure,
         select_model_provider,
     },
-    identity::WorkspaceId,
+    identity::{ChannelDestination, ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
 use lumen_db::{
-    Database, DestinationRevision, ModelEndpointClass, ModelProviderRevision, RepositoryError,
-    WorkspaceModelEgressRevision,
+    ChannelIdentityMapping, Database, DestinationRevision, ModelEndpointClass,
+    ModelProviderRevision, RepositoryError, WorkspaceModelEgressRevision,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -27,10 +27,19 @@ fn secret_ref() -> SecretRefId {
     SecretRefId::parse("5f7cc8b4-e848-4cb4-91ef-27c5983c41a5").expect("secret")
 }
 
+fn principal() -> PrincipalId {
+    PrincipalId::new("local", "alice").expect("principal")
+}
+
 async fn database() -> Database {
     let database = Database::connect_in_memory().await.expect("database");
     database
-        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(500))
+        .bootstrap_workspace(
+            workspace_id(),
+            "Default",
+            &principal(),
+            TimestampMillis::new(500),
+        )
         .await
         .expect("workspace");
     database
@@ -468,4 +477,116 @@ fn destination_revisions_reject_secret_data_class() {
     .expect_err("secret destination policy must fail");
 
     assert!(matches!(error, RepositoryError::InvalidEgressPolicy));
+}
+
+#[tokio::test]
+async fn external_channel_mapping_resolves_only_allowed_identities() {
+    let database = database().await;
+    let external =
+        ExternalChannelIdentity::new("slack", "T123", "C456", "U789").expect("external identity");
+    let mapping = ChannelIdentityMapping::new(
+        external.clone(),
+        principal(),
+        workspace_id(),
+        true,
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(1_000),
+    )
+    .expect("channel mapping");
+
+    assert_eq!(
+        database
+            .resolve_external_channel_identity(&external)
+            .await
+            .expect("unknown identity lookup"),
+        None
+    );
+
+    database
+        .upsert_channel_identity_mapping(&mapping)
+        .await
+        .expect("mapping stored");
+    assert_eq!(
+        database
+            .resolve_external_channel_identity(&external)
+            .await
+            .expect("identity lookup"),
+        Some(mapping.clone())
+    );
+
+    let disabled = ChannelIdentityMapping::new(
+        external.clone(),
+        principal(),
+        workspace_id(),
+        false,
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(2_000),
+    )
+    .expect("disabled mapping");
+    database
+        .upsert_channel_identity_mapping(&disabled)
+        .await
+        .expect("disabled mapping stored");
+    assert_eq!(
+        database
+            .resolve_external_channel_identity(&external)
+            .await
+            .expect("disabled identity lookup"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn allowed_channel_mappings_load_exact_channel_send_capabilities() {
+    let database = database().await;
+    let allowed =
+        ExternalChannelIdentity::new("slack", "T123", "C456", "U789").expect("allowed identity");
+    let disabled =
+        ExternalChannelIdentity::new("slack", "T123", "C999", "U789").expect("disabled identity");
+    database
+        .upsert_channel_identity_mapping(
+            &ChannelIdentityMapping::new(
+                allowed.clone(),
+                principal(),
+                workspace_id(),
+                true,
+                TimestampMillis::new(1_000),
+                TimestampMillis::new(1_000),
+            )
+            .expect("allowed mapping"),
+        )
+        .await
+        .expect("allowed stored");
+    database
+        .upsert_channel_identity_mapping(
+            &ChannelIdentityMapping::new(
+                disabled,
+                principal(),
+                workspace_id(),
+                false,
+                TimestampMillis::new(1_000),
+                TimestampMillis::new(1_000),
+            )
+            .expect("disabled mapping"),
+        )
+        .await
+        .expect("disabled stored");
+
+    let destination = ChannelDestination::new(
+        allowed.provider(),
+        allowed.external_workspace_id(),
+        allowed.channel_id(),
+    )
+    .expect("channel destination");
+
+    assert_eq!(
+        database
+            .allowed_channel_send_capabilities(workspace_id())
+            .await
+            .expect("channel capabilities"),
+        vec![Capability::new(
+            CapabilityName::ChannelSend,
+            ResourceScope::exact("channel", destination.as_scope_value()).expect("channel scope"),
+        )]
+    );
 }
