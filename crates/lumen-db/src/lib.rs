@@ -1,6 +1,7 @@
 //! SQLite persistence for Lumen runtime state.
 
 mod audit;
+mod automation;
 mod egress;
 mod extensions;
 mod migrations;
@@ -11,6 +12,9 @@ use std::path::Path;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
+pub use automation::{
+    ScheduledJobRevision, ServiceIdentity, SkillVersionRecord, WorkflowCaptureDraft,
+};
 pub use egress::{
     ChannelIdentityMapping, DestinationRevision, ModelEndpointClass, ModelProviderRevision,
     WorkspaceModelEgressRevision,
@@ -85,6 +89,8 @@ pub enum RepositoryError {
     PluginSettingConflict,
     #[error("egress policy conflicts with repository constraints")]
     InvalidEgressPolicy,
+    #[error("automation state conflicts with repository constraints")]
+    InvalidAutomationState,
 }
 
 pub(crate) fn timestamp_to_i64(

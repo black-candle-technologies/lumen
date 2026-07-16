@@ -59,16 +59,16 @@ docs/
 
 **Files:** `crates/lumen-db/migrations/0005_durable_automation.sql`, `crates/lumen-db/src/{lib,automation}.rs`, `crates/lumen-db/tests/{database,automation}.rs`, `docs/DATA_MODEL.md`
 
-- [ ] Add failing migration tests for `service_identities`, `scheduled_jobs`, `scheduled_job_revisions`, `scheduled_job_runs`, `scheduled_job_leases`, `agent_skills`, `skill_versions`, `skill_workspace_state`, and `workflow_capture_drafts`.
-- [ ] Add failing repository tests proving service identities are workspace-scoped, owner-linked, enableable, disableable, explicitly grant-scoped, and never inherit owner grants.
-- [ ] Add failing repository tests proving job revisions are append-only, next-due updates are transactional, and stale revisions cannot overwrite newer revisions.
-- [ ] Add failing lease tests proving one occurrence can be claimed once, expired leases can be recovered, active leases cannot be stolen, and duplicate occurrence keys do not create duplicate runs.
-- [ ] Add failing skill tests proving version metadata is immutable, source digests are required, disabled skill versions are not loadable, and capture drafts are separate from published skills.
-- [ ] Confirm focused tests fail before implementation: `cargo test -p lumen-db --test automation`.
-- [ ] Implement the migration and typed repositories.
-- [ ] Update `DATA_MODEL.md` with service identity, job, lease, skill, and capture invariants.
-- [ ] Run `cargo test -p lumen-db --test database` and `cargo test -p lumen-db --test automation`.
-- [ ] Commit as `feat(db): persist durable automation state`.
+- [x] Add failing migration tests for `service_identities`, `scheduled_jobs`, `scheduled_job_revisions`, `scheduled_job_runs`, `scheduled_job_leases`, `agent_skills`, `skill_versions`, `skill_workspace_state`, and `workflow_capture_drafts`.
+- [x] Add failing repository tests proving service identities are workspace-scoped, owner-linked, enableable, disableable, explicitly grant-scoped, and never inherit owner grants.
+- [x] Add failing repository tests proving job revisions are append-only, next-due updates are transactional, and stale revisions cannot overwrite newer revisions.
+- [x] Add failing lease tests proving one occurrence can be claimed once, expired leases can be recovered, active leases cannot be stolen, and duplicate occurrence keys do not create duplicate runs.
+- [x] Add failing skill tests proving version metadata is immutable, source digests are required, disabled skill versions are not loadable, and capture drafts are separate from published skills.
+- [x] Confirm focused tests fail before implementation: `cargo test -p lumen-db --test automation`.
+- [x] Implement the migration and typed repositories.
+- [x] Update `DATA_MODEL.md` with service identity, job, lease, skill, and capture invariants.
+- [x] Run `cargo test -p lumen-db --test database` and `cargo test -p lumen-db --test automation`.
+- [x] Commit as `feat(db): persist durable automation state`.
 
 ## Task 3: Scheduler Runtime
 

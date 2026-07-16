@@ -121,7 +121,7 @@ async fn migration_adds_the_complete_extension_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 4);
+    assert_eq!(migrations, 5);
 }
 
 #[tokio::test]

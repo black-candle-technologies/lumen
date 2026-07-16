@@ -41,7 +41,12 @@ Lumen uses SQLite as its only initial database target. The persistence layer use
 - `capability_grants`
 - `model_providers`
 - `model_routing_policies`
+- `service_identities`
+- `service_identity_grants`
 - `scheduled_jobs`
+- `scheduled_job_revisions`
+- `scheduled_job_runs`
+- `scheduled_job_leases`
 
 ### Extensions
 
@@ -57,6 +62,8 @@ Lumen uses SQLite as its only initial database target. The persistence layer use
 - `plugin_failures`
 - `agent_skills`
 - `skill_versions`
+- `skill_workspace_state`
+- `workflow_capture_drafts`
 
 ### Audit
 
@@ -75,6 +82,12 @@ Lumen uses SQLite as its only initial database target. The persistence layer use
 - Plugin grants can only reference capabilities requested by the manifest.
 - Plugin failure windows survive database reopen and can quarantine one workspace/version.
 - Capability grants reference an existing principal and scope.
+- Service identities are workspace-scoped, owner-linked, and use explicit grants instead of inherited owner authority.
+- Scheduled job revisions are append-only.
+- Scheduled job occurrence keys are unique across crash recovery.
+- Active scheduled job leases cannot be stolen before expiry.
+- Reviewed skill versions are immutable and loaded by digest.
+- Workflow capture drafts remain separate from published skill versions.
 - Every action terminal state has a corresponding audit event.
 - Audit sequence numbers and hash-chain links are committed in order.
 
