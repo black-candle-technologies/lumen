@@ -45,10 +45,12 @@ The implemented slice supports reviewed local packages, exact package/manifest/a
 
 ## Milestone 4: Controlled Egress
 
-- Add explicitly enabled remote model providers.
-- Enforce data classification and provider/workspace egress policy.
-- Add destination-scoped network capabilities.
-- Add external channel adapters with stable identity mapping and allowlisting.
+- [x] Add explicitly enabled remote model providers.
+- [x] Enforce data classification and provider/workspace egress policy.
+- [x] Add destination-scoped network capabilities.
+- [x] Add external channel identity mapping and allowlisting.
+
+The implemented slice keeps local inference as the default while permitting explicit remote model policy, workspace/data-class routing, destination-scoped runtime HTTP egress, authenticated egress policy APIs, web egress controls, and fail-closed audit behavior. Unknown or disabled channels resolve to no authority. Full chat-platform adapter implementations remain outside this milestone.
 
 ## Milestone 5: Durable Automation
 

@@ -123,11 +123,13 @@ docs/
 
 **Files:** security tests under owning crates, `README.md`, `docs/{ARCHITECTURE,DATA_MODEL,MODEL_ROUTING,PLUGIN_SYSTEM,ROADMAP,RUNTIME_EXECUTION,SECURITY}.md`, this plan
 
-- [ ] Add adversarial tests for prompt-injected URLs, plugin-proposed ungranted destinations, redirect attempts, secret leakage, unknown channels, provider disablement, workspace policy revocation, and audit failure.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `CARGO_INCREMENTAL=0 cargo test --workspace`.
-- [ ] Run frontend checks, unit tests, production build, and Playwright.
-- [ ] Update Roadmap Milestone 4 only for behavior proven by the suite.
-- [ ] Run `git diff --check`.
-- [ ] Commit and push the completed milestone branch.
+- [x] Add adversarial tests for prompt-injected URLs, plugin-proposed ungranted destinations, redirect attempts, secret leakage, unknown channels, provider disablement, workspace policy revocation, and audit failure.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Run `CARGO_INCREMENTAL=0 cargo test --workspace`.
+- [x] Run frontend checks, unit tests, production build, and Playwright.
+- [x] Update Roadmap Milestone 4 only for behavior proven by the suite.
+- [x] Run `git diff --check`.
+- [x] Commit and push the completed milestone branch.
+
+Verification completed on July 15, 2026. The suite proves explicit remote-provider policy, data-class and workspace routing, destination-scoped network proposals, redirect denial without following the target, secret redaction, external channel identity mapping and allowlisted channel authority, provider disablement, workspace policy revocation, and audit-failure fail-closed behavior.
