@@ -3,6 +3,7 @@
 pub mod action;
 pub mod approval;
 pub mod audit;
+pub mod automation;
 pub mod capability;
 pub mod egress;
 pub mod executor;

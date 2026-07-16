@@ -69,6 +69,7 @@ Authorization is workspace-scoped:
 - Forwarded identity assertions require a configured trusted proxy.
 - Local desktop access does not imply administrator authority.
 - Service identities used by scheduled jobs have explicit grants and owners.
+- Service identities are represented as `service` principals and do not inherit owner or local-user authority.
 
 The initial release supports a local identity and one or more workspaces, but not hostile multi-tenant isolation between operating-system accounts.
 

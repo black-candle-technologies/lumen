@@ -11,6 +11,7 @@ use crate::{
     action::{ActionEnvelope, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, DispatchError, TimestampMillis, authorize_dispatch},
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
+    automation::JobOrigin,
     capability::{Capability, CapabilitySet, EffectiveCapabilities},
     egress::DataClass,
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorPort},
@@ -71,6 +72,7 @@ pub struct RunContext {
     run_id: RunId,
     workspace_id: WorkspaceId,
     actor: PrincipalId,
+    job_origin: Option<JobOrigin>,
 }
 
 impl RunContext {
@@ -79,7 +81,13 @@ impl RunContext {
             run_id,
             workspace_id,
             actor,
+            job_origin: None,
         }
+    }
+
+    pub fn with_job_origin(mut self, origin: JobOrigin) -> Self {
+        self.job_origin = Some(origin);
+        self
     }
 
     pub const fn run_id(&self) -> RunId {
@@ -92,6 +100,10 @@ impl RunContext {
 
     pub const fn actor(&self) -> &PrincipalId {
         &self.actor
+    }
+
+    pub const fn job_origin(&self) -> Option<&JobOrigin> {
+        self.job_origin.as_ref()
     }
 }
 

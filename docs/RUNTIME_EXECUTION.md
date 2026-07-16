@@ -4,7 +4,7 @@ This document defines the authoritative lifecycle for agent runs and sensitive a
 
 ## Core Entities
 
-- **Request context:** authenticated actor, channel, workspace, request ID, and trust metadata.
+- **Request context:** authenticated actor, channel or job origin, workspace, request ID, and trust metadata.
 - **Agent run:** one bounded model-and-tool loop with model, token, action, time, and cost budgets.
 - **Action proposal:** untrusted structured output from a model, user, job, or plugin.
 - **Action envelope:** runtime-normalized immutable description of an intended effect.
@@ -67,6 +67,12 @@ running -> unknown
 12. Finish the run with a terminal reason.
 
 The loop cannot exceed configured limits for model turns, actions, wall time, tokens, remote cost, or captured bytes.
+
+## Job-Originated Runs
+
+A scheduled job creates an ordinary run with explicit job origin metadata. The run context may carry job ID, job revision, scheduled timestamp, and deterministic occurrence key, while interactive runs keep no job origin.
+
+The occurrence key is derived from `job_id + job_revision + scheduled_for`. It is stable across crash recovery and is the idempotency anchor for scheduler lease and duplicate-run prevention.
 
 ## Approval Concurrency
 

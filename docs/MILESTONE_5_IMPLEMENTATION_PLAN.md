@@ -45,15 +45,15 @@ docs/
 
 **Files:** `crates/lumen-core/src/{lib,automation,identity}.rs`, `crates/lumen-core/tests/automation.rs`, `docs/{RUNTIME_EXECUTION,SECURITY}.md`
 
-- [ ] Add failing tests for `JobId`, `JobRevision`, `SkillId`, `SkillVersion`, `OccurrenceKey`, and service-principal parsing.
-- [ ] Add failing tests proving service principals do not compare equal to local users and cannot be constructed from empty or control-character labels.
-- [ ] Add failing tests for `ScheduleSpec::Once` and `ScheduleSpec::Interval`, including next-due calculation, disabled jobs, zero interval rejection, and bounded timestamp parsing.
-- [ ] Add failing tests proving occurrence keys are deterministic over job ID, revision, and scheduled timestamp.
-- [ ] Confirm focused tests fail before implementation: `cargo test -p lumen-core --test automation`.
-- [ ] Implement the automation types in `crates/lumen-core/src/automation.rs` and export them from `lib.rs`.
-- [ ] Extend `RunContext` or its metadata with optional job occurrence attribution without changing interactive run behavior.
-- [ ] Run `cargo test -p lumen-core --test automation` and `cargo test -p lumen-core --test run_orchestrator`.
-- [ ] Commit as `feat(core): define durable automation types`.
+- [x] Add failing tests for `JobId`, `JobRevision`, `SkillId`, `SkillVersion`, `OccurrenceKey`, and service-principal parsing.
+- [x] Add failing tests proving service principals do not compare equal to local users and cannot be constructed from empty or control-character labels.
+- [x] Add failing tests for `ScheduleSpec::Once` and `ScheduleSpec::Interval`, including next-due calculation, disabled jobs, zero interval rejection, and bounded timestamp parsing.
+- [x] Add failing tests proving occurrence keys are deterministic over job ID, revision, and scheduled timestamp.
+- [x] Confirm focused tests fail before implementation: `cargo test -p lumen-core --test automation`.
+- [x] Implement the automation types in `crates/lumen-core/src/automation.rs` and export them from `lib.rs`.
+- [x] Extend `RunContext` or its metadata with optional job occurrence attribution without changing interactive run behavior.
+- [x] Run `cargo test -p lumen-core --test automation` and `cargo test -p lumen-core --test run_orchestrator`.
+- [x] Commit as `feat(core): define durable automation types`.
 
 ## Task 2: SQL Automation State
 
