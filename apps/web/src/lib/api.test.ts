@@ -14,7 +14,7 @@ describe('ApiClient', () => {
 			expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer local-test-token');
 			expect(new Headers(init?.headers).get('Last-Event-ID')).toBe('4');
 			return new Response(
-				'id: 5\nevent: run.completed\ndata: {"text":"local answer"}\n\n',
+				'id: 5\nevent: run.completed\ndata: {"text":"local answer"}\n\nid: 6\nevent: run.failed\ndata: "late"\n\n',
 				{ status: 200, headers: { 'content-type': 'text/event-stream' } }
 			);
 		});

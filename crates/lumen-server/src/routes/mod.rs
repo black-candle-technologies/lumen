@@ -4,7 +4,7 @@ use axum::{
     Extension, Json, Router,
     extract::rejection::JsonRejection,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response, Sse},
     routing::{get, post},
@@ -283,14 +283,35 @@ async fn authenticate(
     mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    if request.method() == Method::OPTIONS {
+        return with_local_cors(StatusCode::NO_CONTENT.into_response());
+    }
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     let Some(principal) = state.authenticate(authorization) else {
-        return ApiError::Unauthorized.into_response();
+        return with_local_cors(ApiError::Unauthorized.into_response());
     };
     request.extensions_mut().insert(principal);
-    next.run(request).await
+    with_local_cors(next.run(request).await)
+}
+
+fn with_local_cors(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET,POST,OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("authorization,content-type,last-event-id"),
+    );
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    response
 }
 
 #[derive(Deserialize)]

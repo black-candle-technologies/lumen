@@ -281,7 +281,10 @@ export class ApiClient {
 				const frame = buffer.slice(0, boundary);
 				buffer = buffer.slice(boundary + 2);
 				const event = parseFrame(frame);
-				if (event) onEvent(event);
+				if (event) {
+					onEvent(event);
+					if (isTerminalRunEvent(event.event)) return;
+				}
 				boundary = buffer.indexOf('\n\n');
 			}
 			if (done) break;
@@ -339,4 +342,8 @@ function parseFrame(frame: string): RunEvent | null {
 	}
 	if (data.length === 0 || !Number.isFinite(id)) return null;
 	return { id, event, data: JSON.parse(data.join('\n')) as JsonValue };
+}
+
+function isTerminalRunEvent(event: string): boolean {
+	return event === 'run.completed' || event === 'run.failed' || event === 'run.cancelled' || event === 'run.timed_out';
 }
