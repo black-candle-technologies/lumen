@@ -133,15 +133,15 @@ docs/
 
 **Files:** `crates/lumen-server/src/{routes/mod,state}.rs`, `crates/lumen-server/tests/routes.rs`, `apps/web/src/lib/api.ts`, `apps/web/src/lib/api.test.ts`, `apps/web/src/routes/{automation,skills}/+page.svelte`, `apps/web/tests/control-surface.spec.ts`
 
-- [ ] Add failing server route tests for listing, creating, reviewing, enabling, disabling, and updating service identities, jobs, skills, and capture drafts.
-- [ ] Add failing server route tests for authentication, workspace scoping, unknown-field rejection, body limits, secret redaction, conflict states, and disabled-service behavior.
-- [ ] Add failing web API tests for job and skill endpoints.
-- [ ] Add failing Playwright tests proving operators can inspect job state, pause jobs, review skill versions, publish capture drafts, and see audit provenance without secret values or layout overflow.
-- [ ] Confirm frontend tests fail before implementation.
-- [ ] Implement server route DTOs and `RuntimeService` methods following the plugin and egress route patterns.
-- [ ] Implement compact Automation and Skills pages with dense tables, review dialogs, status badges, and icon controls.
-- [ ] Run `pnpm --dir apps/web check`, `pnpm --dir apps/web test`, `pnpm --dir apps/web build`, and `pnpm --dir apps/web test:e2e`.
-- [ ] Commit as `feat(web): add durable automation controls`.
+- [x] Add failing server route tests for listing, creating, reviewing, enabling, disabling, and updating service identities, jobs, skills, and capture drafts.
+- [x] Add failing server route tests for authentication, workspace scoping, unknown-field rejection, body limits, secret redaction, conflict states, and disabled-service behavior.
+- [x] Add failing web API tests for job and skill endpoints.
+- [x] Add failing Playwright tests proving operators can inspect job state, pause jobs, review skill versions, publish capture drafts, and see audit provenance without secret values or layout overflow.
+- [x] Confirm frontend tests fail before implementation.
+- [x] Implement server route DTOs and `RuntimeService` methods following the plugin and egress route patterns.
+- [x] Implement compact Automation and Skills pages with dense tables, review dialogs, status badges, and icon controls.
+- [x] Run `npm run check`, `npm run test`, `npm run build`, and `npm run test:e2e` from `apps/web`.
+- [x] Commit as `feat(web): add durable automation controls`.
 
 ## Task 8: Milestone 5 Verification
 

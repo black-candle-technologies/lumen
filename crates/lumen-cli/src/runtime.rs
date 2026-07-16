@@ -32,7 +32,7 @@ use lumen_core::{
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, ModelEndpointClass,
     ModelProviderRevision, PluginGrantScope, PluginSettingScope, ScheduledJobRevision,
-    SkillVersionRecord, WorkflowCaptureDraft, WorkspaceModelEgressRevision,
+    ServiceIdentity, SkillVersionRecord, WorkflowCaptureDraft, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     filesystem::WorkspaceReader,
@@ -46,13 +46,16 @@ use lumen_integrations::{
 };
 use lumen_server::{
     ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
-    ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand, ChannelMappingCommand,
-    ChannelMappingQuery, ChannelMappingReview, CreateRunCommand, DestinationPolicyCommand,
-    DestinationPolicyQuery, DestinationPolicyReview, EventBroker, PluginActionCommand,
+    ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested, CancelRunCommand,
+    CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview,
+    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview,
+    EventBroker, JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand,
     PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
     PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
     ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated,
-    RuntimeService, ServiceError, ServiceFuture, StagedPluginReview, WorkspaceModelPolicyReview,
+    RuntimeService, ServiceError, ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery,
+    ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
+    WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1531,6 +1534,281 @@ impl RuntimeService for LocalRuntimeService {
             provider_policy_review(provider_revision, Some(&workspace_policy))
         })
     }
+
+    fn list_service_identities(
+        &self,
+        query: ServiceIdentityQuery,
+    ) -> ServiceFuture<'_, Vec<ServiceIdentityReview>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT provider, subject, workspace_id, owner_provider, owner_subject,
+                        label, enabled, created_at, updated_at
+                 FROM service_identities
+                 WHERE workspace_id = ?
+                 ORDER BY label, subject",
+            )
+            .bind(query.workspace_id().to_string())
+            .fetch_all(self.database.pool())
+            .await
+            .map_err(sql_service_error)?;
+            let mut reviews = Vec::with_capacity(rows.len());
+            for row in rows {
+                let principal = principal_from_columns(&row, "provider", "subject")?;
+                let grants = self
+                    .database
+                    .service_identity_grants(query.workspace_id(), &principal)
+                    .await
+                    .map_err(repository_service_error)?
+                    .into_iter()
+                    .map(|capability| capability_review(&capability))
+                    .collect::<Result<Vec<_>, _>>()?;
+                reviews.push(ServiceIdentityReview::new(
+                    PrincipalSummary::new(&principal),
+                    query.workspace_id(),
+                    PrincipalSummary::new(&principal_from_columns(
+                        &row,
+                        "owner_provider",
+                        "owner_subject",
+                    )?),
+                    row.try_get::<String, _>("label")
+                        .map_err(sql_service_error)?,
+                    row.try_get::<i64, _>("enabled")
+                        .map_err(sql_service_error)?
+                        == 1,
+                    grants,
+                    timestamp_from_sql_row(&row, "created_at")?,
+                    timestamp_from_sql_row(&row, "updated_at")?,
+                ));
+            }
+            Ok(reviews)
+        })
+    }
+
+    fn update_service_identity(
+        &self,
+        command: ServiceIdentityCommand,
+    ) -> ServiceFuture<'_, ServiceIdentityReview> {
+        Box::pin(async move {
+            let timestamp = now();
+            let grants = command
+                .grants()
+                .iter()
+                .map(|grant| parse_capability_review(grant, command.workspace_id()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let identity = ServiceIdentity::new(
+                command.principal().clone(),
+                command.workspace_id(),
+                command.actor().clone(),
+                command.label(),
+                command.enabled(),
+                timestamp,
+                timestamp,
+            )
+            .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+            self.database
+                .upsert_service_identity(&identity, grants.iter().cloned())
+                .await
+                .map_err(repository_service_error)?;
+            Ok(ServiceIdentityReview::new(
+                PrincipalSummary::new(identity.principal()),
+                identity.workspace_id(),
+                PrincipalSummary::new(identity.owner()),
+                identity.label(),
+                identity.enabled(),
+                grants
+                    .into_iter()
+                    .map(|capability| capability_review(&capability))
+                    .collect::<Result<Vec<_>, _>>()?,
+                identity.created_at(),
+                identity.updated_at(),
+            ))
+        })
+    }
+
+    fn list_jobs(&self, query: JobReviewQuery) -> ServiceFuture<'_, Vec<JobReview>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT job.job_id, job.workspace_id, job.service_provider, job.service_subject,
+                        job.owner_provider, job.owner_subject, revision.revision,
+                        revision.schedule_kind, revision.schedule_start_at,
+                        revision.interval_millis, revision.prompt, revision.data_class,
+                        revision.max_model_turns, revision.max_actions, revision.enabled,
+                        revision.next_due_at, revision.idempotent, revision.created_at
+                 FROM scheduled_jobs job
+                 JOIN (
+                    SELECT job_id, MAX(revision) AS revision
+                    FROM scheduled_job_revisions
+                    GROUP BY job_id
+                 ) latest ON latest.job_id = job.job_id
+                 JOIN scheduled_job_revisions revision
+                   ON revision.job_id = latest.job_id AND revision.revision = latest.revision
+                 WHERE job.workspace_id = ?
+                 ORDER BY revision.created_at DESC, job.job_id",
+            )
+            .bind(query.workspace_id().to_string())
+            .fetch_all(self.database.pool())
+            .await
+            .map_err(sql_service_error)?;
+            rows.into_iter().map(job_review_from_row).collect()
+        })
+    }
+
+    fn request_job_action(
+        &self,
+        command: JobActionCommand,
+    ) -> ServiceFuture<'_, AutomationActionRequested> {
+        let service = self.clone();
+        Box::pin(async move {
+            let kind = if service
+                .database
+                .latest_scheduled_job_revision(command.job_id())
+                .await
+                .map_err(repository_service_error)?
+                .is_some()
+            {
+                "schedule.job.update"
+            } else {
+                "schedule.job.create"
+            };
+            let capability = Capability::new(
+                if kind == "schedule.job.create" {
+                    CapabilityName::ScheduleCreate
+                } else {
+                    CapabilityName::ScheduleModify
+                },
+                ResourceScope::exact("scheduled_job", command.job_id().to_string())
+                    .map_err(|error| ServiceError::Conflict(error.to_string()))?,
+            );
+            let run_id = service
+                .request_extension_action(
+                    command.workspace_id(),
+                    command.actor().clone(),
+                    scheduled_job_action_proposal(&command, kind),
+                    CapabilitySet::new([capability]),
+                )
+                .await?;
+            Ok(AutomationActionRequested::new(run_id))
+        })
+    }
+
+    fn list_skills(&self, query: SkillReviewQuery) -> ServiceFuture<'_, Vec<SkillReview>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT skill.skill_id, skill.workspace_id, skill.name, skill.description,
+                        version.version, version.source_format, version.source_digest,
+                        version.reviewed, version.created_provider, version.created_subject,
+                        version.reviewed_provider, version.reviewed_subject,
+                        version.created_at, version.reviewed_at,
+                        COALESCE(state.enabled, 0) AS enabled
+                 FROM agent_skills skill
+                 JOIN skill_versions version ON version.skill_id = skill.skill_id
+                 LEFT JOIN skill_workspace_state state
+                   ON state.workspace_id = skill.workspace_id
+                  AND state.skill_id = version.skill_id
+                  AND state.version = version.version
+                 WHERE skill.workspace_id = ?
+                 ORDER BY skill.name, version.version",
+            )
+            .bind(query.workspace_id().to_string())
+            .fetch_all(self.database.pool())
+            .await
+            .map_err(sql_service_error)?;
+            rows.into_iter().map(skill_review_from_row).collect()
+        })
+    }
+
+    fn request_skill_action(
+        &self,
+        command: SkillActionCommand,
+    ) -> ServiceFuture<'_, AutomationActionRequested> {
+        let service = self.clone();
+        Box::pin(async move {
+            if command.kind() != "skill.publish" {
+                return Err(ServiceError::Conflict("unsupported skill action".into()));
+            }
+            let capability = Capability::new(
+                CapabilityName::SkillPublish,
+                ResourceScope::exact("skill", command.skill_id().to_string())
+                    .map_err(|error| ServiceError::Conflict(error.to_string()))?,
+            );
+            let draft_id = command
+                .draft_id()
+                .ok_or_else(|| ServiceError::Conflict("skill publish requires a draft".into()))?;
+            let run_id = service
+                .request_extension_action(
+                    command.workspace_id(),
+                    command.actor().clone(),
+                    ActionProposal::new(
+                        command.kind(),
+                        CanonicalValue::object([
+                            ("draft_id", CanonicalValue::from(draft_id.to_string())),
+                            (
+                                "skill_id",
+                                CanonicalValue::from(command.skill_id().to_string()),
+                            ),
+                            ("version", CanonicalValue::from(command.version().as_str())),
+                            ("name", CanonicalValue::from(command.name())),
+                            ("description", CanonicalValue::from(command.description())),
+                            ("source_format", CanonicalValue::from("markdown")),
+                        ]),
+                    ),
+                    CapabilitySet::new([capability]),
+                )
+                .await?;
+            Ok(AutomationActionRequested::new(run_id))
+        })
+    }
+
+    fn list_capture_drafts(
+        &self,
+        query: SkillReviewQuery,
+    ) -> ServiceFuture<'_, Vec<WorkflowCaptureDraftReview>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT draft_id, workspace_id, title, body, created_provider,
+                        created_subject, created_at
+                 FROM workflow_capture_drafts
+                 WHERE workspace_id = ?
+                 ORDER BY created_at DESC, draft_id",
+            )
+            .bind(query.workspace_id().to_string())
+            .fetch_all(self.database.pool())
+            .await
+            .map_err(sql_service_error)?;
+            rows.into_iter()
+                .map(capture_draft_review_from_row)
+                .collect()
+        })
+    }
+
+    fn capture_workflow(
+        &self,
+        command: CaptureWorkflowCommand,
+    ) -> ServiceFuture<'_, WorkflowCaptureDraftReview> {
+        let service = self.clone();
+        Box::pin(async move {
+            let draft_id = service
+                .capture_workflow_draft(command.run_id(), command.actor().clone())
+                .await?;
+            let draft = service
+                .database
+                .get_workflow_capture_draft(draft_id)
+                .await
+                .map_err(repository_service_error)?
+                .ok_or(ServiceError::NotFound)?;
+            if draft.workspace_id() != command.workspace_id() {
+                return Err(ServiceError::NotFound);
+            }
+            Ok(WorkflowCaptureDraftReview::new(
+                draft.id(),
+                draft.workspace_id(),
+                draft.title(),
+                draft.body(),
+                PrincipalSummary::new(command.actor()),
+                now(),
+            ))
+        })
+    }
 }
 
 async fn apply_provider_policy_update(
@@ -1606,6 +1884,88 @@ fn provider_policy_update_proposal(
             ),
         ]),
     )
+}
+
+fn scheduled_job_action_proposal(command: &JobActionCommand, kind: &str) -> ActionProposal {
+    let (schedule_kind, run_at, start_at, interval_millis) = match command.schedule() {
+        ScheduleSpec::Once { run_at } => (
+            CanonicalValue::from("once"),
+            Some(canonical_u64(run_at.as_u64())),
+            None,
+            None,
+        ),
+        ScheduleSpec::Interval {
+            start_at,
+            interval_millis,
+        } => (
+            CanonicalValue::from("interval"),
+            None,
+            Some(canonical_u64(start_at.as_u64())),
+            Some(canonical_u64(interval_millis)),
+        ),
+    };
+    let mut schedule = BTreeMap::from([("kind".to_owned(), schedule_kind)]);
+    if let Some(run_at) = run_at {
+        schedule.insert("run_at".to_owned(), run_at);
+    }
+    if let Some(start_at) = start_at {
+        schedule.insert("start_at".to_owned(), start_at);
+    }
+    if let Some(interval_millis) = interval_millis {
+        schedule.insert("interval_millis".to_owned(), interval_millis);
+    }
+    let next_due_at = command.schedule().next_after(
+        TimestampMillis::new(now().as_u64().saturating_sub(1)),
+        command.enabled(),
+    );
+    ActionProposal::new(
+        kind,
+        CanonicalValue::object([
+            ("job_id", CanonicalValue::from(command.job_id().to_string())),
+            (
+                "service_provider",
+                CanonicalValue::from(command.service().provider()),
+            ),
+            (
+                "service_subject",
+                CanonicalValue::from(command.service().subject()),
+            ),
+            (
+                "owner_provider",
+                CanonicalValue::from(command.actor().provider()),
+            ),
+            (
+                "owner_subject",
+                CanonicalValue::from(command.actor().subject()),
+            ),
+            ("schedule", CanonicalValue::Object(schedule)),
+            ("prompt", CanonicalValue::from(command.prompt())),
+            (
+                "data_class",
+                CanonicalValue::from(command.data_class().as_str()),
+            ),
+            (
+                "max_model_turns",
+                CanonicalValue::from(i64::from(command.max_model_turns())),
+            ),
+            (
+                "max_actions",
+                CanonicalValue::from(i64::from(command.max_actions())),
+            ),
+            ("enabled", CanonicalValue::from(command.enabled())),
+            (
+                "next_due_at",
+                next_due_at.map_or(CanonicalValue::Null, |timestamp| {
+                    canonical_u64(timestamp.as_u64())
+                }),
+            ),
+            ("idempotent", CanonicalValue::from(command.idempotent())),
+        ]),
+    )
+}
+
+fn canonical_u64(value: u64) -> CanonicalValue {
+    CanonicalValue::from(i64::try_from(value).unwrap_or(i64::MAX))
 }
 
 #[derive(Deserialize)]
@@ -1959,6 +2319,270 @@ fn is_scheduled_job_admin_action(kind: &str) -> bool {
         kind,
         "schedule.job.create" | "schedule.job.update" | "schedule.job.enable"
     )
+}
+
+fn principal_from_columns(
+    row: &sqlx::sqlite::SqliteRow,
+    provider_column: &str,
+    subject_column: &str,
+) -> Result<lumen_core::identity::PrincipalId, ServiceError> {
+    lumen_core::identity::PrincipalId::new(
+        row.try_get::<String, _>(provider_column)
+            .map_err(sql_service_error)?,
+        row.try_get::<String, _>(subject_column)
+            .map_err(sql_service_error)?,
+    )
+    .map_err(|error| ServiceError::Internal(error.to_string()))
+}
+
+fn timestamp_from_sql_row(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<TimestampMillis, ServiceError> {
+    Ok(TimestampMillis::new(
+        u64::try_from(row.try_get::<i64, _>(column).map_err(sql_service_error)?)
+            .map_err(|_| ServiceError::Internal("invalid timestamp".into()))?,
+    ))
+}
+
+fn optional_timestamp_from_sql_row(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<Option<TimestampMillis>, ServiceError> {
+    row.try_get::<Option<i64>, _>(column)
+        .map_err(sql_service_error)?
+        .map(|value| {
+            u64::try_from(value)
+                .map(TimestampMillis::new)
+                .map_err(|_| ServiceError::Internal("invalid timestamp".into()))
+        })
+        .transpose()
+}
+
+fn data_class_from_sql(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<DataClass, ServiceError> {
+    match row
+        .try_get::<String, _>(column)
+        .map_err(sql_service_error)?
+        .as_str()
+    {
+        "public" => Ok(DataClass::Public),
+        "workspace" => Ok(DataClass::Workspace),
+        "sensitive" => Ok(DataClass::Sensitive),
+        _ => Err(ServiceError::Internal("invalid data class".into())),
+    }
+}
+
+fn schedule_from_sql(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleSpec, ServiceError> {
+    let start_at = timestamp_from_sql_row(row, "schedule_start_at")?;
+    match row
+        .try_get::<String, _>("schedule_kind")
+        .map_err(sql_service_error)?
+        .as_str()
+    {
+        "once" => Ok(ScheduleSpec::once(start_at)),
+        "interval" => {
+            let interval_millis = u64::try_from(
+                row.try_get::<i64, _>("interval_millis")
+                    .map_err(sql_service_error)?,
+            )
+            .map_err(|_| ServiceError::Internal("invalid interval".into()))?;
+            ScheduleSpec::interval(start_at, Duration::from_millis(interval_millis))
+                .map_err(|error| ServiceError::Internal(error.to_string()))
+        }
+        _ => Err(ServiceError::Internal("invalid schedule".into())),
+    }
+}
+
+fn job_review_from_row(row: sqlx::sqlite::SqliteRow) -> Result<JobReview, ServiceError> {
+    Ok(JobReview::new(
+        JobId::from_uuid(
+            row.try_get::<String, _>("job_id")
+                .map_err(sql_service_error)?
+                .parse()
+                .map_err(|_| ServiceError::Internal("invalid job ID".into()))?,
+        ),
+        JobRevision::new(
+            u64::try_from(
+                row.try_get::<i64, _>("revision")
+                    .map_err(sql_service_error)?,
+            )
+            .map_err(|_| ServiceError::Internal("invalid job revision".into()))?,
+        )
+        .map_err(|error| ServiceError::Internal(error.to_string()))?,
+        lumen_core::identity::WorkspaceId::from_uuid(
+            row.try_get::<String, _>("workspace_id")
+                .map_err(sql_service_error)?
+                .parse()
+                .map_err(|_| ServiceError::Internal("invalid workspace ID".into()))?,
+        ),
+        PrincipalSummary::new(&principal_from_columns(
+            &row,
+            "service_provider",
+            "service_subject",
+        )?),
+        PrincipalSummary::new(&principal_from_columns(
+            &row,
+            "owner_provider",
+            "owner_subject",
+        )?),
+        schedule_from_sql(&row)?,
+        row.try_get::<String, _>("prompt")
+            .map_err(sql_service_error)?,
+        data_class_from_sql(&row, "data_class")?,
+        u32::try_from(
+            row.try_get::<i64, _>("max_model_turns")
+                .map_err(sql_service_error)?,
+        )
+        .map_err(|_| ServiceError::Internal("invalid model turn budget".into()))?,
+        u32::try_from(
+            row.try_get::<i64, _>("max_actions")
+                .map_err(sql_service_error)?,
+        )
+        .map_err(|_| ServiceError::Internal("invalid action budget".into()))?,
+        row.try_get::<i64, _>("enabled")
+            .map_err(sql_service_error)?
+            == 1,
+        optional_timestamp_from_sql_row(&row, "next_due_at")?,
+        row.try_get::<i64, _>("idempotent")
+            .map_err(sql_service_error)?
+            == 1,
+        timestamp_from_sql_row(&row, "created_at")?,
+    ))
+}
+
+fn skill_review_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SkillReview, ServiceError> {
+    let workspace_id = lumen_core::identity::WorkspaceId::from_uuid(
+        row.try_get::<String, _>("workspace_id")
+            .map_err(sql_service_error)?
+            .parse()
+            .map_err(|_| ServiceError::Internal("invalid workspace ID".into()))?,
+    );
+    let reviewed_by = match (
+        row.try_get::<Option<String>, _>("reviewed_provider")
+            .map_err(sql_service_error)?,
+        row.try_get::<Option<String>, _>("reviewed_subject")
+            .map_err(sql_service_error)?,
+    ) {
+        (Some(provider), Some(subject)) => Some(PrincipalSummary::new(
+            &lumen_core::identity::PrincipalId::new(provider, subject)
+                .map_err(|error| ServiceError::Internal(error.to_string()))?,
+        )),
+        _ => None,
+    };
+    Ok(SkillReview::new(
+        SkillId::from_uuid(
+            row.try_get::<String, _>("skill_id")
+                .map_err(sql_service_error)?
+                .parse()
+                .map_err(|_| ServiceError::Internal("invalid skill ID".into()))?,
+        ),
+        SkillVersion::parse(
+            row.try_get::<String, _>("version")
+                .map_err(sql_service_error)?,
+        )
+        .map_err(|error| ServiceError::Internal(error.to_string()))?,
+        workspace_id,
+        row.try_get::<String, _>("name")
+            .map_err(sql_service_error)?,
+        row.try_get::<String, _>("description")
+            .map_err(sql_service_error)?,
+        row.try_get::<String, _>("source_format")
+            .map_err(sql_service_error)?,
+        row.try_get::<String, _>("source_digest")
+            .map_err(sql_service_error)?,
+        row.try_get::<i64, _>("reviewed")
+            .map_err(sql_service_error)?
+            == 1,
+        row.try_get::<i64, _>("enabled")
+            .map_err(sql_service_error)?
+            == 1,
+        PrincipalSummary::new(&principal_from_columns(
+            &row,
+            "created_provider",
+            "created_subject",
+        )?),
+        reviewed_by,
+        timestamp_from_sql_row(&row, "created_at")?,
+        optional_timestamp_from_sql_row(&row, "reviewed_at")?,
+    ))
+}
+
+fn capture_draft_review_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<WorkflowCaptureDraftReview, ServiceError> {
+    Ok(WorkflowCaptureDraftReview::new(
+        row.try_get::<String, _>("draft_id")
+            .map_err(sql_service_error)?
+            .parse()
+            .map_err(|_| ServiceError::Internal("invalid capture draft ID".into()))?,
+        lumen_core::identity::WorkspaceId::from_uuid(
+            row.try_get::<String, _>("workspace_id")
+                .map_err(sql_service_error)?
+                .parse()
+                .map_err(|_| ServiceError::Internal("invalid workspace ID".into()))?,
+        ),
+        row.try_get::<String, _>("title")
+            .map_err(sql_service_error)?,
+        row.try_get::<String, _>("body")
+            .map_err(sql_service_error)?,
+        PrincipalSummary::new(&principal_from_columns(
+            &row,
+            "created_provider",
+            "created_subject",
+        )?),
+        timestamp_from_sql_row(&row, "created_at")?,
+    ))
+}
+
+fn parse_capability_review(
+    value: &CanonicalValue,
+    workspace_id: lumen_core::identity::WorkspaceId,
+) -> Result<Capability, ServiceError> {
+    let CanonicalValue::Object(object) = value else {
+        return Err(ServiceError::Conflict(
+            "capability grant must be an object".into(),
+        ));
+    };
+    let name = match object.get("name") {
+        Some(CanonicalValue::String(value)) => CapabilityName::parse(value)
+            .ok_or_else(|| ServiceError::Conflict("invalid capability name".into()))?,
+        _ => {
+            return Err(ServiceError::Conflict(
+                "capability grant requires a name".into(),
+            ));
+        }
+    };
+    let scope = match object.get("scope") {
+        Some(CanonicalValue::String(scope)) if scope == "workspace" => {
+            ResourceScope::workspace(workspace_id)
+        }
+        Some(CanonicalValue::Object(scope)) => match (
+            scope.get("type"),
+            scope.get("resource_type"),
+            scope.get("value"),
+        ) {
+            (
+                Some(CanonicalValue::String(kind)),
+                Some(CanonicalValue::String(resource_type)),
+                Some(CanonicalValue::String(resource_value)),
+            ) if kind == "exact" => ResourceScope::exact(resource_type, resource_value)
+                .map_err(|error| ServiceError::Conflict(error.to_string()))?,
+            _ => {
+                return Err(ServiceError::Conflict(
+                    "unsupported capability grant scope".into(),
+                ));
+            }
+        },
+        _ => {
+            return Err(ServiceError::Conflict(
+                "capability grant requires a scope".into(),
+            ));
+        }
+    };
+    Ok(Capability::new(name, scope))
 }
 
 fn channel_mapping_review(

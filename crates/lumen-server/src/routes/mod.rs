@@ -12,6 +12,7 @@ use axum::{
 use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::ApprovalId,
+    automation::{JobId, ScheduleSpec, SkillId, SkillVersion},
     egress::{DataClass, DestinationScope, ProviderId},
     extension::{PluginId, PluginVersion, Sha256Digest},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
@@ -21,9 +22,11 @@ use uuid::Uuid;
 
 use crate::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
-    CancelRunCommand, ChannelMappingCommand, ChannelMappingQuery, CreateRunCommand,
-    DestinationPolicyCommand, DestinationPolicyQuery, PluginActionCommand, PluginDetailsQuery,
-    PluginReviewQuery, ProviderPolicyCommand, ProviderPolicyQuery, ServiceError,
+    CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery,
+    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, JobActionCommand,
+    JobReviewQuery, PluginActionCommand, PluginDetailsQuery, PluginReviewQuery,
+    ProviderPolicyCommand, ProviderPolicyQuery, ServiceError, ServiceIdentityCommand,
+    ServiceIdentityQuery, SkillActionCommand, SkillReviewQuery,
 };
 
 pub fn router(state: ApiState) -> Router {
@@ -73,6 +76,27 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/v1/workspaces/{workspace_id}/egress/providers",
             get(list_provider_policies).post(update_provider_policy),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/automation/service-identities",
+            get(list_service_identities).post(update_service_identity),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/automation/jobs",
+            get(list_jobs),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/automation/jobs/{job_id}",
+            post(request_job_action),
+        )
+        .route("/api/v1/workspaces/{workspace_id}/skills", get(list_skills))
+        .route(
+            "/api/v1/workspaces/{workspace_id}/skills/capture-drafts",
+            get(list_capture_drafts).post(capture_workflow),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/skills/capture-drafts/{draft_id}/publish",
+            post(publish_capture_draft),
         )
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
@@ -275,6 +299,246 @@ async fn update_provider_policy(
         ))
         .await?;
     Ok(Json(policy))
+}
+
+#[derive(Serialize)]
+struct ServiceIdentitiesResponse {
+    service_identities: Vec<crate::ServiceIdentityReview>,
+}
+
+async fn list_service_identities(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<ServiceIdentitiesResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let service_identities = state
+        .service
+        .list_service_identities(ServiceIdentityQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(ServiceIdentitiesResponse { service_identities }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceIdentityBody {
+    subject: String,
+    label: String,
+    enabled: bool,
+    grants: Vec<CanonicalValue>,
+}
+
+async fn update_service_identity(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    body: Result<Json<ServiceIdentityBody>, JsonRejection>,
+) -> Result<Json<crate::ServiceIdentityReview>, ApiError> {
+    let Json(body) =
+        body.map_err(|_| ApiError::BadRequest("invalid service identity body".into()))?;
+    if body.label.trim().is_empty() || body.label.len() > 128 || body.grants.len() > 64 {
+        return Err(ApiError::BadRequest("invalid service identity".into()));
+    }
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let principal = PrincipalId::new("service", body.subject)
+        .map_err(|_| ApiError::BadRequest("invalid service identity".into()))?;
+    let review = state
+        .service
+        .update_service_identity(ServiceIdentityCommand::new(
+            workspace_id,
+            actor,
+            principal,
+            body.label,
+            body.enabled,
+            body.grants,
+        ))
+        .await?;
+    Ok(Json(review))
+}
+
+#[derive(Serialize)]
+struct JobsResponse {
+    jobs: Vec<crate::JobReview>,
+}
+
+async fn list_jobs(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<JobsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let jobs = state
+        .service
+        .list_jobs(JobReviewQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(JobsResponse { jobs }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobActionBody {
+    service_subject: String,
+    schedule: ScheduleSpec,
+    prompt: String,
+    data_class: DataClass,
+    max_model_turns: u32,
+    max_actions: u32,
+    enabled: bool,
+    idempotent: bool,
+}
+
+async fn request_job_action(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path((workspace, job)): Path<(String, String)>,
+    body: Result<Json<JobActionBody>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError::BadRequest("invalid job body".into()))?;
+    if body.prompt.trim().is_empty()
+        || body.prompt.len() > 8192
+        || body.data_class == DataClass::Secret
+        || body.max_model_turns == 0
+        || body.max_actions == 0
+        || matches!(
+            body.schedule,
+            ScheduleSpec::Interval {
+                interval_millis: 0,
+                ..
+            }
+        )
+    {
+        return Err(ApiError::BadRequest("invalid job body".into()));
+    }
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let job_id = parse_job(&job)?;
+    let service = PrincipalId::new("service", body.service_subject)
+        .map_err(|_| ApiError::BadRequest("invalid service identity".into()))?;
+    let result = state
+        .service
+        .request_job_action(JobActionCommand::new(
+            workspace_id,
+            actor,
+            job_id,
+            service,
+            body.schedule,
+            body.prompt,
+            body.data_class,
+            body.max_model_turns,
+            body.max_actions,
+            body.enabled,
+            body.idempotent,
+        ))
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(result)))
+}
+
+#[derive(Serialize)]
+struct SkillsResponse {
+    skills: Vec<crate::SkillReview>,
+}
+
+async fn list_skills(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<SkillsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let skills = state
+        .service
+        .list_skills(SkillReviewQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(SkillsResponse { skills }))
+}
+
+#[derive(Serialize)]
+struct CaptureDraftsResponse {
+    drafts: Vec<crate::WorkflowCaptureDraftReview>,
+}
+
+async fn list_capture_drafts(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+) -> Result<Json<CaptureDraftsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let drafts = state
+        .service
+        .list_capture_drafts(SkillReviewQuery::new(workspace_id, actor))
+        .await?;
+    Ok(Json(CaptureDraftsResponse { drafts }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureWorkflowBody {
+    run_id: RunId,
+}
+
+async fn capture_workflow(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path(workspace): Path<String>,
+    body: Result<Json<CaptureWorkflowBody>, JsonRejection>,
+) -> Result<Json<crate::WorkflowCaptureDraftReview>, ApiError> {
+    let Json(body) =
+        body.map_err(|_| ApiError::BadRequest("invalid workflow capture body".into()))?;
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let draft = state
+        .service
+        .capture_workflow(CaptureWorkflowCommand::new(
+            workspace_id,
+            actor,
+            body.run_id,
+        ))
+        .await?;
+    Ok(Json(draft))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishCaptureDraftBody {
+    skill_id: SkillId,
+    version: String,
+    name: String,
+    description: String,
+}
+
+async fn publish_capture_draft(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path((workspace, draft)): Path<(String, String)>,
+    body: Result<Json<PublishCaptureDraftBody>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError::BadRequest("invalid skill publish body".into()))?;
+    if body.name.trim().is_empty() || body.name.len() > 128 || body.description.len() > 2048 {
+        return Err(ApiError::BadRequest("invalid skill publish body".into()));
+    }
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let draft_id = Uuid::parse_str(&draft)
+        .map_err(|_| ApiError::BadRequest("invalid resource identifier".into()))?;
+    let version = SkillVersion::parse(body.version)
+        .map_err(|_| ApiError::BadRequest("invalid skill version".into()))?;
+    let result = state
+        .service
+        .request_skill_action(SkillActionCommand::publish(
+            workspace_id,
+            actor,
+            draft_id,
+            body.skill_id,
+            version,
+            body.name,
+            body.description,
+        ))
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(result)))
 }
 
 async fn authenticate(
@@ -594,6 +858,10 @@ fn parse_workspace(value: &str) -> Result<WorkspaceId, ApiError> {
 
 fn parse_run(value: &str) -> Result<RunId, ApiError> {
     parse_uuid(value).map(RunId::from_uuid)
+}
+
+fn parse_job(value: &str) -> Result<JobId, ApiError> {
+    parse_uuid(value).map(JobId::from_uuid)
 }
 
 fn parse_approval(value: &str) -> Result<ApprovalId, ApiError> {

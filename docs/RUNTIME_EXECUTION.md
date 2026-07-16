@@ -107,6 +107,14 @@ Workflow capture creates draft skill material only from completed source runs wh
 
 Publishing a capture draft as a reviewed skill is a `skill.publish` action. It requires the `skill.publish` capability, goes through approval, dispatch reservation, execution, and audit, writes immutable local skill source, stores the reviewed skill version digest in SQL, and enables the version for the workspace only after approval is consumed.
 
+## Automation API
+
+The local API exposes workspace-scoped control-surface routes for service identities, scheduled jobs, reviewed skills, and capture drafts. Review/list routes read SQL state and return redacted summaries suitable for operator inspection.
+
+Mutating scheduled jobs and publishing capture drafts do not bypass the action lifecycle. Job create/update requests become `schedule.job.create` or `schedule.job.update` actions with `schedule.create` or `schedule.modify` capabilities. Capture-draft publishing becomes `skill.publish`. These actions require approval under the runtime policy and are applied only after approval consumption, dispatch reservation, and audit.
+
+Service identity updates are bounded to service principals and canonical capability grants. Job routes reject secret data classes, zero budgets, invalid schedules, unknown fields, and out-of-workspace access before service dispatch.
+
 ## Cancellation
 
 Cancellation stops further model turns, revokes pending dispatch reservations, sends protocol cancellation, and terminates the isolated process tree after a grace period. Cancellation is an outcome, not deletion; all prior records remain auditable.

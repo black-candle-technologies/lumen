@@ -310,6 +310,102 @@ test.beforeEach(async ({ page }) => {
 			}
 		});
 	});
+	await page.route('**/api/v1/workspaces/*/automation/service-identities', async (route) => {
+		await route.fulfill({
+			json: {
+				service_identities: [
+					{
+						principal: { provider: 'service', subject: 'nightly' },
+						workspace_id: workspaceId,
+						owner: { provider: 'local', subject: 'operator' },
+						label: 'Nightly reviewer',
+						enabled: true,
+						grants: [{ name: 'model.prompt', scope: 'workspace' }],
+						created_at: 10,
+						updated_at: 20
+					}
+				]
+			}
+		});
+	});
+	await page.route('**/api/v1/workspaces/*/automation/jobs', async (route) => {
+		await route.fulfill({
+			json: {
+				jobs: [
+					{
+						job_id: '05e0bb38-b491-4532-b9b6-0ac57ec4f357',
+						revision: 2,
+						workspace_id: workspaceId,
+						service: { provider: 'service', subject: 'nightly' },
+						owner: { provider: 'local', subject: 'operator' },
+						schedule: { kind: 'interval', start_at: 1000, interval_millis: 60000 },
+						prompt: `Summarize ${'open issue queues '.repeat(10)}`,
+						data_class: 'workspace',
+						max_model_turns: 4,
+						max_actions: 8,
+						enabled: true,
+						next_due_at: 2000,
+						idempotent: true,
+						created_at: 10
+					}
+				]
+			}
+		});
+	});
+	await page.route('**/api/v1/workspaces/*/automation/jobs/*', async (route) => {
+		expect(route.request().postDataJSON()).toMatchObject({
+			service_subject: 'nightly',
+			enabled: false,
+			data_class: 'workspace'
+		});
+		await route.fulfill({ status: 202, json: { run_id: 'run-job', state: 'approval_requested' } });
+	});
+	await page.route('**/api/v1/workspaces/*/skills/capture-drafts/*/publish', async (route) => {
+		expect(route.request().postDataJSON()).toMatchObject({
+			version: '1.0.0',
+			name: 'Captured triage workflow'
+		});
+		await route.fulfill({ status: 202, json: { run_id: 'run-skill', state: 'approval_requested' } });
+	});
+	await page.route('**/api/v1/workspaces/*/skills/capture-drafts', async (route) => {
+		await route.fulfill({
+			json: {
+				drafts: [
+					{
+						draft_id: '00000000-0000-0000-0000-000000000000',
+						workspace_id: workspaceId,
+						title: 'Captured triage workflow',
+						body: `Source run: run-1\nAction: process.spawn\nSecret: [redacted]\n${'Expected output retained. '.repeat(30)}`,
+						created_by: { provider: 'local', subject: 'operator' },
+						created_at: 30
+					}
+				]
+			}
+		});
+	});
+	await page.route('**/api/v1/workspaces/*/skills', async (route) => {
+		await route.fulfill({
+			json: {
+				skills: [
+					{
+						skill_id: '7f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763',
+						version: '1.0.0',
+						workspace_id: workspaceId,
+						name: 'Issue triage',
+						description: 'Summarize and route issue queues',
+						source_format: 'markdown',
+						source_digest: 'a'.repeat(64),
+						reviewed: true,
+						enabled: true,
+						created_by: { provider: 'local', subject: 'operator' },
+						reviewed_by: { provider: 'local', subject: 'reviewer' },
+						created_at: 10,
+						reviewed_at: 20
+					}
+				]
+			}
+		});
+	});
 });
 
 test('streams a local chat result and can request cancellation', async ({ page }, testInfo) => {
@@ -441,4 +537,34 @@ test('shows egress channel controls and updates allowlisting', async ({ page }, 
 	await page.getByRole('button', { name: 'Disable slack T123 C456' }).click();
 	await expect(page.getByText('Disabled slack:T123:C456')).toBeVisible();
 	await page.screenshot({ path: testInfo.outputPath('egress.png') });
+});
+
+test('shows automation controls and pauses scheduled jobs through approval requests', async ({ page }, testInfo) => {
+	await page.goto('/automation');
+
+	await expect(page.getByRole('heading', { name: 'Automation' })).toBeVisible();
+	await expect(page.getByText('Nightly reviewer')).toBeVisible();
+	await expect(page.getByText('service/nightly').first()).toBeVisible();
+	await expect(page.getByText('every 60000 ms from 1000')).toBeVisible();
+	await expect(page.getByText('model.prompt')).toHaveCount(0);
+	await expect(page.getByText('browser-secret-must-not-render')).toHaveCount(0);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: /Pause job/ }).click();
+	await expect(page.getByText('Approval requested: run-job')).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('automation.png') });
+});
+
+test('shows skill reviews and publishes capture drafts without revealing secrets', async ({ page }, testInfo) => {
+	await page.goto('/skills');
+
+	await expect(page.getByRole('heading', { name: 'Skills' })).toBeVisible();
+	await expect(page.getByText('Issue triage')).toBeVisible();
+	await expect(page.getByText('a'.repeat(64))).toBeVisible();
+	await expect(page.getByText('Captured triage workflow')).toBeVisible();
+	await expect(page.getByText('[redacted]')).toBeVisible();
+	await expect(page.getByText('browser-secret-must-not-render')).toHaveCount(0);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: 'Publish capture draft Captured triage workflow' }).click();
+	await expect(page.getByText('Approval requested: run-skill')).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('skills.png') });
 });

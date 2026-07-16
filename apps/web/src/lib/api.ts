@@ -162,6 +162,88 @@ export type ProviderPolicyUpdate = {
 	workspace_allowed_data_classes: DataClass[];
 };
 
+export type ServiceIdentity = {
+	principal: PrincipalSummary;
+	workspace_id: string;
+	owner: PrincipalSummary;
+	label: string;
+	enabled: boolean;
+	grants: JsonValue[];
+	created_at: number;
+	updated_at: number;
+};
+
+export type ServiceIdentityUpdate = {
+	subject: string;
+	label: string;
+	enabled: boolean;
+	grants: JsonValue[];
+};
+
+export type ScheduleSpec =
+	| { kind: 'once'; run_at: number }
+	| { kind: 'interval'; start_at: number; interval_millis: number };
+
+export type JobReview = {
+	job_id: string;
+	revision: number;
+	workspace_id: string;
+	service: PrincipalSummary;
+	owner: PrincipalSummary;
+	schedule: ScheduleSpec;
+	prompt: string;
+	data_class: DataClass;
+	max_model_turns: number;
+	max_actions: number;
+	enabled: boolean;
+	next_due_at?: number | null;
+	idempotent: boolean;
+	created_at: number;
+};
+
+export type JobActionRequest = {
+	service_subject: string;
+	schedule: ScheduleSpec;
+	prompt: string;
+	data_class: DataClass;
+	max_model_turns: number;
+	max_actions: number;
+	enabled: boolean;
+	idempotent: boolean;
+};
+
+export type SkillReview = {
+	skill_id: string;
+	version: string;
+	workspace_id: string;
+	name: string;
+	description: string;
+	source_format: string;
+	source_digest: string;
+	reviewed: boolean;
+	enabled: boolean;
+	created_by: PrincipalSummary;
+	reviewed_by?: PrincipalSummary | null;
+	created_at: number;
+	reviewed_at?: number | null;
+};
+
+export type WorkflowCaptureDraft = {
+	draft_id: string;
+	workspace_id: string;
+	title: string;
+	body: string;
+	created_by: PrincipalSummary;
+	created_at: number;
+};
+
+export type SkillPublishRequest = {
+	skill_id: string;
+	version: string;
+	name: string;
+	description: string;
+};
+
 export class ApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -255,6 +337,64 @@ export class ApiClient {
 
 	async updateProviderPolicy(request: ProviderPolicyUpdate): Promise<ProviderPolicy> {
 		return this.request('egress/providers', { method: 'POST', body: JSON.stringify(request) });
+	}
+
+	async listServiceIdentities(): Promise<ServiceIdentity[]> {
+		const response = await this.request<{ service_identities: ServiceIdentity[] }>(
+			'automation/service-identities'
+		);
+		return response.service_identities;
+	}
+
+	async updateServiceIdentity(request: ServiceIdentityUpdate): Promise<ServiceIdentity> {
+		return this.request('automation/service-identities', {
+			method: 'POST',
+			body: JSON.stringify(request)
+		});
+	}
+
+	async listJobs(): Promise<JobReview[]> {
+		const response = await this.request<{ jobs: JobReview[] }>('automation/jobs');
+		return response.jobs;
+	}
+
+	async requestJobAction(
+		jobId: string,
+		request: JobActionRequest
+	): Promise<{ run_id: string; state: string }> {
+		return this.request(`automation/jobs/${encodeURIComponent(jobId)}`, {
+			method: 'POST',
+			body: JSON.stringify(request)
+		});
+	}
+
+	async listSkills(): Promise<SkillReview[]> {
+		const response = await this.request<{ skills: SkillReview[] }>('skills');
+		return response.skills;
+	}
+
+	async listCaptureDrafts(): Promise<WorkflowCaptureDraft[]> {
+		const response = await this.request<{ drafts: WorkflowCaptureDraft[] }>(
+			'skills/capture-drafts'
+		);
+		return response.drafts;
+	}
+
+	async captureWorkflow(runId: string): Promise<WorkflowCaptureDraft> {
+		return this.request('skills/capture-drafts', {
+			method: 'POST',
+			body: JSON.stringify({ run_id: runId })
+		});
+	}
+
+	async publishCaptureDraft(
+		draftId: string,
+		request: SkillPublishRequest
+	): Promise<{ run_id: string; state: string }> {
+		return this.request(`skills/capture-drafts/${encodeURIComponent(draftId)}/publish`, {
+			method: 'POST',
+			body: JSON.stringify(request)
+		});
 	}
 
 	async streamRunEvents(

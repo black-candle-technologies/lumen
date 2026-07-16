@@ -3,11 +3,13 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import Bot from '@lucide/svelte/icons/bot';
+	import BookOpenCheck from '@lucide/svelte/icons/book-open-check';
 	import CheckSquare from '@lucide/svelte/icons/square-check';
 	import FileClock from '@lucide/svelte/icons/file-clock';
 	import Puzzle from '@lucide/svelte/icons/puzzle';
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import Settings from '@lucide/svelte/icons/settings';
+	import Timer from '@lucide/svelte/icons/timer';
 	import favicon from '$lib/assets/favicon.svg';
 	import ConnectionDialog from '$lib/components/ConnectionDialog.svelte';
 	import { connection, isConfigured, loadConnection, saveConnection } from '$lib/connection';
@@ -23,6 +25,8 @@
 	const navigation = [
 		{ href: '/', label: 'Chat', icon: Bot },
 		{ href: '/approvals', label: 'Approvals', icon: CheckSquare },
+		{ href: '/automation', label: 'Automation', icon: Timer },
+		{ href: '/skills', label: 'Skills', icon: BookOpenCheck },
 		{ href: '/plugins', label: 'Plugins', icon: Puzzle },
 		{ href: '/egress', label: 'Egress', icon: ShieldCheck },
 		{ href: '/audit', label: 'Audit', icon: FileClock }

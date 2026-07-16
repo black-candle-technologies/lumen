@@ -13,22 +13,27 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
+    automation::{JobId, JobRevision, ScheduleSpec, SkillId, SkillVersion},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
 };
 use lumen_server::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
-    ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, CancelRunCommand,
-    ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview, CreateRunCommand,
-    DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview, EventBroker,
+    ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested,
+    CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery,
+    ChannelMappingReview, CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery,
+    DestinationPolicyReview, EventBroker, JobActionCommand, JobReview, JobReviewQuery,
     PluginActionCommand, PluginActionRequested, PluginComponentReview, PluginDetailsQuery,
     PluginFailureReview, PluginReviewQuery, PluginSettingReview, PluginVersionDetails,
     PrincipalSummary, ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview,
     RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceError,
-    ServiceFuture, StagedPluginReview, WorkspaceModelPolicyReview, router,
+    ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery, ServiceIdentityReview,
+    SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
+    WorkflowCaptureDraftReview, WorkspaceModelPolicyReview, router,
 };
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const TOKEN: &str = "local-test-token";
 
@@ -53,6 +58,17 @@ struct FakeService {
     provider_policy_queries: Mutex<Vec<ProviderPolicyQuery>>,
     provider_policy_commands: Mutex<Vec<ProviderPolicyCommand>>,
     provider_policy_reviews: Mutex<Vec<ProviderPolicyReview>>,
+    service_identity_queries: Mutex<Vec<ServiceIdentityQuery>>,
+    service_identity_commands: Mutex<Vec<ServiceIdentityCommand>>,
+    service_identity_reviews: Mutex<Vec<ServiceIdentityReview>>,
+    job_queries: Mutex<Vec<JobReviewQuery>>,
+    job_action_commands: Mutex<Vec<JobActionCommand>>,
+    job_reviews: Mutex<Vec<JobReview>>,
+    skill_queries: Mutex<Vec<SkillReviewQuery>>,
+    skill_action_commands: Mutex<Vec<SkillActionCommand>>,
+    skill_reviews: Mutex<Vec<SkillReview>>,
+    capture_commands: Mutex<Vec<CaptureWorkflowCommand>>,
+    capture_drafts: Mutex<Vec<WorkflowCaptureDraftReview>>,
 }
 
 impl RuntimeService for FakeService {
@@ -328,6 +344,113 @@ impl RuntimeService for FakeService {
                     TimestampMillis::new(2_000),
                 )),
                 TimestampMillis::new(1_000),
+            ))
+        })
+    }
+
+    fn list_service_identities(
+        &self,
+        query: ServiceIdentityQuery,
+    ) -> ServiceFuture<'_, Vec<ServiceIdentityReview>> {
+        self.service_identity_queries
+            .lock()
+            .expect("service identity queries")
+            .push(query);
+        let reviews = self
+            .service_identity_reviews
+            .lock()
+            .expect("service identity reviews")
+            .clone();
+        Box::pin(async move { Ok(reviews) })
+    }
+
+    fn update_service_identity(
+        &self,
+        command: ServiceIdentityCommand,
+    ) -> ServiceFuture<'_, ServiceIdentityReview> {
+        self.service_identity_commands
+            .lock()
+            .expect("service identity commands")
+            .push(command.clone());
+        Box::pin(async move {
+            Ok(ServiceIdentityReview::new(
+                PrincipalSummary::new(command.principal()),
+                command.workspace_id(),
+                PrincipalSummary::new(command.actor()),
+                command.label(),
+                command.enabled(),
+                command.grants().to_vec(),
+                TimestampMillis::new(10),
+                TimestampMillis::new(20),
+            ))
+        })
+    }
+
+    fn list_jobs(&self, query: JobReviewQuery) -> ServiceFuture<'_, Vec<JobReview>> {
+        self.job_queries.lock().expect("job queries").push(query);
+        let reviews = self.job_reviews.lock().expect("job reviews").clone();
+        Box::pin(async move { Ok(reviews) })
+    }
+
+    fn request_job_action(
+        &self,
+        command: JobActionCommand,
+    ) -> ServiceFuture<'_, AutomationActionRequested> {
+        self.job_action_commands
+            .lock()
+            .expect("job action commands")
+            .push(command);
+        Box::pin(async { Ok(AutomationActionRequested::new(RunId::new())) })
+    }
+
+    fn list_skills(&self, query: SkillReviewQuery) -> ServiceFuture<'_, Vec<SkillReview>> {
+        self.skill_queries
+            .lock()
+            .expect("skill queries")
+            .push(query);
+        let reviews = self.skill_reviews.lock().expect("skill reviews").clone();
+        Box::pin(async move { Ok(reviews) })
+    }
+
+    fn request_skill_action(
+        &self,
+        command: SkillActionCommand,
+    ) -> ServiceFuture<'_, AutomationActionRequested> {
+        self.skill_action_commands
+            .lock()
+            .expect("skill action commands")
+            .push(command);
+        Box::pin(async { Ok(AutomationActionRequested::new(RunId::new())) })
+    }
+
+    fn list_capture_drafts(
+        &self,
+        query: SkillReviewQuery,
+    ) -> ServiceFuture<'_, Vec<WorkflowCaptureDraftReview>> {
+        self.skill_queries
+            .lock()
+            .expect("skill queries")
+            .push(query);
+        let drafts = self.capture_drafts.lock().expect("capture drafts").clone();
+        Box::pin(async move { Ok(drafts) })
+    }
+
+    fn capture_workflow(
+        &self,
+        command: CaptureWorkflowCommand,
+    ) -> ServiceFuture<'_, WorkflowCaptureDraftReview> {
+        self.capture_commands
+            .lock()
+            .expect("capture commands")
+            .push(command.clone());
+        Box::pin(async move {
+            Ok(WorkflowCaptureDraftReview::new(
+                Uuid::nil(),
+                command.workspace_id(),
+                "Captured workflow",
+                "Source run: redacted",
+                PrincipalSummary::new(command.actor()),
+                TimestampMillis::new(30),
             ))
         })
     }
@@ -726,6 +849,273 @@ async fn provider_policy_updates_validate_data_classes_and_forward() {
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn automation_control_routes_are_authenticated_scoped_and_validated() {
+    let workspace_id = WorkspaceId::new();
+    let job_id = JobId::new();
+    let skill_id = SkillId::new();
+    let (app, service, _) = test_app(workspace_id);
+    service
+        .service_identity_reviews
+        .lock()
+        .expect("service identities")
+        .push(ServiceIdentityReview::new(
+            PrincipalSummary::new(&PrincipalId::new("service", "nightly").expect("service")),
+            workspace_id,
+            PrincipalSummary::new(&PrincipalId::new("local", "operator").expect("owner")),
+            "Nightly reviewer",
+            true,
+            vec![CanonicalValue::object([
+                ("name", CanonicalValue::from("model.prompt")),
+                ("scope", CanonicalValue::from("workspace")),
+            ])],
+            TimestampMillis::new(10),
+            TimestampMillis::new(20),
+        ));
+    service
+        .job_reviews
+        .lock()
+        .expect("jobs")
+        .push(JobReview::new(
+            job_id,
+            JobRevision::new(2).expect("revision"),
+            workspace_id,
+            PrincipalSummary::new(&PrincipalId::new("service", "nightly").expect("service")),
+            PrincipalSummary::new(&PrincipalId::new("local", "operator").expect("owner")),
+            ScheduleSpec::interval(
+                TimestampMillis::new(1_000),
+                std::time::Duration::from_secs(60),
+            )
+            .expect("schedule"),
+            "Summarize open issues",
+            DataClass::Workspace,
+            4,
+            8,
+            true,
+            Some(TimestampMillis::new(2_000)),
+            true,
+            TimestampMillis::new(10),
+        ));
+    service
+        .skill_reviews
+        .lock()
+        .expect("skills")
+        .push(SkillReview::new(
+            skill_id,
+            SkillVersion::parse("1.0.0").expect("version"),
+            workspace_id,
+            "Issue triage",
+            "Summarize and route issue queues",
+            "markdown",
+            "a".repeat(64),
+            true,
+            true,
+            PrincipalSummary::new(&PrincipalId::new("local", "operator").expect("creator")),
+            Some(PrincipalSummary::new(
+                &PrincipalId::new("local", "reviewer").expect("reviewer"),
+            )),
+            TimestampMillis::new(10),
+            Some(TimestampMillis::new(20)),
+        ));
+    service
+        .capture_drafts
+        .lock()
+        .expect("capture drafts")
+        .push(WorkflowCaptureDraftReview::new(
+            Uuid::nil(),
+            workspace_id,
+            "Captured workflow",
+            "no secret token",
+            PrincipalSummary::new(&PrincipalId::new("local", "operator").expect("creator")),
+            TimestampMillis::new(30),
+        ));
+
+    let identities = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/automation/service-identities"),
+            Body::empty(),
+        ))
+        .await
+        .expect("identities response");
+    assert_eq!(identities.status(), StatusCode::OK);
+    let body = json_body(identities).await;
+    assert_eq!(
+        body["service_identities"][0]["principal"]["subject"],
+        "nightly"
+    );
+    assert_eq!(
+        body["service_identities"][0]["grants"][0]["name"],
+        "model.prompt"
+    );
+
+    let updated_identity = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/automation/service-identities"),
+            Body::from(
+                serde_json::json!({
+                    "subject":"nightly",
+                    "label":"Nightly reviewer",
+                    "enabled":true,
+                    "grants":[{"name":"model.prompt","scope":"workspace"}]
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .expect("identity update");
+    assert_eq!(updated_identity.status(), StatusCode::OK);
+
+    let jobs = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/automation/jobs"),
+            Body::empty(),
+        ))
+        .await
+        .expect("jobs response");
+    assert_eq!(jobs.status(), StatusCode::OK);
+    let body = json_body(jobs).await;
+    assert_eq!(body["jobs"][0]["job_id"], job_id.to_string());
+    assert_eq!(body["jobs"][0]["schedule"]["kind"], "interval");
+
+    let job_update = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/automation/jobs/{job_id}"),
+            Body::from(
+                serde_json::json!({
+                    "service_subject":"nightly",
+                    "schedule":{"kind":"once","run_at":3_000},
+                    "prompt":"Summarize open issues",
+                    "data_class":"workspace",
+                    "max_model_turns":4,
+                    "max_actions":8,
+                    "enabled":false,
+                    "idempotent":true
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .expect("job update");
+    assert_eq!(job_update.status(), StatusCode::ACCEPTED);
+
+    let skills = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/skills"),
+            Body::empty(),
+        ))
+        .await
+        .expect("skills response");
+    assert_eq!(skills.status(), StatusCode::OK);
+    let body = json_body(skills).await;
+    assert_eq!(body["skills"][0]["skill_id"], skill_id.to_string());
+    assert_eq!(body["skills"][0]["source_digest"], "a".repeat(64));
+
+    let drafts = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/skills/capture-drafts"),
+            Body::empty(),
+        ))
+        .await
+        .expect("drafts response");
+    assert_eq!(drafts.status(), StatusCode::OK);
+    let body = json_body(drafts).await;
+    assert_eq!(body["drafts"][0]["body"], "no secret token");
+
+    let capture = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/skills/capture-drafts"),
+            Body::from(serde_json::json!({ "run_id": RunId::new() }).to_string()),
+        ))
+        .await
+        .expect("capture response");
+    assert_eq!(capture.status(), StatusCode::OK);
+
+    let publish = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!(
+                "/api/v1/workspaces/{workspace_id}/skills/capture-drafts/{}/publish",
+                Uuid::nil()
+            ),
+            Body::from(
+                serde_json::json!({
+                    "skill_id": skill_id,
+                    "version":"1.0.1",
+                    "name":"Issue triage",
+                    "description":"Summarize and route issue queues"
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .expect("publish response");
+    assert_eq!(publish.status(), StatusCode::ACCEPTED);
+
+    let bad_job = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/automation/jobs/{job_id}"),
+            Body::from(
+                serde_json::json!({
+                    "service_subject":"nightly",
+                    "schedule":{"kind":"interval","start_at":3_000,"interval_millis":0},
+                    "prompt":"Summarize open issues",
+                    "data_class":"secret",
+                    "max_model_turns":4,
+                    "max_actions":8,
+                    "enabled":true,
+                    "idempotent":true,
+                    "extra":"rejected"
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .expect("bad job response");
+    assert_eq!(bad_job.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        service
+            .service_identity_queries
+            .lock()
+            .expect("identity queries")[0]
+            .actor()
+            .subject(),
+        "operator"
+    );
+    assert_eq!(
+        service
+            .job_action_commands
+            .lock()
+            .expect("job action commands")[0]
+            .job_id(),
+        job_id
+    );
+    assert_eq!(
+        service
+            .skill_action_commands
+            .lock()
+            .expect("skill commands")[0]
+            .kind(),
+        "skill.publish"
+    );
 }
 
 fn request(method: &str, uri: String, body: Body) -> Request<Body> {

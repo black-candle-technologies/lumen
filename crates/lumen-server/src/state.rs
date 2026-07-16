@@ -9,6 +9,7 @@ use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     audit::{AuditEventId, AuditEventKind, AuditOutcome},
+    automation::{JobId, JobRevision, ScheduleSpec, SkillId, SkillVersion},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
     secret::SecretRefId,
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::EventBroker;
 
@@ -64,6 +66,32 @@ pub trait RuntimeService: Send + Sync {
         &self,
         command: ProviderPolicyCommand,
     ) -> ServiceFuture<'_, ProviderPolicyReview>;
+    fn list_service_identities(
+        &self,
+        query: ServiceIdentityQuery,
+    ) -> ServiceFuture<'_, Vec<ServiceIdentityReview>>;
+    fn update_service_identity(
+        &self,
+        command: ServiceIdentityCommand,
+    ) -> ServiceFuture<'_, ServiceIdentityReview>;
+    fn list_jobs(&self, query: JobReviewQuery) -> ServiceFuture<'_, Vec<JobReview>>;
+    fn request_job_action(
+        &self,
+        command: JobActionCommand,
+    ) -> ServiceFuture<'_, AutomationActionRequested>;
+    fn list_skills(&self, query: SkillReviewQuery) -> ServiceFuture<'_, Vec<SkillReview>>;
+    fn request_skill_action(
+        &self,
+        command: SkillActionCommand,
+    ) -> ServiceFuture<'_, AutomationActionRequested>;
+    fn list_capture_drafts(
+        &self,
+        query: SkillReviewQuery,
+    ) -> ServiceFuture<'_, Vec<WorkflowCaptureDraftReview>>;
+    fn capture_workflow(
+        &self,
+        command: CaptureWorkflowCommand,
+    ) -> ServiceFuture<'_, WorkflowCaptureDraftReview>;
 }
 
 #[derive(Clone)]
@@ -838,6 +866,504 @@ impl ProviderPolicyReview {
         self.state = Some("approval_requested");
         self.approval_run_id = Some(run_id);
         self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceIdentityQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl ServiceIdentityQuery {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceIdentityCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    principal: PrincipalId,
+    label: String,
+    enabled: bool,
+    grants: Vec<CanonicalValue>,
+}
+
+impl ServiceIdentityCommand {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        principal: PrincipalId,
+        label: String,
+        enabled: bool,
+        grants: Vec<CanonicalValue>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            principal,
+            label,
+            enabled,
+            grants,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn grants(&self) -> &[CanonicalValue] {
+        &self.grants
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServiceIdentityReview {
+    principal: PrincipalSummary,
+    workspace_id: WorkspaceId,
+    owner: PrincipalSummary,
+    label: String,
+    enabled: bool,
+    grants: Vec<CanonicalValue>,
+    created_at: TimestampMillis,
+    updated_at: TimestampMillis,
+}
+
+impl ServiceIdentityReview {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        principal: PrincipalSummary,
+        workspace_id: WorkspaceId,
+        owner: PrincipalSummary,
+        label: impl Into<String>,
+        enabled: bool,
+        grants: Vec<CanonicalValue>,
+        created_at: TimestampMillis,
+        updated_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            principal,
+            workspace_id,
+            owner,
+            label: label.into(),
+            enabled,
+            grants,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobReviewQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl JobReviewQuery {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobActionCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    job_id: JobId,
+    service: PrincipalId,
+    schedule: ScheduleSpec,
+    prompt: String,
+    data_class: DataClass,
+    max_model_turns: u32,
+    max_actions: u32,
+    enabled: bool,
+    idempotent: bool,
+}
+
+impl JobActionCommand {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        job_id: JobId,
+        service: PrincipalId,
+        schedule: ScheduleSpec,
+        prompt: String,
+        data_class: DataClass,
+        max_model_turns: u32,
+        max_actions: u32,
+        enabled: bool,
+        idempotent: bool,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            job_id,
+            service,
+            schedule,
+            prompt,
+            data_class,
+            max_model_turns,
+            max_actions,
+            enabled,
+            idempotent,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub const fn service(&self) -> &PrincipalId {
+        &self.service
+    }
+
+    pub const fn schedule(&self) -> ScheduleSpec {
+        self.schedule
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub const fn data_class(&self) -> DataClass {
+        self.data_class
+    }
+
+    pub const fn max_model_turns(&self) -> u32 {
+        self.max_model_turns
+    }
+
+    pub const fn max_actions(&self) -> u32 {
+        self.max_actions
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn idempotent(&self) -> bool {
+        self.idempotent
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JobReview {
+    job_id: JobId,
+    revision: JobRevision,
+    workspace_id: WorkspaceId,
+    service: PrincipalSummary,
+    owner: PrincipalSummary,
+    schedule: ScheduleSpec,
+    prompt: String,
+    data_class: DataClass,
+    max_model_turns: u32,
+    max_actions: u32,
+    enabled: bool,
+    next_due_at: Option<TimestampMillis>,
+    idempotent: bool,
+    created_at: TimestampMillis,
+}
+
+impl JobReview {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        job_id: JobId,
+        revision: JobRevision,
+        workspace_id: WorkspaceId,
+        service: PrincipalSummary,
+        owner: PrincipalSummary,
+        schedule: ScheduleSpec,
+        prompt: impl Into<String>,
+        data_class: DataClass,
+        max_model_turns: u32,
+        max_actions: u32,
+        enabled: bool,
+        next_due_at: Option<TimestampMillis>,
+        idempotent: bool,
+        created_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            job_id,
+            revision,
+            workspace_id,
+            service,
+            owner,
+            schedule,
+            prompt: prompt.into(),
+            data_class,
+            max_model_turns,
+            max_actions,
+            enabled,
+            next_due_at,
+            idempotent,
+            created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillReviewQuery {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+}
+
+impl SkillReviewQuery {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillActionCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    kind: String,
+    draft_id: Option<Uuid>,
+    skill_id: SkillId,
+    version: SkillVersion,
+    name: String,
+    description: String,
+}
+
+impl SkillActionCommand {
+    pub(crate) fn publish(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        draft_id: Uuid,
+        skill_id: SkillId,
+        version: SkillVersion,
+        name: String,
+        description: String,
+    ) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            kind: "skill.publish".to_owned(),
+            draft_id: Some(draft_id),
+            skill_id,
+            version,
+            name,
+            description,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub const fn draft_id(&self) -> Option<Uuid> {
+        self.draft_id
+    }
+
+    pub const fn skill_id(&self) -> SkillId {
+        self.skill_id
+    }
+
+    pub const fn version(&self) -> &SkillVersion {
+        &self.version
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SkillReview {
+    skill_id: SkillId,
+    version: SkillVersion,
+    workspace_id: WorkspaceId,
+    name: String,
+    description: String,
+    source_format: String,
+    source_digest: String,
+    reviewed: bool,
+    enabled: bool,
+    created_by: PrincipalSummary,
+    reviewed_by: Option<PrincipalSummary>,
+    created_at: TimestampMillis,
+    reviewed_at: Option<TimestampMillis>,
+}
+
+impl SkillReview {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        skill_id: SkillId,
+        version: SkillVersion,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        source_format: impl Into<String>,
+        source_digest: impl Into<String>,
+        reviewed: bool,
+        enabled: bool,
+        created_by: PrincipalSummary,
+        reviewed_by: Option<PrincipalSummary>,
+        created_at: TimestampMillis,
+        reviewed_at: Option<TimestampMillis>,
+    ) -> Self {
+        Self {
+            skill_id,
+            version,
+            workspace_id,
+            name: name.into(),
+            description: description.into(),
+            source_format: source_format.into(),
+            source_digest: source_digest.into(),
+            reviewed,
+            enabled,
+            created_by,
+            reviewed_by,
+            created_at,
+            reviewed_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureWorkflowCommand {
+    workspace_id: WorkspaceId,
+    actor: PrincipalId,
+    run_id: RunId,
+}
+
+impl CaptureWorkflowCommand {
+    pub(crate) const fn new(workspace_id: WorkspaceId, actor: PrincipalId, run_id: RunId) -> Self {
+        Self {
+            workspace_id,
+            actor,
+            run_id,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowCaptureDraftReview {
+    draft_id: Uuid,
+    workspace_id: WorkspaceId,
+    title: String,
+    body: String,
+    created_by: PrincipalSummary,
+    created_at: TimestampMillis,
+}
+
+impl WorkflowCaptureDraftReview {
+    pub fn new(
+        draft_id: Uuid,
+        workspace_id: WorkspaceId,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        created_by: PrincipalSummary,
+        created_at: TimestampMillis,
+    ) -> Self {
+        Self {
+            draft_id,
+            workspace_id,
+            title: title.into(),
+            body: body.into(),
+            created_by,
+            created_at,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct AutomationActionRequested {
+    run_id: RunId,
+    state: &'static str,
+}
+
+impl AutomationActionRequested {
+    pub const fn new(run_id: RunId) -> Self {
+        Self {
+            run_id,
+            state: "approval_requested",
+        }
     }
 }
 
