@@ -74,7 +74,9 @@ A scheduled job creates an ordinary run with explicit job origin metadata. The r
 
 The occurrence key is derived from `job_id + job_revision + scheduled_for`. It is stable across crash recovery and is the idempotency anchor for scheduler lease and duplicate-run prevention.
 
-The local scheduler claims due occurrences through SQLite leases, creates runs as the service principal, and advances `next_due_at` only after a run has been reserved for the occurrence. Disabled jobs, disabled service identities, active leases, existing occurrence run IDs, and unreadable service grants fail closed before a duplicate run can be created.
+The local scheduler claims due occurrences through SQLite leases, creates runs as the service principal, and advances `next_due_at` only after a run has been reserved for the occurrence. Disabled jobs, disabled service identities, active leases, existing non-unknown occurrence run IDs, and unreadable service grants fail closed before a duplicate run can be created.
+
+When a scheduled occurrence reaches a terminal run outcome, the occurrence row is updated to `succeeded`, `failed`, `cancelled`, or `unknown`. Idempotent jobs may replace an `unknown` occurrence run with a new retry run. Non-idempotent jobs leave the unknown run attached to the occurrence for operator reconciliation.
 
 ## Approval Concurrency
 

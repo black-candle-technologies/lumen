@@ -12,7 +12,7 @@ use lumen_core::{
         TimestampMillis,
     },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
-    automation::{JobOrigin, OccurrenceKey},
+    automation::{JobId, JobOrigin, JobRevision, OccurrenceKey, ScheduleSpec},
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
     egress::{DataClass, DestinationScope, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
@@ -318,12 +318,15 @@ impl LocalRuntimeService {
             return Ok(None);
         };
         let occurrence = OccurrenceKey::new(job.job_id(), job.revision(), scheduled_for);
-        if self
+        if let Some(existing) = self
             .database
-            .scheduled_occurrence_run_id(&occurrence)
+            .scheduled_occurrence_record(&occurrence)
             .await
-            .map_err(|error| ServiceError::Internal(format!("load scheduled occurrence: {error}")))?
-            .is_some()
+            .map_err(|error| {
+                ServiceError::Internal(format!("load scheduled occurrence: {error}"))
+            })?
+            && existing.run_id().is_some()
+            && (existing.state() != "unknown" || !job.idempotent())
         {
             return Ok(None);
         }
@@ -344,13 +347,15 @@ impl LocalRuntimeService {
         }
         if let Some(existing) = self
             .database
-            .scheduled_occurrence_run_id(&occurrence)
+            .scheduled_occurrence_record(&occurrence)
             .await
             .map_err(|error| {
                 ServiceError::Internal(format!("reload scheduled occurrence: {error}"))
             })?
+            && let Some(run_id) = existing.run_id()
+            && (existing.state() != "unknown" || !job.idempotent())
         {
-            return Ok(Some(existing));
+            return Ok(Some(run_id));
         }
         let grants = self
             .database
@@ -532,6 +537,16 @@ impl LocalRuntimeService {
                     .database
                     .update_run_state(run_id, state, Some(timestamp))
                     .await;
+                if stored.state.context().job_origin().is_some() {
+                    let _ = self
+                        .database
+                        .complete_scheduled_occurrence_for_run(
+                            run_id,
+                            scheduled_occurrence_terminal_state(&outcome),
+                            timestamp,
+                        )
+                        .await;
+                }
                 let _ = self
                     .events
                     .publish(stored.workspace_id, run_id, kind, payload);
@@ -1448,6 +1463,205 @@ fn parse_provider_policy_update_action(
     Ok(parsed)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduledJobAdminAction {
+    job_id: String,
+    service_provider: String,
+    service_subject: String,
+    owner_provider: String,
+    owner_subject: String,
+    schedule: ScheduledJobScheduleAction,
+    prompt: String,
+    data_class: DataClass,
+    max_model_turns: i64,
+    max_actions: i64,
+    enabled: bool,
+    next_due_at: Option<i64>,
+    idempotent: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduledJobScheduleAction {
+    kind: String,
+    run_at: Option<i64>,
+    start_at: Option<i64>,
+    interval_millis: Option<i64>,
+}
+
+struct ParsedScheduledJobAdminAction {
+    job_id: JobId,
+    service: lumen_core::identity::PrincipalId,
+    owner: lumen_core::identity::PrincipalId,
+    schedule: ScheduleSpec,
+    prompt: String,
+    data_class: DataClass,
+    max_model_turns: u32,
+    max_actions: u32,
+    enabled: bool,
+    next_due_at: Option<TimestampMillis>,
+    idempotent: bool,
+}
+
+async fn apply_scheduled_job_action(
+    database: &Database,
+    kind: &str,
+    workspace_id: lumen_core::identity::WorkspaceId,
+    parsed: ParsedScheduledJobAdminAction,
+) -> Result<(), ServiceError> {
+    let latest = database
+        .latest_scheduled_job_revision(parsed.job_id)
+        .await
+        .map_err(repository_service_error)?;
+    let revision = match (kind, latest.as_ref()) {
+        ("schedule.job.create", None) => JobRevision::new(1),
+        ("schedule.job.create", Some(_)) => {
+            return Err(ServiceError::Conflict(
+                "scheduled job already exists".into(),
+            ));
+        }
+        ("schedule.job.update" | "schedule.job.enable", Some(current)) => {
+            JobRevision::new(current.revision().as_u64().saturating_add(1))
+        }
+        ("schedule.job.update" | "schedule.job.enable", None) => {
+            return Err(ServiceError::NotFound);
+        }
+        _ => {
+            return Err(ServiceError::Conflict(
+                "unsupported scheduled job action".into(),
+            ));
+        }
+    }
+    .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    let created_at = now();
+    let revision = ScheduledJobRevision::new(
+        parsed.job_id,
+        revision,
+        workspace_id,
+        parsed.service,
+        parsed.owner,
+        parsed.schedule,
+        parsed.prompt,
+        parsed.data_class,
+        parsed.max_model_turns,
+        parsed.max_actions,
+        parsed.enabled,
+        parsed.next_due_at,
+        parsed.idempotent,
+        created_at,
+    )
+    .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    database
+        .append_scheduled_job_revision(&revision)
+        .await
+        .map_err(repository_service_error)
+}
+
+fn parse_scheduled_job_action(
+    arguments: &CanonicalValue,
+) -> Result<ParsedScheduledJobAdminAction, lumen_core::executor::ExecutorError> {
+    let value = serde_json::to_value(arguments)
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+    let parsed: ScheduledJobAdminAction = serde_json::from_value(value)
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+    let job_id = JobId::from_uuid(
+        parsed
+            .job_id
+            .parse()
+            .map_err(|_| lumen_core::executor::ExecutorError::new("invalid job ID"))?,
+    );
+    let service =
+        lumen_core::identity::PrincipalId::new(parsed.service_provider, parsed.service_subject)
+            .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+    let owner = lumen_core::identity::PrincipalId::new(parsed.owner_provider, parsed.owner_subject)
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+    if parsed.prompt.is_empty() || parsed.prompt.len() > 8192 {
+        return Err(lumen_core::executor::ExecutorError::new(
+            "scheduled job prompt length is invalid",
+        ));
+    }
+    if parsed.max_model_turns <= 0 || parsed.max_actions <= 0 {
+        return Err(lumen_core::executor::ExecutorError::new(
+            "scheduled job budgets must be positive",
+        ));
+    }
+    let max_model_turns = u32::try_from(parsed.max_model_turns).map_err(|_| {
+        lumen_core::executor::ExecutorError::new("scheduled job model budget is invalid")
+    })?;
+    let max_actions = u32::try_from(parsed.max_actions).map_err(|_| {
+        lumen_core::executor::ExecutorError::new("scheduled job action budget is invalid")
+    })?;
+    let next_due_at = parsed.next_due_at.map(timestamp_from_i64).transpose()?;
+    Ok(ParsedScheduledJobAdminAction {
+        job_id,
+        service,
+        owner,
+        schedule: parse_scheduled_job_schedule(parsed.schedule)?,
+        prompt: parsed.prompt,
+        data_class: parsed.data_class,
+        max_model_turns,
+        max_actions,
+        enabled: parsed.enabled,
+        next_due_at,
+        idempotent: parsed.idempotent,
+    })
+}
+
+fn parse_scheduled_job_schedule(
+    schedule: ScheduledJobScheduleAction,
+) -> Result<ScheduleSpec, lumen_core::executor::ExecutorError> {
+    match schedule.kind.as_str() {
+        "once" => {
+            let run_at = timestamp_from_i64(schedule.run_at.ok_or_else(|| {
+                lumen_core::executor::ExecutorError::new("once schedule requires run_at")
+            })?)?;
+            if schedule.start_at.is_some() || schedule.interval_millis.is_some() {
+                return Err(lumen_core::executor::ExecutorError::new(
+                    "once schedule cannot include interval fields",
+                ));
+            }
+            Ok(ScheduleSpec::once(run_at))
+        }
+        "interval" => {
+            let start_at = timestamp_from_i64(schedule.start_at.ok_or_else(|| {
+                lumen_core::executor::ExecutorError::new("interval schedule requires start_at")
+            })?)?;
+            let interval_millis = schedule.interval_millis.ok_or_else(|| {
+                lumen_core::executor::ExecutorError::new(
+                    "interval schedule requires interval_millis",
+                )
+            })?;
+            if interval_millis <= 0 || schedule.run_at.is_some() {
+                return Err(lumen_core::executor::ExecutorError::new(
+                    "interval schedule fields are invalid",
+                ));
+            }
+            let interval_millis = u64::try_from(interval_millis).map_err(|_| {
+                lumen_core::executor::ExecutorError::new("interval duration is invalid")
+            })?;
+            ScheduleSpec::interval(start_at, Duration::from_millis(interval_millis))
+                .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))
+        }
+        _ => Err(lumen_core::executor::ExecutorError::new(
+            "scheduled job schedule kind is invalid",
+        )),
+    }
+}
+
+fn timestamp_from_i64(value: i64) -> Result<TimestampMillis, lumen_core::executor::ExecutorError> {
+    Ok(TimestampMillis::new(u64::try_from(value).map_err(
+        |_| lumen_core::executor::ExecutorError::new("timestamp cannot be negative"),
+    )?))
+}
+
+fn is_scheduled_job_admin_action(kind: &str) -> bool {
+    matches!(
+        kind,
+        "schedule.job.create" | "schedule.job.update" | "schedule.job.enable"
+    )
+}
+
 fn channel_mapping_review(
     mapping: ChannelIdentityMapping,
 ) -> Result<ChannelMappingReview, ServiceError> {
@@ -2013,6 +2227,24 @@ impl ExecutorPort for RoutingExecutor {
                 )])))
             });
         }
+        if is_scheduled_job_admin_action(action.action().kind().as_str()) {
+            return Box::pin(async move {
+                let parsed = parse_scheduled_job_action(action.action().arguments())?;
+                let job_id = parsed.job_id;
+                apply_scheduled_job_action(
+                    &self.database,
+                    action.action().kind().as_str(),
+                    action.action().workspace_id(),
+                    parsed,
+                )
+                .await
+                .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+                Ok(ExecutionOutcome::Succeeded(CanonicalValue::object([(
+                    "job_id",
+                    CanonicalValue::from(job_id.to_string()),
+                )])))
+            });
+        }
         if is_extension_action(action.action().kind().as_str()) {
             self.extension.execute(action, cancellation)
         } else {
@@ -2062,6 +2294,15 @@ fn terminal_event(outcome: &RunOutcome) -> (&'static str, &'static str, Canonica
             "run.failed",
             CanonicalValue::from(format!("{other:?}")),
         ),
+    }
+}
+
+const fn scheduled_occurrence_terminal_state(outcome: &RunOutcome) -> &'static str {
+    match outcome {
+        RunOutcome::Completed { .. } => "succeeded",
+        RunOutcome::Cancelled => "cancelled",
+        RunOutcome::ExecutionUnknown { .. } => "unknown",
+        _ => "failed",
     }
 }
 

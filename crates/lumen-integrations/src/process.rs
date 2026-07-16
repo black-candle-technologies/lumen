@@ -12,7 +12,7 @@ use lumen_core::{
     capability::{Capability, CapabilityName, ResourceScope, WorkspacePath},
     egress::{DataClass, DestinationScope, ProviderId},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
-    identity::{ComponentId, WorkspaceId},
+    identity::{ComponentId, PrincipalId, WorkspaceId},
     model::ActionProposal,
     run::{ActionNormalizer, NormalizationError, RunContext},
     secret::SecretRefId,
@@ -208,6 +208,29 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                     vec![Capability::new(
                         CapabilityName::PolicyModify,
                         ResourceScope::exact("egress_provider", provider_id.as_str())
+                            .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    )],
+                ))
+            }
+            "schedule.job.create" | "schedule.job.update" | "schedule.job.enable" => {
+                let (job_id, arguments) = normalize_scheduled_job_arguments(&arguments)?;
+                let capability = if kind.as_str() == "schedule.job.create" {
+                    CapabilityName::ScheduleCreate
+                } else {
+                    CapabilityName::ScheduleModify
+                };
+                Ok(ActionEnvelope::new(
+                    ActionId::new(),
+                    context.run_id(),
+                    context.workspace_id(),
+                    context.actor().clone(),
+                    self.component.clone(),
+                    ActionKind::new(kind)
+                        .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    arguments,
+                    vec![Capability::new(
+                        capability,
+                        ResourceScope::exact("scheduled_job", job_id)
                             .map_err(|error| NormalizationError::new(error.to_string()))?,
                     )],
                 ))
@@ -479,6 +502,33 @@ struct ProviderPolicyUpdateArguments {
     workspace_allowed_data_classes: Vec<DataClass>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduledJobArguments {
+    job_id: String,
+    service_provider: String,
+    service_subject: String,
+    owner_provider: String,
+    owner_subject: String,
+    schedule: ScheduledJobScheduleArguments,
+    prompt: String,
+    data_class: DataClass,
+    max_model_turns: i64,
+    max_actions: i64,
+    enabled: bool,
+    next_due_at: Option<i64>,
+    idempotent: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduledJobScheduleArguments {
+    kind: String,
+    run_at: Option<i64>,
+    start_at: Option<i64>,
+    interval_millis: Option<i64>,
+}
+
 fn parse_arguments<T: for<'de> Deserialize<'de>>(
     arguments: &CanonicalValue,
 ) -> Result<T, NormalizationError> {
@@ -507,6 +557,117 @@ fn normalize_data_classes(classes: Vec<DataClass>) -> Result<Vec<DataClass>, Nor
         ));
     }
     Ok(normalized)
+}
+
+fn normalize_scheduled_job_arguments(
+    arguments: &CanonicalValue,
+) -> Result<(String, CanonicalValue), NormalizationError> {
+    let parsed: ScheduledJobArguments = parse_arguments(arguments)?;
+    let job_id = uuid::Uuid::parse_str(&parsed.job_id)
+        .map_err(|_| NormalizationError::new("scheduled job ID must be a UUID"))?
+        .to_string();
+    let service = PrincipalId::new(parsed.service_provider, parsed.service_subject)
+        .map_err(|error| NormalizationError::new(error.to_string()))?;
+    let owner = PrincipalId::new(parsed.owner_provider, parsed.owner_subject)
+        .map_err(|error| NormalizationError::new(error.to_string()))?;
+    if parsed.prompt.is_empty() || parsed.prompt.len() > 8192 {
+        return Err(NormalizationError::new(
+            "scheduled job prompt length is invalid",
+        ));
+    }
+    if parsed.max_model_turns <= 0 || parsed.max_actions <= 0 {
+        return Err(NormalizationError::new(
+            "scheduled job budgets must be positive",
+        ));
+    }
+    if parsed.data_class == DataClass::Secret {
+        return Err(NormalizationError::new(
+            "scheduled jobs cannot request secret model data",
+        ));
+    }
+    let schedule = normalize_scheduled_job_schedule(parsed.schedule)?;
+    let next_due_at = parsed
+        .next_due_at
+        .map(nonnegative_timestamp)
+        .transpose()?
+        .map(CanonicalValue::from)
+        .unwrap_or(CanonicalValue::Null);
+    Ok((
+        job_id.clone(),
+        CanonicalValue::object([
+            ("job_id", CanonicalValue::from(job_id)),
+            ("service_provider", CanonicalValue::from(service.provider())),
+            ("service_subject", CanonicalValue::from(service.subject())),
+            ("owner_provider", CanonicalValue::from(owner.provider())),
+            ("owner_subject", CanonicalValue::from(owner.subject())),
+            ("schedule", schedule),
+            ("prompt", CanonicalValue::from(parsed.prompt)),
+            (
+                "data_class",
+                CanonicalValue::from(parsed.data_class.as_str()),
+            ),
+            (
+                "max_model_turns",
+                CanonicalValue::from(parsed.max_model_turns),
+            ),
+            ("max_actions", CanonicalValue::from(parsed.max_actions)),
+            ("enabled", CanonicalValue::from(parsed.enabled)),
+            ("next_due_at", next_due_at),
+            ("idempotent", CanonicalValue::from(parsed.idempotent)),
+        ]),
+    ))
+}
+
+fn normalize_scheduled_job_schedule(
+    schedule: ScheduledJobScheduleArguments,
+) -> Result<CanonicalValue, NormalizationError> {
+    match schedule.kind.as_str() {
+        "once" => {
+            let run_at = nonnegative_timestamp(
+                schedule
+                    .run_at
+                    .ok_or_else(|| NormalizationError::new("once schedule requires run_at"))?,
+            )?;
+            if schedule.start_at.is_some() || schedule.interval_millis.is_some() {
+                return Err(NormalizationError::new(
+                    "once schedule cannot include interval fields",
+                ));
+            }
+            Ok(CanonicalValue::object([
+                ("kind", CanonicalValue::from("once")),
+                ("run_at", CanonicalValue::from(run_at)),
+            ]))
+        }
+        "interval" => {
+            let start_at =
+                nonnegative_timestamp(schedule.start_at.ok_or_else(|| {
+                    NormalizationError::new("interval schedule requires start_at")
+                })?)?;
+            let interval_millis = schedule.interval_millis.ok_or_else(|| {
+                NormalizationError::new("interval schedule requires interval_millis")
+            })?;
+            if interval_millis <= 0 || schedule.run_at.is_some() {
+                return Err(NormalizationError::new(
+                    "interval schedule fields are invalid",
+                ));
+            }
+            Ok(CanonicalValue::object([
+                ("kind", CanonicalValue::from("interval")),
+                ("start_at", CanonicalValue::from(start_at)),
+                ("interval_millis", CanonicalValue::from(interval_millis)),
+            ]))
+        }
+        _ => Err(NormalizationError::new(
+            "scheduled job schedule kind is invalid",
+        )),
+    }
+}
+
+fn nonnegative_timestamp(value: i64) -> Result<i64, NormalizationError> {
+    if value < 0 {
+        return Err(NormalizationError::new("timestamp cannot be negative"));
+    }
+    Ok(value)
 }
 
 fn normalize_http_method(value: &str) -> Result<&'static str, NormalizationError> {

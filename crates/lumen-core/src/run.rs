@@ -188,6 +188,10 @@ impl RunState {
         self.pending_action.is_some()
     }
 
+    pub const fn context(&self) -> &RunContext {
+        &self.context
+    }
+
     fn finish(&mut self, outcome: RunOutcome) -> RunOutcome {
         self.terminal_outcome = Some(outcome.clone());
         outcome

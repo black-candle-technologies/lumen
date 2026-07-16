@@ -91,15 +91,15 @@ docs/
 
 **Files:** `crates/lumen-core/src/{approval,run}.rs`, `crates/lumen-db/src/automation.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`
 
-- [ ] Add failing tests proving schedule creation, job enablement, and authority expansion require approval.
-- [ ] Add failing tests proving job edits create a new revision and pending occurrences keep the revision they were created with.
-- [ ] Add failing tests proving idempotent job actions may retry after unknown outcomes while non-idempotent unknown outcomes require operator reconciliation.
-- [ ] Add failing tests proving approval replay cannot create duplicate job occurrences or duplicate runs.
-- [ ] Confirm focused tests fail before implementation.
-- [ ] Implement idempotency policy fields and dispatch-time checks.
-- [ ] Connect job admin actions to the existing action, capability, approval, reservation, execution, and audit lifecycle.
-- [ ] Run focused runtime and core approval tests.
-- [ ] Commit as `feat(automation): bind jobs to approval and idempotency`.
+- [x] Add failing tests proving schedule creation, job enablement, and authority expansion require approval.
+- [x] Add failing tests proving job edits create a new revision and pending occurrences keep the revision they were created with.
+- [x] Add failing tests proving idempotent job actions may retry after unknown outcomes while non-idempotent unknown outcomes require operator reconciliation.
+- [x] Add failing tests proving approval replay cannot create duplicate job occurrences or duplicate runs.
+- [x] Confirm focused tests fail before implementation.
+- [x] Implement idempotency policy fields and dispatch-time checks.
+- [x] Connect job admin actions to the existing action, capability, approval, reservation, execution, and audit lifecycle.
+- [x] Run focused runtime and core approval tests.
+- [x] Commit as `feat(automation): bind jobs to approval and idempotency`.
 
 ## Task 5: Reviewed Skills
 

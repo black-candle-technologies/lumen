@@ -101,6 +101,22 @@ pub struct ScheduledJobRevision {
     created_at: TimestampMillis,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledOccurrenceRecord {
+    run_id: Option<lumen_core::action::RunId>,
+    state: String,
+}
+
+impl ScheduledOccurrenceRecord {
+    pub const fn run_id(&self) -> Option<lumen_core::action::RunId> {
+        self.run_id
+    }
+
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+}
+
 impl ScheduledJobRevision {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -652,6 +668,34 @@ impl Database {
         .transpose()
     }
 
+    pub async fn scheduled_occurrence_record(
+        &self,
+        key: &OccurrenceKey,
+    ) -> Result<Option<ScheduledOccurrenceRecord>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT run_id, state FROM scheduled_job_runs
+                 WHERE occurrence_key = ?",
+        )
+        .bind(key.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            let run_id = match row.try_get::<Option<String>, _>("run_id")? {
+                Some(value) => Some(lumen_core::action::RunId::from_uuid(
+                    value
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                )),
+                None => None,
+            };
+            Ok(ScheduledOccurrenceRecord {
+                run_id,
+                state: row.try_get("state")?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn mark_scheduled_occurrence_running(
         &self,
         key: &OccurrenceKey,
@@ -661,7 +705,7 @@ impl Database {
         let updated = sqlx::query(
             "UPDATE scheduled_job_runs
              SET run_id = ?, state = 'running', updated_at = ?
-             WHERE occurrence_key = ? AND run_id IS NULL",
+             WHERE occurrence_key = ? AND (run_id IS NULL OR state = 'unknown')",
         )
         .bind(run_id.to_string())
         .bind(timestamp_to_i64(now)?)
@@ -672,6 +716,28 @@ impl Database {
         if updated == 0 {
             return Err(RepositoryError::ExecutionStateConflict);
         }
+        Ok(())
+    }
+
+    pub async fn complete_scheduled_occurrence_for_run(
+        &self,
+        run_id: lumen_core::action::RunId,
+        state: &str,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(state, "succeeded" | "failed" | "cancelled" | "unknown") {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        sqlx::query(
+            "UPDATE scheduled_job_runs
+             SET state = ?, updated_at = ?
+             WHERE run_id = ?",
+        )
+        .bind(state)
+        .bind(timestamp_to_i64(now)?)
+        .bind(run_id.to_string())
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
