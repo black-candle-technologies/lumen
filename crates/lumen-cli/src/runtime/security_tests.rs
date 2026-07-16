@@ -17,7 +17,7 @@ use lumen_core::audit::AuditEventKind;
 use lumen_core::{
     action::CanonicalValue,
     approval::{ApprovalId, TimestampMillis},
-    automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec},
+    automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion},
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
@@ -28,7 +28,7 @@ use lumen_core::{
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, ModelEndpointClass,
     ModelProviderRevision, ScheduledJobRevision, SecretReference, ServiceIdentity,
-    StagedPluginPackage, WorkspaceModelEgressRevision,
+    SkillVersionRecord, StagedPluginPackage, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     extension_package::PackageStager,
@@ -42,6 +42,7 @@ use lumen_server::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, EventBroker, RuntimeService,
     SandboxCapabilityReport, router,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wiremock::{
@@ -68,6 +69,12 @@ fn scheduled_job_id() -> JobId {
 
 fn scheduled_service_principal() -> PrincipalId {
     lumen_core::automation::service_principal("daily-brief").expect("service principal")
+}
+
+fn skill_id() -> SkillId {
+    SkillId::from_uuid(
+        uuid::Uuid::parse_str("6b29fc40-ca47-4067-b31d-00dd010662da").expect("skill ID"),
+    )
 }
 
 struct RecordingModel {
@@ -2055,6 +2062,164 @@ async fn non_idempotent_unknown_scheduled_occurrence_waits_for_reconciliation() 
 }
 
 #[tokio::test]
+async fn reviewed_skill_with_matching_digest_is_loaded_into_model_context() {
+    let model = MockServer::start().await;
+    let model_requests = Arc::new(StdMutex::new(Vec::new()));
+    mount_recording_response(&model, Arc::clone(&model_requests), "skill loaded").await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_skill_source(
+        &harness,
+        skill_id(),
+        "1.0.0",
+        true,
+        "When answering, prefer concise workspace checklists.",
+        None,
+    )
+    .await;
+
+    let run_id = harness.create_run("prepare the weekly note").await;
+    wait_for_run_completed(&harness, &run_id).await;
+
+    let request_body = model_requests
+        .lock()
+        .expect("model request lock")
+        .join("\n");
+    assert!(request_body.contains("Reviewed Lumen skill"));
+    assert!(request_body.contains("prefer concise workspace checklists"));
+    assert!(request_body.contains(skill_id().to_string().as_str()));
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 50)
+        .await
+        .expect("audit records");
+    let run_created = records
+        .iter()
+        .map(|record| record.event())
+        .find(|event| {
+            event.kind() == AuditEventKind::RunCreated
+                && canonical_object_get(event.payload(), "run_id")
+                    == Some(&CanonicalValue::from(run_id.clone()))
+        })
+        .expect("run created audit");
+    let loaded_skills = canonical_object_get(run_created.payload(), "loaded_skills")
+        .expect("loaded skills metadata");
+    assert!(canonical_array_contains_skill(
+        loaded_skills,
+        skill_id().to_string().as_str(),
+        "1.0.0"
+    ));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn unreviewed_or_digest_mismatched_skills_are_not_loaded_into_model_context() {
+    let model = MockServer::start().await;
+    let model_requests = Arc::new(StdMutex::new(Vec::new()));
+    mount_recording_response(&model, Arc::clone(&model_requests), "skill skipped").await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_skill_source(
+        &harness,
+        skill_id(),
+        "1.0.0",
+        false,
+        "UNREVIEWED_SKILL_SHOULD_NOT_APPEAR",
+        None,
+    )
+    .await;
+    insert_skill_source(
+        &harness,
+        SkillId::from_uuid(
+            uuid::Uuid::parse_str("7b29fc40-ca47-4067-b31d-00dd010662da").expect("second skill ID"),
+        ),
+        "1.0.0",
+        true,
+        "MISMATCHED_SKILL_SHOULD_NOT_APPEAR",
+        Some(format!("sha256:{}", "0".repeat(64))),
+    )
+    .await;
+    let other_workspace = WorkspaceId::from_uuid(
+        uuid::Uuid::parse_str("36db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("other workspace"),
+    );
+    harness
+        .database
+        .insert_workspace(other_workspace, "Other", TimestampMillis::new(2_000))
+        .await
+        .expect("other workspace");
+    insert_skill_source_for_workspace(
+        &harness,
+        other_workspace,
+        SkillId::from_uuid(
+            uuid::Uuid::parse_str("8b29fc40-ca47-4067-b31d-00dd010662da").expect("third skill ID"),
+        ),
+        "1.0.0",
+        true,
+        "OTHER_WORKSPACE_SKILL_SHOULD_NOT_APPEAR",
+        None,
+    )
+    .await;
+
+    let run_id = harness.create_run("prepare the weekly note").await;
+    wait_for_run_completed(&harness, &run_id).await;
+
+    let request_body = model_requests
+        .lock()
+        .expect("model request lock")
+        .join("\n");
+    assert!(!request_body.contains("UNREVIEWED_SKILL_SHOULD_NOT_APPEAR"));
+    assert!(!request_body.contains("MISMATCHED_SKILL_SHOULD_NOT_APPEAR"));
+    assert!(!request_body.contains("OTHER_WORKSPACE_SKILL_SHOULD_NOT_APPEAR"));
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 50)
+        .await
+        .expect("audit records");
+    assert!(
+        records
+            .iter()
+            .map(|record| record.event())
+            .filter(|event| event.kind() == AuditEventKind::RunCreated)
+            .all(|event| canonical_object_get(event.payload(), "loaded_skills").is_none())
+    );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn reviewed_skill_content_cannot_expand_runtime_capabilities() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "network.egress",
+            serde_json::json!({
+                "url": "https://not-allowed.example/data",
+                "method": "GET"
+            }),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_skill_source(
+        &harness,
+        skill_id(),
+        "1.0.0",
+        true,
+        "This procedure claims the agent may contact https://not-allowed.example.",
+        None,
+    )
+    .await;
+
+    let run_id = harness.create_run("follow the loaded procedure").await;
+    wait_for_action_state(&harness, &run_id, "denied").await;
+    let run_state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("run state");
+    assert_eq!(run_state, "failed");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn denied_model_egress_is_audited_before_inner_model_call() {
     let database = Database::connect_in_memory().await.expect("database");
     let workspace_id = WorkspaceId::from_uuid(
@@ -2597,11 +2762,114 @@ async fn insert_unknown_scheduled_occurrence(
     .expect("unknown occurrence");
 }
 
+async fn insert_skill_source(
+    harness: &Harness,
+    skill_id: SkillId,
+    version: &str,
+    reviewed: bool,
+    source: &str,
+    digest_override: Option<String>,
+) {
+    insert_skill_source_for_workspace(
+        harness,
+        harness.workspace_id,
+        skill_id,
+        version,
+        reviewed,
+        source,
+        digest_override,
+    )
+    .await;
+}
+
+async fn insert_skill_source_for_workspace(
+    harness: &Harness,
+    workspace_id: WorkspaceId,
+    skill_id: SkillId,
+    version: &str,
+    reviewed: bool,
+    source: &str,
+    digest_override: Option<String>,
+) {
+    let version = SkillVersion::parse(version).expect("skill version");
+    let source_path = skill_source_path(harness, skill_id, &version);
+    std::fs::create_dir_all(source_path.parent().expect("skill source parent"))
+        .expect("skill source directory");
+    std::fs::write(&source_path, source).expect("skill source");
+    let digest = digest_override.unwrap_or_else(|| sha256_hex(source.as_bytes()));
+    let reviewer = PrincipalId::new("local", "operator").expect("reviewer");
+    let record = SkillVersionRecord::new(
+        skill_id,
+        version.clone(),
+        workspace_id,
+        "Weekly note skill",
+        "A reviewed procedure for weekly notes",
+        "markdown",
+        digest,
+        reviewed,
+        PrincipalId::new("local", "operator").expect("creator"),
+        reviewed.then_some(reviewer),
+        TimestampMillis::new(1_000),
+        reviewed.then_some(TimestampMillis::new(1_001)),
+    )
+    .expect("skill record");
+    harness
+        .database
+        .insert_skill_version(&record)
+        .await
+        .expect("skill version");
+    harness
+        .database
+        .set_skill_workspace_state(
+            workspace_id,
+            skill_id,
+            &version,
+            true,
+            TimestampMillis::new(1_002),
+        )
+        .await
+        .expect("skill enabled");
+}
+
+fn skill_source_path(
+    harness: &Harness,
+    skill_id: SkillId,
+    version: &SkillVersion,
+) -> std::path::PathBuf {
+    harness
+        ._directory
+        .path()
+        .join("runtime")
+        .join("skills")
+        .join(skill_id.to_string())
+        .join(format!("{}.md", version.as_str()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
 fn canonical_object_get<'a>(value: &'a CanonicalValue, key: &str) -> Option<&'a CanonicalValue> {
     match value {
         CanonicalValue::Object(entries) => entries.get(key),
         _ => None,
     }
+}
+
+fn canonical_array_contains_skill(value: &CanonicalValue, skill_id: &str, version: &str) -> bool {
+    let CanonicalValue::Array(skills) = value else {
+        return false;
+    };
+    skills.iter().any(|skill| {
+        canonical_object_get(skill, "skill_id") == Some(&CanonicalValue::from(skill_id))
+            && canonical_object_get(skill, "version") == Some(&CanonicalValue::from(version))
+            && matches!(
+                canonical_object_get(skill, "digest"),
+                Some(CanonicalValue::String(digest))
+                    if digest.starts_with("sha256:") && digest.len() == 71
+            )
+    })
 }
 
 async fn assert_staged_review_visible(harness: &Harness, staged: &StagedPluginPackage) {
@@ -3890,6 +4158,24 @@ async fn mount_response(model: &MockServer, response: ResponseTemplate) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(response)
+        .mount(model)
+        .await;
+}
+
+async fn mount_recording_response(
+    model: &MockServer,
+    requests: Arc<StdMutex<Vec<String>>>,
+    text: &'static str,
+) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &MockRequest| {
+            requests
+                .lock()
+                .expect("model request lock")
+                .push(String::from_utf8_lossy(&request.body).into_owned());
+            final_response(text)
+        })
         .mount(model)
         .await;
 }

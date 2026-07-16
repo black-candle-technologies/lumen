@@ -95,6 +95,12 @@ Automatic retry is allowed only when:
 
 Unknown non-idempotent actions require user reconciliation rather than blind retry.
 
+## Reviewed Skills
+
+Reviewed, enabled skill versions are loaded as untrusted procedure context before the first model turn. The runtime reads skill source from local runtime storage, verifies the content digest against SQL metadata, bounds the rendered context, and skips unreviewed, disabled, wrong-workspace, missing, or digest-mismatched skills.
+
+Skill context does not grant capabilities, approve actions, change policy, or bypass plugin grants. Any model action influenced by a skill still re-enters normal normalization, capability evaluation, approval, dispatch, and audit. Run audit metadata records loaded skill IDs, versions, and digests.
+
 ## Cancellation
 
 Cancellation stops further model turns, revokes pending dispatch reservations, sends protocol cancellation, and terminates the isolated process tree after a grace period. Cancellation is an outcome, not deletion; all prior records remain auditable.

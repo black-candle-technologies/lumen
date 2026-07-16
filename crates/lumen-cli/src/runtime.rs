@@ -22,14 +22,15 @@ use lumen_core::{
     run::{
         ActionFuture, ActionNormalizer, ActionPort, ActionPortError, ApprovalFuture, ApprovalPort,
         ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError,
-        NormalizationError, RunBudget, RunContext, RunOrchestrator, RunOutcome, RunState,
+        LoadedSkillMetadata, NormalizationError, RunBudget, RunContext, RunOrchestrator,
+        RunOutcome, RunState,
     },
     secret::SecretRefId,
 };
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, ModelEndpointClass,
     ModelProviderRevision, PluginGrantScope, PluginSettingScope, ScheduledJobRevision,
-    WorkspaceModelEgressRevision,
+    SkillVersionRecord, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     filesystem::WorkspaceReader,
@@ -52,6 +53,7 @@ use lumen_server::{
     RuntimeService, ServiceError, ServiceFuture, StagedPluginReview, WorkspaceModelPolicyReview,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -406,7 +408,11 @@ impl LocalRuntimeService {
         if let Some(origin) = request.job_origin {
             context = context.with_job_origin(origin);
         }
-        let state = RunState::new(context, &request.prompt, request.budget)
+        let reviewed_skills = self
+            .prompt_with_reviewed_skills(request.workspace_id, &request.prompt)
+            .await?;
+        context = context.with_loaded_skills(reviewed_skills.loaded_skills);
+        let state = RunState::new(context, reviewed_skills.prompt, request.budget)
             .with_data_class(request.data_class);
         self.runs.lock().await.insert(
             run_id,
@@ -435,6 +441,79 @@ impl LocalRuntimeService {
             .map_err(|error| ServiceError::Internal(error.to_string()))?;
         self.spawn_advance(run_id).await;
         Ok(run_id)
+    }
+
+    async fn prompt_with_reviewed_skills(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        prompt: &str,
+    ) -> Result<ReviewedSkillPrompt, ServiceError> {
+        let skills = self
+            .database
+            .enabled_skill_versions(workspace_id)
+            .await
+            .map_err(repository_service_error)?;
+        let mut rendered = Vec::new();
+        let mut loaded_skills = Vec::new();
+        for skill in skills {
+            if let Some(context) = self
+                .load_reviewed_skill_context(workspace_id, &skill)
+                .await?
+            {
+                loaded_skills.push(context.metadata);
+                rendered.push(context.rendered);
+            }
+        }
+        if rendered.is_empty() {
+            return Ok(ReviewedSkillPrompt {
+                prompt: prompt.to_owned(),
+                loaded_skills,
+            });
+        }
+        Ok(ReviewedSkillPrompt {
+            prompt: format!("{}\n\nUser request:\n{}", rendered.join("\n\n"), prompt),
+            loaded_skills,
+        })
+    }
+
+    async fn load_reviewed_skill_context(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        skill: &SkillVersionRecord,
+    ) -> Result<Option<LoadedReviewedSkill>, ServiceError> {
+        if !skill.reviewed() || skill.workspace_id() != workspace_id {
+            return Ok(None);
+        }
+        let path = self
+            .data_root
+            .join("skills")
+            .join(skill.skill_id().to_string())
+            .join(format!("{}.md", skill.version().as_str()));
+        let source = match tokio::fs::read_to_string(&path).await {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ServiceError::Internal(error.to_string())),
+        };
+        if source.len() > 65_536 || sha256_hex(source.as_bytes()) != skill.source_digest() {
+            return Ok(None);
+        }
+        Ok(Some(LoadedReviewedSkill {
+            metadata: LoadedSkillMetadata::new(
+                skill.skill_id().to_string(),
+                skill.version().as_str(),
+                skill.source_digest(),
+            ),
+            rendered: format!(
+                "Reviewed Lumen skill\nid: {}\nversion: {}\ndigest: {}\nformat: {}\nname: {}\ndescription: {}\n\n{}",
+                skill.skill_id(),
+                skill.version().as_str(),
+                skill.source_digest(),
+                skill.source_format(),
+                skill.name(),
+                skill.description(),
+                source
+            ),
+        }))
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -797,9 +876,13 @@ impl RuntimeService for LocalRuntimeService {
                 .create_run(run_id, command.workspace_id(), command.actor(), now())
                 .await
                 .map_err(repository_service_error)?;
+            let reviewed_skills = service
+                .prompt_with_reviewed_skills(command.workspace_id(), command.prompt())
+                .await?;
             let state = RunState::new(
-                RunContext::new(run_id, command.workspace_id(), command.actor().clone()),
-                command.prompt(),
+                RunContext::new(run_id, command.workspace_id(), command.actor().clone())
+                    .with_loaded_skills(reviewed_skills.loaded_skills),
+                reviewed_skills.prompt,
                 service.budget,
             )
             .with_data_class(command.data_class());
@@ -1655,6 +1738,11 @@ fn timestamp_from_i64(value: i64) -> Result<TimestampMillis, lumen_core::executo
     )?))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
 fn is_scheduled_job_admin_action(kind: &str) -> bool {
     matches!(
         kind,
@@ -2070,6 +2158,16 @@ struct StoredRun {
     state: RunState,
     model_override: Option<Arc<dyn ModelPort>>,
     capabilities_override: Option<EffectiveCapabilities>,
+}
+
+struct ReviewedSkillPrompt {
+    prompt: String,
+    loaded_skills: Vec<LoadedSkillMetadata>,
+}
+
+struct LoadedReviewedSkill {
+    rendered: String,
+    metadata: LoadedSkillMetadata,
 }
 
 struct StoredRunRequest {

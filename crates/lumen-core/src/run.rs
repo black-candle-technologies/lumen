@@ -73,6 +73,7 @@ pub struct RunContext {
     workspace_id: WorkspaceId,
     actor: PrincipalId,
     job_origin: Option<JobOrigin>,
+    loaded_skills: Vec<LoadedSkillMetadata>,
 }
 
 impl RunContext {
@@ -82,11 +83,17 @@ impl RunContext {
             workspace_id,
             actor,
             job_origin: None,
+            loaded_skills: Vec::new(),
         }
     }
 
     pub fn with_job_origin(mut self, origin: JobOrigin) -> Self {
         self.job_origin = Some(origin);
+        self
+    }
+
+    pub fn with_loaded_skills(mut self, loaded_skills: Vec<LoadedSkillMetadata>) -> Self {
+        self.loaded_skills = loaded_skills;
         self
     }
 
@@ -104,6 +111,43 @@ impl RunContext {
 
     pub const fn job_origin(&self) -> Option<&JobOrigin> {
         self.job_origin.as_ref()
+    }
+
+    pub fn loaded_skills(&self) -> &[LoadedSkillMetadata] {
+        &self.loaded_skills
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadedSkillMetadata {
+    skill_id: String,
+    version: String,
+    digest: String,
+}
+
+impl LoadedSkillMetadata {
+    pub fn new(
+        skill_id: impl Into<String>,
+        version: impl Into<String>,
+        digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            skill_id: skill_id.into(),
+            version: version.into(),
+            digest: digest.into(),
+        }
+    }
+
+    pub fn skill_id(&self) -> &str {
+        &self.skill_id
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 }
 
@@ -791,6 +835,25 @@ impl<'a> RunOrchestrator<'a> {
                     CanonicalValue::from(origin.occurrence_key().as_str()),
                 ),
             ]);
+        }
+        if !state.context.loaded_skills().is_empty() {
+            payload.push((
+                "loaded_skills",
+                CanonicalValue::Array(
+                    state
+                        .context
+                        .loaded_skills()
+                        .iter()
+                        .map(|skill| {
+                            CanonicalValue::object([
+                                ("skill_id", CanonicalValue::from(skill.skill_id())),
+                                ("version", CanonicalValue::from(skill.version())),
+                                ("digest", CanonicalValue::from(skill.digest())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
         }
         self.audit
             .record(AuditEvent::new(

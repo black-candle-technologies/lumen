@@ -105,15 +105,15 @@ docs/
 
 **Files:** `crates/lumen-core/src/automation.rs`, `crates/lumen-db/src/automation.rs`, `crates/lumen-cli/src/runtime.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`, `docs/RUNTIME_EXECUTION.md`
 
-- [ ] Add failing tests proving unreviewed skill drafts are never loaded into model context.
-- [ ] Add failing tests proving reviewed skill versions load only when the stored digest matches the source content.
-- [ ] Add failing tests proving skills cannot add capabilities, approve actions, change policy, or bypass plugin grants.
-- [ ] Add failing tests proving skill retrieval is workspace-scoped and records loaded skill IDs, versions, and digests in audit metadata.
-- [ ] Confirm focused tests fail before implementation.
-- [ ] Implement skill version storage, digest validation, workspace enablement, and bounded context rendering.
-- [ ] Include reviewed skill content in model input as untrusted procedure context with explicit source metadata.
-- [ ] Run focused runtime security tests and `cargo test -p lumen-db --test automation`.
-- [ ] Commit as `feat(skills): load reviewed versioned skills`.
+- [x] Add failing tests proving unreviewed skill drafts are never loaded into model context.
+- [x] Add failing tests proving reviewed skill versions load only when the stored digest matches the source content.
+- [x] Add failing tests proving skills cannot add capabilities, approve actions, change policy, or bypass plugin grants.
+- [x] Add failing tests proving skill retrieval is workspace-scoped and records loaded skill IDs, versions, and digests in audit metadata.
+- [x] Confirm focused tests fail before implementation.
+- [x] Implement skill version storage, digest validation, workspace enablement, and bounded context rendering.
+- [x] Include reviewed skill content in model input as untrusted procedure context with explicit source metadata.
+- [x] Run focused runtime security tests and `cargo test -p lumen-db --test automation`.
+- [x] Commit as `feat(skills): load reviewed versioned skills`.
 
 ## Task 6: Workflow Capture
 

@@ -286,6 +286,30 @@ impl SkillVersionRecord {
     pub const fn version(&self) -> &SkillVersion {
         &self.version
     }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn source_format(&self) -> &str {
+        &self.source_format
+    }
+
+    pub fn source_digest(&self) -> &str {
+        &self.source_digest
+    }
+
+    pub const fn reviewed(&self) -> bool {
+        self.reviewed
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
