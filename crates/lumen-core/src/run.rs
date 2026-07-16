@@ -757,6 +757,37 @@ impl<'a> RunOrchestrator<'a> {
         outcome: AuditOutcome,
         now: TimestampMillis,
     ) -> Result<(), AuditPortError> {
+        let mut payload = vec![
+            (
+                "run_id",
+                CanonicalValue::from(state.context.run_id().to_string()),
+            ),
+            (
+                "actor",
+                CanonicalValue::from(state.context.actor().subject()),
+            ),
+        ];
+        if let Some(origin) = state.context.job_origin() {
+            payload.extend([
+                ("job_id", CanonicalValue::from(origin.job_id().to_string())),
+                (
+                    "job_revision",
+                    CanonicalValue::from(
+                        i64::try_from(origin.revision().as_u64()).unwrap_or(i64::MAX),
+                    ),
+                ),
+                (
+                    "scheduled_for",
+                    CanonicalValue::from(
+                        i64::try_from(origin.scheduled_for().as_u64()).unwrap_or(i64::MAX),
+                    ),
+                ),
+                (
+                    "occurrence_key",
+                    CanonicalValue::from(origin.occurrence_key().as_str()),
+                ),
+            ]);
+        }
         self.audit
             .record(AuditEvent::new(
                 AuditEventId::new(),
@@ -764,16 +795,7 @@ impl<'a> RunOrchestrator<'a> {
                 kind,
                 outcome,
                 Some(state.context.workspace_id()),
-                CanonicalValue::object([
-                    (
-                        "run_id",
-                        CanonicalValue::from(state.context.run_id().to_string()),
-                    ),
-                    (
-                        "actor",
-                        CanonicalValue::from(state.context.actor().subject()),
-                    ),
-                ]),
+                CanonicalValue::object(payload),
             ))
             .await
     }

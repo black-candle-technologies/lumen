@@ -156,6 +156,50 @@ impl ScheduledJobRevision {
     pub const fn revision(&self) -> JobRevision {
         self.revision
     }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn service(&self) -> &PrincipalId {
+        &self.service
+    }
+
+    pub const fn owner(&self) -> &PrincipalId {
+        &self.owner
+    }
+
+    pub const fn schedule(&self) -> ScheduleSpec {
+        self.schedule
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub const fn data_class(&self) -> DataClass {
+        self.data_class
+    }
+
+    pub const fn max_model_turns(&self) -> u32 {
+        self.max_model_turns
+    }
+
+    pub const fn max_actions(&self) -> u32 {
+        self.max_actions
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn next_due_at(&self) -> Option<TimestampMillis> {
+        self.next_due_at
+    }
+
+    pub const fn idempotent(&self) -> bool {
+        self.idempotent
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -481,6 +525,51 @@ impl Database {
             .transpose()
     }
 
+    pub async fn due_scheduled_job_revisions(
+        &self,
+        now: TimestampMillis,
+    ) -> Result<Vec<ScheduledJobRevision>, RepositoryError> {
+        let rows = sqlx::query(
+            "WITH latest_revisions AS (
+                SELECT job_id, MAX(revision) AS revision
+                FROM scheduled_job_revisions
+                GROUP BY job_id
+             )
+             SELECT job.workspace_id, job.service_provider, job.service_subject,
+                    job.owner_provider, job.owner_subject, job.job_id,
+                    revision.revision, revision.schedule_kind, revision.schedule_start_at,
+                    revision.interval_millis, revision.prompt, revision.data_class,
+                    revision.max_model_turns, revision.max_actions, revision.enabled,
+                    revision.next_due_at, revision.idempotent, revision.created_at
+             FROM latest_revisions latest
+             JOIN scheduled_jobs job ON job.job_id = latest.job_id
+             JOIN scheduled_job_revisions revision
+               ON revision.job_id = latest.job_id AND revision.revision = latest.revision
+             JOIN service_identities service
+               ON service.provider = job.service_provider
+              AND service.subject = job.service_subject
+              AND service.workspace_id = job.workspace_id
+             WHERE revision.enabled = 1
+               AND service.enabled = 1
+               AND revision.next_due_at IS NOT NULL
+               AND revision.next_due_at <= ?
+             ORDER BY revision.next_due_at, job.job_id",
+        )
+        .bind(timestamp_to_i64(now)?)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let job_id = JobId::from_uuid(
+                    row.try_get::<String, _>("job_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                );
+                scheduled_job_revision_from_row(job_id, &row)
+            })
+            .collect()
+    }
+
     pub async fn claim_job_occurrence(
         &self,
         key: &OccurrenceKey,
@@ -540,6 +629,72 @@ impl Database {
             .await?;
         transaction.commit().await?;
         Ok(true)
+    }
+
+    pub async fn scheduled_occurrence_run_id(
+        &self,
+        key: &OccurrenceKey,
+    ) -> Result<Option<lumen_core::action::RunId>, RepositoryError> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM scheduled_job_runs
+                 WHERE occurrence_key = ? AND run_id IS NOT NULL",
+        )
+        .bind(key.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|value| {
+            Ok(lumen_core::action::RunId::from_uuid(
+                value
+                    .parse()
+                    .map_err(|_| RepositoryError::InvalidAutomationState)?,
+            ))
+        })
+        .transpose()
+    }
+
+    pub async fn mark_scheduled_occurrence_running(
+        &self,
+        key: &OccurrenceKey,
+        run_id: lumen_core::action::RunId,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let updated = sqlx::query(
+            "UPDATE scheduled_job_runs
+             SET run_id = ?, state = 'running', updated_at = ?
+             WHERE occurrence_key = ? AND run_id IS NULL",
+        )
+        .bind(run_id.to_string())
+        .bind(timestamp_to_i64(now)?)
+        .bind(key.as_str())
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        Ok(())
+    }
+
+    pub async fn advance_scheduled_job_next_due(
+        &self,
+        job_id: JobId,
+        revision: JobRevision,
+        next_due_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE scheduled_job_revisions
+             SET next_due_at = ?
+             WHERE job_id = ? AND revision = ?",
+        )
+        .bind(next_due_at.map(timestamp_to_i64).transpose()?)
+        .bind(job_id.to_string())
+        .bind(
+            i64::try_from(revision.as_u64())
+                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+        )
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     pub async fn insert_skill_version(

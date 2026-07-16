@@ -17,6 +17,7 @@ use lumen_core::audit::AuditEventKind;
 use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
+    automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec},
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
@@ -26,7 +27,8 @@ use lumen_core::{
 };
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, ModelEndpointClass,
-    ModelProviderRevision, SecretReference, StagedPluginPackage, WorkspaceModelEgressRevision,
+    ModelProviderRevision, ScheduledJobRevision, SecretReference, ServiceIdentity,
+    StagedPluginPackage, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     extension_package::PackageStager,
@@ -59,6 +61,14 @@ use crate::{
 };
 
 const TOKEN: &str = "security-test-token";
+
+fn scheduled_job_id() -> JobId {
+    JobId::from_uuid(uuid::Uuid::parse_str("7825c2e7-1d9c-40df-ad69-209aeb02fc8d").expect("job ID"))
+}
+
+fn scheduled_service_principal() -> PrincipalId {
+    lumen_core::automation::service_principal("daily-brief").expect("service principal")
+}
 
 struct RecordingModel {
     calls: AtomicUsize,
@@ -1445,6 +1455,297 @@ async fn sensitive_provider_policy_expansion_requires_approval_before_mutation()
 }
 
 #[tokio::test]
+async fn scheduled_due_once_job_creates_one_service_attributed_run() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("scheduled done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsRead,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+
+    let created = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass");
+
+    assert_eq!(created.len(), 1);
+    let run_id = created[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "completed").await;
+    let actor: (String, String) =
+        sqlx::query_as("SELECT actor_provider, actor_subject FROM agent_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("run actor");
+    assert_eq!(actor, ("service".to_owned(), "daily-brief".to_owned()));
+    let occurrence = OccurrenceKey::new(
+        scheduled_job_id(),
+        JobRevision::new(1).expect("revision"),
+        TimestampMillis::new(1_000),
+    );
+    let stored_run_id: String =
+        sqlx::query_scalar("SELECT run_id FROM scheduled_job_runs WHERE occurrence_key = ?")
+            .bind(occurrence.as_str())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("scheduled run");
+    assert_eq!(stored_run_id, run_id.to_string());
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 50)
+        .await
+        .expect("audit records");
+    let run_created = records
+        .iter()
+        .map(|record| record.event())
+        .find(|event| {
+            event.kind() == AuditEventKind::RunCreated
+                && canonical_object_get(event.payload(), "run_id")
+                    == Some(&CanonicalValue::from(run_id.to_string()))
+        })
+        .expect("run created audit");
+    assert_eq!(
+        canonical_object_get(run_created.payload(), "job_id"),
+        Some(&CanonicalValue::from(scheduled_job_id().to_string()))
+    );
+    assert_eq!(
+        canonical_object_get(run_created.payload(), "occurrence_key"),
+        Some(&CanonicalValue::from(occurrence.as_str()))
+    );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_interval_job_advances_next_due_after_reservation() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("interval done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::interval(TimestampMillis::new(1_000), Duration::from_millis(60_000))
+            .expect("interval"),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+
+    let created = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass");
+
+    assert_eq!(created.len(), 1);
+    let next_due: i64 = sqlx::query_scalar(
+        "SELECT next_due_at FROM scheduled_job_revisions WHERE job_id = ? AND revision = 1",
+    )
+    .bind(scheduled_job_id().to_string())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("next due");
+    assert_eq!(next_due, 61_000);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_disabled_jobs_and_services_do_not_create_runs() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, false, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+
+    assert!(
+        harness
+            .service
+            .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+            .await
+            .expect("scheduler pass")
+            .is_empty()
+    );
+
+    let enabled_service = ServiceIdentity::new(
+        scheduled_service_principal(),
+        harness.workspace_id,
+        PrincipalId::new("local", "operator").expect("owner"),
+        "Daily brief",
+        true,
+        TimestampMillis::new(2_500),
+        TimestampMillis::new(2_500),
+    )
+    .expect("service");
+    harness
+        .database
+        .upsert_service_identity(&enabled_service, [])
+        .await
+        .expect("service enabled");
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(3_000)),
+        false,
+        Some(TimestampMillis::new(3_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+
+    assert!(
+        harness
+            .service
+            .run_due_scheduled_jobs_once(TimestampMillis::new(4_000))
+            .await
+            .expect("scheduler pass")
+            .is_empty()
+    );
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE actor_provider = 'service'")
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("run count");
+    assert_eq!(run_count, 0);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_claimed_occurrence_recovers_without_duplicate_runs() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("recovered")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    let occurrence = OccurrenceKey::new(
+        scheduled_job_id(),
+        JobRevision::new(1).expect("revision"),
+        TimestampMillis::new(1_000),
+    );
+    assert!(
+        harness
+            .database
+            .claim_job_occurrence(
+                &occurrence,
+                uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("lease"),
+                TimestampMillis::new(1_500),
+                TimestampMillis::new(1_900),
+            )
+            .await
+            .expect("claim")
+    );
+
+    let first = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass");
+    assert_eq!(first.len(), 1);
+    wait_for_run_state(&harness, &first[0].to_string(), "completed").await;
+    let second = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_500))
+        .await
+        .expect("scheduler pass");
+
+    assert!(second.is_empty());
+    let run_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_job_runs WHERE occurrence_key = ? AND run_id IS NOT NULL",
+    )
+    .bind(occurrence.as_str())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("scheduled run count");
+    assert_eq!(run_count, 1);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_job_fails_closed_when_service_grants_cannot_be_loaded() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsRead,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    sqlx::query(
+        "UPDATE service_identity_grants
+         SET capability_name = 'not.a.capability'
+         WHERE provider = 'service' AND subject = 'daily-brief'",
+    )
+    .execute(harness.database.pool())
+    .await
+    .expect("corrupt grant");
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+
+    let error = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect_err("corrupt grants fail closed");
+
+    assert!(error.to_string().contains("load scheduled service grants"));
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE actor_provider = 'service'")
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("run count");
+    assert_eq!(run_count, 0);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn denied_model_egress_is_audited_before_inner_model_call() {
     let database = Database::connect_in_memory().await.expect("database");
     let workspace_id = WorkspaceId::from_uuid(
@@ -1817,6 +2118,94 @@ async fn wait_for_run_completed(harness: &Harness, run_id: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("run {run_id} did not complete");
+}
+
+async fn wait_for_run_state(harness: &Harness, run_id: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(harness.database.pool())
+            .await
+            .expect("run state");
+        if state.as_deref() == Some(expected) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("run {run_id} did not reach state {expected}; actual {state:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn insert_scheduled_service(
+    harness: &Harness,
+    enabled: bool,
+    grants: impl IntoIterator<Item = Capability>,
+) {
+    let service = ServiceIdentity::new(
+        scheduled_service_principal(),
+        harness.workspace_id,
+        PrincipalId::new("local", "operator").expect("owner"),
+        "Daily brief",
+        enabled,
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(1_000),
+    )
+    .expect("service identity");
+    harness
+        .database
+        .upsert_service_identity(&service, grants)
+        .await
+        .expect("service stored");
+}
+
+async fn insert_scheduled_job(
+    harness: &Harness,
+    schedule: ScheduleSpec,
+    enabled: bool,
+    next_due_at: Option<TimestampMillis>,
+    data_class: DataClass,
+    max_model_turns: u32,
+    max_actions: u32,
+) {
+    let revision = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(revision) FROM scheduled_job_revisions WHERE job_id = ?",
+    )
+    .bind(scheduled_job_id().to_string())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("latest job revision")
+    .map_or(1_u64, |value| u64::try_from(value).expect("revision") + 1);
+    let job = ScheduledJobRevision::new(
+        scheduled_job_id(),
+        JobRevision::new(revision).expect("revision"),
+        harness.workspace_id,
+        scheduled_service_principal(),
+        PrincipalId::new("local", "operator").expect("owner"),
+        schedule,
+        "scheduled prompt",
+        data_class,
+        max_model_turns,
+        max_actions,
+        enabled,
+        next_due_at,
+        true,
+        TimestampMillis::new(1_000 + revision),
+    )
+    .expect("scheduled job");
+    harness
+        .database
+        .append_scheduled_job_revision(&job)
+        .await
+        .expect("scheduled job stored");
+}
+
+fn canonical_object_get<'a>(value: &'a CanonicalValue, key: &str) -> Option<&'a CanonicalValue> {
+    match value {
+        CanonicalValue::Object(entries) => entries.get(key),
+        _ => None,
+    }
 }
 
 async fn assert_staged_review_visible(harness: &Harness, staged: &StagedPluginPackage) {

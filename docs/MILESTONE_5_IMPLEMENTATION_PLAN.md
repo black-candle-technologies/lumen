@@ -74,18 +74,18 @@ docs/
 
 **Files:** `crates/lumen-cli/src/runtime.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`, `crates/lumen-core/src/run.rs`
 
-- [ ] Add failing runtime tests proving a due one-shot job creates exactly one agent run attributed to the configured service identity.
-- [ ] Add failing runtime tests proving interval jobs advance `next_due_at` only after a job run is reserved.
-- [ ] Add failing runtime tests proving disabled jobs and disabled service identities do not create runs.
-- [ ] Add failing crash-recovery tests proving a claimed occurrence without a run is retried once and a claimed occurrence with a run is reconciled without duplication.
-- [ ] Add failing tests proving job-created runs use configured data class, budget, and workspace policy.
-- [ ] Add failing tests proving scheduler dispatch fails closed when service identity policy or capability grants cannot be loaded.
-- [ ] Confirm focused tests fail before implementation: `cargo test -p lumen-cli runtime::security_tests::scheduled`.
-- [ ] Implement a local scheduler loop with bounded polling, SQLite lease claiming, cancellation on service shutdown, and no distributed worker assumptions.
-- [ ] Create job-originated runs through the existing `LocalRuntimeService` run path rather than a scheduler-specific executor path.
-- [ ] Record job ID, revision, occurrence key, service principal, and owner in audit payloads.
-- [ ] Run focused runtime security tests and `cargo test -p lumen-cli`.
-- [ ] Commit as `feat(runtime): execute leased scheduled jobs`.
+- [x] Add failing runtime tests proving a due one-shot job creates exactly one run attributed to the configured service identity.
+- [x] Add failing runtime tests proving interval jobs advance `next_due_at` only after a job run is reserved.
+- [x] Add failing runtime tests proving disabled jobs and disabled service identities do not create runs.
+- [x] Add failing crash-recovery tests proving a claimed occurrence without a run is retried once and a claimed occurrence with a run is reconciled without duplication.
+- [x] Add failing tests proving job-created runs use configured data class, budget, and workspace policy.
+- [x] Add failing tests proving scheduler dispatch fails closed when service identity policy or capability grants cannot be loaded.
+- [x] Confirm focused tests fail before implementation: `cargo test -p lumen-cli runtime::security_tests::scheduled`.
+- [x] Implement a local scheduler loop with bounded polling, SQLite lease claiming, cancellation on service shutdown, and no distributed worker assumptions.
+- [x] Create job-originated runs through the existing `LocalRuntimeService` run path rather than a scheduler-specific executor path.
+- [x] Record job ID, revision, occurrence key, service principal, and owner in audit payloads.
+- [x] Run focused runtime security tests and `cargo test -p lumen-cli`.
+- [x] Commit as `feat(runtime): execute leased scheduled jobs`.
 
 ## Task 4: Job Policy, Approval, And Idempotency
 

@@ -12,6 +12,7 @@ use lumen_core::{
         TimestampMillis,
     },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
+    automation::{JobOrigin, OccurrenceKey},
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
     egress::{DataClass, DestinationScope, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
@@ -27,7 +28,8 @@ use lumen_core::{
 };
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, ModelEndpointClass,
-    ModelProviderRevision, PluginGrantScope, PluginSettingScope, WorkspaceModelEgressRevision,
+    ModelProviderRevision, PluginGrantScope, PluginSettingScope, ScheduledJobRevision,
+    WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     filesystem::WorkspaceReader,
@@ -85,6 +87,7 @@ pub(crate) struct LocalRuntimeService {
     cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    scheduler_cancellation: CancellationToken,
     redactor: Arc<SecretRedactor>,
 }
 
@@ -232,7 +235,7 @@ impl LocalRuntimeService {
         grants.extend(network_egress_capabilities);
         grants.extend(channel_send_capabilities);
         let ambient_capabilities = CapabilitySet::new(grants);
-        Ok(Self {
+        let service = Self {
             model: Arc::new(model),
             enforce_model_egress_policy: config.model.allow_remote,
             normalizer: Arc::new(normalizer),
@@ -256,8 +259,11 @@ impl LocalRuntimeService {
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            scheduler_cancellation: CancellationToken::new(),
             redactor,
-        })
+        };
+        service.spawn_scheduler_loop().await;
+        Ok(service)
     }
 
     async fn spawn_advance(&self, run_id: RunId) {
@@ -265,7 +271,169 @@ impl LocalRuntimeService {
         self.tasks.lock().await.push(handle);
     }
 
+    async fn spawn_scheduler_loop(&self) {
+        let handle = tokio::spawn(self.clone().scheduled_job_loop());
+        self.tasks.lock().await.push(handle);
+    }
+
+    async fn scheduled_job_loop(self) {
+        loop {
+            tokio::select! {
+                biased;
+                () = self.scheduler_cancellation.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    if self.scheduler_cancellation.is_cancelled() {
+                        break;
+                    }
+                    let _ = self.run_due_scheduled_jobs_once(now()).await;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn run_due_scheduled_jobs_once(
+        &self,
+        timestamp: TimestampMillis,
+    ) -> Result<Vec<RunId>, ServiceError> {
+        let due = self
+            .database
+            .due_scheduled_job_revisions(timestamp)
+            .await
+            .map_err(|error| ServiceError::Internal(format!("load due scheduled jobs: {error}")))?;
+        let mut created = Vec::new();
+        for job in due {
+            if let Some(run_id) = self.run_due_scheduled_job(job, timestamp).await? {
+                created.push(run_id);
+            }
+        }
+        Ok(created)
+    }
+
+    async fn run_due_scheduled_job(
+        &self,
+        job: ScheduledJobRevision,
+        timestamp: TimestampMillis,
+    ) -> Result<Option<RunId>, ServiceError> {
+        let Some(scheduled_for) = job.next_due_at() else {
+            return Ok(None);
+        };
+        let occurrence = OccurrenceKey::new(job.job_id(), job.revision(), scheduled_for);
+        if self
+            .database
+            .scheduled_occurrence_run_id(&occurrence)
+            .await
+            .map_err(|error| ServiceError::Internal(format!("load scheduled occurrence: {error}")))?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let claimed = self
+            .database
+            .claim_job_occurrence(
+                &occurrence,
+                uuid::Uuid::new_v4(),
+                timestamp,
+                TimestampMillis::new(timestamp.as_u64().saturating_add(30_000)),
+            )
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("claim scheduled occurrence: {error}"))
+            })?;
+        if !claimed {
+            return Ok(None);
+        }
+        if let Some(existing) = self
+            .database
+            .scheduled_occurrence_run_id(&occurrence)
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("reload scheduled occurrence: {error}"))
+            })?
+        {
+            return Ok(Some(existing));
+        }
+        let grants = self
+            .database
+            .service_identity_grants(job.workspace_id(), job.service())
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("load scheduled service grants: {error}"))
+            })?;
+        let run_id = self
+            .create_stored_run(StoredRunRequest {
+                workspace_id: job.workspace_id(),
+                actor: job.service().clone(),
+                prompt: job.prompt().to_owned(),
+                budget: RunBudget::new(job.max_model_turns(), job.max_actions()),
+                data_class: job.data_class(),
+                model_override: None,
+                capabilities_override: Some(EffectiveCapabilities::new([
+                    self.ambient_capabilities.clone(),
+                    CapabilitySet::new(grants),
+                ])),
+                job_origin: Some(JobOrigin::new(job.job_id(), job.revision(), scheduled_for)),
+            })
+            .await?;
+        self.database
+            .mark_scheduled_occurrence_running(&occurrence, run_id, timestamp)
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("mark scheduled occurrence running: {error}"))
+            })?;
+        self.database
+            .advance_scheduled_job_next_due(
+                job.job_id(),
+                job.revision(),
+                job.schedule().next_after(scheduled_for, job.enabled()),
+            )
+            .await
+            .map_err(|error| ServiceError::Internal(format!("advance scheduled job: {error}")))?;
+        Ok(Some(run_id))
+    }
+
+    async fn create_stored_run(&self, request: StoredRunRequest) -> Result<RunId, ServiceError> {
+        let run_id = RunId::new();
+        self.database
+            .create_run(run_id, request.workspace_id, &request.actor, now())
+            .await
+            .map_err(repository_service_error)?;
+        let mut context = RunContext::new(run_id, request.workspace_id, request.actor);
+        if let Some(origin) = request.job_origin {
+            context = context.with_job_origin(origin);
+        }
+        let state = RunState::new(context, &request.prompt, request.budget)
+            .with_data_class(request.data_class);
+        self.runs.lock().await.insert(
+            run_id,
+            StoredRun {
+                workspace_id: request.workspace_id,
+                state,
+                model_override: request.model_override,
+                capabilities_override: request.capabilities_override,
+            },
+        );
+        self.cancellations
+            .lock()
+            .await
+            .insert(run_id, CancellationToken::new());
+        self.run_workspaces
+            .lock()
+            .await
+            .insert(run_id, request.workspace_id);
+        self.events
+            .publish(
+                request.workspace_id,
+                run_id,
+                "run.created",
+                CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+            )
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        self.spawn_advance(run_id).await;
+        Ok(run_id)
+    }
+
     pub(crate) async fn shutdown(&self) {
+        self.scheduler_cancellation.cancel();
         let mut tasks = std::mem::take(&mut *self.tasks.lock().await);
         let completed = tokio::time::timeout(Duration::from_secs(5), async {
             for task in &mut tasks {
@@ -1688,6 +1856,17 @@ struct StoredRun {
     state: RunState,
     model_override: Option<Arc<dyn ModelPort>>,
     capabilities_override: Option<EffectiveCapabilities>,
+}
+
+struct StoredRunRequest {
+    workspace_id: lumen_core::identity::WorkspaceId,
+    actor: lumen_core::identity::PrincipalId,
+    prompt: String,
+    budget: RunBudget,
+    data_class: DataClass,
+    model_override: Option<Arc<dyn ModelPort>>,
+    capabilities_override: Option<EffectiveCapabilities>,
+    job_origin: Option<JobOrigin>,
 }
 
 struct EgressCheckedModel {

@@ -74,6 +74,8 @@ A scheduled job creates an ordinary run with explicit job origin metadata. The r
 
 The occurrence key is derived from `job_id + job_revision + scheduled_for`. It is stable across crash recovery and is the idempotency anchor for scheduler lease and duplicate-run prevention.
 
+The local scheduler claims due occurrences through SQLite leases, creates runs as the service principal, and advances `next_due_at` only after a run has been reserved for the occurrence. Disabled jobs, disabled service identities, active leases, existing occurrence run IDs, and unreadable service grants fail closed before a duplicate run can be created.
+
 ## Approval Concurrency
 
 Approval uses an atomic compare-and-set transition. Only a pending, unexpired request with a matching fingerprint may be granted. Consumption and dispatch reservation occur transactionally so concurrent workers cannot reuse a one-shot approval.
