@@ -870,6 +870,9 @@ mod tests {
             outcome,
             ExecutionOutcome::Failed("network redirect denied".to_owned())
         );
+        let requests = server.received_requests().await.expect("received requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/redirect");
     }
 
     #[tokio::test]
