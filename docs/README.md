@@ -22,6 +22,8 @@ These documents are the authoritative design baseline for Lumen. When a roadmap 
 - [Implementation Plan](IMPLEMENTATION_PLAN.md): ordered work for the first local runtime kernel
 - [Milestone 4 Design](MILESTONE_4_DESIGN.md): controlled egress scope, policy, provider, network, and channel boundaries
 - [Milestone 4 Implementation Plan](MILESTONE_4_IMPLEMENTATION_PLAN.md): ordered work for remote providers, network egress, channels, and verification
+- [Milestone 5 Design](MILESTONE_5_DESIGN.md): durable scheduled jobs, service identities, reviewed skills, and workflow capture
+- [Milestone 5 Implementation Plan](MILESTONE_5_IMPLEMENTATION_PLAN.md): ordered work for automation persistence, scheduling, skills, capture, UI, and verification
 
 ## Decision Priority
 
