@@ -147,11 +147,11 @@ docs/
 
 **Files:** security tests under owning crates, `README.md`, `docs/{ARCHITECTURE,DATA_MODEL,MODEL_ROUTING,PLUGIN_SYSTEM,ROADMAP,RUNTIME_EXECUTION,SECURITY}.md`, this plan
 
-- [ ] Add adversarial tests for duplicate due occurrences, lease stealing, crash recovery, disabled service identities, stale job revisions, policy revocation during execution, approval replay, skill digest tampering, unreviewed skill loading, prompt-injected skill edits, secret leakage during capture, unknown job owners, and audit failure.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `CARGO_INCREMENTAL=0 cargo test --workspace`.
-- [ ] Run frontend checks, unit tests, production build, and Playwright.
-- [ ] Update Roadmap Milestone 5 only for behavior proven by the suite.
-- [ ] Run `git diff --check`.
-- [ ] Commit and push the completed milestone branch.
+- [x] Add adversarial tests for duplicate due occurrences, lease stealing, crash recovery, disabled service identities, stale job revisions, policy revocation during execution, approval replay, skill digest tampering, unreviewed skill loading, prompt-injected skill edits, secret leakage during capture, unknown job owners, and audit failure.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Run `CARGO_INCREMENTAL=0 cargo test --workspace`.
+- [x] Run frontend checks, unit tests, production build, and Playwright.
+- [x] Update Roadmap Milestone 5 only for behavior proven by the suite.
+- [x] Run `git diff --check`.
+- [x] Commit and push the completed milestone branch.

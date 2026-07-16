@@ -54,9 +54,12 @@ The implemented slice keeps local inference as the default while permitting expl
 
 ## Milestone 5: Durable Automation
 
-- Add scheduled jobs with service identities, owners, leases, and idempotency.
-- Add reviewed, versioned skills without inherited authority.
-- Add workflow capture only after approval and audit semantics are stable.
+- [x] Add scheduled jobs with service identities, owners, leases, and idempotency.
+- [x] Add reviewed, versioned skills without inherited authority.
+- [x] Add workflow capture only after approval and audit semantics are stable.
+- [x] Add authenticated automation and skills control-surface APIs and web pages.
+
+The implemented slice adds service identities with explicit grants, append-only scheduled job revisions, lease-backed due occurrence execution, idempotent retry handling for unknown outcomes, reviewed skill loading by digest, workflow capture from completed audited runs, approval-bound skill publishing, and operator web controls for jobs, skills, and capture drafts. Scheduled-job mutations and skill publishing re-enter the normal action lifecycle instead of directly mutating runtime state. The suite covers duplicate occurrence prevention, lease recovery, disabled services, stale revisions, approval replay, skill tampering, unreviewed skills, capture redaction, unknown job owners, and audit failure.
 
 ## Deferred
 

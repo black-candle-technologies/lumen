@@ -1965,6 +1965,50 @@ async fn schedule_job_enablement_requires_approval_before_revision_change() {
 }
 
 #[tokio::test]
+async fn schedule_job_action_with_unknown_owner_fails_without_creating_job() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("admin done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    let mut arguments = scheduled_job_action_arguments(
+        "unknown owner scheduled prompt",
+        DataClass::Public,
+        2,
+        1,
+        true,
+        true,
+    );
+    let CanonicalValue::Object(object) = &mut arguments else {
+        panic!("scheduled job arguments must be an object");
+    };
+    object.insert(
+        "owner_subject".to_owned(),
+        CanonicalValue::from("missing-operator"),
+    );
+
+    let run_id = request_scheduled_job_admin_action(
+        &harness,
+        "schedule.job.create",
+        CapabilityName::ScheduleCreate,
+        arguments,
+    )
+    .await;
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+
+    assert!(
+        harness
+            .database
+            .latest_scheduled_job_revision(scheduled_job_id())
+            .await
+            .expect("latest job")
+            .is_none()
+    );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn idempotent_unknown_scheduled_occurrence_retries_with_a_new_run() {
     let model = MockServer::start().await;
     mount_response(&model, final_response("retry done")).await;
