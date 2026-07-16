@@ -119,15 +119,15 @@ docs/
 
 **Files:** `crates/lumen-cli/src/runtime.rs`, `crates/lumen-db/src/automation.rs`, `crates/lumen-cli/src/runtime/security_tests.rs`, `docs/RUNTIME_EXECUTION.md`
 
-- [ ] Add failing tests proving capture is rejected when the source run is not terminal successful or the audit chain does not verify.
-- [ ] Add failing tests proving captured drafts redact secret values, approval tokens, raw diagnostics, and sensitive payload fragments.
-- [ ] Add failing tests proving captured drafts include source run IDs, action kinds, artifact digests, required variables, expected outputs, and failure notes.
-- [ ] Add failing tests proving publishing a capture draft creates a reviewed skill version only after explicit approval.
-- [ ] Confirm focused tests fail before implementation.
-- [ ] Implement capture draft generation from persisted run/action/audit records.
-- [ ] Implement publish flow through the existing action lifecycle.
-- [ ] Run focused capture and skill tests.
-- [ ] Commit as `feat(skills): capture audited workflows as drafts`.
+- [x] Add failing tests proving capture is rejected when the source run is not terminal successful or the audit chain does not verify.
+- [x] Add failing tests proving captured drafts redact secret values, approval tokens, raw diagnostics, and sensitive payload fragments.
+- [x] Add failing tests proving captured drafts include source run IDs, action kinds, artifact digests, required variables, expected outputs, and failure notes.
+- [x] Add failing tests proving publishing a capture draft creates a reviewed skill version only after explicit approval.
+- [x] Confirm focused tests fail before implementation.
+- [x] Implement capture draft generation from persisted run/action/audit records.
+- [x] Implement publish flow through the existing action lifecycle.
+- [x] Run focused capture and skill tests.
+- [x] Commit as `feat(skills): capture audited workflows as drafts`.
 
 ## Task 7: Automation APIs And Web Controls
 

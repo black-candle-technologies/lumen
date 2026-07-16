@@ -29,6 +29,8 @@ pub enum CapabilityName {
     ScheduleCreate,
     #[serde(rename = "schedule.modify")]
     ScheduleModify,
+    #[serde(rename = "skill.publish")]
+    SkillPublish,
     #[serde(rename = "plugin.install")]
     PluginInstall,
     #[serde(rename = "plugin.update")]
@@ -61,6 +63,7 @@ impl CapabilityName {
             Self::ChannelSend => "channel.send",
             Self::ScheduleCreate => "schedule.create",
             Self::ScheduleModify => "schedule.modify",
+            Self::SkillPublish => "skill.publish",
             Self::PluginInstall => "plugin.install",
             Self::PluginUpdate => "plugin.update",
             Self::PluginEnable => "plugin.enable",
@@ -85,6 +88,7 @@ impl CapabilityName {
             "channel.send" => Self::ChannelSend,
             "schedule.create" => Self::ScheduleCreate,
             "schedule.modify" => Self::ScheduleModify,
+            "skill.publish" => Self::SkillPublish,
             "plugin.install" => Self::PluginInstall,
             "plugin.update" => Self::PluginUpdate,
             "plugin.enable" => Self::PluginEnable,

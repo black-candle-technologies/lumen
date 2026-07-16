@@ -101,6 +101,12 @@ Reviewed, enabled skill versions are loaded as untrusted procedure context befor
 
 Skill context does not grant capabilities, approve actions, change policy, or bypass plugin grants. Any model action influenced by a skill still re-enters normal normalization, capability evaluation, approval, dispatch, and audit. Run audit metadata records loaded skill IDs, versions, and digests.
 
+## Workflow Capture
+
+Workflow capture creates draft skill material only from completed source runs whose audit chain verifies. Draft bodies are generated from persisted run, action, and audit records, include source run IDs, action kinds, action argument digests, required-variable notes, expected outputs, and failure notes, and avoid copying raw action arguments or known secret values.
+
+Publishing a capture draft as a reviewed skill is a `skill.publish` action. It requires the `skill.publish` capability, goes through approval, dispatch reservation, execution, and audit, writes immutable local skill source, stores the reviewed skill version digest in SQL, and enables the version for the workspace only after approval is consumed.
+
 ## Cancellation
 
 Cancellation stops further model turns, revokes pending dispatch reservations, sends protocol cancellation, and terminates the isolated process tree after a grace period. Cancellation is an outcome, not deletion; all prior records remain auditable.

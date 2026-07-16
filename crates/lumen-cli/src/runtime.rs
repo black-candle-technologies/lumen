@@ -12,7 +12,9 @@ use lumen_core::{
         TimestampMillis,
     },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
-    automation::{JobId, JobOrigin, JobRevision, OccurrenceKey, ScheduleSpec},
+    automation::{
+        JobId, JobOrigin, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion,
+    },
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
     egress::{DataClass, DestinationScope, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
@@ -30,7 +32,7 @@ use lumen_core::{
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, ModelEndpointClass,
     ModelProviderRevision, PluginGrantScope, PluginSettingScope, ScheduledJobRevision,
-    SkillVersionRecord, WorkspaceModelEgressRevision,
+    SkillVersionRecord, WorkflowCaptureDraft, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     filesystem::WorkspaceReader,
@@ -190,6 +192,7 @@ impl LocalRuntimeService {
         let executor = RedactingExecutor {
             inner: Arc::new(RoutingExecutor {
                 database: database.clone(),
+                data_root: Arc::from(data_root.as_path()),
                 builtin: builtin_executor,
                 extension: extension_executor,
             }),
@@ -514,6 +517,92 @@ impl LocalRuntimeService {
                 source
             ),
         }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn capture_workflow_draft(
+        &self,
+        run_id: RunId,
+        actor: lumen_core::identity::PrincipalId,
+    ) -> Result<uuid::Uuid, ServiceError> {
+        self.database.verify_audit_chain().await.map_err(|error| {
+            ServiceError::Conflict(format!("audit chain does not verify: {error}"))
+        })?;
+        let run = sqlx::query("SELECT workspace_id, state FROM agent_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_optional(self.database.pool())
+            .await
+            .map_err(sql_service_error)?
+            .ok_or(ServiceError::NotFound)?;
+        let workspace_id = lumen_core::identity::WorkspaceId::from_uuid(
+            run.try_get::<String, _>("workspace_id")
+                .map_err(sql_service_error)?
+                .parse()
+                .map_err(|_| ServiceError::Internal("invalid run workspace".into()))?,
+        );
+        let state: String = run.try_get("state").map_err(sql_service_error)?;
+        if state != "completed" {
+            return Err(ServiceError::Conflict(
+                "workflow capture requires a completed source run".into(),
+            ));
+        }
+        let actions = sqlx::query(
+            "SELECT kind, arguments_json, state FROM actions
+             WHERE run_id = ? ORDER BY created_at, id",
+        )
+        .bind(run_id.to_string())
+        .fetch_all(self.database.pool())
+        .await
+        .map_err(sql_service_error)?;
+        let mut action_lines = Vec::new();
+        for action in actions {
+            let arguments: String = action
+                .try_get("arguments_json")
+                .map_err(sql_service_error)?;
+            action_lines.push(format!(
+                "- kind: {}; state: {}; arguments_sha256: {}",
+                action
+                    .try_get::<String, _>("kind")
+                    .map_err(sql_service_error)?,
+                action
+                    .try_get::<String, _>("state")
+                    .map_err(sql_service_error)?,
+                sha256_hex(arguments.as_bytes())
+            ));
+        }
+        if action_lines.is_empty() {
+            action_lines.push("- none".to_owned());
+        }
+        let audit_records = self
+            .database
+            .list_audit_records(workspace_id, 0, 1_000)
+            .await
+            .map_err(repository_service_error)?;
+        let event_kinds = audit_records
+            .iter()
+            .map(|record| record.event().kind().as_str())
+            .collect::<Vec<_>>();
+        let mut body = format!(
+            "# Captured Workflow\n\nsource_run_id: {run_id}\nsource_workspace_id: {workspace_id}\n\n## Actions\n{}\n\n## Audit Events\n{}\n\n## Required Variables\n- operator must review variables before publishing\n\n## Expected Outputs\n- source run completed successfully\n\n## Failure Notes\n- none captured",
+            action_lines.join("\n"),
+            event_kinds.join(", ")
+        );
+        self.redactor.redact_string(&mut body);
+        let draft = WorkflowCaptureDraft::new(
+            uuid::Uuid::new_v4(),
+            workspace_id,
+            format!("Captured workflow {run_id}"),
+            body,
+            actor,
+            now(),
+        )
+        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+        let draft_id = draft.id();
+        self.database
+            .insert_workflow_capture_draft(&draft)
+            .await
+            .map_err(repository_service_error)?;
+        Ok(draft_id)
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -1732,6 +1821,128 @@ fn parse_scheduled_job_schedule(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillPublishAction {
+    draft_id: String,
+    skill_id: String,
+    version: String,
+    name: String,
+    description: String,
+    source_format: String,
+}
+
+struct ParsedSkillPublishAction {
+    draft_id: uuid::Uuid,
+    skill_id: SkillId,
+    version: SkillVersion,
+    name: String,
+    description: String,
+    source_format: String,
+}
+
+async fn apply_skill_publish_action(
+    database: &Database,
+    data_root: &Path,
+    workspace_id: lumen_core::identity::WorkspaceId,
+    actor: lumen_core::identity::PrincipalId,
+    parsed: ParsedSkillPublishAction,
+) -> Result<SkillId, ServiceError> {
+    let draft = database
+        .get_workflow_capture_draft(parsed.draft_id)
+        .await
+        .map_err(repository_service_error)?
+        .ok_or(ServiceError::NotFound)?;
+    if draft.workspace_id() != workspace_id {
+        return Err(ServiceError::NotFound);
+    }
+    let source_path = data_root
+        .join("skills")
+        .join(parsed.skill_id.to_string())
+        .join(format!("{}.md", parsed.version.as_str()));
+    tokio::fs::create_dir_all(
+        source_path
+            .parent()
+            .ok_or_else(|| ServiceError::Internal("invalid skill source path".into()))?,
+    )
+    .await
+    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    tokio::fs::write(&source_path, draft.body())
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let digest = sha256_hex(draft.body().as_bytes());
+    let created_at = now();
+    let record = SkillVersionRecord::new(
+        parsed.skill_id,
+        parsed.version.clone(),
+        workspace_id,
+        parsed.name,
+        parsed.description,
+        parsed.source_format,
+        digest,
+        true,
+        actor.clone(),
+        Some(actor),
+        created_at,
+        Some(created_at),
+    )
+    .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    database
+        .insert_skill_version(&record)
+        .await
+        .map_err(repository_service_error)?;
+    database
+        .set_skill_workspace_state(
+            workspace_id,
+            parsed.skill_id,
+            &parsed.version,
+            true,
+            created_at,
+        )
+        .await
+        .map_err(repository_service_error)?;
+    Ok(parsed.skill_id)
+}
+
+fn parse_skill_publish_action(
+    arguments: &CanonicalValue,
+) -> Result<ParsedSkillPublishAction, lumen_core::executor::ExecutorError> {
+    let value = serde_json::to_value(arguments)
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+    let parsed: SkillPublishAction = serde_json::from_value(value)
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+    let draft_id = parsed
+        .draft_id
+        .parse()
+        .map_err(|_| lumen_core::executor::ExecutorError::new("invalid capture draft ID"))?;
+    let skill_id = SkillId::from_uuid(
+        parsed
+            .skill_id
+            .parse()
+            .map_err(|_| lumen_core::executor::ExecutorError::new("invalid skill ID"))?,
+    );
+    let version = SkillVersion::parse(parsed.version)
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+    if parsed.name.is_empty()
+        || parsed.name.len() > 128
+        || parsed.description.is_empty()
+        || parsed.description.len() > 2048
+        || parsed.source_format != "markdown"
+    {
+        return Err(lumen_core::executor::ExecutorError::new(
+            "skill publish metadata is invalid",
+        ));
+    }
+    Ok(ParsedSkillPublishAction {
+        draft_id,
+        skill_id,
+        version,
+        name: parsed.name,
+        description: parsed.description,
+        source_format: parsed.source_format,
+    })
+}
+
 fn timestamp_from_i64(value: i64) -> Result<TimestampMillis, lumen_core::executor::ExecutorError> {
     Ok(TimestampMillis::new(u64::try_from(value).map_err(
         |_| lumen_core::executor::ExecutorError::new("timestamp cannot be negative"),
@@ -2296,6 +2507,7 @@ impl ActionNormalizer for RoutingNormalizer {
 
 struct RoutingExecutor {
     database: Database,
+    data_root: Arc<Path>,
     builtin: Arc<dyn ExecutorPort>,
     extension: Arc<dyn ExecutorPort>,
 }
@@ -2340,6 +2552,24 @@ impl ExecutorPort for RoutingExecutor {
                 Ok(ExecutionOutcome::Succeeded(CanonicalValue::object([(
                     "job_id",
                     CanonicalValue::from(job_id.to_string()),
+                )])))
+            });
+        }
+        if action.action().kind().as_str() == "skill.publish" {
+            return Box::pin(async move {
+                let parsed = parse_skill_publish_action(action.action().arguments())?;
+                let skill_id = apply_skill_publish_action(
+                    &self.database,
+                    self.data_root.as_ref(),
+                    action.action().workspace_id(),
+                    action.action().actor().clone(),
+                    parsed,
+                )
+                .await
+                .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+                Ok(ExecutionOutcome::Succeeded(CanonicalValue::object([(
+                    "skill_id",
+                    CanonicalValue::from(skill_id.to_string()),
                 )])))
             });
         }

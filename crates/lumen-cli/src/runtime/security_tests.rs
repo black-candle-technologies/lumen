@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use lumen_core::audit::AuditEventKind;
 use lumen_core::{
-    action::CanonicalValue,
+    action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion},
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
@@ -2220,6 +2220,146 @@ async fn reviewed_skill_content_cannot_expand_runtime_capabilities() {
 }
 
 #[tokio::test]
+async fn workflow_capture_rejects_incomplete_runs_and_broken_audit_chains() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("capture later").await;
+    let parsed_run_id = RunId::from_uuid(run_id.parse().expect("run ID"));
+
+    let incomplete = harness
+        .service
+        .capture_workflow_draft(
+            parsed_run_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+        )
+        .await
+        .expect_err("incomplete run rejected");
+    assert!(incomplete.to_string().contains("completed source run"));
+
+    wait_for_run_completed(&harness, &run_id).await;
+    sqlx::query("UPDATE audit_events SET payload_json = '{}' WHERE sequence = 1")
+        .execute(harness.database.pool())
+        .await
+        .expect("tamper audit");
+    let tampered = harness
+        .service
+        .capture_workflow_draft(
+            parsed_run_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+        )
+        .await
+        .expect_err("tampered audit rejected");
+    assert!(tampered.to_string().contains("audit chain"));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_material() {
+    let model = MockServer::start().await;
+    let turn = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turn = Arc::clone(&turn);
+            move |_request: &MockRequest| {
+                if turn.fetch_add(1, Ordering::SeqCst) == 0 {
+                    action_response(
+                        "process.spawn",
+                        serde_json::json!({
+                            "program": "/bin/echo",
+                            "args": ["draft-sensitive-fragment"],
+                        }),
+                    )
+                } else {
+                    final_response("captured")
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("capture this workflow").await;
+    approve_pending(&harness).await;
+    wait_for_run_completed(&harness, &run_id).await;
+
+    let draft_id = harness
+        .service
+        .capture_workflow_draft(
+            RunId::from_uuid(run_id.parse().expect("run ID")),
+            PrincipalId::new("local", "operator").expect("operator"),
+        )
+        .await
+        .expect("capture draft");
+    let draft = harness
+        .database
+        .get_workflow_capture_draft(draft_id)
+        .await
+        .expect("draft lookup")
+        .expect("draft exists");
+
+    assert!(draft.body().contains(&format!("source_run_id: {run_id}")));
+    assert!(draft.body().contains("kind: process.spawn"));
+    assert!(draft.body().contains("arguments_sha256: sha256:"));
+    assert!(draft.body().contains("Expected Outputs"));
+    assert!(draft.body().contains("Required Variables"));
+    assert!(!draft.body().contains(TOKEN));
+    assert!(!draft.body().contains("draft-sensitive-fragment"));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn workflow_capture_publish_creates_reviewed_skill_only_after_approval() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("captured")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("capture publishable workflow").await;
+    wait_for_run_completed(&harness, &run_id).await;
+    let draft_id = harness
+        .service
+        .capture_workflow_draft(
+            RunId::from_uuid(run_id.parse().expect("run ID")),
+            PrincipalId::new("local", "operator").expect("operator"),
+        )
+        .await
+        .expect("capture draft");
+
+    let skill_id = SkillId::from_uuid(
+        uuid::Uuid::parse_str("9b29fc40-ca47-4067-b31d-00dd010662da").expect("published skill ID"),
+    );
+    let publish_run = request_skill_publish(&harness, draft_id, skill_id).await;
+    wait_for_run_state(&harness, &publish_run.to_string(), "awaiting_approval").await;
+    assert!(
+        harness
+            .database
+            .enabled_skill_versions(harness.workspace_id)
+            .await
+            .expect("enabled skills")
+            .is_empty()
+    );
+
+    approve_pending(&harness).await;
+    wait_for_run_completed(&harness, &publish_run.to_string()).await;
+    let enabled = harness
+        .database
+        .enabled_skill_versions(harness.workspace_id)
+        .await
+        .expect("enabled skills");
+    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled[0].skill_id(), skill_id);
+    assert_eq!(enabled[0].version().as_str(), "1.0.0");
+    assert!(enabled[0].reviewed());
+    let source_path = skill_source_path(
+        &harness,
+        skill_id,
+        &SkillVersion::parse("1.0.0").expect("version"),
+    );
+    let source = std::fs::read_to_string(source_path).expect("published skill source");
+    assert!(source.contains(&format!("source_run_id: {run_id}")));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn denied_model_egress_is_audited_before_inner_model_call() {
     let database = Database::connect_in_memory().await.expect("database");
     let workspace_id = WorkspaceId::from_uuid(
@@ -2632,6 +2772,39 @@ async fn request_scheduled_job_admin_action(
         )
         .await
         .expect("scheduled job admin action")
+}
+
+async fn request_skill_publish(
+    harness: &Harness,
+    draft_id: uuid::Uuid,
+    skill_id: SkillId,
+) -> lumen_core::action::RunId {
+    harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+            ActionProposal::new(
+                "skill.publish",
+                CanonicalValue::object([
+                    ("draft_id", CanonicalValue::from(draft_id.to_string())),
+                    ("skill_id", CanonicalValue::from(skill_id.to_string())),
+                    ("version", CanonicalValue::from("1.0.0")),
+                    ("name", CanonicalValue::from("Captured workflow skill")),
+                    (
+                        "description",
+                        CanonicalValue::from("A reviewed skill published from a captured workflow"),
+                    ),
+                    ("source_format", CanonicalValue::from("markdown")),
+                ]),
+            ),
+            CapabilitySet::new([Capability::new(
+                CapabilityName::SkillPublish,
+                ResourceScope::exact("skill", skill_id.to_string()).expect("skill scope"),
+            )]),
+        )
+        .await
+        .expect("skill publish action")
 }
 
 fn scheduled_job_action_arguments(

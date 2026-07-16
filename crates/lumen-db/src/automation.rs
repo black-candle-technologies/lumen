@@ -333,7 +333,7 @@ impl WorkflowCaptureDraft {
     ) -> Result<Self, RepositoryError> {
         let title = title.into();
         let body = body.into();
-        if invalid_text(&title, 128) || invalid_text(&body, 65_536) {
+        if invalid_text(&title, 128) || invalid_body_text(&body, 65_536) {
             return Err(RepositoryError::InvalidAutomationState);
         }
         Ok(Self {
@@ -348,6 +348,18 @@ impl WorkflowCaptureDraft {
 
     pub const fn id(&self) -> Uuid {
         self.id
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
     }
 }
 
@@ -1132,6 +1144,15 @@ fn invalid_text(value: &str, max_len: usize) -> bool {
         || value.len() > max_len
         || value.trim() != value
         || value.chars().any(char::is_control)
+}
+
+fn invalid_body_text(value: &str, max_len: usize) -> bool {
+    value.is_empty()
+        || value.len() > max_len
+        || value.trim() != value
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
 }
 
 fn valid_sha256_digest(value: &str) -> bool {

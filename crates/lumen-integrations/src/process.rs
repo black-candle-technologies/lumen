@@ -9,6 +9,7 @@ use std::{
 
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue},
+    automation::{SkillId, SkillVersion},
     capability::{Capability, CapabilityName, ResourceScope, WorkspacePath},
     egress::{DataClass, DestinationScope, ProviderId},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
@@ -231,6 +232,24 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                     vec![Capability::new(
                         capability,
                         ResourceScope::exact("scheduled_job", job_id)
+                            .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    )],
+                ))
+            }
+            "skill.publish" => {
+                let (skill_id, arguments) = normalize_skill_publish_arguments(&arguments)?;
+                Ok(ActionEnvelope::new(
+                    ActionId::new(),
+                    context.run_id(),
+                    context.workspace_id(),
+                    context.actor().clone(),
+                    self.component.clone(),
+                    ActionKind::new(kind)
+                        .map_err(|error| NormalizationError::new(error.to_string()))?,
+                    arguments,
+                    vec![Capability::new(
+                        CapabilityName::SkillPublish,
+                        ResourceScope::exact("skill", skill_id)
                             .map_err(|error| NormalizationError::new(error.to_string()))?,
                     )],
                 ))
@@ -529,6 +548,17 @@ struct ScheduledJobScheduleArguments {
     interval_millis: Option<i64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillPublishArguments {
+    draft_id: String,
+    skill_id: String,
+    version: String,
+    name: String,
+    description: String,
+    source_format: String,
+}
+
 fn parse_arguments<T: for<'de> Deserialize<'de>>(
     arguments: &CanonicalValue,
 ) -> Result<T, NormalizationError> {
@@ -661,6 +691,40 @@ fn normalize_scheduled_job_schedule(
             "scheduled job schedule kind is invalid",
         )),
     }
+}
+
+fn normalize_skill_publish_arguments(
+    arguments: &CanonicalValue,
+) -> Result<(String, CanonicalValue), NormalizationError> {
+    let parsed: SkillPublishArguments = parse_arguments(arguments)?;
+    let draft_id = uuid::Uuid::parse_str(&parsed.draft_id)
+        .map_err(|_| NormalizationError::new("capture draft ID must be a UUID"))?
+        .to_string();
+    let skill_id = SkillId::from_uuid(
+        uuid::Uuid::parse_str(&parsed.skill_id)
+            .map_err(|_| NormalizationError::new("skill ID must be a UUID"))?,
+    );
+    let version = SkillVersion::parse(parsed.version)
+        .map_err(|error| NormalizationError::new(error.to_string()))?;
+    if parsed.name.is_empty()
+        || parsed.name.len() > 128
+        || parsed.description.is_empty()
+        || parsed.description.len() > 2048
+        || parsed.source_format != "markdown"
+    {
+        return Err(NormalizationError::new("skill publish metadata is invalid"));
+    }
+    Ok((
+        skill_id.to_string(),
+        CanonicalValue::object([
+            ("draft_id", CanonicalValue::from(draft_id)),
+            ("skill_id", CanonicalValue::from(skill_id.to_string())),
+            ("version", CanonicalValue::from(version.as_str())),
+            ("name", CanonicalValue::from(parsed.name)),
+            ("description", CanonicalValue::from(parsed.description)),
+            ("source_format", CanonicalValue::from(parsed.source_format)),
+        ]),
+    ))
 }
 
 fn nonnegative_timestamp(value: i64) -> Result<i64, NormalizationError> {

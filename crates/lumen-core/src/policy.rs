@@ -98,6 +98,7 @@ impl Default for Policy {
                 CapabilityName::MessageSend,
                 CapabilityName::ScheduleCreate,
                 CapabilityName::ScheduleModify,
+                CapabilityName::SkillPublish,
                 CapabilityName::PluginInstall,
                 CapabilityName::PluginUpdate,
                 CapabilityName::PluginEnable,
