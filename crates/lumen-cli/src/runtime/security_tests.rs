@@ -13,7 +13,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use lumen_core::audit::AuditEventKind;
+use lumen_core::audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome};
 use lumen_core::{
     action::{CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
@@ -1155,11 +1155,13 @@ async fn public_class_input_is_allowed_through_public_remote_model_policy() {
         .await
         .expect("workspace policy stored");
     let inner = Arc::new(RecordingModel::new());
+    let run_id = RunId::new();
     let model = EgressCheckedModel {
         inner: inner.clone(),
         database: database.clone(),
         audit: super::DatabaseAudit(database.clone()),
         workspace_id,
+        run_id,
     };
 
     let output = model
@@ -1182,6 +1184,7 @@ async fn public_class_input_is_allowed_through_public_remote_model_policy() {
     assert_eq!(
         event.payload(),
         &CanonicalValue::object([
+            ("run_id", CanonicalValue::from(run_id.to_string())),
             ("data_class", CanonicalValue::from("public")),
             ("egress_occurred", CanonicalValue::from(true)),
             ("endpoint_class", CanonicalValue::from("remote")),
@@ -2310,12 +2313,36 @@ async fn workflow_capture_rejects_incomplete_runs_and_broken_audit_chains() {
     let incomplete = harness
         .service
         .capture_workflow_draft(
+            harness.workspace_id,
             parsed_run_id,
             PrincipalId::new("local", "operator").expect("operator"),
         )
         .await
         .expect_err("incomplete run rejected");
     assert!(incomplete.to_string().contains("completed source run"));
+
+    let drafts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_capture_drafts")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("draft count");
+    let wrong_workspace = harness
+        .service
+        .capture_workflow_draft(
+            WorkspaceId::new(),
+            parsed_run_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+        )
+        .await
+        .expect_err("cross-workspace capture rejected");
+    assert!(matches!(
+        wrong_workspace,
+        lumen_server::ServiceError::NotFound
+    ));
+    let drafts_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_capture_drafts")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("draft count");
+    assert_eq!(drafts_after, drafts_before);
 
     wait_for_run_completed(&harness, &run_id).await;
     sqlx::query("UPDATE audit_events SET payload_json = '{}' WHERE sequence = 1")
@@ -2325,6 +2352,7 @@ async fn workflow_capture_rejects_incomplete_runs_and_broken_audit_chains() {
     let tampered = harness
         .service
         .capture_workflow_draft(
+            harness.workspace_id,
             parsed_run_id,
             PrincipalId::new("local", "operator").expect("operator"),
         )
@@ -2359,6 +2387,23 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
         .mount(&model)
         .await;
     let harness = Harness::new(&model, |_| {}).await;
+    for index in 0_u64..1_001 {
+        harness
+            .database
+            .append_audit_event(AuditEvent::new(
+                AuditEventId::new(),
+                TimestampMillis::new(index),
+                AuditEventKind::AuthenticationAccepted,
+                AuditOutcome::Success,
+                Some(harness.workspace_id),
+                CanonicalValue::object([(
+                    "run_id",
+                    CanonicalValue::from("00000000-0000-4000-8000-000000000000"),
+                )]),
+            ))
+            .await
+            .expect("older unrelated audit event");
+    }
     let run_id = harness.create_run("capture this workflow").await;
     approve_pending(&harness).await;
     wait_for_run_completed(&harness, &run_id).await;
@@ -2368,6 +2413,7 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
     let draft_id = harness
         .service
         .capture_workflow_draft(
+            harness.workspace_id,
             RunId::from_uuid(run_id.parse().expect("run ID")),
             PrincipalId::new("local", "operator").expect("operator"),
         )
@@ -2385,6 +2431,27 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
     assert!(draft.body().contains("arguments_sha256: sha256:"));
     assert!(draft.body().contains("Expected Outputs"));
     assert!(draft.body().contains("Required Variables"));
+    let expected_events = harness
+        .database
+        .list_audit_records_for_run(
+            harness.workspace_id,
+            RunId::from_uuid(run_id.parse().expect("run ID")),
+        )
+        .await
+        .expect("source run audit events")
+        .into_iter()
+        .map(|record| record.event().kind().as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rendered_events = draft
+        .body()
+        .split_once("## Audit Events\n")
+        .expect("audit section")
+        .1
+        .split_once("\n\n## Required Variables")
+        .expect("end audit section")
+        .0;
+    assert_eq!(rendered_events, expected_events);
     assert_eq!(draft.body().matches("run_created").count(), 1);
     assert!(!draft.body().contains(TOKEN));
     assert!(!draft.body().contains("draft-sensitive-fragment"));
@@ -2401,6 +2468,7 @@ async fn workflow_capture_publish_creates_reviewed_skill_only_after_approval() {
     let draft_id = harness
         .service
         .capture_workflow_draft(
+            harness.workspace_id,
             RunId::from_uuid(run_id.parse().expect("run ID")),
             PrincipalId::new("local", "operator").expect("operator"),
         )
@@ -2472,11 +2540,13 @@ async fn denied_model_egress_is_audited_before_inner_model_call() {
         .await
         .expect("provider stored");
     let inner = Arc::new(RecordingModel::new());
+    let run_id = RunId::new();
     let model = EgressCheckedModel {
         inner: inner.clone(),
         database: database.clone(),
         audit: super::DatabaseAudit(database.clone()),
         workspace_id,
+        run_id,
     };
 
     let error = model
@@ -2502,6 +2572,7 @@ async fn denied_model_egress_is_audited_before_inner_model_call() {
     assert_eq!(
         event.payload(),
         &CanonicalValue::object([
+            ("run_id", CanonicalValue::from(run_id.to_string())),
             ("data_class", CanonicalValue::from("workspace")),
             ("egress_occurred", CanonicalValue::from(false)),
             ("failure", CanonicalValue::from(error.message())),
@@ -2552,11 +2623,13 @@ async fn disabled_remote_provider_is_denied_before_inner_model_call() {
         .await
         .expect("workspace policy stored");
     let inner = Arc::new(RecordingModel::new());
+    let run_id = RunId::new();
     let model = EgressCheckedModel {
         inner: inner.clone(),
         database: database.clone(),
         audit: super::DatabaseAudit(database.clone()),
         workspace_id,
+        run_id,
     };
 
     let error = model
@@ -2566,8 +2639,14 @@ async fn disabled_remote_provider_is_denied_before_inner_model_call() {
 
     assert_eq!(error.message(), "no eligible model provider is configured");
     assert_eq!(inner.call_count(), 0);
-    assert_model_egress_denied_audit(&database, workspace_id, DataClass::Public, error.message())
-        .await;
+    assert_model_egress_denied_audit(
+        &database,
+        workspace_id,
+        run_id,
+        DataClass::Public,
+        error.message(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2623,11 +2702,13 @@ async fn revoked_workspace_model_policy_is_denied_before_inner_model_call() {
             .expect("workspace policy stored");
     }
     let inner = Arc::new(RecordingModel::new());
+    let run_id = RunId::new();
     let model = EgressCheckedModel {
         inner: inner.clone(),
         database: database.clone(),
         audit: super::DatabaseAudit(database.clone()),
         workspace_id,
+        run_id,
     };
 
     let error = model
@@ -2643,6 +2724,7 @@ async fn revoked_workspace_model_policy_is_denied_before_inner_model_call() {
     assert_model_egress_denied_audit(
         &database,
         workspace_id,
+        run_id,
         DataClass::Workspace,
         error.message(),
     )
@@ -2652,6 +2734,7 @@ async fn revoked_workspace_model_policy_is_denied_before_inner_model_call() {
 async fn assert_model_egress_denied_audit(
     database: &Database,
     workspace_id: WorkspaceId,
+    run_id: RunId,
     data_class: DataClass,
     failure: &str,
 ) {
@@ -2668,6 +2751,7 @@ async fn assert_model_egress_denied_audit(
     assert_eq!(
         event.payload(),
         &CanonicalValue::object([
+            ("run_id", CanonicalValue::from(run_id.to_string())),
             ("data_class", CanonicalValue::from(data_class.as_str())),
             ("egress_occurred", CanonicalValue::from(false)),
             ("failure", CanonicalValue::from(failure)),

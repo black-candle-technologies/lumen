@@ -525,24 +525,20 @@ impl LocalRuntimeService {
     #[allow(dead_code)]
     pub(crate) async fn capture_workflow_draft(
         &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
         run_id: RunId,
         actor: lumen_core::identity::PrincipalId,
     ) -> Result<uuid::Uuid, ServiceError> {
         self.database.verify_audit_chain().await.map_err(|error| {
             ServiceError::Conflict(format!("audit chain does not verify: {error}"))
         })?;
-        let run = sqlx::query("SELECT workspace_id, state FROM agent_runs WHERE id = ?")
+        let run = sqlx::query("SELECT state FROM agent_runs WHERE id = ? AND workspace_id = ?")
             .bind(run_id.to_string())
+            .bind(workspace_id.to_string())
             .fetch_optional(self.database.pool())
             .await
             .map_err(sql_service_error)?
             .ok_or(ServiceError::NotFound)?;
-        let workspace_id = lumen_core::identity::WorkspaceId::from_uuid(
-            run.try_get::<String, _>("workspace_id")
-                .map_err(sql_service_error)?
-                .parse()
-                .map_err(|_| ServiceError::Internal("invalid run workspace".into()))?,
-        );
         let state: String = run.try_get("state").map_err(sql_service_error)?;
         if state != "completed" {
             return Err(ServiceError::Conflict(
@@ -578,19 +574,11 @@ impl LocalRuntimeService {
         }
         let audit_records = self
             .database
-            .list_audit_records(workspace_id, 0, 1_000)
+            .list_audit_records_for_run(workspace_id, run_id)
             .await
             .map_err(repository_service_error)?;
         let event_kinds = audit_records
             .iter()
-            .filter(|record| {
-                matches!(
-                    record.event().payload(),
-                    CanonicalValue::Object(values)
-                        if values.get("run_id")
-                            == Some(&CanonicalValue::from(run_id.to_string()))
-                )
-            })
             .map(|record| record.event().kind().as_str())
             .collect::<Vec<_>>();
         let mut body = format!(
@@ -659,6 +647,7 @@ impl LocalRuntimeService {
                 database: self.database.clone(),
                 audit: DatabaseAudit(self.database.clone()),
                 workspace_id: stored.workspace_id,
+                run_id,
             })
         } else {
             None
@@ -1796,7 +1785,11 @@ impl RuntimeService for LocalRuntimeService {
         let service = self.clone();
         Box::pin(async move {
             let draft_id = service
-                .capture_workflow_draft(command.run_id(), command.actor().clone())
+                .capture_workflow_draft(
+                    command.workspace_id(),
+                    command.run_id(),
+                    command.actor().clone(),
+                )
                 .await?;
             let draft = service
                 .database
@@ -1804,9 +1797,6 @@ impl RuntimeService for LocalRuntimeService {
                 .await
                 .map_err(repository_service_error)?
                 .ok_or(ServiceError::NotFound)?;
-            if draft.workspace_id() != command.workspace_id() {
-                return Err(ServiceError::NotFound);
-            }
             Ok(WorkflowCaptureDraftReview::new(
                 draft.id(),
                 draft.workspace_id(),
@@ -3029,6 +3019,7 @@ struct EgressCheckedModel {
     database: Database,
     audit: DatabaseAudit,
     workspace_id: lumen_core::identity::WorkspaceId,
+    run_id: RunId,
 }
 
 impl ModelPort for EgressCheckedModel {
@@ -3069,6 +3060,7 @@ impl EgressCheckedModel {
                 AuditOutcome::Success,
                 Some(self.workspace_id),
                 CanonicalValue::object([
+                    ("run_id", CanonicalValue::from(self.run_id.to_string())),
                     ("data_class", CanonicalValue::from(data_class.as_str())),
                     (
                         "egress_occurred",
@@ -3101,6 +3093,7 @@ impl EgressCheckedModel {
                 AuditOutcome::Denied,
                 Some(self.workspace_id),
                 CanonicalValue::object([
+                    ("run_id", CanonicalValue::from(self.run_id.to_string())),
                     ("data_class", CanonicalValue::from(data_class.as_str())),
                     ("egress_occurred", CanonicalValue::from(false)),
                     ("failure", CanonicalValue::from(failure)),

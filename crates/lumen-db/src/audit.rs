@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use lumen_core::{
-    action::CanonicalValue,
+    action::{CanonicalValue, RunId},
     approval::TimestampMillis,
     audit::{
         AuditEvent, AuditEventId, AuditEventKind, AuditHash, AuditIntegrityError, AuditOutcome,
@@ -100,6 +100,28 @@ impl Database {
         .bind(workspace_id.to_string())
         .bind(after)
         .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(record_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))
+    }
+
+    pub async fn list_audit_records_for_run(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Vec<AuditRecord>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT sequence, event_id, timestamp, event_type, outcome, workspace_id,
+                    payload_json, previous_hash, event_hash
+             FROM audit_events
+             WHERE workspace_id = ? AND json_extract(payload_json, '$.run_id') = ?
+             ORDER BY sequence",
+        )
+        .bind(workspace_id.to_string())
+        .bind(run_id.to_string())
         .fetch_all(&self.pool)
         .await?;
         rows.iter()

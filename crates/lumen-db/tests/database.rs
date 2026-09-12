@@ -108,7 +108,7 @@ async fn empty_database_runs_the_initial_migration() {
         .fetch_one(database.pool())
         .await
         .expect("migration metadata loads");
-    assert_eq!(migration_count, 5);
+    assert_eq!(migration_count, 6);
 }
 
 #[tokio::test]
@@ -134,7 +134,7 @@ async fn file_database_reopens_without_reapplying_migrations() {
         .expect("migration count loads");
 
     assert_eq!(workspace_count, 1);
-    assert_eq!(migration_count, 5);
+    assert_eq!(migration_count, 6);
 }
 
 #[tokio::test]
