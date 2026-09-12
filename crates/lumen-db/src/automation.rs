@@ -502,7 +502,7 @@ impl Database {
         &self,
         revision: &ScheduledJobRevision,
     ) -> Result<(), RepositoryError> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT OR IGNORE INTO scheduled_jobs (
                 job_id, workspace_id, service_provider, service_subject,
@@ -544,7 +544,10 @@ impl Database {
         .bind(revision.job_id.to_string())
         .fetch_one(&mut *transaction)
         .await?;
-        if revision_number != latest.map_or(1, |value| value.saturating_add(1)) {
+        let expected_revision = latest
+            .map_or(Some(1), |value| value.checked_add(1))
+            .ok_or(RepositoryError::InvalidAutomationState)?;
+        if revision_number != expected_revision {
             return Err(RepositoryError::ExecutionStateConflict);
         }
         let (schedule_kind, schedule_start_at, interval_millis) = schedule_parts(revision.schedule);
@@ -657,7 +660,7 @@ impl Database {
     ) -> Result<bool, RepositoryError> {
         let now_i64 = timestamp_to_i64(now)?;
         let expires_i64 = timestamp_to_i64(expires_at)?;
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let eligible: i64 = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1

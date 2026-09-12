@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use lumen_core::{
     approval::TimestampMillis,
@@ -12,6 +12,8 @@ use lumen_db::{
     WorkflowCaptureDraft,
 };
 use sqlx::Row;
+use tempfile::{TempDir, tempdir};
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn workspace_id() -> WorkspaceId {
@@ -46,6 +48,23 @@ async fn database() -> Database {
         .await
         .expect("workspace");
     database
+}
+
+async fn file_databases() -> (TempDir, Database, Database) {
+    let directory = tempdir().expect("temporary directory");
+    let path = directory.path().join("automation-race.sqlite3");
+    let first = Database::connect(&path).await.expect("first database");
+    first
+        .bootstrap_workspace(
+            workspace_id(),
+            "Default",
+            &owner(),
+            TimestampMillis::new(500),
+        )
+        .await
+        .expect("workspace");
+    let second = Database::connect(&path).await.expect("second database");
+    (directory, first, second)
 }
 
 async fn insert_service_and_job(database: &Database) {
@@ -120,7 +139,7 @@ async fn migration_adds_durable_automation_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 5);
+    assert_eq!(migrations, 6);
 }
 
 #[tokio::test]
@@ -248,6 +267,63 @@ async fn scheduled_job_revisions_are_append_only_and_load_latest() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_revision_appends_have_one_winner() {
+    let (_directory, first_database, second_database) = file_databases().await;
+    insert_service_and_job(&first_database).await;
+    let revision = ScheduledJobRevision::new(
+        job_id(),
+        JobRevision::new(2).expect("revision"),
+        workspace_id(),
+        service(),
+        owner(),
+        ScheduleSpec::once(TimestampMillis::new(3_000)),
+        "second revision",
+        DataClass::Workspace,
+        1,
+        1,
+        true,
+        Some(TimestampMillis::new(3_000)),
+        false,
+        TimestampMillis::new(2_000),
+    )
+    .expect("revision");
+    let barrier = Arc::new(Barrier::new(3));
+    let first = tokio::spawn({
+        let barrier = Arc::clone(&barrier);
+        let revision = revision.clone();
+        async move {
+            barrier.wait().await;
+            first_database
+                .append_scheduled_job_revision(&revision)
+                .await
+        }
+    });
+    let second = tokio::spawn({
+        let barrier = Arc::clone(&barrier);
+        async move {
+            barrier.wait().await;
+            second_database
+                .append_scheduled_job_revision(&revision)
+                .await
+        }
+    });
+    barrier.wait().await;
+    let results = [
+        first.await.expect("first task"),
+        second.await.expect("second task"),
+    ];
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(RepositoryError::ExecutionStateConflict)))
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn scheduled_job_identity_cannot_move_between_workspaces() {
     let database = database().await;
@@ -335,6 +411,151 @@ async fn job_occurrence_leases_are_unique_and_expired_leases_recover() {
         .await
         .expect("run count");
     assert_eq!(rows, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_occurrence_claims_have_one_winner() {
+    let (_directory, first_database, second_database) = file_databases().await;
+    insert_service_and_job(&first_database).await;
+    let key = OccurrenceKey::new(
+        job_id(),
+        JobRevision::new(1).expect("revision"),
+        TimestampMillis::new(2_000),
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let first = tokio::spawn({
+        let barrier = Arc::clone(&barrier);
+        let key = key.clone();
+        async move {
+            barrier.wait().await;
+            first_database
+                .claim_job_occurrence(
+                    &key,
+                    Uuid::new_v4(),
+                    TimestampMillis::new(2_100),
+                    TimestampMillis::new(3_000),
+                )
+                .await
+        }
+    });
+    let second = tokio::spawn({
+        let barrier = Arc::clone(&barrier);
+        async move {
+            barrier.wait().await;
+            second_database
+                .claim_job_occurrence(
+                    &key,
+                    Uuid::new_v4(),
+                    TimestampMillis::new(2_100),
+                    TimestampMillis::new(3_000),
+                )
+                .await
+        }
+    });
+    barrier.wait().await;
+    let results = [
+        first.await.expect("first task").expect("first claim"),
+        second.await.expect("second task").expect("second claim"),
+    ];
+
+    assert_eq!(results.into_iter().filter(|claimed| *claimed).count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn occurrence_claim_waits_for_concurrent_eligibility_changes() {
+    for change in ["service-disabled", "new-revision", "job-disabled"] {
+        let (_directory, writer, claimant) = file_databases().await;
+        insert_service_and_job(&writer).await;
+        let mut transaction = writer
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("writer transaction");
+        match change {
+            "service-disabled" => {
+                sqlx::query(
+                    "UPDATE service_identities SET enabled = 0
+                     WHERE workspace_id = ? AND provider = ? AND subject = ?",
+                )
+                .bind(workspace_id().to_string())
+                .bind(service().provider())
+                .bind(service().subject())
+                .execute(&mut *transaction)
+                .await
+                .expect("service disabled");
+            }
+            "new-revision" | "job-disabled" => {
+                sqlx::query(
+                    "INSERT INTO scheduled_job_revisions (
+                        job_id, revision, schedule_kind, schedule_start_at, interval_millis,
+                        prompt, data_class, max_model_turns, max_actions, enabled,
+                        next_due_at, idempotent, created_at
+                     )
+                     SELECT job_id, 2, schedule_kind, schedule_start_at, interval_millis,
+                            prompt, data_class, max_model_turns, max_actions, ?, ?,
+                            idempotent, 1500
+                     FROM scheduled_job_revisions WHERE job_id = ? AND revision = 1",
+                )
+                .bind(if change == "new-revision" {
+                    1_i64
+                } else {
+                    0_i64
+                })
+                .bind(if change == "new-revision" {
+                    Some(3_000_i64)
+                } else {
+                    None
+                })
+                .bind(job_id().to_string())
+                .execute(&mut *transaction)
+                .await
+                .expect("job revision changed");
+            }
+            _ => unreachable!(),
+        }
+
+        let key = OccurrenceKey::new(
+            job_id(),
+            JobRevision::new(1).expect("revision"),
+            TimestampMillis::new(2_000),
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let mut claim = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                claimant
+                    .claim_job_occurrence(
+                        &key,
+                        Uuid::new_v4(),
+                        TimestampMillis::new(2_100),
+                        TimestampMillis::new(3_000),
+                    )
+                    .await
+            }
+        });
+        barrier.wait().await;
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut claim)
+                .await
+                .is_err(),
+            "claim must wait for {change} transaction"
+        );
+        transaction.commit().await.expect("state change committed");
+        assert!(
+            !claim
+                .await
+                .expect("claim task")
+                .expect("claim after state change"),
+            "claim must reject {change}"
+        );
+        let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_job_leases")
+            .fetch_one(writer.pool())
+            .await
+            .expect("lease count");
+        assert_eq!(leases, 0, "{change} must not create a lease");
+    }
 }
 
 #[tokio::test]
