@@ -728,11 +728,11 @@ impl ExtensionAdminExecutor {
         }
         let relative = artifact
             .strip_prefix(&self.data_root)
-            .map_err(|_| "installed artifact escaped the runtime data directory".to_owned())?
-            .to_str()
-            .ok_or_else(|| "installed artifact path is not UTF-8".to_owned())?;
+            .map_err(|_| "installed artifact escaped the runtime data directory".to_owned())?;
+        let relative = crate::relative_storage_path(relative)
+            .ok_or_else(|| "installed artifact path is not portable".to_owned())?;
         self.database
-            .install_staged_plugin(arguments.stage_id, relative, now())
+            .install_staged_plugin(arguments.stage_id, &relative, now())
             .await
             .map_err(|error| error.to_string())?;
         Ok(CanonicalValue::object([

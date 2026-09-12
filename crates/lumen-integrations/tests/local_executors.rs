@@ -15,13 +15,14 @@ use lumen_core::{
     run::{ActionNormalizer, RunContext},
     secret::SecretRefId,
 };
+#[cfg(unix)]
+use lumen_integrations::sandbox::ProcessMonitor;
 use lumen_integrations::{
     filesystem::{FilesystemError, WorkspaceReader},
     process::{BuiltinActionNormalizer, ProcessError, ProcessExecutor, ProcessRequest},
     sandbox::{
-        MonitoredCommand, ProcessMonitor, ResourceLimits, SandboxBackend, SandboxError,
-        SandboxFuture, SandboxOutput, SandboxReport, SandboxRequest, SandboxStrength,
-        SystemSandbox,
+        MonitoredCommand, ResourceLimits, SandboxBackend, SandboxError, SandboxFuture,
+        SandboxOutput, SandboxReport, SandboxRequest, SandboxStrength, SystemSandbox,
     },
 };
 use tempfile::tempdir;
@@ -37,6 +38,16 @@ fn run_context() -> RunContext {
 
 fn resource_limits() -> ResourceLimits {
     ResourceLimits::new(2, 256 * 1024 * 1024, 1024 * 1024, 64, 512).expect("valid resource limits")
+}
+
+fn test_program() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let program = std::path::PathBuf::from(
+        std::env::var_os("ComSpec").expect("ComSpec identifies the Windows command processor"),
+    );
+    #[cfg(not(windows))]
+    let program = std::path::PathBuf::from("/bin/echo");
+    std::fs::canonicalize(program).expect("test executable")
 }
 
 #[test]
@@ -411,7 +422,9 @@ fn process_proposals_bind_the_canonical_executable_and_read_only_workspace() {
                 lumen_core::action::CanonicalValue::object([
                     (
                         "program",
-                        lumen_core::action::CanonicalValue::from("/bin/echo"),
+                        lumen_core::action::CanonicalValue::from(
+                            test_program().to_string_lossy().into_owned(),
+                        ),
                     ),
                     (
                         "args",
@@ -428,10 +441,7 @@ fn process_proposals_bind_the_canonical_executable_and_read_only_workspace() {
         )
         .expect("proposal normalizes");
 
-    let canonical_program = std::fs::canonicalize("/bin/echo")
-        .expect("echo executable")
-        .to_string_lossy()
-        .into_owned();
+    let canonical_program = test_program().to_string_lossy().into_owned();
     assert_eq!(action.kind().as_str(), "process.spawn");
     assert!(action.required_capabilities().contains(&Capability::new(
         CapabilityName::FsRead,
@@ -459,7 +469,9 @@ fn process_secret_bindings_fingerprint_only_opaque_references() {
                 lumen_core::action::CanonicalValue::object([
                     (
                         "program",
-                        lumen_core::action::CanonicalValue::from("/bin/echo"),
+                        lumen_core::action::CanonicalValue::from(
+                            test_program().to_string_lossy().into_owned(),
+                        ),
                     ),
                     (
                         "secret_environment",
@@ -496,7 +508,9 @@ fn process_secret_bindings_reject_non_uuid_references() {
                 lumen_core::action::CanonicalValue::object([
                     (
                         "program",
-                        lumen_core::action::CanonicalValue::from("/bin/echo"),
+                        lumen_core::action::CanonicalValue::from(
+                            test_program().to_string_lossy().into_owned(),
+                        ),
                     ),
                     (
                         "secret_environment",
@@ -530,7 +544,7 @@ async fn system_sandbox_reports_strength_and_enforces_it_when_available() {
     let workspace = tempdir().expect("temporary workspace");
     let output = sandbox
         .execute(SandboxRequest::new(
-            MonitoredCommand::new("/bin/echo")
+            MonitoredCommand::new(test_program())
                 .args(["sandboxed"])
                 .current_dir(workspace.path()),
             Duration::from_secs(2),
@@ -711,7 +725,7 @@ fn process_executor(
 ) -> ProcessExecutor {
     ProcessExecutor::new(
         workspace,
-        [std::path::PathBuf::from("/bin/echo")],
+        [test_program()],
         BTreeSet::from(["LANG".to_owned()]),
         Duration::from_secs(2),
         1024,
@@ -750,7 +764,7 @@ async fn process_executor_rejects_unapproved_environment_variables() {
 
     let result = executor
         .execute(
-            ProcessRequest::new("/bin/echo", ["hello"], environment),
+            ProcessRequest::new(test_program(), ["hello"], environment),
             CancellationToken::new(),
         )
         .await;
@@ -771,7 +785,7 @@ async fn process_executor_passes_only_validated_request_to_sandbox() {
     let outcome = executor
         .execute(
             ProcessRequest::new(
-                "/bin/echo",
+                test_program(),
                 ["hello"],
                 BTreeMap::from([("LANG".to_owned(), "C".to_owned())]),
             ),
@@ -806,7 +820,7 @@ async fn process_executor_preserves_sandbox_cancellation_and_timeout() {
 
         let outcome = executor
             .execute(
-                ProcessRequest::new("/bin/echo", ["hello"], BTreeMap::new()),
+                ProcessRequest::new(test_program(), ["hello"], BTreeMap::new()),
                 CancellationToken::new(),
             )
             .await
@@ -824,7 +838,7 @@ async fn process_executor_denies_when_kernel_sandbox_is_unavailable() {
 
     let result = executor
         .execute(
-            ProcessRequest::new("/bin/echo", ["hello"], BTreeMap::new()),
+            ProcessRequest::new(test_program(), ["hello"], BTreeMap::new()),
             CancellationToken::new(),
         )
         .await;

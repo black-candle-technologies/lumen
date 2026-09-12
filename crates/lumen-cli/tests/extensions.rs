@@ -7,6 +7,9 @@ use lumen_integrations::secrets::InMemorySecretStore;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
+mod support;
+use support::toml_path;
+
 fn write_config(root: &std::path::Path) -> std::path::PathBuf {
     let workspace = root.join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -15,20 +18,20 @@ fn write_config(root: &std::path::Path) -> std::path::PathBuf {
         &path,
         format!(
             r#"[database]
-path = "{}"
+path = {}
 [model]
 endpoint = "http://127.0.0.1:8080/v1/"
 model = "local-model"
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
-            root.join("lumen.sqlite3").display(),
-            workspace.display()
+            toml_path(root.join("lumen.sqlite3")),
+            toml_path(&workspace)
         ),
     )
     .expect("config");

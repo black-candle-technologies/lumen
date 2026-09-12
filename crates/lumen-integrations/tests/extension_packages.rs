@@ -8,6 +8,14 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
+#[cfg(not(unix))]
+#[allow(clippy::permissions_set_readonly_false)]
+fn make_test_file_writable(path: &std::path::Path) {
+    let mut permissions = fs::metadata(path).expect("metadata").permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions).expect("make mutable for adversarial test");
+}
+
 fn write_package(root: &Path, artifact: &[u8]) {
     fs::create_dir_all(root.join("schemas")).expect("schema directory");
     fs::write(root.join("plugin.wasm"), artifact).expect("artifact");
@@ -266,11 +274,7 @@ fn install_rechecks_every_approved_digest_before_copying() {
         fs::set_permissions(&artifact, permissions).expect("make mutable for adversarial test");
     }
     #[cfg(not(unix))]
-    {
-        let mut permissions = fs::metadata(&artifact).expect("metadata").permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(&artifact, permissions).expect("make mutable for adversarial test");
-    }
+    make_test_file_writable(&artifact);
     fs::write(&artifact, b"substituted after approval").expect("substitute");
 
     assert!(matches!(

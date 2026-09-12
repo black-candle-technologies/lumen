@@ -141,6 +141,11 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn toml_string(value: impl Into<String>) -> String {
+    toml::Value::String(value.into()).to_string()
+}
+
 fn resolve_relative(path: &mut PathBuf, base: &Path) {
     if path.is_relative() {
         *path = base.join(&*path);
@@ -394,4 +399,45 @@ pub enum ConfigError {
     InvalidLimit,
     #[error("required sandbox is unavailable: {0}")]
     SandboxUnavailable(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{Config, toml_string};
+
+    #[test]
+    fn runtime_config_round_trips_platform_paths() {
+        for path in [
+            r"C:\Users\Test User\Lumen\workspace",
+            r"C:\Temp\foo\bar",
+            "/tmp/lumen/workspace",
+            "path with spaces",
+            "Unicode path/燈",
+        ] {
+            let config = Config::parse(&format!(
+                r#"[database]
+path = "ignored.sqlite3"
+[model]
+endpoint = "http://127.0.0.1:8080/v1/"
+model = "local-model"
+[runtime]
+data_directory = {path}
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = {path}
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+                path = toml_string(path)
+            ))
+            .expect("serialized path must parse");
+
+            assert_eq!(config.runtime.data_directory, PathBuf::from(path));
+            assert_eq!(config.workspace.path, PathBuf::from(path));
+        }
+    }
 }

@@ -317,7 +317,7 @@ fn find_linux_bubblewrap(mut available: impl FnMut(&Path) -> bool) -> Option<Pat
         .find(|path| available(path))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn linux_sandbox_report(_executable: PathBuf) -> SandboxReport {
     SandboxReport::with_guarantees(
         "linux-bubblewrap",
@@ -796,7 +796,7 @@ impl ProcessMonitor {
         timeout: Duration,
         output_limit: usize,
         cancellation: CancellationToken,
-        resource_limits: ResourceLimits,
+        _resource_limits: ResourceLimits,
         stdin: Option<Vec<u8>>,
     ) -> Result<SandboxOutput, SandboxError> {
         if output_limit == 0 {
@@ -826,7 +826,7 @@ impl ProcessMonitor {
             unsafe {
                 process
                     .as_std_mut()
-                    .pre_exec(move || apply_unix_resource_limits(resource_limits));
+                    .pre_exec(move || apply_unix_resource_limits(_resource_limits));
             }
         }
 
@@ -1005,9 +1005,9 @@ async fn read_output(
     }
 }
 
-async fn terminate_process_tree(child: &mut tokio::process::Child, process_id: Option<u32>) {
+async fn terminate_process_tree(child: &mut tokio::process::Child, _process_id: Option<u32>) {
     #[cfg(unix)]
-    if let Some(process_id) = process_id.and_then(|value| i32::try_from(value).ok()) {
+    if let Some(process_id) = _process_id.and_then(|value| i32::try_from(value).ok()) {
         use nix::{
             sys::signal::{Signal, killpg},
             unistd::Pid,
@@ -1042,7 +1042,9 @@ pub enum SandboxError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::PathBuf};
+    #[cfg(any(target_os = "linux", windows))]
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -1057,6 +1059,7 @@ mod tests {
         )));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_profile_isolates_namespaces_and_exposes_one_executable() {
         let command = MonitoredCommand::new("/usr/bin/example")
@@ -1112,6 +1115,7 @@ mod tests {
         assert!(wrapped.environment().is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_plugin_profile_has_no_workspace_home_or_inherited_environment() {
         let command = MonitoredCommand::new("/lumen-data/plugins/example/tool")
@@ -1169,8 +1173,26 @@ mod tests {
 
     #[tokio::test]
     async fn process_monitor_writes_exact_stdin_without_inheriting_terminal_input() {
+        #[cfg(windows)]
+        let command = MonitoredCommand::new(
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows directory"))
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+        )
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$inputStream = [Console]::OpenStandardInput(); $inputStream.CopyTo([Console]::OpenStandardOutput())",
+        ])
+        .envs(BTreeMap::from([(
+            "SystemRoot".to_owned(),
+            std::env::var("SystemRoot").expect("Windows directory"),
+        )]));
+        #[cfg(not(windows))]
+        let command = MonitoredCommand::new("/bin/cat");
         let output = ProcessMonitor::run_with_stdin(
-            MonitoredCommand::new("/bin/cat").current_dir("/"),
+            command,
             Duration::from_secs(1),
             1024,
             CancellationToken::new(),
@@ -1183,6 +1205,7 @@ mod tests {
         assert_eq!(output.stderr(), b"");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_report_names_each_enforced_guarantee_without_claiming_seccomp() {
         let report = linux_sandbox_report(PathBuf::from("/usr/bin/bwrap"));

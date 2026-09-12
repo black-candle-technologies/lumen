@@ -23,6 +23,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct WorkspaceReader {
     directory: Arc<Dir>,
+    root: Arc<std::path::PathBuf>,
     max_read_bytes: usize,
     max_write_bytes: usize,
 }
@@ -44,10 +45,13 @@ impl WorkspaceReader {
             return Err(FilesystemError::InvalidWriteLimit);
         }
 
-        let directory = Dir::open_ambient_dir(root, ambient_authority())
+        let root = std::fs::canonicalize(root)
+            .map_err(|error| FilesystemError::OpenWorkspace(error.to_string()))?;
+        let directory = Dir::open_ambient_dir(&root, ambient_authority())
             .map_err(|error| FilesystemError::OpenWorkspace(error.to_string()))?;
         Ok(Self {
             directory: Arc::new(directory),
+            root: Arc::new(root),
             max_read_bytes,
             max_write_bytes,
         })
@@ -90,11 +94,12 @@ impl WorkspaceReader {
     pub async fn replace_text(&self, prepared: &PreparedFileWrite) -> Result<(), FilesystemError> {
         prepared.validate(self.max_write_bytes)?;
         let directory = clone_dir(&self.directory)?;
+        let root = Arc::clone(&self.root);
         let prepared = prepared.clone();
         let read_limit = self.max_read_bytes;
 
         tokio::task::spawn_blocking(move || {
-            replace_text_blocking(&directory, &prepared, read_limit)
+            replace_text_blocking(&directory, &root, &prepared, read_limit)
         })
         .await
         .map_err(|error| FilesystemError::Write(error.to_string()))?
@@ -246,21 +251,22 @@ impl FileContent {
 
 fn replace_text_blocking(
     directory: &Dir,
+    root: &Path,
     prepared: &PreparedFileWrite,
     read_limit: usize,
 ) -> Result<(), FilesystemError> {
     let path = Path::new(prepared.path());
     let parent = open_parent(directory, path)?;
-    let file_name = path
-        .file_name()
+    path.file_name()
         .ok_or_else(|| FilesystemError::InvalidPreparedWrite("target has no file name".into()))?;
     if snapshot(directory, prepared.path(), read_limit)? != prepared.before {
         return Err(FilesystemError::WriteConflict);
     }
 
     let temp_name = next_temp_name();
+    let target = root.join(path);
     let result = write_and_replace(
-        &parent, file_name, &temp_name, prepared, directory, read_limit,
+        &parent, &temp_name, &target, root, prepared, directory, read_limit,
     );
     if result.is_err() {
         let _ = parent.remove_file(&temp_name);
@@ -270,12 +276,16 @@ fn replace_text_blocking(
 
 fn write_and_replace(
     parent: &Dir,
-    file_name: &OsStr,
     temp_name: &str,
+    target: &Path,
+    workspace_root: &Path,
     prepared: &PreparedFileWrite,
     root: &Dir,
     read_limit: usize,
 ) -> Result<(), FilesystemError> {
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| FilesystemError::InvalidPreparedWrite("target has no file name".into()))?;
     let mut options = OpenOptions::new();
     options
         .write(true)
@@ -297,15 +307,19 @@ fn write_and_replace(
         .map_err(|error| FilesystemError::Write(error.to_string()))?;
     temp.sync_all()
         .map_err(|error| FilesystemError::Write(error.to_string()))?;
+    drop(temp);
 
     if snapshot(root, prepared.path(), read_limit)? != prepared.before {
         return Err(FilesystemError::WriteConflict);
     }
 
     if prepared.before.exists {
-        parent
-            .rename(temp_name, parent, file_name)
+        let target = std::fs::canonicalize(target)
             .map_err(|error| FilesystemError::Write(error.to_string()))?;
+        if !target.starts_with(workspace_root) {
+            return Err(FilesystemError::AccessDenied);
+        }
+        replace_existing(parent, temp_name, file_name, &target)?;
     } else {
         parent
             .hard_link(temp_name, parent, file_name)
@@ -322,6 +336,58 @@ fn write_and_replace(
 }
 
 #[cfg(unix)]
+fn replace_existing(
+    parent: &Dir,
+    temp_name: &str,
+    file_name: &OsStr,
+    _target: &Path,
+) -> Result<(), FilesystemError> {
+    parent
+        .rename(temp_name, parent, file_name)
+        .map_err(|error| FilesystemError::Write(error.to_string()))
+}
+
+#[cfg(windows)]
+fn replace_existing(
+    _parent: &Dir,
+    temp_name: &str,
+    _file_name: &OsStr,
+    target: &Path,
+) -> Result<(), FilesystemError> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| FilesystemError::Write("target has no parent directory".into()))?;
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let replacement_path = parent.join(temp_name);
+    let target_wide = wide(target);
+    let replacement = wide(&replacement_path);
+    if unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        return Err(FilesystemError::Write(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn sync_directory(directory: &Dir) -> Result<(), FilesystemError> {
     let descriptor = rustix::fs::openat(
         directory,
@@ -335,7 +401,12 @@ fn sync_directory(directory: &Dir) -> Result<(), FilesystemError> {
         .map_err(|error| FilesystemError::Write(error.to_string()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(_directory: &Dir) -> Result<(), FilesystemError> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(directory: &Dir) -> Result<(), FilesystemError> {
     clone_dir(directory)?
         .into_std_file()

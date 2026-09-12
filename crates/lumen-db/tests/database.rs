@@ -17,6 +17,13 @@ fn workspace_id() -> WorkspaceId {
     )
 }
 
+fn test_executable() -> String {
+    std::env::current_exe()
+        .expect("current test executable")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn action_id() -> ActionId {
     ActionId::from_uuid(
         Uuid::parse_str("63908e55-6719-48c4-b43b-95f52264703f").expect("valid UUID"),
@@ -168,12 +175,13 @@ async fn secret_reference_repository_never_stores_secret_values() {
         .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
         .await
         .expect("workspace stored");
+    let executable = test_executable();
     let reference = SecretReference::new(
         lumen_core::secret::SecretRefId::parse("5f7cc8b4-e848-4cb4-91ef-27c5983c41a5")
             .expect("secret reference"),
         workspace_id(),
         "GitHub token",
-        "/usr/bin/git",
+        &executable,
         "GITHUB_TOKEN",
         TimestampMillis::new(1_100),
     )
@@ -190,9 +198,9 @@ async fn secret_reference_repository_never_stores_secret_values() {
         .expect("reference query")
         .expect("reference found");
     assert_eq!(loaded, reference);
-    assert!(loaded.allows(workspace_id(), "/usr/bin/git", "GITHUB_TOKEN"));
-    assert!(!loaded.allows(workspace_id(), "/usr/bin/curl", "GITHUB_TOKEN"));
-    assert!(!loaded.allows(workspace_id(), "/usr/bin/git", "OTHER_TOKEN"));
+    assert!(loaded.allows(workspace_id(), &executable, "GITHUB_TOKEN"));
+    assert!(!loaded.allows(workspace_id(), "C:\\other", "GITHUB_TOKEN"));
+    assert!(!loaded.allows(workspace_id(), &executable, "OTHER_TOKEN"));
     let schema: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'secret_references'",
     )
@@ -234,7 +242,7 @@ async fn secret_references_are_workspace_scoped_and_deletable() {
         lumen_core::secret::SecretRefId::new(),
         workspace_id(),
         "Build token",
-        "/usr/bin/env",
+        test_executable(),
         "BUILD_TOKEN",
         TimestampMillis::new(1_100),
     )

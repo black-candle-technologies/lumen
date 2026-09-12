@@ -54,7 +54,7 @@ use super::{
     EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand, RedactingExecutor, now,
 };
 use crate::{
-    config::Config,
+    config::{Config, toml_string},
     extension_runtime::{
         GrantArguments, GrantInput, InstallArguments, QuarantineReleaseArguments, SettingArguments,
         VersionArguments, action_proposal, admin_capabilities,
@@ -62,6 +62,50 @@ use crate::{
 };
 
 const TOKEN: &str = "security-test-token";
+
+fn test_program() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let program = std::path::PathBuf::from(
+        std::env::var_os("ComSpec").expect("ComSpec identifies the Windows command processor"),
+    );
+    #[cfg(not(windows))]
+    let program = std::path::PathBuf::from("/bin/echo");
+    std::fs::canonicalize(program).expect("test executable")
+}
+
+fn other_test_program() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let program = std::path::PathBuf::from(
+        std::env::var_os("SystemRoot").expect("SystemRoot identifies the Windows directory"),
+    )
+    .join("System32/more.com");
+    #[cfg(not(windows))]
+    let program = std::path::PathBuf::from("/bin/cat");
+    std::fs::canonicalize(program).expect("alternate test executable")
+}
+
+fn test_program_string() -> String {
+    test_program().to_string_lossy().into_owned()
+}
+
+fn path_toml(path: impl AsRef<std::path::Path>) -> String {
+    toml_string(path.as_ref().to_string_lossy().into_owned())
+}
+
+fn stored_relative_path(path: &std::path::Path, root: &std::path::Path) -> String {
+    crate::relative_storage_path(path.strip_prefix(root).expect("relative path"))
+        .expect("portable relative path")
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::permissions_set_readonly_false)]
+fn make_test_file_writable(path: &std::path::Path) {
+    let mut permissions = std::fs::metadata(path)
+        .expect("artifact metadata")
+        .permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).expect("make artifact mutable");
+}
 
 fn scheduled_job_id() -> JobId {
     JobId::from_uuid(uuid::Uuid::parse_str("7825c2e7-1d9c-40df-ad69-209aeb02fc8d").expect("job ID"))
@@ -284,19 +328,20 @@ model = "local-model"
 streaming = false
 
 [process]
-allowed_programs = ["/bin/echo"]
+allowed_programs = [{}]
 
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
             model.uri(),
-            harness._directory.path().join("workspace").display()
+            toml_string(test_program_string()),
+            path_toml(harness._directory.path().join("workspace"))
         ))
         .expect("cancellable config");
         let events = EventBroker::new(128);
@@ -355,23 +400,24 @@ model = "local-model"
 streaming = false
 
 [runtime]
-data_directory = "{}"
+data_directory = {}
 
 [process]
-allowed_programs = ["/bin/echo"]
+allowed_programs = [{}]
 
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
             model.uri(),
-            directory.path().join("runtime").display(),
-            workspace.display()
+            path_toml(directory.path().join("runtime")),
+            toml_string(test_program_string()),
+            path_toml(&workspace)
         ))
         .expect("security config");
         let database = Database::connect_in_memory().await.expect("database");
@@ -757,11 +803,7 @@ async fn stage_lifecycle_version(
     let record = StagedPluginPackage::new(
         stage_id,
         staged.manifest().clone(),
-        staged
-            .quarantine_path()
-            .strip_prefix(&data_root)
-            .expect("relative quarantine")
-            .to_string_lossy(),
+        stored_relative_path(staged.quarantine_path(), &data_root),
         staged.files().clone(),
         staged.package_digest().clone(),
         staged.manifest_digest().clone(),
@@ -789,11 +831,7 @@ async fn stage_subprocess_fixture(harness: &Harness) -> StagedPluginPackage {
     let record = StagedPluginPackage::new(
         uuid::Uuid::new_v4(),
         staged.manifest().clone(),
-        staged
-            .quarantine_path()
-            .strip_prefix(&data_root)
-            .expect("relative quarantine")
-            .to_string_lossy(),
+        stored_relative_path(staged.quarantine_path(), &data_root),
         staged.files().clone(),
         staged.package_digest().clone(),
         staged.manifest_digest().clone(),
@@ -821,11 +859,7 @@ async fn stage_wasm_fixture(harness: &Harness, artifact: &[u8]) -> StagedPluginP
     let record = StagedPluginPackage::new(
         uuid::Uuid::new_v4(),
         staged.manifest().clone(),
-        staged
-            .quarantine_path()
-            .strip_prefix(&data_root)
-            .expect("relative quarantine")
-            .to_string_lossy(),
+        stored_relative_path(staged.quarantine_path(), &data_root),
         staged.files().clone(),
         staged.package_digest().clone(),
         staged.manifest_digest().clone(),
@@ -911,19 +945,19 @@ streaming = false
 remote_provider = {{ id = "openai-compatible", allowed_data_classes = ["public"] }}
 
 [runtime]
-data_directory = "{}"
+data_directory = {}
 
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
-        runtime.display(),
-        workspace.display()
+        path_toml(&runtime),
+        path_toml(&workspace)
     ))
     .expect("remote runtime config");
     let database = Database::connect_in_memory().await.expect("database");
@@ -1010,19 +1044,19 @@ timeout_seconds = 1
 remote_provider = {{ id = "openai-compatible", allowed_data_classes = ["public"] }}
 
 [runtime]
-data_directory = "{}"
+data_directory = {}
 
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
-        runtime.display(),
-        workspace.display()
+        path_toml(&runtime),
+        path_toml(&workspace)
     ))
     .expect("remote runtime config");
     let database = Database::connect_in_memory().await.expect("database");
@@ -1187,23 +1221,24 @@ model = "local-model"
 streaming = false
 
 [runtime]
-data_directory = "{}"
+data_directory = {}
 
 [process]
-allowed_programs = ["/bin/echo"]
+allowed_programs = [{}]
 
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
             model.uri(),
-            harness._directory.path().join("runtime").display(),
-            harness._directory.path().join("workspace").display()
+            path_toml(harness._directory.path().join("runtime")),
+            toml_string(test_program_string()),
+            path_toml(harness._directory.path().join("workspace"))
         ))
         .expect("runtime config"),
         harness.database.clone(),
@@ -1307,23 +1342,24 @@ model = "local-model"
 streaming = false
 
 [runtime]
-data_directory = "{}"
+data_directory = {}
 
 [process]
-allowed_programs = ["/bin/echo"]
+allowed_programs = [{}]
 
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
             model.uri(),
-            harness._directory.path().join("runtime").display(),
-            harness._directory.path().join("workspace").display()
+            path_toml(harness._directory.path().join("runtime")),
+            toml_string(test_program_string()),
+            path_toml(harness._directory.path().join("workspace"))
         ))
         .expect("runtime config"),
         harness.database.clone(),
@@ -2311,7 +2347,7 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
                     action_response(
                         "process.spawn",
                         serde_json::json!({
-                            "program": "/bin/echo",
+                            "program": test_program_string(),
                             "args": ["draft-sensitive-fragment"],
                         }),
                     )
@@ -2326,6 +2362,8 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
     let run_id = harness.create_run("capture this workflow").await;
     approve_pending(&harness).await;
     wait_for_run_completed(&harness, &run_id).await;
+    let unrelated_run = harness.create_run("unrelated workflow").await;
+    wait_for_run_completed(&harness, &unrelated_run).await;
 
     let draft_id = harness
         .service
@@ -2347,6 +2385,7 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
     assert!(draft.body().contains("arguments_sha256: sha256:"));
     assert!(draft.body().contains("Expected Outputs"));
     assert!(draft.body().contains("Required Variables"));
+    assert_eq!(draft.body().matches("run_created").count(), 1);
     assert!(!draft.body().contains(TOKEN));
     assert!(!draft.body().contains("draft-sensitive-fragment"));
     harness.service.shutdown().await;
@@ -2654,10 +2693,7 @@ async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage
             ),
         ]),
     };
-    let executable = std::fs::canonicalize("/bin/echo")
-        .expect("echo executable")
-        .to_string_lossy()
-        .into_owned();
+    let executable = test_program_string();
     let process_grant = GrantInput {
         name: "process.spawn".into(),
         scope: CanonicalValue::object([
@@ -3155,10 +3191,7 @@ async fn grant_subprocess_effect_authority(harness: &Harness, staged: &StagedPlu
             ),
         ]),
     };
-    let executable = std::fs::canonicalize("/bin/echo")
-        .expect("echo executable")
-        .to_string_lossy()
-        .into_owned();
+    let executable = test_program_string();
     let process_grant = GrantInput {
         name: "process.spawn".into(),
         scope: CanonicalValue::object([
@@ -3473,13 +3506,7 @@ async fn approved_plugin_install_rejects_post_approval_substitution_without_retr
         std::fs::set_permissions(&artifact, permissions).expect("make artifact mutable");
     }
     #[cfg(not(unix))]
-    {
-        let mut permissions = std::fs::metadata(&artifact)
-            .expect("artifact metadata")
-            .permissions();
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&artifact, permissions).expect("make artifact mutable");
-    }
+    make_test_file_writable(&artifact);
     std::fs::write(&artifact, b"substituted after approval").expect("substitute artifact");
 
     let granted = harness
@@ -3524,18 +3551,18 @@ endpoint = "{}/v1/"
 model = "local-model"
 streaming = false
 [runtime]
-data_directory = "{}"
+data_directory = {}
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
         model.uri(),
-        data_root.display(),
-        workspace.display()
+        path_toml(&data_root),
+        path_toml(&workspace)
     ))
     .expect("config");
     let database = Database::connect_in_memory().await.expect("database");
@@ -3557,11 +3584,10 @@ subject = "operator"
     let staged_record = StagedPluginPackage::new(
         uuid::Uuid::new_v4(),
         staged.manifest().clone(),
-        staged
-            .quarantine_path()
-            .strip_prefix(std::fs::canonicalize(&data_root).expect("canonical root"))
-            .expect("relative quarantine")
-            .to_string_lossy(),
+        stored_relative_path(
+            staged.quarantine_path(),
+            &std::fs::canonicalize(&data_root).expect("canonical root"),
+        ),
         staged.files().clone(),
         staged.package_digest().clone(),
         staged.manifest_digest().clone(),
@@ -4017,7 +4043,7 @@ async fn plugin_process_proposal_requires_child_approval_and_exact_executable_gr
         |_| {},
         lumen_extension_sdk::Response::proposal(
             "process.spawn",
-            serde_json::json!({"program": "/bin/echo", "args": ["hello"]}),
+            serde_json::json!({"program": test_program_string(), "args": ["hello"]}),
         ),
     )
     .await;
@@ -4164,6 +4190,8 @@ async fn tampered_installed_artifact_is_globally_quarantined_before_host_entry()
         std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o755))
             .expect("unseal test artifact");
     }
+    #[cfg(windows)]
+    make_test_file_writable(&artifact);
     std::fs::write(&artifact, b"tampered bytes").expect("tamper artifact");
 
     let run_id = harness
@@ -4404,7 +4432,7 @@ async fn hostile_content_cannot_expand_the_executable_allowlist() {
         &model,
         action_response(
             "process.spawn",
-            serde_json::json!({"program":"/bin/sh","args":["-c","cat /etc/passwd"],"environment":{}}),
+            serde_json::json!({"program":other_test_program(),"args":["hostile"],"environment":{}}),
         ),
     )
     .await;
@@ -4507,7 +4535,7 @@ async fn known_secrets_in_model_actions_are_rejected_before_persistence() {
         &model,
         action_response(
             "process.spawn",
-            serde_json::json!({"program":"/bin/echo","args":[TOKEN],"environment":{}}),
+            serde_json::json!({"program":test_program_string(),"args":[TOKEN],"environment":{}}),
         ),
     )
     .await;
@@ -4537,7 +4565,7 @@ async fn approval_policy_mutation_and_replay_never_dispatch_twice() {
                 if turn.fetch_add(1, Ordering::SeqCst) == 0 {
                     action_response(
                         "process.spawn",
-                        serde_json::json!({"program":"/bin/echo","args":["hello"],"environment":{}}),
+                        serde_json::json!({"program":test_program_string(),"args":["hello"],"environment":{}}),
                     )
                 } else {
                     final_response("done")
@@ -4604,7 +4632,7 @@ async fn granted_approval_dispatches_once_and_http_replay_is_rejected() {
                 if turn.fetch_add(1, Ordering::SeqCst) == 0 {
                     action_response(
                         "process.spawn",
-                        serde_json::json!({"program":"/bin/echo","args":["hello"],"environment":{}}),
+                        serde_json::json!({"program":test_program_string(),"args":["hello"],"environment":{}}),
                     )
                 } else {
                     final_response("done")
@@ -4819,7 +4847,7 @@ async fn approved_secret_output_exfiltration_is_redacted_from_every_boundary() {
                     action_response(
                         "process.spawn",
                         serde_json::json!({
-                            "program":"/bin/echo",
+                            "program":test_program_string(),
                             "secret_environment":{"API_TOKEN":reference_id.to_string()}
                         }),
                     )
@@ -4834,10 +4862,7 @@ async fn approved_secret_output_exfiltration_is_redacted_from_every_boundary() {
         &model,
         SecretSetup {
             id: reference_id,
-            program: std::fs::canonicalize("/bin/echo")
-                .expect("echo executable")
-                .to_string_lossy()
-                .into_owned(),
+            program: test_program_string(),
             environment: "API_TOKEN".to_owned(),
             value: secret.to_owned(),
         },
@@ -4847,10 +4872,7 @@ async fn approved_secret_output_exfiltration_is_redacted_from_every_boundary() {
         SecretRefId::new(),
         harness.workspace_id,
         "unrelated secret label",
-        std::fs::canonicalize("/bin/echo")
-            .expect("echo executable")
-            .to_string_lossy()
-            .into_owned(),
+        test_program_string(),
         "OTHER_TOKEN",
         TimestampMillis::new(2),
     )
@@ -4959,28 +4981,19 @@ async fn missing_or_mismatched_secret_scope_never_reaches_the_sandbox() {
     for (case, program, environment, remove_reference) in [
         (
             "program",
-            std::fs::canonicalize("/bin/cat")
-                .expect("cat executable")
-                .to_string_lossy()
-                .into_owned(),
+            other_test_program().to_string_lossy().into_owned(),
             "API_TOKEN".to_owned(),
             false,
         ),
         (
             "environment",
-            std::fs::canonicalize("/bin/echo")
-                .expect("echo executable")
-                .to_string_lossy()
-                .into_owned(),
+            test_program_string(),
             "OTHER_TOKEN".to_owned(),
             false,
         ),
         (
             "missing",
-            std::fs::canonicalize("/bin/echo")
-                .expect("echo executable")
-                .to_string_lossy()
-                .into_owned(),
+            test_program_string(),
             "API_TOKEN".to_owned(),
             true,
         ),
@@ -4992,7 +5005,7 @@ async fn missing_or_mismatched_secret_scope_never_reaches_the_sandbox() {
             action_response(
                 "process.spawn",
                 serde_json::json!({
-                    "program":"/bin/echo",
+                    "program":test_program_string(),
                     "secret_environment":{"API_TOKEN":reference_id.to_string()}
                 }),
             ),
@@ -5043,7 +5056,7 @@ async fn another_workspaces_secret_reference_is_denied_before_approval() {
         action_response(
             "process.spawn",
             serde_json::json!({
-                "program":"/bin/echo",
+                "program":test_program_string(),
                 "secret_environment":{"API_TOKEN":reference_id.to_string()}
             }),
         ),
@@ -5063,10 +5076,7 @@ async fn another_workspaces_secret_reference_is_denied_before_approval() {
                 reference_id,
                 other_workspace,
                 "other workspace secret",
-                std::fs::canonicalize("/bin/echo")
-                    .expect("echo executable")
-                    .to_string_lossy()
-                    .into_owned(),
+                test_program_string(),
                 "API_TOKEN",
                 TimestampMillis::new(2),
             )
@@ -5098,7 +5108,7 @@ async fn secret_scope_does_not_expand_literal_environment_permissions() {
         action_response(
             "process.spawn",
             serde_json::json!({
-                "program":"/bin/echo",
+                "program":test_program_string(),
                 "environment":{"API_TOKEN":"attacker-controlled"}
             }),
         ),
@@ -5108,10 +5118,7 @@ async fn secret_scope_does_not_expand_literal_environment_permissions() {
         &model,
         SecretSetup {
             id: reference_id,
-            program: std::fs::canonicalize("/bin/echo")
-                .expect("echo executable")
-                .to_string_lossy()
-                .into_owned(),
+            program: test_program_string(),
             environment: "API_TOKEN".to_owned(),
             value: "stored-secret".to_owned(),
         },
@@ -5142,7 +5149,7 @@ async fn run_cancellation_reaches_an_executing_process_and_persists_cancelled() 
         &model,
         action_response(
             "process.spawn",
-            serde_json::json!({"program":"/bin/echo","args":["waiting"]}),
+            serde_json::json!({"program":test_program_string(),"args":["waiting"]}),
         ),
     )
     .await;

@@ -14,6 +14,19 @@ use lumen_db::Database;
 use lumen_integrations::secrets::{InMemorySecretStore, SecretStore};
 use tempfile::tempdir;
 
+mod support;
+use support::toml_path;
+
+fn test_program() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let program = std::path::PathBuf::from(
+        std::env::var_os("ComSpec").expect("ComSpec identifies the Windows command processor"),
+    );
+    #[cfg(not(windows))]
+    let program = std::path::PathBuf::from("/bin/echo");
+    std::fs::canonicalize(program).expect("test executable")
+}
+
 fn write_config(directory: &std::path::Path) -> std::path::PathBuf {
     let config_path = directory.join("lumen.toml");
     let database = directory.join("lumen.sqlite3");
@@ -22,7 +35,7 @@ fn write_config(directory: &std::path::Path) -> std::path::PathBuf {
     let contents = format!(
         r#"
 [database]
-path = "{}"
+path = {}
 
 [model]
 endpoint = "http://127.0.0.1:8080/v1/"
@@ -31,14 +44,14 @@ model = "local-model"
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
-        database.display(),
-        workspace.display()
+        toml_path(&database),
+        toml_path(&workspace)
     );
     std::fs::write(&config_path, contents).expect("config written");
     config_path
@@ -161,7 +174,7 @@ async fn secret_create_reads_only_supplied_standard_input_and_list_omits_values(
             command: Command::Secret {
                 command: SecretCommand::Create {
                     label: "GitHub token".to_owned(),
-                    program: "/bin/echo".into(),
+                    program: test_program(),
                     environment: "GITHUB_TOKEN".to_owned(),
                 },
             },
@@ -246,7 +259,7 @@ async fn secret_create_rejects_command_line_values_and_duplicate_labels() {
                 command: Command::Secret {
                     command: SecretCommand::Create {
                         label: "duplicate".to_owned(),
-                        program: "/bin/echo".into(),
+                        program: test_program(),
                         environment: "TOKEN".to_owned(),
                     },
                 },
@@ -279,7 +292,7 @@ async fn secret_delete_removes_keychain_value_before_metadata() {
             command: Command::Secret {
                 command: SecretCommand::Create {
                     label: "delete me".to_owned(),
-                    program: "/bin/echo".into(),
+                    program: test_program(),
                     environment: "TOKEN".to_owned(),
                 },
             },

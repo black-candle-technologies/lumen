@@ -5,7 +5,7 @@ mod runtime;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -28,6 +28,17 @@ use lumen_integrations::{
 use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
 use sha2::Digest as _;
 use thiserror::Error;
+
+fn relative_storage_path(path: &Path) -> Option<String> {
+    let segments = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
 
 #[derive(Clone, Debug, Eq, Parser, PartialEq)]
 #[command(name = "lumen", version, about = "Local-first AI agent runtime")]
@@ -274,9 +285,9 @@ async fn execute_plugin_command(
             let relative = staged
                 .quarantine_path()
                 .strip_prefix(&data_root)
-                .map_err(|_| CliError::Runtime("quarantine escaped the data directory".into()))?
-                .to_string_lossy()
-                .into_owned();
+                .map_err(|_| CliError::Runtime("quarantine escaped the data directory".into()))?;
+            let relative = relative_storage_path(relative)
+                .ok_or_else(|| CliError::Runtime("quarantine path is not portable".into()))?;
             let stage_id = uuid::Uuid::new_v4();
             let record = StagedPluginPackage::new(
                 stage_id,

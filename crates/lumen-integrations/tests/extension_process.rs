@@ -15,11 +15,13 @@ use lumen_extension_sdk::{
     InvocationResponse, MAX_FRAME_BYTES, Response, SubprocessRequest, SubprocessResponse,
     decode_frame, encode_frame,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use lumen_integrations::sandbox::SystemSandbox;
 use lumen_integrations::{
     extension_process::{SubprocessHost, SubprocessHostError},
     sandbox::{
         ResourceLimits, SandboxBackend, SandboxError, SandboxFuture, SandboxOutput, SandboxProfile,
-        SandboxReport, SandboxRequest, SandboxStrength, SystemSandbox,
+        SandboxReport, SandboxRequest, SandboxStrength,
     },
 };
 use sha2::{Digest as _, Sha256};
@@ -95,6 +97,7 @@ fn resource_limits() -> ResourceLimits {
     ResourceLimits::new(1, 256 * 1024 * 1024, 64 * 1024, 32, 4).unwrap()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn digest_file(path: &Path) -> Sha256Digest {
     Sha256Digest::parse(format!(
         "{:x}",
@@ -103,6 +106,7 @@ fn digest_file(path: &Path) -> Sha256Digest {
     .unwrap()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sdk_subprocess_fixture() -> (TempDir, PathBuf) {
     let source = std::env::current_exe()
         .unwrap()
@@ -375,7 +379,7 @@ async fn rejects_digest_nonce_request_protocol_and_trailing_substitution() {
 #[tokio::test]
 async fn classifies_malformed_oversized_exit_timeout_and_cancellation() {
     let (_directory, path, digest) = fixture();
-    let mut cases: Vec<(Result<SandboxOutput, SandboxError>, SubprocessHostError)> = vec![
+    let cases: Vec<(Result<SandboxOutput, SandboxError>, SubprocessHostError)> = vec![
         (
             Ok(SandboxOutput::new(Some(0), vec![0, 0, 0, 1, 0xff], vec![])),
             SubprocessHostError::InvalidUtf8,
@@ -421,28 +425,32 @@ async fn classifies_malformed_oversized_exit_timeout_and_cancellation() {
             SubprocessHostError::Crash,
         ),
         (
-            Ok(SandboxOutput::terminated_by_signal(
-                nix::libc::SIGXCPU,
-                vec![],
-                vec![],
-            )),
-            SubprocessHostError::ResourceExhaustion,
-        ),
-        (
             Err(SandboxError::TimedOut),
             SubprocessHostError::DeadlineExceeded,
         ),
         (Err(SandboxError::Cancelled), SubprocessHostError::Cancelled),
     ];
     #[cfg(unix)]
-    cases.push((
-        Ok(SandboxOutput::new(
-            Some(128 + nix::libc::SIGKILL),
-            vec![],
-            vec![],
-        )),
-        SubprocessHostError::ResourceExhaustion,
-    ));
+    let cases = {
+        let mut cases = cases;
+        cases.push((
+            Ok(SandboxOutput::terminated_by_signal(
+                nix::libc::SIGXCPU,
+                vec![],
+                vec![],
+            )),
+            SubprocessHostError::ResourceExhaustion,
+        ));
+        cases.push((
+            Ok(SandboxOutput::new(
+                Some(128 + nix::libc::SIGKILL),
+                vec![],
+                vec![],
+            )),
+            SubprocessHostError::ResourceExhaustion,
+        ));
+        cases
+    };
     for (result, expected) in cases {
         let result = Arc::new(Mutex::new(Some(result)));
         let sandbox = Arc::new(FakeSandbox::new(move |_| {
