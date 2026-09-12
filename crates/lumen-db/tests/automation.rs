@@ -325,6 +325,40 @@ async fn concurrent_revision_appends_have_one_winner() {
 }
 
 #[tokio::test]
+async fn exhausted_revision_sequence_fails_closed() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    sqlx::query("UPDATE scheduled_job_revisions SET revision = ? WHERE job_id = ?")
+        .bind(i64::MAX)
+        .bind(job_id().to_string())
+        .execute(database.pool())
+        .await
+        .expect("revision exhausted");
+    let next = ScheduledJobRevision::new(
+        job_id(),
+        JobRevision::new(2).expect("revision"),
+        workspace_id(),
+        service(),
+        owner(),
+        ScheduleSpec::once(TimestampMillis::new(3_000)),
+        "next revision",
+        DataClass::Workspace,
+        1,
+        1,
+        true,
+        Some(TimestampMillis::new(3_000)),
+        false,
+        TimestampMillis::new(2_000),
+    )
+    .expect("revision");
+
+    assert!(matches!(
+        database.append_scheduled_job_revision(&next).await,
+        Err(RepositoryError::InvalidAutomationState)
+    ));
+}
+
+#[tokio::test]
 async fn scheduled_job_identity_cannot_move_between_workspaces() {
     let database = database().await;
     insert_service_and_job(&database).await;
