@@ -2407,6 +2407,18 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
     let run_id = harness.create_run("capture this workflow").await;
     approve_pending(&harness).await;
     wait_for_run_completed(&harness, &run_id).await;
+    harness
+        .database
+        .append_audit_event(AuditEvent::new(
+            AuditEventId::new(),
+            TimestampMillis::new(2_000),
+            AuditEventKind::ModelEgress,
+            AuditOutcome::Success,
+            Some(harness.workspace_id),
+            CanonicalValue::object([("run_id", CanonicalValue::from(run_id.clone()))]),
+        ))
+        .await
+        .expect("source run model egress event");
     let unrelated_run = harness.create_run("unrelated workflow").await;
     wait_for_run_completed(&harness, &unrelated_run).await;
 
@@ -2443,6 +2455,7 @@ async fn workflow_capture_draft_includes_provenance_and_redacts_sensitive_materi
         .map(|record| record.event().kind().as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    assert!(expected_events.contains("model_egress"));
     let rendered_events = draft
         .body()
         .split_once("## Audit Events\n")
