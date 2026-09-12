@@ -40,7 +40,6 @@
 				enabled,
 				idempotent: job.idempotent
 			});
-			jobs = jobs.map((current) => current.job_id === job.job_id ? { ...current, enabled } : current);
 			notice = `Approval requested: ${result.run_id}`;
 			error = '';
 		} catch (cause) {

@@ -518,6 +518,35 @@ impl Database {
         .bind(timestamp_to_i64(revision.created_at)?)
         .execute(&mut *transaction)
         .await?;
+        let identity: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT workspace_id, service_provider, service_subject, owner_provider, owner_subject
+             FROM scheduled_jobs WHERE job_id = ?",
+        )
+        .bind(revision.job_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if identity
+            != (
+                revision.workspace_id.to_string(),
+                revision.service.provider().to_owned(),
+                revision.service.subject().to_owned(),
+                revision.owner.provider().to_owned(),
+                revision.owner.subject().to_owned(),
+            )
+        {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        let revision_number = i64::try_from(revision.revision.as_u64())
+            .map_err(|_| RepositoryError::InvalidAutomationState)?;
+        let latest: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(revision) FROM scheduled_job_revisions WHERE job_id = ?",
+        )
+        .bind(revision.job_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if revision_number != latest.map_or(1, |value| value.saturating_add(1)) {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
         let (schedule_kind, schedule_start_at, interval_millis) = schedule_parts(revision.schedule);
         sqlx::query(
             "INSERT INTO scheduled_job_revisions (
@@ -527,10 +556,7 @@ impl Database {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(revision.job_id.to_string())
-        .bind(
-            i64::try_from(revision.revision.as_u64())
-                .map_err(|_| RepositoryError::InvalidAutomationState)?,
-        )
+        .bind(revision_number)
         .bind(schedule_kind)
         .bind(timestamp_to_i64(schedule_start_at)?)
         .bind(
@@ -632,6 +658,39 @@ impl Database {
         let now_i64 = timestamp_to_i64(now)?;
         let expires_i64 = timestamp_to_i64(expires_at)?;
         let mut transaction = self.pool().begin().await?;
+        let eligible: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM scheduled_jobs job
+                JOIN scheduled_job_revisions revision ON revision.job_id = job.job_id
+                JOIN service_identities service
+                  ON service.workspace_id = job.workspace_id
+                 AND service.provider = job.service_provider
+                 AND service.subject = job.service_subject
+                WHERE job.job_id = ?
+                  AND revision.revision = ?
+                  AND revision.revision = (
+                      SELECT MAX(latest.revision)
+                      FROM scheduled_job_revisions latest
+                      WHERE latest.job_id = job.job_id
+                  )
+                  AND revision.enabled = 1
+                  AND revision.next_due_at = ?
+                  AND service.enabled = 1
+             )",
+        )
+        .bind(key.job_id().to_string())
+        .bind(
+            i64::try_from(key.revision().as_u64())
+                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+        )
+        .bind(timestamp_to_i64(key.scheduled_for())?)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if eligible == 0 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO scheduled_job_runs (
                 occurrence_key, job_id, revision, scheduled_for, state, created_at, updated_at

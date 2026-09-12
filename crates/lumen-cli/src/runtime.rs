@@ -583,6 +583,14 @@ impl LocalRuntimeService {
             .map_err(repository_service_error)?;
         let event_kinds = audit_records
             .iter()
+            .filter(|record| {
+                matches!(
+                    record.event().payload(),
+                    CanonicalValue::Object(values)
+                        if values.get("run_id")
+                            == Some(&CanonicalValue::from(run_id.to_string()))
+                )
+            })
             .map(|record| record.event().kind().as_str())
             .collect::<Vec<_>>();
         let mut body = format!(
@@ -3485,7 +3493,7 @@ mod tests {
     };
 
     use super::{LocalRuntimeService, now};
-    use crate::config::Config;
+    use crate::config::{Config, toml_string};
 
     struct EnforcedSandbox;
 
@@ -3529,14 +3537,14 @@ streaming = false
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
             model.uri(),
-            workspace.display()
+            toml_string(workspace.to_string_lossy().into_owned())
         ))
         .expect("runtime config");
         let database = Database::connect_in_memory().await.expect("database");

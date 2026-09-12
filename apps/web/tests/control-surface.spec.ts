@@ -551,6 +551,7 @@ test('shows automation controls and pauses scheduled jobs through approval reque
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 	await page.getByRole('button', { name: /Pause job/ }).click();
 	await expect(page.getByText('Approval requested: run-job')).toBeVisible();
+	await expect(page.getByRole('button', { name: /Pause job/ })).toBeVisible();
 	await page.screenshot({ path: testInfo.outputPath('automation.png') });
 });
 

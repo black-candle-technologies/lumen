@@ -242,7 +242,48 @@ async fn scheduled_job_revisions_are_append_only_and_load_latest() {
         Some(second)
     );
     let duplicate = database.append_scheduled_job_revision(&first).await;
-    assert!(matches!(duplicate, Err(RepositoryError::Sqlx(_))));
+    assert!(matches!(
+        duplicate,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+}
+
+#[tokio::test]
+async fn scheduled_job_identity_cannot_move_between_workspaces() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let other_workspace = WorkspaceId::new();
+    let revision = ScheduledJobRevision::new(
+        job_id(),
+        JobRevision::new(2).expect("revision"),
+        other_workspace,
+        lumen_core::automation::service_principal("other").expect("service"),
+        owner(),
+        ScheduleSpec::once(TimestampMillis::new(3_000)),
+        "cross-workspace mutation",
+        DataClass::Workspace,
+        1,
+        1,
+        true,
+        Some(TimestampMillis::new(3_000)),
+        false,
+        TimestampMillis::new(2_000),
+    )
+    .expect("job revision");
+
+    assert!(matches!(
+        database.append_scheduled_job_revision(&revision).await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+    assert_eq!(
+        database
+            .latest_scheduled_job_revision(job_id())
+            .await
+            .expect("job loaded")
+            .expect("job exists")
+            .workspace_id(),
+        workspace_id()
+    );
 }
 
 #[tokio::test]
@@ -294,6 +335,80 @@ async fn job_occurrence_leases_are_unique_and_expired_leases_recover() {
         .await
         .expect("run count");
     assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn occurrence_claim_rechecks_latest_job_and_service_state() {
+    let first_database = database().await;
+    insert_service_and_job(&first_database).await;
+    first_database
+        .append_scheduled_job_revision(
+            &ScheduledJobRevision::new(
+                job_id(),
+                JobRevision::new(2).expect("revision"),
+                workspace_id(),
+                service(),
+                owner(),
+                ScheduleSpec::once(TimestampMillis::new(2_000)),
+                "disabled",
+                DataClass::Workspace,
+                1,
+                1,
+                false,
+                None,
+                false,
+                TimestampMillis::new(1_500),
+            )
+            .expect("disabled revision"),
+        )
+        .await
+        .expect("disabled revision stored");
+    let stale = OccurrenceKey::new(
+        job_id(),
+        JobRevision::new(1).expect("revision"),
+        TimestampMillis::new(2_000),
+    );
+    assert!(
+        !first_database
+            .claim_job_occurrence(
+                &stale,
+                Uuid::new_v4(),
+                TimestampMillis::new(2_100),
+                TimestampMillis::new(3_000),
+            )
+            .await
+            .expect("stale claim checked")
+    );
+
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    database
+        .upsert_service_identity(
+            &ServiceIdentity::new(
+                service(),
+                workspace_id(),
+                owner(),
+                "Daily brief",
+                false,
+                TimestampMillis::new(1_000),
+                TimestampMillis::new(1_500),
+            )
+            .expect("disabled service"),
+            [],
+        )
+        .await
+        .expect("service disabled");
+    assert!(
+        !database
+            .claim_job_occurrence(
+                &stale,
+                Uuid::new_v4(),
+                TimestampMillis::new(2_100),
+                TimestampMillis::new(3_000),
+            )
+            .await
+            .expect("disabled service claim checked")
+    );
 }
 
 #[tokio::test]
