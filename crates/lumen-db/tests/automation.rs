@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use lumen_core::{
+    action::RunId,
     approval::TimestampMillis,
     automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion},
     capability::{Capability, CapabilityName, ResourceScope},
@@ -139,7 +140,7 @@ async fn migration_adds_durable_automation_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 6);
+    assert_eq!(migrations, 7);
 }
 
 #[tokio::test]
@@ -445,6 +446,292 @@ async fn job_occurrence_leases_are_unique_and_expired_leases_recover() {
         .await
         .expect("run count");
     assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn scheduled_run_handoff_is_atomic_lease_fenced_and_terminal_idempotent() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let job = database
+        .latest_scheduled_job_revision(job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+    let first_lease = Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("lease");
+    let second_lease = Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("lease");
+    let run_id = RunId::new();
+    assert!(
+        database
+            .claim_job_occurrence(
+                &key,
+                first_lease,
+                TimestampMillis::new(2_100),
+                TimestampMillis::new(3_000),
+            )
+            .await
+            .expect("claim")
+    );
+    database
+        .persist_scheduled_run_handoff(
+            &job,
+            &key,
+            first_lease,
+            run_id,
+            None,
+            TimestampMillis::new(2_200),
+        )
+        .await
+        .expect("durable handoff");
+
+    let stored: (String, String, String, Option<i64>) = sqlx::query_as(
+        "SELECT occurrence.run_id, occurrence.state, run.state, revision.next_due_at
+         FROM scheduled_job_runs occurrence
+         JOIN agent_runs run ON run.id = occurrence.run_id
+         JOIN scheduled_job_revisions revision
+           ON revision.job_id = occurrence.job_id AND revision.revision = occurrence.revision
+         WHERE occurrence.occurrence_key = ?",
+    )
+    .bind(key.as_str())
+    .fetch_one(database.pool())
+    .await
+    .expect("stored handoff");
+    assert_eq!(
+        stored,
+        (run_id.to_string(), "claimed".into(), "created".into(), None)
+    );
+    assert!(matches!(
+        database
+            .start_scheduled_run(
+                &key,
+                second_lease,
+                run_id,
+                TimestampMillis::new(2_300),
+                TimestampMillis::new(4_000),
+            )
+            .await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+    assert!(matches!(
+        database
+            .start_scheduled_run(
+                &key,
+                first_lease,
+                run_id,
+                TimestampMillis::new(3_001),
+                TimestampMillis::new(4_000),
+            )
+            .await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+    assert!(
+        database
+            .claim_ready_scheduled_run(
+                &key,
+                second_lease,
+                TimestampMillis::new(3_001),
+                TimestampMillis::new(4_000),
+            )
+            .await
+            .expect("ready claim")
+    );
+    database
+        .start_scheduled_run(
+            &key,
+            second_lease,
+            run_id,
+            TimestampMillis::new(3_100),
+            TimestampMillis::new(5_000),
+        )
+        .await
+        .expect("fenced start");
+    assert!(
+        database
+            .scheduled_run_lease_is_current(&key, second_lease, run_id,)
+            .await
+            .expect("current lease")
+    );
+    assert!(
+        !database
+            .scheduled_run_lease_is_current(&key, first_lease, run_id,)
+            .await
+            .expect("stale lease")
+    );
+    assert!(matches!(
+        database
+            .start_scheduled_run(
+                &key,
+                second_lease,
+                run_id,
+                TimestampMillis::new(3_200),
+                TimestampMillis::new(5_000),
+            )
+            .await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+    database
+        .complete_scheduled_occurrence_for_run(run_id, "succeeded", TimestampMillis::new(3_300))
+        .await
+        .expect("completion");
+    database
+        .complete_scheduled_occurrence_for_run(run_id, "succeeded", TimestampMillis::new(3_400))
+        .await
+        .expect("idempotent completion");
+    assert!(matches!(
+        database
+            .complete_scheduled_occurrence_for_run(run_id, "failed", TimestampMillis::new(3_500),)
+            .await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+}
+
+#[tokio::test]
+async fn expired_started_handoff_recovers_as_unknown_without_redispatch() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let job = database
+        .latest_scheduled_job_revision(job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+    let lease = Uuid::new_v4();
+    let run_id = RunId::new();
+    database
+        .claim_job_occurrence(
+            &key,
+            lease,
+            TimestampMillis::new(2_100),
+            TimestampMillis::new(3_000),
+        )
+        .await
+        .expect("claim");
+    database
+        .persist_scheduled_run_handoff(&job, &key, lease, run_id, None, TimestampMillis::new(2_200))
+        .await
+        .expect("handoff");
+    database
+        .start_scheduled_run(
+            &key,
+            lease,
+            run_id,
+            TimestampMillis::new(2_300),
+            TimestampMillis::new(4_000),
+        )
+        .await
+        .expect("start");
+
+    assert!(
+        database
+            .recover_expired_running_scheduled_runs(TimestampMillis::new(3_999))
+            .await
+            .expect("active recovery")
+            .is_empty()
+    );
+    assert_eq!(
+        database
+            .recover_expired_running_scheduled_runs(TimestampMillis::new(4_000))
+            .await
+            .expect("expired recovery"),
+        vec![run_id]
+    );
+    let states: (String, String) = sqlx::query_as(
+        "SELECT occurrence.state, run.state
+         FROM scheduled_job_runs occurrence JOIN agent_runs run ON run.id = occurrence.run_id
+         WHERE occurrence.occurrence_key = ?",
+    )
+    .bind(key.as_str())
+    .fetch_one(database.pool())
+    .await
+    .expect("recovered states");
+    assert_eq!(states, ("unknown".into(), "failed".into()));
+    assert!(
+        database
+            .recover_expired_running_scheduled_runs(TimestampMillis::new(4_000))
+            .await
+            .expect("repeat recovery")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn scheduled_handoff_rechecks_job_and_service_after_claim() {
+    for change in ["new-revision", "service-disabled"] {
+        let database = database().await;
+        insert_service_and_job(&database).await;
+        let job = database
+            .latest_scheduled_job_revision(job_id())
+            .await
+            .expect("job load")
+            .expect("job");
+        let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+        let lease = Uuid::new_v4();
+        assert!(
+            database
+                .claim_job_occurrence(
+                    &key,
+                    lease,
+                    TimestampMillis::new(2_100),
+                    TimestampMillis::new(3_000),
+                )
+                .await
+                .expect("claim")
+        );
+        if change == "new-revision" {
+            database
+                .append_scheduled_job_revision(
+                    &ScheduledJobRevision::new(
+                        job_id(),
+                        JobRevision::new(2).expect("revision"),
+                        workspace_id(),
+                        service(),
+                        owner(),
+                        ScheduleSpec::once(TimestampMillis::new(4_000)),
+                        "replacement",
+                        DataClass::Workspace,
+                        4,
+                        2,
+                        true,
+                        Some(TimestampMillis::new(4_000)),
+                        false,
+                        TimestampMillis::new(2_200),
+                    )
+                    .expect("replacement job"),
+                )
+                .await
+                .expect("replacement stored");
+        } else {
+            sqlx::query("UPDATE service_identities SET enabled = 0")
+                .execute(database.pool())
+                .await
+                .expect("service disabled");
+        }
+        assert!(matches!(
+            database
+                .persist_scheduled_run_handoff(
+                    &job,
+                    &key,
+                    lease,
+                    RunId::new(),
+                    None,
+                    TimestampMillis::new(2_300),
+                )
+                .await,
+            Err(RepositoryError::ExecutionStateConflict)
+        ));
+        let state: (Option<String>, String) =
+            sqlx::query_as("SELECT run_id, state FROM scheduled_job_runs WHERE occurrence_key = ?")
+                .bind(key.as_str())
+                .fetch_one(database.pool())
+                .await
+                .expect("occurrence");
+        assert_eq!(state, (None, "claimed".into()), "{change}");
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(database.pool())
+            .await
+            .expect("run count");
+        assert_eq!(runs, 0, "{change}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

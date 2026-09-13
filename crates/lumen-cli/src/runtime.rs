@@ -90,6 +90,7 @@ pub(crate) struct LocalRuntimeService {
     ambient_capabilities: CapabilitySet,
     capabilities: EffectiveCapabilities,
     budget: RunBudget,
+    scheduled_execution_lease_millis: u64,
     runs: Arc<Mutex<BTreeMap<RunId, StoredRun>>>,
     cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
@@ -264,6 +265,11 @@ impl LocalRuntimeService {
                 Duration::from_secs(config.runtime.max_wall_time_seconds),
                 config.runtime.max_captured_result_bytes,
             ),
+            scheduled_execution_lease_millis: config
+                .runtime
+                .max_wall_time_seconds
+                .saturating_mul(1_000)
+                .saturating_add(30_000),
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -271,6 +277,10 @@ impl LocalRuntimeService {
             scheduler_cancellation: CancellationToken::new(),
             redactor,
         };
+        service
+            .recover_scheduled_run_handoffs(now())
+            .await
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
         service.spawn_scheduler_loop().await;
         Ok(service)
     }
@@ -304,18 +314,79 @@ impl LocalRuntimeService {
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
+        let mut created = self.recover_scheduled_run_handoffs(timestamp).await?;
         let due = self
             .database
             .due_scheduled_job_revisions(timestamp)
             .await
             .map_err(|error| ServiceError::Internal(format!("load due scheduled jobs: {error}")))?;
-        let mut created = Vec::new();
         for job in due {
             if let Some(run_id) = self.run_due_scheduled_job(job, timestamp).await? {
                 created.push(run_id);
             }
         }
         Ok(created)
+    }
+
+    async fn recover_scheduled_run_handoffs(
+        &self,
+        timestamp: TimestampMillis,
+    ) -> Result<Vec<RunId>, ServiceError> {
+        self.database
+            .recover_expired_running_scheduled_runs(timestamp)
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("recover running scheduled runs: {error}"))
+            })?;
+        let ready = self
+            .database
+            .ready_scheduled_run_handoffs()
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("load ready scheduled runs: {error}"))
+            })?;
+        let mut recovered = Vec::new();
+        for (occurrence, run_id, job) in ready {
+            let lease_id = uuid::Uuid::new_v4();
+            let claimed = self
+                .database
+                .claim_ready_scheduled_run(
+                    &occurrence,
+                    lease_id,
+                    timestamp,
+                    scheduled_lease_expiry(timestamp),
+                )
+                .await
+                .map_err(|error| {
+                    ServiceError::Internal(format!("claim ready scheduled run: {error}"))
+                })?;
+            if !claimed {
+                continue;
+            }
+            let stored = self
+                .prepare_stored_run(
+                    run_id,
+                    self.scheduled_run_request(&job, &occurrence, lease_id)
+                        .await?,
+                )
+                .await?;
+            self.publish_run_created(run_id, stored.workspace_id)?;
+            self.database
+                .start_scheduled_run(
+                    &occurrence,
+                    lease_id,
+                    run_id,
+                    timestamp,
+                    self.scheduled_execution_lease_expiry(timestamp),
+                )
+                .await
+                .map_err(|error| {
+                    ServiceError::Internal(format!("start recovered scheduled run: {error}"))
+                })?;
+            self.install_and_spawn_run(run_id, stored).await;
+            recovered.push(run_id);
+        }
+        Ok(recovered)
     }
 
     async fn run_due_scheduled_job(
@@ -339,13 +410,14 @@ impl LocalRuntimeService {
         {
             return Ok(None);
         }
+        let lease_id = uuid::Uuid::new_v4();
         let claimed = self
             .database
             .claim_job_occurrence(
                 &occurrence,
-                uuid::Uuid::new_v4(),
+                lease_id,
                 timestamp,
-                TimestampMillis::new(timestamp.as_u64().saturating_add(30_000)),
+                scheduled_lease_expiry(timestamp),
             )
             .await
             .map_err(|error| {
@@ -366,6 +438,45 @@ impl LocalRuntimeService {
         {
             return Ok(Some(run_id));
         }
+        let request = self
+            .scheduled_run_request(&job, &occurrence, lease_id)
+            .await?;
+        let run_id = RunId::new();
+        let stored = self.prepare_stored_run(run_id, request).await?;
+        self.database
+            .persist_scheduled_run_handoff(
+                &job,
+                &occurrence,
+                lease_id,
+                run_id,
+                job.schedule().next_after(scheduled_for, job.enabled()),
+                timestamp,
+            )
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("persist scheduled run handoff: {error}"))
+            })?;
+        self.publish_run_created(run_id, stored.workspace_id)?;
+        self.database
+            .start_scheduled_run(
+                &occurrence,
+                lease_id,
+                run_id,
+                timestamp,
+                self.scheduled_execution_lease_expiry(timestamp),
+            )
+            .await
+            .map_err(|error| ServiceError::Internal(format!("start scheduled run: {error}")))?;
+        self.install_and_spawn_run(run_id, stored).await;
+        Ok(Some(run_id))
+    }
+
+    async fn scheduled_run_request(
+        &self,
+        job: &ScheduledJobRevision,
+        occurrence: &OccurrenceKey,
+        lease_id: uuid::Uuid,
+    ) -> Result<StoredRunRequest, ServiceError> {
         let grants = self
             .database
             .service_identity_grants(job.workspace_id(), job.service())
@@ -373,46 +484,41 @@ impl LocalRuntimeService {
             .map_err(|error| {
                 ServiceError::Internal(format!("load scheduled service grants: {error}"))
             })?;
-        let run_id = self
-            .create_stored_run(StoredRunRequest {
-                workspace_id: job.workspace_id(),
-                actor: job.service().clone(),
-                prompt: job.prompt().to_owned(),
-                budget: self
-                    .budget
-                    .with_step_limits(job.max_model_turns(), job.max_actions()),
-                data_class: job.data_class(),
-                model_override: None,
-                capabilities_override: Some(EffectiveCapabilities::new([
-                    self.ambient_capabilities.clone(),
-                    CapabilitySet::new(grants),
-                ])),
-                job_origin: Some(JobOrigin::new(job.job_id(), job.revision(), scheduled_for)),
-            })
-            .await?;
-        self.database
-            .mark_scheduled_occurrence_running(&occurrence, run_id, timestamp)
-            .await
-            .map_err(|error| {
-                ServiceError::Internal(format!("mark scheduled occurrence running: {error}"))
-            })?;
-        self.database
-            .advance_scheduled_job_next_due(
-                job.job_id(),
-                job.revision(),
-                job.schedule().next_after(scheduled_for, job.enabled()),
-            )
-            .await
-            .map_err(|error| ServiceError::Internal(format!("advance scheduled job: {error}")))?;
-        Ok(Some(run_id))
+        Ok(StoredRunRequest {
+            workspace_id: job.workspace_id(),
+            actor: job.service().clone(),
+            prompt: job.prompt().to_owned(),
+            budget: self
+                .budget
+                .with_step_limits(job.max_model_turns(), job.max_actions()),
+            data_class: job.data_class(),
+            model_override: None,
+            capabilities_override: Some(EffectiveCapabilities::new([
+                self.ambient_capabilities.clone(),
+                CapabilitySet::new(grants),
+            ])),
+            job_origin: Some(JobOrigin::new(
+                occurrence.job_id(),
+                occurrence.revision(),
+                occurrence.scheduled_for(),
+            )),
+            scheduled_handoff: Some((occurrence.clone(), lease_id)),
+        })
     }
 
-    async fn create_stored_run(&self, request: StoredRunRequest) -> Result<RunId, ServiceError> {
-        let run_id = RunId::new();
-        self.database
-            .create_run(run_id, request.workspace_id, &request.actor, now())
-            .await
-            .map_err(repository_service_error)?;
+    fn scheduled_execution_lease_expiry(&self, timestamp: TimestampMillis) -> TimestampMillis {
+        TimestampMillis::new(
+            timestamp
+                .as_u64()
+                .saturating_add(self.scheduled_execution_lease_millis),
+        )
+    }
+
+    async fn prepare_stored_run(
+        &self,
+        run_id: RunId,
+        request: StoredRunRequest,
+    ) -> Result<StoredRun, ServiceError> {
         let mut context = RunContext::new(run_id, request.workspace_id, request.actor);
         if let Some(origin) = request.job_origin {
             context = context.with_job_origin(origin);
@@ -423,15 +529,34 @@ impl LocalRuntimeService {
         context = context.with_loaded_skills(reviewed_skills.loaded_skills);
         let state = RunState::new(context, reviewed_skills.prompt, request.budget)
             .with_data_class(request.data_class);
-        self.runs.lock().await.insert(
-            run_id,
-            StoredRun {
-                workspace_id: request.workspace_id,
-                state,
-                model_override: request.model_override,
-                capabilities_override: request.capabilities_override,
-            },
-        );
+        Ok(StoredRun {
+            workspace_id: request.workspace_id,
+            state,
+            model_override: request.model_override,
+            capabilities_override: request.capabilities_override,
+            scheduled_handoff: request.scheduled_handoff,
+        })
+    }
+
+    fn publish_run_created(
+        &self,
+        run_id: RunId,
+        workspace_id: lumen_core::identity::WorkspaceId,
+    ) -> Result<(), ServiceError> {
+        self.events
+            .publish(
+                workspace_id,
+                run_id,
+                "run.created",
+                CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+            )
+            .map(|_| ())
+            .map_err(|error| ServiceError::Internal(error.to_string()))
+    }
+
+    async fn install_and_spawn_run(&self, run_id: RunId, stored: StoredRun) {
+        let workspace_id = stored.workspace_id;
+        self.runs.lock().await.insert(run_id, stored);
         self.cancellations
             .lock()
             .await
@@ -439,17 +564,8 @@ impl LocalRuntimeService {
         self.run_workspaces
             .lock()
             .await
-            .insert(run_id, request.workspace_id);
-        self.events
-            .publish(
-                request.workspace_id,
-                run_id,
-                "run.created",
-                CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
-            )
-            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            .insert(run_id, workspace_id);
         self.spawn_advance(run_id).await;
-        Ok(run_id)
     }
 
     async fn prompt_with_reviewed_skills(
@@ -629,6 +745,17 @@ impl LocalRuntimeService {
         let Some(mut stored) = self.runs.lock().await.remove(&run_id) else {
             return;
         };
+        if let Some((occurrence, lease_id)) = &stored.scheduled_handoff {
+            let current = self
+                .database
+                .scheduled_run_lease_is_current(occurrence, *lease_id, run_id)
+                .await
+                .unwrap_or(false);
+            if !current {
+                self.finish_run(run_id).await;
+                return;
+            }
+        }
         let _ = self
             .database
             .update_run_state(run_id, "running", None)
@@ -799,6 +926,7 @@ impl LocalRuntimeService {
                 ),
                 model_override: Some(model),
                 capabilities_override: Some(EffectiveCapabilities::new([capabilities])),
+                scheduled_handoff: None,
             },
         );
         self.cancellations
@@ -985,6 +1113,7 @@ impl RuntimeService for LocalRuntimeService {
                     state,
                     model_override: None,
                     capabilities_override: None,
+                    scheduled_handoff: None,
                 },
             );
             service
@@ -2998,6 +3127,7 @@ struct StoredRun {
     state: RunState,
     model_override: Option<Arc<dyn ModelPort>>,
     capabilities_override: Option<EffectiveCapabilities>,
+    scheduled_handoff: Option<(OccurrenceKey, uuid::Uuid)>,
 }
 
 struct ReviewedSkillPrompt {
@@ -3019,6 +3149,7 @@ struct StoredRunRequest {
     model_override: Option<Arc<dyn ModelPort>>,
     capabilities_override: Option<EffectiveCapabilities>,
     job_origin: Option<JobOrigin>,
+    scheduled_handoff: Option<(OccurrenceKey, uuid::Uuid)>,
 }
 
 struct EgressCheckedModel {
@@ -3473,6 +3604,10 @@ pub(crate) fn now() -> TimestampMillis {
         .unwrap_or_default()
         .as_millis();
     TimestampMillis::new(u64::try_from(millis).unwrap_or(u64::MAX))
+}
+
+fn scheduled_lease_expiry(timestamp: TimestampMillis) -> TimestampMillis {
+    TimestampMillis::new(timestamp.as_u64().saturating_add(30_000))
 }
 
 #[cfg(test)]

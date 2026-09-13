@@ -1578,6 +1578,13 @@ async fn scheduled_due_once_job_creates_one_service_attributed_run() {
             .await
             .expect("scheduled run");
     assert_eq!(stored_run_id, run_id.to_string());
+    let occurrence_state: String =
+        sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE occurrence_key = ?")
+            .bind(occurrence.as_str())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("scheduled occurrence state");
+    assert_eq!(occurrence_state, "succeeded");
     let records = harness
         .database
         .list_audit_records(harness.workspace_id, 0, 50)
@@ -1901,6 +1908,111 @@ async fn scheduled_claimed_occurrence_recovers_without_duplicate_runs() {
     .fetch_one(harness.database.pool())
     .await
     .expect("scheduled run count");
+    assert_eq!(run_count, 1);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn committed_unstarted_scheduled_handoff_recovers_the_same_run() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("recovered ready run")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    let job = harness
+        .database
+        .latest_scheduled_job_revision(scheduled_job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let occurrence = OccurrenceKey::new(
+        scheduled_job_id(),
+        JobRevision::new(1).expect("revision"),
+        TimestampMillis::new(1_000),
+    );
+    let lease = uuid::Uuid::new_v4();
+    let run_id = RunId::new();
+    assert!(
+        harness
+            .database
+            .claim_job_occurrence(
+                &occurrence,
+                lease,
+                TimestampMillis::new(1_500),
+                TimestampMillis::new(1_900),
+            )
+            .await
+            .expect("claim")
+    );
+    harness
+        .database
+        .persist_scheduled_run_handoff(
+            &job,
+            &occurrence,
+            lease,
+            run_id,
+            None,
+            TimestampMillis::new(1_600),
+        )
+        .await
+        .expect("committed handoff");
+
+    assert!(
+        model
+            .received_requests()
+            .await
+            .expect("model requests")
+            .is_empty()
+    );
+    let before: (String, String) = sqlx::query_as(
+        "SELECT occurrence.state, run.state
+         FROM scheduled_job_runs occurrence JOIN agent_runs run ON run.id = occurrence.run_id
+         WHERE occurrence.occurrence_key = ?",
+    )
+    .bind(occurrence.as_str())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("ready handoff");
+    assert_eq!(before, ("claimed".into(), "created".into()));
+
+    assert_eq!(
+        harness
+            .service
+            .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+            .await
+            .expect("recovery pass"),
+        vec![run_id]
+    );
+    wait_for_run_state(&harness, &run_id.to_string(), "completed").await;
+    let occurrence_state: String =
+        sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE occurrence_key = ?")
+            .bind(occurrence.as_str())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("occurrence state");
+    assert_eq!(occurrence_state, "succeeded");
+    assert_eq!(
+        model
+            .received_requests()
+            .await
+            .expect("model requests")
+            .len(),
+        1
+    );
+    let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("run count");
     assert_eq!(run_count, 1);
     harness.service.shutdown().await;
 }
