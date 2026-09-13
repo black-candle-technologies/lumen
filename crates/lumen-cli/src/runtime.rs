@@ -304,7 +304,10 @@ impl LocalRuntimeService {
                     if self.scheduler_cancellation.is_cancelled() {
                         break;
                     }
-                    let _ = self.run_due_scheduled_jobs_once(now()).await;
+                    let timestamp = now();
+                    if let Err(error) = self.run_due_scheduled_jobs_once(timestamp).await {
+                        self.record_scheduler_poll_failure(&error, timestamp).await;
+                    }
                 }
             }
         }
@@ -321,11 +324,87 @@ impl LocalRuntimeService {
             .await
             .map_err(|error| ServiceError::Internal(format!("load due scheduled jobs: {error}")))?;
         for job in due {
-            if let Some(run_id) = self.run_due_scheduled_job(job, timestamp).await? {
-                created.push(run_id);
+            match self.run_due_scheduled_job(job.clone(), timestamp).await {
+                Ok(Some(run_id)) => created.push(run_id),
+                Ok(None) => {}
+                Err(error) => {
+                    self.record_scheduler_job_failure(
+                        &job,
+                        job.next_due_at().unwrap_or(timestamp),
+                        &error,
+                        timestamp,
+                    )
+                    .await?;
+                }
             }
         }
         Ok(created)
+    }
+
+    async fn record_scheduler_job_failure(
+        &self,
+        job: &ScheduledJobRevision,
+        scheduled_for: TimestampMillis,
+        error: &ServiceError,
+        timestamp: TimestampMillis,
+    ) -> Result<(), ServiceError> {
+        let diagnostic = self.bounded_diagnostic(error);
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                timestamp,
+                AuditEventKind::SchedulerJobFailed,
+                AuditOutcome::Failure,
+                Some(job.workspace_id()),
+                CanonicalValue::object([
+                    ("job_id", CanonicalValue::from(job.job_id().to_string())),
+                    (
+                        "revision",
+                        CanonicalValue::from(
+                            i64::try_from(job.revision().as_u64()).unwrap_or(i64::MAX),
+                        ),
+                    ),
+                    (
+                        "scheduled_for",
+                        CanonicalValue::from(
+                            i64::try_from(scheduled_for.as_u64()).unwrap_or(i64::MAX),
+                        ),
+                    ),
+                    ("diagnostic", CanonicalValue::from(diagnostic)),
+                ]),
+            ))
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))
+    }
+
+    async fn record_scheduler_poll_failure(
+        &self,
+        error: &ServiceError,
+        timestamp: TimestampMillis,
+    ) {
+        let diagnostic = self.bounded_diagnostic(error);
+        eprintln!("event=scheduler_poll_failed diagnostic={diagnostic:?}");
+        if self
+            .audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                timestamp,
+                AuditEventKind::SchedulerPollFailed,
+                AuditOutcome::Failure,
+                None,
+                CanonicalValue::object([("diagnostic", CanonicalValue::from(diagnostic))]),
+            ))
+            .await
+            .is_err()
+        {
+            eprintln!("event=scheduler_poll_failed diagnostic_persistence=failed");
+        }
+    }
+
+    fn bounded_diagnostic(&self, error: &impl std::fmt::Display) -> String {
+        let mut diagnostic = error.to_string();
+        self.redactor.redact_string(&mut diagnostic);
+        diagnostic.chars().take(256).collect()
     }
 
     async fn recover_scheduled_run_handoffs(
@@ -347,46 +426,71 @@ impl LocalRuntimeService {
             })?;
         let mut recovered = Vec::new();
         for (occurrence, run_id, job) in ready {
-            let lease_id = uuid::Uuid::new_v4();
-            let claimed = self
-                .database
-                .claim_ready_scheduled_run(
-                    &occurrence,
-                    lease_id,
-                    timestamp,
-                    scheduled_lease_expiry(timestamp),
-                )
+            match self
+                .recover_ready_scheduled_run(&occurrence, run_id, &job, timestamp)
                 .await
-                .map_err(|error| {
-                    ServiceError::Internal(format!("claim ready scheduled run: {error}"))
-                })?;
-            if !claimed {
-                continue;
+            {
+                Ok(true) => recovered.push(run_id),
+                Ok(false) => {}
+                Err(error) => {
+                    self.record_scheduler_job_failure(
+                        &job,
+                        occurrence.scheduled_for(),
+                        &error,
+                        timestamp,
+                    )
+                    .await?;
+                }
             }
-            let stored = self
-                .prepare_stored_run(
-                    run_id,
-                    self.scheduled_run_request(&job, &occurrence, lease_id)
-                        .await?,
-                )
-                .await?;
-            self.publish_run_created(run_id, stored.workspace_id)?;
-            self.database
-                .start_scheduled_run(
-                    &occurrence,
-                    lease_id,
-                    run_id,
-                    timestamp,
-                    self.scheduled_execution_lease_expiry(timestamp),
-                )
-                .await
-                .map_err(|error| {
-                    ServiceError::Internal(format!("start recovered scheduled run: {error}"))
-                })?;
-            self.install_and_spawn_run(run_id, stored).await;
-            recovered.push(run_id);
         }
         Ok(recovered)
+    }
+
+    async fn recover_ready_scheduled_run(
+        &self,
+        occurrence: &OccurrenceKey,
+        run_id: RunId,
+        job: &ScheduledJobRevision,
+        timestamp: TimestampMillis,
+    ) -> Result<bool, ServiceError> {
+        let lease_id = uuid::Uuid::new_v4();
+        let claimed = self
+            .database
+            .claim_ready_scheduled_run(
+                occurrence,
+                lease_id,
+                timestamp,
+                scheduled_lease_expiry(timestamp),
+            )
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("claim ready scheduled run: {error}"))
+            })?;
+        if !claimed {
+            return Ok(false);
+        }
+        let stored = self
+            .prepare_stored_run(
+                run_id,
+                self.scheduled_run_request(job, occurrence, lease_id)
+                    .await?,
+            )
+            .await?;
+        self.publish_run_created(run_id, stored.workspace_id)?;
+        self.database
+            .start_scheduled_run(
+                occurrence,
+                lease_id,
+                run_id,
+                timestamp,
+                self.scheduled_execution_lease_expiry(timestamp),
+            )
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("start recovered scheduled run: {error}"))
+            })?;
+        self.install_and_spawn_run(run_id, stored).await;
+        Ok(true)
     }
 
     async fn run_due_scheduled_job(
@@ -746,20 +850,46 @@ impl LocalRuntimeService {
             return;
         };
         if let Some((occurrence, lease_id)) = &stored.scheduled_handoff {
-            let current = self
+            let current = match self
                 .database
                 .scheduled_run_lease_is_current(occurrence, *lease_id, run_id)
                 .await
-                .unwrap_or(false);
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "dispatch_fence",
+                        &error,
+                        now(),
+                    )
+                    .await;
+                    self.finish_run(run_id).await;
+                    return;
+                }
+            };
             if !current {
                 self.finish_run(run_id).await;
                 return;
             }
         }
-        let _ = self
+        if let Err(error) = self
             .database
             .update_run_state(run_id, "running", None)
+            .await
+        {
+            self.record_run_reconciliation_required(
+                stored.workspace_id,
+                run_id,
+                "run_start",
+                &error,
+                now(),
+            )
             .await;
+            self.finish_run(run_id).await;
+            return;
+        }
         let cancellation = self
             .cancellations
             .lock()
@@ -812,11 +942,23 @@ impl LocalRuntimeService {
             .await
         {
             Ok(RunOutcome::AwaitingApproval { approval_id }) => {
-                let _ = self
+                if let Err(error) = self
                     .database
                     .update_run_state(run_id, "awaiting_approval", None)
+                    .await
+                {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "approval_pause",
+                        &error,
+                        now(),
+                    )
                     .await;
-                let _ = self.events.publish(
+                    self.finish_run(run_id).await;
+                    return;
+                }
+                if let Err(error) = self.events.publish(
                     stored.workspace_id,
                     run_id,
                     "approval.required",
@@ -824,37 +966,37 @@ impl LocalRuntimeService {
                         "approval_id",
                         CanonicalValue::from(approval_id.to_string()),
                     )]),
-                );
+                ) {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "approval_event",
+                        &error,
+                        now(),
+                    )
+                    .await;
+                }
                 self.runs.lock().await.insert(run_id, stored);
             }
             Ok(outcome) => {
                 let (state, kind, mut payload) = terminal_event(&outcome);
                 self.redactor.redact_value(&mut payload);
-                let timestamp = now();
-                let _ = self
-                    .database
-                    .update_run_state(run_id, state, Some(timestamp))
-                    .await;
-                if stored.state.context().job_origin().is_some() {
-                    let _ = self
-                        .database
-                        .complete_scheduled_occurrence_for_run(
-                            run_id,
-                            scheduled_occurrence_terminal_state(&outcome),
-                            timestamp,
-                        )
-                        .await;
-                }
-                let _ = self
-                    .events
-                    .publish(stored.workspace_id, run_id, kind, payload);
-                self.finish_run(run_id).await;
+                self.terminalize_stored_run(
+                    run_id,
+                    &stored,
+                    state,
+                    scheduled_occurrence_terminal_state(&outcome),
+                    kind,
+                    payload,
+                    None,
+                    now(),
+                )
+                .await;
             }
             Err(error) => {
                 let timestamp = now();
-                if cancellation.is_cancelled() {
-                    let _ = self
-                        .audit
+                let audit_failure = if cancellation.is_cancelled() {
+                    self.audit
                         .record(AuditEvent::new(
                             AuditEventId::new(),
                             timestamp,
@@ -866,34 +1008,160 @@ impl LocalRuntimeService {
                                 CanonicalValue::from(run_id.to_string()),
                             )]),
                         ))
-                        .await;
-                }
-                let _ = self
-                    .database
-                    .update_run_state(
-                        run_id,
-                        if cancellation.is_cancelled() {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        },
-                        Some(timestamp),
-                    )
-                    .await;
-                let mut message = error.to_string();
-                self.redactor.redact_string(&mut message);
-                let _ = self.events.publish(
-                    stored.workspace_id,
+                        .await
+                        .err()
+                        .map(|error| ("cancellation_audit", error.to_string()))
+                } else {
+                    None
+                };
+                let cancelled = cancellation.is_cancelled();
+                self.terminalize_stored_run(
                     run_id,
-                    if cancellation.is_cancelled() {
+                    &stored,
+                    if cancelled { "cancelled" } else { "failed" },
+                    if cancelled { "cancelled" } else { "failed" },
+                    if cancelled {
                         "run.cancelled"
                     } else {
                         "run.failed"
                     },
-                    CanonicalValue::from(message),
-                );
-                self.finish_run(run_id).await;
+                    CanonicalValue::from(self.bounded_diagnostic(&error)),
+                    audit_failure,
+                    timestamp,
+                )
+                .await;
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn terminalize_stored_run(
+        &self,
+        run_id: RunId,
+        stored: &StoredRun,
+        state: &str,
+        scheduled_state: &str,
+        event_kind: &str,
+        payload: CanonicalValue,
+        prerequisite_failure: Option<(&'static str, String)>,
+        timestamp: TimestampMillis,
+    ) {
+        let scheduled_state = stored.scheduled_handoff.as_ref().map(|_| scheduled_state);
+        match self
+            .database
+            .terminalize_run(run_id, state, scheduled_state, timestamp)
+            .await
+        {
+            Ok(()) if prerequisite_failure.is_none() => {
+                let terminal_audit = if state == "failed" {
+                    self.audit
+                        .record(AuditEvent::new(
+                            AuditEventId::new(),
+                            timestamp,
+                            AuditEventKind::RunFailed,
+                            if scheduled_state == Some("unknown") {
+                                AuditOutcome::Unknown
+                            } else {
+                                AuditOutcome::Failure
+                            },
+                            Some(stored.workspace_id),
+                            CanonicalValue::object([(
+                                "run_id",
+                                CanonicalValue::from(run_id.to_string()),
+                            )]),
+                        ))
+                        .await
+                        .map_err(|error| error.to_string())
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = terminal_audit {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "terminal_audit",
+                        &error,
+                        timestamp,
+                    )
+                    .await;
+                } else if let Err(error) =
+                    self.events
+                        .publish(stored.workspace_id, run_id, event_kind, payload)
+                {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "terminal_event",
+                        &error,
+                        timestamp,
+                    )
+                    .await;
+                }
+            }
+            Ok(()) => {
+                let (stage, error) = prerequisite_failure.expect("checked as present");
+                self.record_run_reconciliation_required(
+                    stored.workspace_id,
+                    run_id,
+                    stage,
+                    &error,
+                    timestamp,
+                )
+                .await;
+            }
+            Err(error) => {
+                self.record_run_reconciliation_required(
+                    stored.workspace_id,
+                    run_id,
+                    "terminal_persistence",
+                    &error,
+                    timestamp,
+                )
+                .await;
+            }
+        }
+        self.finish_run(run_id).await;
+    }
+
+    async fn record_run_reconciliation_required(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        run_id: RunId,
+        stage: &'static str,
+        error: &impl std::fmt::Display,
+        timestamp: TimestampMillis,
+    ) {
+        let diagnostic = self.bounded_diagnostic(error);
+        let payload = CanonicalValue::object([
+            ("run_id", CanonicalValue::from(run_id.to_string())),
+            ("stage", CanonicalValue::from(stage)),
+            ("diagnostic", CanonicalValue::from(diagnostic.clone())),
+        ]);
+        if self
+            .audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                timestamp,
+                AuditEventKind::RunReconciliationRequired,
+                AuditOutcome::Unknown,
+                Some(workspace_id),
+                payload.clone(),
+            ))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "event=run_reconciliation_required run_id={run_id} stage={stage} diagnostic={diagnostic:?} audit_persistence=failed"
+            );
+        }
+        if self
+            .events
+            .publish(workspace_id, run_id, "run.reconciliation_required", payload)
+            .is_err()
+        {
+            eprintln!(
+                "event=run_reconciliation_required run_id={run_id} stage={stage} diagnostic={diagnostic:?} event_publication=failed"
+            );
         }
     }
 

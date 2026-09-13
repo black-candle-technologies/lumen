@@ -386,6 +386,32 @@ async fn request_timeout_is_reported_without_fallback() {
 }
 
 #[tokio::test]
+async fn unreachable_endpoint_is_reported_without_fallback() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+    let endpoint = format!(
+        "http://{}/v1/",
+        listener.local_addr().expect("loopback address")
+    );
+    drop(listener);
+    let config = OpenAiCompatibleConfig::new(endpoint, "local-model", EndpointPolicy::LoopbackOnly)
+        .expect("loopback config")
+        .with_timeout(Duration::from_secs(1));
+    let client = OpenAiCompatibleClient::new(config).expect("client builds");
+
+    let error = client
+        .generate(input())
+        .await
+        .expect_err("endpoint is unreachable");
+
+    assert!(
+        error.message().contains("model request failed")
+            || error.message() == "model request timed out",
+        "unexpected error: {}",
+        error.message()
+    );
+}
+
+#[tokio::test]
 async fn response_body_is_rejected_when_it_exceeds_the_configured_limit() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

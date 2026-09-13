@@ -1611,6 +1611,219 @@ async fn scheduled_due_once_job_creates_one_service_attributed_run() {
 }
 
 #[tokio::test]
+async fn scheduled_provider_failure_terminalizes_both_records() {
+    let model = MockServer::start().await;
+    mount_response(&model, ResponseTemplate::new(500)).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("terminal states");
+    assert_eq!(states, ("failed".into(), "failed".into()));
+    harness.wait_for_audit(AuditEventKind::RunFailed).await;
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_terminal_write_failure_surfaces_reconciliation_without_false_state() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("logical success")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    sqlx::query(
+        "CREATE TRIGGER fail_scheduled_terminalization
+         BEFORE UPDATE OF state ON scheduled_job_runs
+         WHEN NEW.state = 'succeeded'
+         BEGIN SELECT RAISE(FAIL, 'injected terminal write failure'); END",
+    )
+    .execute(harness.database.pool())
+    .await
+    .expect("fault trigger");
+
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    harness
+        .wait_for_audit(AuditEventKind::RunReconciliationRequired)
+        .await;
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("consistent preterminal states");
+    assert_eq!(states, ("running".into(), "running".into()));
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 100)
+        .await
+        .expect("audit records");
+    let reconciliation = records
+        .iter()
+        .map(|record| record.event())
+        .find(|event| event.kind() == AuditEventKind::RunReconciliationRequired)
+        .expect("reconciliation audit");
+    assert_eq!(
+        canonical_object_get(reconciliation.payload(), "stage"),
+        Some(&CanonicalValue::from("terminal_persistence"))
+    );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
+    let model = MockServer::start().await;
+    mount_response(&model, ResponseTemplate::new(500)).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    sqlx::query(
+        "CREATE TRIGGER fail_run_failed_audit
+         BEFORE INSERT ON audit_events
+         WHEN NEW.event_type = 'run_failed'
+         BEGIN SELECT RAISE(FAIL, 'injected audit failure'); END",
+    )
+    .execute(harness.database.pool())
+    .await
+    .expect("fault trigger");
+
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    harness
+        .wait_for_audit(AuditEventKind::RunReconciliationRequired)
+        .await;
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("terminal states");
+    assert_eq!(states, ("failed".into(), "failed".into()));
+    let records = harness
+        .database
+        .list_audit_records_for_run(harness.workspace_id, run_id)
+        .await
+        .expect("run audit records");
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.event().kind() == AuditEventKind::RunFailed)
+    );
+    assert!(records.iter().any(|record| {
+        let event = record.event();
+        event.kind() == AuditEventKind::RunReconciliationRequired
+            && canonical_object_get(event.payload(), "stage")
+                == Some(&CanonicalValue::from("terminal_audit"))
+    }));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_cancellation_terminalizes_both_records() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        final_response("too late").set_delay(Duration::from_secs(5)),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    for _ in 0..100 {
+        if !model
+            .received_requests()
+            .await
+            .expect("model requests")
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let cancelled = harness
+        .request("POST", &format!("runs/{run_id}/cancel"), "")
+        .await;
+    assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
+    wait_for_run_state(&harness, &run_id.to_string(), "cancelled").await;
+    let occurrence_state: String =
+        sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("occurrence state");
+    assert_eq!(occurrence_state, "cancelled");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn interactive_and_scheduled_runs_share_the_runtime_wall_time_limit() {
     let model = MockServer::start().await;
     mount_response(
@@ -2050,19 +2263,182 @@ async fn scheduled_job_fails_closed_when_service_grants_cannot_be_loaded() {
     )
     .await;
 
-    let error = harness
+    let created = harness
         .service
         .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
         .await
-        .expect_err("corrupt grants fail closed");
+        .expect("bad job is isolated");
 
-    assert!(error.to_string().contains("load scheduled service grants"));
+    assert!(created.is_empty());
     let run_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE actor_provider = 'service'")
             .fetch_one(harness.database.pool())
             .await
             .expect("run count");
     assert_eq!(run_count, 0);
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 100)
+        .await
+        .expect("audit records");
+    assert!(records.iter().any(|record| {
+        let event = record.event();
+        event.kind() == AuditEventKind::SchedulerJobFailed
+            && canonical_object_get(event.payload(), "job_id")
+                == Some(&CanonicalValue::from(scheduled_job_id().to_string()))
+            && matches!(
+                canonical_object_get(event.payload(), "diagnostic"),
+                Some(CanonicalValue::String(value)) if value.chars().count() <= 256
+            )
+    }));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduler_poll_failure_is_persisted_with_a_bounded_redacted_diagnostic() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let error = lumen_server::ServiceError::Internal(format!(
+        "poll failed with {TOKEN}:{}",
+        "x".repeat(400)
+    ));
+
+    harness
+        .service
+        .record_scheduler_poll_failure(&error, TimestampMillis::new(2_000))
+        .await;
+
+    let (workspace_id, payload): (Option<String>, String) = sqlx::query_as(
+        "SELECT workspace_id, payload_json FROM audit_events
+         WHERE event_type = 'scheduler_poll_failed'",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("poll failure audit");
+    assert!(workspace_id.is_none());
+    let payload: serde_json::Value = serde_json::from_str(&payload).expect("audit payload");
+    let diagnostic = payload["diagnostic"].as_str().expect("diagnostic");
+    assert!(diagnostic.chars().count() <= 256);
+    assert!(!diagnostic.contains(TOKEN));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_bad_scheduled_job_does_not_starve_an_independent_due_job() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("good job completed")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    let owner = PrincipalId::new("local", "operator").expect("owner");
+    let bad_service = lumen_core::automation::service_principal("bad-job").expect("service");
+    harness
+        .database
+        .upsert_service_identity(
+            &ServiceIdentity::new(
+                bad_service.clone(),
+                harness.workspace_id,
+                owner.clone(),
+                "Bad job",
+                true,
+                TimestampMillis::new(500),
+                TimestampMillis::new(500),
+            )
+            .expect("bad service"),
+            [],
+        )
+        .await
+        .expect("bad service stored");
+    let bad_job_id = JobId::from_uuid(
+        uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("job ID"),
+    );
+    harness
+        .database
+        .append_scheduled_job_revision(
+            &ScheduledJobRevision::new(
+                bad_job_id,
+                JobRevision::new(1).expect("revision"),
+                harness.workspace_id,
+                bad_service,
+                owner,
+                ScheduleSpec::once(TimestampMillis::new(1_000)),
+                "bad job",
+                DataClass::Public,
+                2,
+                1,
+                true,
+                Some(TimestampMillis::new(1_000)),
+                false,
+                TimestampMillis::new(500),
+            )
+            .expect("bad job"),
+        )
+        .await
+        .expect("bad job stored");
+    sqlx::query(
+        "CREATE TRIGGER fail_bad_scheduled_run_run
+         BEFORE INSERT ON agent_runs
+         WHEN NEW.actor_provider = 'service' AND NEW.actor_subject = 'bad-job'
+         BEGIN SELECT RAISE(FAIL, 'injected pre-dispatch failure'); END",
+    )
+    .execute(harness.database.pool())
+    .await
+    .expect("fault trigger");
+
+    let created = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("isolated scheduler pass");
+    assert_eq!(created.len(), 1);
+    wait_for_run_state(&harness, &created[0].to_string(), "completed").await;
+    let bad_occurrence = OccurrenceKey::new(
+        bad_job_id,
+        JobRevision::new(1).expect("revision"),
+        TimestampMillis::new(1_000),
+    );
+    let bad_state: (Option<String>, String) =
+        sqlx::query_as("SELECT run_id, state FROM scheduled_job_runs WHERE occurrence_key = ?")
+            .bind(bad_occurrence.as_str())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("bad occurrence");
+    assert_eq!(bad_state, (None, "claimed".into()));
+    let good_occurrence_state: String =
+        sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE run_id = ?")
+            .bind(created[0].to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("good occurrence");
+    assert_eq!(good_occurrence_state, "succeeded");
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 100)
+        .await
+        .expect("audit records");
+    assert!(records.iter().any(|record| {
+        let event = record.event();
+        event.kind() == AuditEventKind::SchedulerJobFailed
+            && canonical_object_get(event.payload(), "job_id")
+                == Some(&CanonicalValue::from(bad_job_id.to_string()))
+    }));
+    assert_eq!(
+        model
+            .received_requests()
+            .await
+            .expect("model requests")
+            .len(),
+        1
+    );
     harness.service.shutdown().await;
 }
 

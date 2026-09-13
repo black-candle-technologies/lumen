@@ -453,12 +453,78 @@ impl Database {
         ) {
             return Err(RepositoryError::InvalidRunState(state.to_owned()));
         }
-        sqlx::query("UPDATE agent_runs SET state = ?, completed_at = ? WHERE id = ?")
+        let updated = sqlx::query("UPDATE agent_runs SET state = ?, completed_at = ? WHERE id = ?")
             .bind(state)
             .bind(completed_at.map(timestamp_to_i64).transpose()?)
             .bind(run_id.to_string())
             .execute(&self.pool)
-            .await?;
+            .await?
+            .rows_affected();
+        if updated != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        Ok(())
+    }
+
+    pub async fn terminalize_run(
+        &self,
+        run_id: lumen_core::action::RunId,
+        state: &str,
+        scheduled_state: Option<&str>,
+        completed_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(state, "completed" | "failed" | "cancelled")
+            || scheduled_state.is_some_and(|state| {
+                !matches!(state, "succeeded" | "failed" | "cancelled" | "unknown")
+            })
+        {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        let completed_at = timestamp_to_i64(completed_at)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let updated = sqlx::query(
+            "UPDATE agent_runs SET state = ?, completed_at = ?
+             WHERE id = ? AND state IN ('created', 'running', 'awaiting_approval')",
+        )
+        .bind(state)
+        .bind(completed_at)
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+                    .bind(run_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            if current.as_deref() != Some(state) {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+        }
+        if let Some(scheduled_state) = scheduled_state {
+            let updated = sqlx::query(
+                "UPDATE scheduled_job_runs SET state = ?, updated_at = ?
+                 WHERE run_id = ? AND state = 'running'",
+            )
+            .bind(scheduled_state)
+            .bind(completed_at)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if updated == 0 {
+                let current: Option<String> =
+                    sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE run_id = ?")
+                        .bind(run_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if current.as_deref() != Some(scheduled_state) {
+                    return Err(RepositoryError::ExecutionStateConflict);
+                }
+            }
+        }
+        transaction.commit().await?;
         Ok(())
     }
 

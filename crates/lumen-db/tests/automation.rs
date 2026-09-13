@@ -655,6 +655,97 @@ async fn expired_started_handoff_recovers_as_unknown_without_redispatch() {
 }
 
 #[tokio::test]
+async fn scheduled_terminalization_rolls_back_both_records_on_write_failure() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let job = database
+        .latest_scheduled_job_revision(job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+    let lease = Uuid::new_v4();
+    let run_id = RunId::new();
+    database
+        .claim_job_occurrence(
+            &key,
+            lease,
+            TimestampMillis::new(2_100),
+            TimestampMillis::new(3_000),
+        )
+        .await
+        .expect("claim");
+    database
+        .persist_scheduled_run_handoff(&job, &key, lease, run_id, None, TimestampMillis::new(2_200))
+        .await
+        .expect("handoff");
+    database
+        .start_scheduled_run(
+            &key,
+            lease,
+            run_id,
+            TimestampMillis::new(2_300),
+            TimestampMillis::new(4_000),
+        )
+        .await
+        .expect("start");
+    sqlx::query(
+        "CREATE TRIGGER fail_scheduled_terminalization
+         BEFORE UPDATE OF state ON scheduled_job_runs
+         WHEN OLD.run_id = NEW.run_id AND NEW.state = 'failed'
+         BEGIN SELECT RAISE(FAIL, 'injected terminal write failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("fault trigger");
+
+    assert!(matches!(
+        database
+            .terminalize_run(
+                run_id,
+                "failed",
+                Some("failed"),
+                TimestampMillis::new(2_400)
+            )
+            .await,
+        Err(RepositoryError::Sqlx(_))
+    ));
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("rolled-back states");
+    assert_eq!(states, ("running".into(), "running".into()));
+
+    sqlx::query("DROP TRIGGER fail_scheduled_terminalization")
+        .execute(database.pool())
+        .await
+        .expect("remove fault trigger");
+    database
+        .terminalize_run(
+            run_id,
+            "failed",
+            Some("failed"),
+            TimestampMillis::new(2_500),
+        )
+        .await
+        .expect("terminalization");
+    database
+        .terminalize_run(
+            run_id,
+            "failed",
+            Some("failed"),
+            TimestampMillis::new(2_600),
+        )
+        .await
+        .expect("idempotent terminalization");
+}
+
+#[tokio::test]
 async fn scheduled_handoff_rechecks_job_and_service_after_claim() {
     for change in ["new-revision", "service-disabled"] {
         let database = database().await;
