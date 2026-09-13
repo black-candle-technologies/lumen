@@ -60,6 +60,7 @@ use lumen_server::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -72,6 +73,19 @@ use crate::{
     CliError,
     config::{Config, RemoteDataClass},
 };
+
+const REVIEWED_SKILL_SOURCE_MAX_BYTES: usize = 65_536;
+
+async fn read_bounded_skill_source(
+    reader: impl AsyncRead + Unpin,
+) -> Result<Option<Vec<u8>>, std::io::Error> {
+    let mut source = Vec::with_capacity(REVIEWED_SKILL_SOURCE_MAX_BYTES + 1);
+    reader
+        .take((REVIEWED_SKILL_SOURCE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut source)
+        .await?;
+    Ok((source.len() <= REVIEWED_SKILL_SOURCE_MAX_BYTES).then_some(source))
+}
 
 #[derive(Clone)]
 pub(crate) struct LocalRuntimeService {
@@ -718,12 +732,21 @@ impl LocalRuntimeService {
             .join("skills")
             .join(skill.skill_id().to_string())
             .join(format!("{}.md", skill.version().as_str()));
-        let source = match tokio::fs::read_to_string(&path).await {
-            Ok(source) => source,
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ServiceError::Internal(error.to_string())),
         };
-        if source.len() > 65_536 || sha256_hex(source.as_bytes()) != skill.source_digest() {
+        let Some(source) = read_bounded_skill_source(file)
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let source = String::from_utf8(source).map_err(|_| {
+            ServiceError::Internal("reviewed skill source is not valid UTF-8".into())
+        })?;
+        if sha256_hex(source.as_bytes()) != skill.source_digest() {
             return Ok(None);
         }
         Ok(Some(LoadedReviewedSkill {

@@ -51,7 +51,8 @@ use wiremock::{
 };
 
 use super::{
-    EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand, RedactingExecutor, now,
+    EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand,
+    REVIEWED_SKILL_SOURCE_MAX_BYTES, RedactingExecutor, now, read_bounded_skill_source,
 };
 use crate::{
     config::{Config, toml_string},
@@ -2842,6 +2843,82 @@ async fn reviewed_skill_with_matching_digest_is_loaded_into_model_context() {
         skill_id().to_string().as_str(),
         "1.0.0"
     ));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn reviewed_skill_reader_accepts_exact_limit_and_rejects_one_more_byte() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let source = "x".repeat(REVIEWED_SKILL_SOURCE_MAX_BYTES);
+    insert_skill_source(&harness, skill_id(), "1.0.0", true, &source, None).await;
+    let skill = harness
+        .database
+        .enabled_skill_versions(harness.workspace_id)
+        .await
+        .expect("enabled skills")
+        .into_iter()
+        .next()
+        .expect("reviewed skill");
+
+    let loaded = harness
+        .service
+        .load_reviewed_skill_context(harness.workspace_id, &skill)
+        .await
+        .expect("exact-limit source")
+        .expect("skill loaded");
+    assert!(loaded.rendered.ends_with(&source));
+
+    let path = skill_source_path(&harness, skill_id(), skill.version());
+    std::fs::write(&path, format!("{source}x")).expect("oversized skill source");
+    assert!(
+        harness
+            .service
+            .load_reviewed_skill_context(harness.workspace_id, &skill)
+            .await
+            .expect("overflow is excluded")
+            .is_none()
+    );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn reviewed_skill_reader_bounds_an_unending_source_and_rejects_invalid_utf8() {
+    let bounded = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_bounded_skill_source(tokio::io::repeat(b'x')),
+    )
+    .await
+    .expect("bounded reader returned")
+    .expect("bounded read");
+    assert!(bounded.is_none());
+
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_skill_source(&harness, skill_id(), "1.0.0", true, "valid", None).await;
+    let skill = harness
+        .database
+        .enabled_skill_versions(harness.workspace_id)
+        .await
+        .expect("enabled skills")
+        .into_iter()
+        .next()
+        .expect("reviewed skill");
+    std::fs::write(
+        skill_source_path(&harness, skill_id(), skill.version()),
+        [0xff],
+    )
+    .expect("invalid UTF-8 source");
+
+    let error = match harness
+        .service
+        .load_reviewed_skill_context(harness.workspace_id, &skill)
+        .await
+    {
+        Ok(_) => panic!("invalid UTF-8 was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("not valid UTF-8"));
     harness.service.shutdown().await;
 }
 
