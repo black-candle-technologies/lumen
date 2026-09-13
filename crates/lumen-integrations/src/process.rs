@@ -14,7 +14,7 @@ use lumen_core::{
     egress::{DataClass, DestinationScope, ProviderId},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorError, ExecutorFuture, ExecutorPort},
     identity::{ComponentId, PrincipalId, WorkspaceId},
-    model::ActionProposal,
+    model::{ActionProposal, ModelTool},
     run::{ActionNormalizer, NormalizationError, RunContext},
     secret::SecretRefId,
 };
@@ -258,6 +258,72 @@ impl ActionNormalizer for BuiltinActionNormalizer {
                 "unsupported built-in action: {kind}"
             ))),
         }
+    }
+
+    fn model_tools(&self, _context: &RunContext) -> Vec<ModelTool> {
+        vec![
+            ModelTool::new(
+                "filesystem_read",
+                "Read a UTF-8 text file from the current workspace.",
+                "filesystem.read",
+                object_schema(
+                    [("path", string_schema("Workspace-relative path to read."))],
+                    ["path"],
+                ),
+            ),
+            ModelTool::new(
+                "filesystem_write",
+                "Replace or create a UTF-8 text file in the current workspace. Execution may require approval.",
+                "filesystem.write",
+                object_schema(
+                    [
+                        ("path", string_schema("Workspace-relative path to write.")),
+                        ("content", string_schema("Complete UTF-8 file contents.")),
+                    ],
+                    ["path", "content"],
+                ),
+            ),
+            ModelTool::new(
+                "process_spawn",
+                "Run an executable already allowed by the local runtime.",
+                "process.spawn",
+                object_schema(
+                    [
+                        ("program", string_schema("Allowed executable path.")),
+                        ("args", string_array_schema()),
+                        ("environment", string_map_schema()),
+                        ("secret_environment", string_map_schema()),
+                    ],
+                    ["program"],
+                ),
+            ),
+            ModelTool::new(
+                "network_egress",
+                "Send an HTTP GET or POST request to an allowed HTTPS destination.",
+                "network.egress",
+                object_schema(
+                    [
+                        ("url", string_schema("Allowed HTTPS URL.")),
+                        (
+                            "method",
+                            CanonicalValue::object([
+                                ("type", CanonicalValue::from("string")),
+                                (
+                                    "enum",
+                                    CanonicalValue::Array(
+                                        ["GET", "POST"]
+                                            .into_iter()
+                                            .map(CanonicalValue::from)
+                                            .collect(),
+                                    ),
+                                ),
+                            ]),
+                        ),
+                    ],
+                    ["url", "method"],
+                ),
+            ),
+        ]
     }
 }
 
@@ -557,6 +623,48 @@ struct SkillPublishArguments {
     name: String,
     description: String,
     source_format: String,
+}
+
+fn object_schema<const P: usize, const R: usize>(
+    properties: [(&str, CanonicalValue); P],
+    required: [&str; R],
+) -> CanonicalValue {
+    CanonicalValue::object([
+        ("type", CanonicalValue::from("object")),
+        ("properties", CanonicalValue::object(properties)),
+        (
+            "required",
+            CanonicalValue::Array(required.into_iter().map(CanonicalValue::from).collect()),
+        ),
+        ("additionalProperties", CanonicalValue::from(false)),
+    ])
+}
+
+fn string_schema(description: &str) -> CanonicalValue {
+    CanonicalValue::object([
+        ("type", CanonicalValue::from("string")),
+        ("description", CanonicalValue::from(description)),
+    ])
+}
+
+fn string_array_schema() -> CanonicalValue {
+    CanonicalValue::object([
+        ("type", CanonicalValue::from("array")),
+        (
+            "items",
+            CanonicalValue::object([("type", CanonicalValue::from("string"))]),
+        ),
+    ])
+}
+
+fn string_map_schema() -> CanonicalValue {
+    CanonicalValue::object([
+        ("type", CanonicalValue::from("object")),
+        (
+            "additionalProperties",
+            CanonicalValue::object([("type", CanonicalValue::from("string"))]),
+        ),
+    ])
 }
 
 fn parse_arguments<T: for<'de> Deserialize<'de>>(

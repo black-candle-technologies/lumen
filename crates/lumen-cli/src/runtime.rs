@@ -19,7 +19,7 @@ use lumen_core::{
     egress::{DataClass, DestinationScope, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
     extension::{PluginComponentId, PluginId, PluginVersion},
-    model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort},
+    model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort, ModelTool},
     policy::{Policy, PolicyVersion},
     run::{
         ActionFuture, ActionNormalizer, ActionPort, ActionPortError, ApprovalFuture, ApprovalPort,
@@ -2854,6 +2854,10 @@ impl ActionNormalizer for SecretRejectingNormalizer {
         }
         Ok(action)
     }
+
+    fn model_tools(&self, context: &RunContext) -> Vec<ModelTool> {
+        self.inner.model_tools(context)
+    }
 }
 
 impl ExecutorPort for RedactingExecutor {
@@ -3127,6 +3131,12 @@ impl ActionNormalizer for RoutingNormalizer {
         } else {
             self.builtin.normalize(context, proposal)
         }
+    }
+
+    fn model_tools(&self, context: &RunContext) -> Vec<ModelTool> {
+        let mut tools = self.builtin.model_tools(context);
+        tools.extend(self.extension.model_tools(context));
+        tools
     }
 }
 

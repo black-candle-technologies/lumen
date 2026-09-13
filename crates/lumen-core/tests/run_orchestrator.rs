@@ -22,7 +22,10 @@ use lumen_core::{
         PluginVersion, ProtocolVersion, Sha256Digest,
     },
     identity::{ComponentId, PrincipalId, WorkspaceId},
-    model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelOutput, ModelPort},
+    model::{
+        ActionProposal, ModelError, ModelFuture, ModelInput, ModelOutput, ModelPort, ModelRole,
+        ModelTool, ModelToolCall,
+    },
     policy::{DenialReason, Policy, PolicyVersion},
     run::{
         ActionFuture, ActionNormalizer, ActionPort, ApprovalFuture, ApprovalPort,
@@ -138,6 +141,23 @@ impl ActionNormalizer for FakeNormalizer {
                 ),
             )],
         ))
+    }
+
+    fn model_tools(&self, _context: &RunContext) -> Vec<ModelTool> {
+        [
+            ("filesystem_read", "filesystem.read"),
+            ("filesystem_write", "filesystem.write"),
+        ]
+        .into_iter()
+        .map(|(name, kind)| {
+            ModelTool::new(
+                name,
+                "Workspace file operation.",
+                kind,
+                CanonicalValue::object([("type", CanonicalValue::from("object"))]),
+            )
+        })
+        .collect()
     }
 }
 
@@ -747,6 +767,63 @@ async fn pending_approval_pauses_and_resume_does_not_repeat_the_model_call() {
     assert_eq!(model.call_count(), 2);
     assert_eq!(executor.call_count(), 1);
     assert!(audit.events().contains(&AuditEventKind::ApprovalConsumed));
+}
+
+#[tokio::test]
+async fn tool_call_identity_and_result_are_preserved_after_approval() {
+    let arguments = CanonicalValue::object([
+        ("path", CanonicalValue::from("notes/today.md")),
+        ("content", CanonicalValue::from("written")),
+    ]);
+    let model = FakeModel::new([
+        ModelOutput::Action(
+            ActionProposal::new("filesystem.write", arguments.clone())
+                .with_tool_call(ModelToolCall::new("call-1", "filesystem_write", arguments)),
+        ),
+        ModelOutput::FinalText("saved".to_owned()),
+    ]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::pending_then_grant();
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(run_context(), "write", RunBudget::new(3, 2));
+    let orchestrator = orchestrator(&model, &executor, &approvals, &audit);
+    let capabilities = capabilities(CapabilityName::FsWrite);
+
+    assert!(matches!(
+        orchestrator
+            .run_until_blocked(&mut state, &capabilities, NOW)
+            .await
+            .expect("run pauses"),
+        RunOutcome::AwaitingApproval { .. }
+    ));
+    let outcome = orchestrator
+        .run_until_blocked(&mut state, &capabilities, NOW)
+        .await
+        .expect("run resumes");
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Completed {
+            text: "saved".into()
+        }
+    );
+    let inputs = model.inputs();
+    assert!(
+        inputs[0]
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "filesystem_write")
+    );
+    let messages = inputs[1].messages();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1].role(), ModelRole::Assistant);
+    assert_eq!(
+        messages[1].tool_call().expect("assistant tool call").id(),
+        "call-1"
+    );
+    assert_eq!(messages[2].role(), ModelRole::Tool);
+    assert_eq!(messages[2].tool_call_id(), Some("call-1"));
+    assert_eq!(messages[2].content(), &CanonicalValue::from("written"));
 }
 
 #[tokio::test]

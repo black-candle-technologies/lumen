@@ -3498,11 +3498,15 @@ fn final_response(text: &str) -> ResponseTemplate {
 }
 
 fn action_response(kind: &str, arguments: serde_json::Value) -> ResponseTemplate {
+    let name = kind.replace('.', "_");
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "choices": [{"message": {
             "content": null,
-            "tool_calls": [{"function": {
-                "name": kind,
+            "tool_calls": [{
+                "id": "call_test",
+                "type": "function",
+                "function": {
+                "name": name,
                 "arguments": serde_json::to_string(&arguments).expect("arguments JSON")
             }}]
         }}]

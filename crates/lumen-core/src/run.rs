@@ -19,6 +19,7 @@ use crate::{
     identity::{ComponentId, PrincipalId, WorkspaceId},
     model::{
         ActionProposal, ModelError, ModelInput, ModelMessage, ModelOutput, ModelPort, ModelRole,
+        ModelTool,
     },
     policy::{DenialReason, Policy, PolicyDecision, PolicyVersion},
 };
@@ -34,6 +35,10 @@ pub trait ActionNormalizer: Send + Sync {
         context: &RunContext,
         proposal: ActionProposal,
     ) -> Result<ActionEnvelope, NormalizationError>;
+
+    fn model_tools(&self, _context: &RunContext) -> Vec<ModelTool> {
+        Vec::new()
+    }
 }
 
 pub trait ApprovalPort: Send + Sync {
@@ -246,6 +251,7 @@ impl RunState {
 struct PendingAction {
     action: ActionEnvelope,
     approval_id: ApprovalId,
+    tool_call_id: Option<String>,
 }
 
 struct ChildAttribution {
@@ -345,11 +351,19 @@ impl<'a> RunOrchestrator<'a> {
 
             if let Some(pending) = state.pending_action.take() {
                 match self
-                    .resolve_approval(state, pending.action, pending.approval_id, now)
+                    .resolve_approval(
+                        state,
+                        pending.action,
+                        pending.approval_id,
+                        pending.tool_call_id,
+                        now,
+                    )
                     .await?
                 {
-                    ActionProgress::Ready(action) => {
-                        if let Some(outcome) = self.execute(state, action, now).await? {
+                    ActionProgress::Ready(action, tool_call_id) => {
+                        if let Some(outcome) =
+                            self.execute(state, action, tool_call_id, now).await?
+                        {
                             return Ok(outcome);
                         }
                         continue;
@@ -379,7 +393,9 @@ impl<'a> RunOrchestrator<'a> {
                         .await;
                 }
                 let generation = self.model.generate(
-                    ModelInput::new(state.messages.clone()).with_data_class(state.data_class),
+                    ModelInput::new(state.messages.clone())
+                        .with_data_class(state.data_class)
+                        .with_tools(self.normalizer.model_tools(&state.context)),
                 );
                 let output = match self.wall_time_remaining(state) {
                     Some(remaining) => match tokio::time::timeout(remaining, generation).await {
@@ -425,7 +441,14 @@ impl<'a> RunOrchestrator<'a> {
                         now,
                     )
                     .await?;
+                    let tool_call = proposal.tool_call().cloned();
                     let action = self.normalizer.normalize(&state.context, proposal)?;
+                    let tool_call_id = tool_call.as_ref().map(|call| call.id().to_owned());
+                    if let Some(tool_call) = tool_call {
+                        state
+                            .messages
+                            .push(ModelMessage::assistant_tool_call(tool_call));
+                    }
                     let (action, evaluation_capabilities) = match attribution {
                         Some(attribution) => (
                             action
@@ -481,7 +504,12 @@ impl<'a> RunOrchestrator<'a> {
                                 now,
                             )?;
                             if let Some(outcome) = self
-                                .execute(state, AuthorizedAction::new(action, authorization), now)
+                                .execute(
+                                    state,
+                                    AuthorizedAction::new(action, authorization),
+                                    tool_call_id,
+                                    now,
+                                )
                                 .await?
                             {
                                 return Ok(outcome);
@@ -504,6 +532,7 @@ impl<'a> RunOrchestrator<'a> {
                                     state.pending_action = Some(PendingAction {
                                         action,
                                         approval_id,
+                                        tool_call_id,
                                     });
                                     return Ok(RunOutcome::AwaitingApproval { approval_id });
                                 }
@@ -515,6 +544,7 @@ impl<'a> RunOrchestrator<'a> {
                                         .execute(
                                             state,
                                             AuthorizedAction::new(action, authorization),
+                                            tool_call_id,
                                             now,
                                         )
                                         .await?
@@ -547,6 +577,7 @@ impl<'a> RunOrchestrator<'a> {
         state: &RunState,
         action: ActionEnvelope,
         expected_id: ApprovalId,
+        tool_call_id: Option<String>,
         now: TimestampMillis,
     ) -> Result<ActionProgress, RunError> {
         match self
@@ -563,6 +594,7 @@ impl<'a> RunOrchestrator<'a> {
                     PendingAction {
                         action,
                         approval_id,
+                        tool_call_id,
                     },
                 ))
             }
@@ -573,10 +605,10 @@ impl<'a> RunOrchestrator<'a> {
                 let authorization = self
                     .consume_approval(state, &action, &mut approval, now)
                     .await?;
-                Ok(ActionProgress::Ready(AuthorizedAction::new(
-                    action,
-                    authorization,
-                )))
+                Ok(ActionProgress::Ready(
+                    AuthorizedAction::new(action, authorization),
+                    tool_call_id,
+                ))
             }
             ApprovalResolution::Rejected(approval_id) => {
                 if approval_id != expected_id {
@@ -631,6 +663,7 @@ impl<'a> RunOrchestrator<'a> {
         &self,
         state: &mut RunState,
         action: AuthorizedAction,
+        tool_call_id: Option<String>,
         now: TimestampMillis,
     ) -> Result<Option<RunOutcome>, RunError> {
         self.audit(
@@ -682,9 +715,10 @@ impl<'a> RunOrchestrator<'a> {
                     ));
                 }
                 state.captured_result_bytes += captured;
-                state
-                    .messages
-                    .push(ModelMessage::new(ModelRole::Tool, result));
+                state.messages.push(match tool_call_id {
+                    Some(call_id) => ModelMessage::tool_result(call_id, result),
+                    None => ModelMessage::new(ModelRole::Tool, result),
+                });
                 Ok(None)
             }
             ExecutionOutcome::Proposed(proposal) => {
@@ -869,7 +903,7 @@ impl<'a> RunOrchestrator<'a> {
 }
 
 enum ActionProgress {
-    Ready(AuthorizedAction),
+    Ready(AuthorizedAction, Option<String>),
     Blocked(RunOutcome, PendingAction),
     Terminal(RunOutcome),
 }

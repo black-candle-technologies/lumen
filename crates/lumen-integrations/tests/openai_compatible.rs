@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use lumen_core::{
     action::CanonicalValue,
-    model::{ModelInput, ModelMessage, ModelOutput, ModelPort, ModelRole},
+    model::{
+        ModelInput, ModelMessage, ModelOutput, ModelPort, ModelRole, ModelTool, ModelToolCall,
+    },
 };
 use lumen_integrations::openai_compatible::{
     EndpointClass, EndpointPolicy, OpenAiCompatibleClient, OpenAiCompatibleConfig,
@@ -21,6 +23,33 @@ fn input() -> ModelInput {
         ModelRole::User,
         CanonicalValue::from("hello"),
     )])
+}
+
+fn read_tool() -> ModelTool {
+    ModelTool::new(
+        "filesystem_read",
+        "Read a workspace file.",
+        "filesystem.read",
+        CanonicalValue::object([
+            ("type", CanonicalValue::from("object")),
+            (
+                "properties",
+                CanonicalValue::object([(
+                    "path",
+                    CanonicalValue::object([("type", CanonicalValue::from("string"))]),
+                )]),
+            ),
+            (
+                "required",
+                CanonicalValue::Array(vec![CanonicalValue::from("path")]),
+            ),
+            ("additionalProperties", CanonicalValue::from(false)),
+        ]),
+    )
+}
+
+fn tool_input() -> ModelInput {
+    input().with_tools(vec![read_tool()])
 }
 
 fn config(server: &MockServer) -> OpenAiCompatibleConfig {
@@ -58,6 +87,74 @@ async fn sends_openai_request_and_parses_text_completion() {
 }
 
 #[tokio::test]
+async fn sends_runtime_tool_schema_and_correlated_follow_up_messages() {
+    let server = MockServer::start().await;
+    let call = ModelToolCall::new(
+        "call-1",
+        "filesystem_read",
+        CanonicalValue::object([("path", CanonicalValue::from("nonce.txt"))]),
+    );
+    let input = ModelInput::new(vec![
+        ModelMessage::new(ModelRole::User, CanonicalValue::from("read nonce.txt")),
+        ModelMessage::assistant_tool_call(call),
+        ModelMessage::tool_result(
+            "call-1",
+            CanonicalValue::object([("contents", CanonicalValue::from("random-nonce"))]),
+        ),
+    ])
+    .with_tools(vec![read_tool()]);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_json(json!({
+            "model": "local-model",
+            "messages": [
+                {"role": "user", "content": "read nonce.txt"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "filesystem_read",
+                            "arguments": "{\"path\":\"nonce.txt\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "content": "{\"contents\":\"random-nonce\"}",
+                    "tool_call_id": "call-1"
+                }
+            ],
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "filesystem_read",
+                    "description": "Read a workspace file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "random-nonce"}}]
+        })))
+        .mount(&server)
+        .await;
+    let client = OpenAiCompatibleClient::new(config(&server)).expect("client builds");
+
+    let output = client.generate(input).await.expect("completion succeeds");
+
+    assert_eq!(output, ModelOutput::FinalText("random-nonce".into()));
+}
+
+#[tokio::test]
 async fn parses_structured_tool_call_as_untrusted_action_proposal() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -67,8 +164,10 @@ async fn parses_structured_tool_call_as_untrusted_action_proposal() {
                 "message": {
                     "content": null,
                     "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
                         "function": {
-                            "name": "filesystem.read",
+                            "name": "filesystem_read",
                             "arguments": "{\"path\":\"notes/today.md\"}"
                         }
                     }]
@@ -79,11 +178,17 @@ async fn parses_structured_tool_call_as_untrusted_action_proposal() {
         .await;
     let client = OpenAiCompatibleClient::new(config(&server)).expect("client builds");
 
-    let output = client.generate(input()).await.expect("completion succeeds");
+    let output = client
+        .generate(tool_input())
+        .await
+        .expect("completion succeeds");
 
     match output {
         ModelOutput::Action(proposal) => {
             assert_eq!(proposal.kind(), "filesystem.read");
+            let call = proposal.tool_call().expect("tool call identity");
+            assert_eq!(call.id(), "call-1");
+            assert_eq!(call.name(), "filesystem_read");
             assert_eq!(
                 proposal.into_arguments(),
                 CanonicalValue::object([("path", CanonicalValue::from("notes/today.md"))])
@@ -101,8 +206,10 @@ async fn rejects_malformed_tool_arguments() {
             "choices": [{
                 "message": {
                     "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
                         "function": {
-                            "name": "filesystem.read",
+                            "name": "filesystem_read",
                             "arguments": "not-json"
                         }
                     }]
@@ -114,7 +221,7 @@ async fn rejects_malformed_tool_arguments() {
     let client = OpenAiCompatibleClient::new(config(&server)).expect("client builds");
 
     let error = client
-        .generate(input())
+        .generate(tool_input())
         .await
         .expect_err("malformed arguments fail");
 
@@ -122,11 +229,88 @@ async fn rejects_malformed_tool_arguments() {
 }
 
 #[tokio::test]
+async fn rejects_unknown_or_multiple_tool_calls() {
+    let unknown_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "unknown_tool", "arguments": "{}"}
+            }]}}]
+        })))
+        .mount(&unknown_server)
+        .await;
+    let client = OpenAiCompatibleClient::new(config(&unknown_server)).expect("client builds");
+    let error = client
+        .generate(tool_input())
+        .await
+        .expect_err("unknown tool fails");
+    assert!(error.message().contains("unknown tool"));
+
+    let multiple_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "filesystem_read", "arguments": "{\"path\":\"a\"}"}
+                },
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "filesystem_read", "arguments": "{\"path\":\"b\"}"}
+                }
+            ]}}]
+        })))
+        .mount(&multiple_server)
+        .await;
+    let client = OpenAiCompatibleClient::new(config(&multiple_server)).expect("client builds");
+    let error = client
+        .generate(tool_input())
+        .await
+        .expect_err("multiple calls fail");
+    assert!(error.message().contains("multiple tool calls"));
+}
+
+#[tokio::test]
+async fn streams_one_tool_call_without_losing_its_identity() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"filesystem_\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"\\\"nonce.txt\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(body, "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let client =
+        OpenAiCompatibleClient::new(config(&server).with_streaming(true)).expect("client builds");
+
+    let output = client
+        .generate(tool_input())
+        .await
+        .expect("streamed tool call succeeds");
+
+    let ModelOutput::Action(proposal) = output else {
+        panic!("expected action proposal")
+    };
+    assert_eq!(proposal.kind(), "filesystem.read");
+    assert_eq!(proposal.tool_call().expect("call identity").id(), "call-1");
+}
+
+#[tokio::test]
 async fn consumes_sse_stream_and_aggregates_text() {
     let server = MockServer::start().await;
     let body = concat!(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
         "data: [DONE]\n\n"
     );
     Mock::given(method("POST"))

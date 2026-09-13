@@ -1,4 +1,4 @@
-use std::{net::IpAddr, time::Duration};
+use std::{collections::BTreeSet, net::IpAddr, time::Duration};
 
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -6,7 +6,7 @@ use lumen_core::{
     action::CanonicalValue,
     model::{
         ActionProposal, ModelError, ModelFuture, ModelInput, ModelMessage, ModelOutput, ModelPort,
-        ModelRole,
+        ModelRole, ModelTool, ModelToolCall,
     },
 };
 use reqwest::{Client, redirect::Policy as RedirectPolicy};
@@ -188,6 +188,7 @@ impl OpenAiCompatibleClient {
             model: &self.config.model,
             messages: input.messages().iter().map(RequestMessage::from).collect(),
             stream: self.config.streaming,
+            tools: request_tools(input.tools())?,
         };
         let response = self
             .client
@@ -204,19 +205,23 @@ impl OpenAiCompatibleClient {
         }
 
         if self.config.streaming {
-            parse_stream(response, self.config.max_response_bytes).await
+            parse_stream(response, self.config.max_response_bytes, input.tools()).await
         } else {
             let body = read_limited(response, self.config.max_response_bytes).await?;
             let response = serde_json::from_slice::<ChatResponse>(&body).map_err(|error| {
                 ModelError::new(format!("invalid model response JSON: {error}"))
             })?;
-            let message = response
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| ModelError::new("model response contained no choices"))?
-                .message;
-            output_from_parts(message.content.unwrap_or_default(), message.tool_calls)
+            let [choice] = response.choices.try_into().map_err(|choices: Vec<_>| {
+                ModelError::new(format!(
+                    "model response must contain exactly one choice, got {}",
+                    choices.len()
+                ))
+            })?;
+            output_from_parts(
+                choice.message.content.unwrap_or_default(),
+                choice.message.tool_calls,
+                input.tools(),
+            )
         }
     }
 }
@@ -249,6 +254,7 @@ fn is_loopback(url: &Url) -> Result<bool, ModelConfigError> {
 async fn parse_stream(
     response: reqwest::Response,
     max_response_bytes: usize,
+    tools: &[ModelTool],
 ) -> Result<ModelOutput, ModelError> {
     let mut bytes_seen = 0_usize;
     let limited = response.bytes_stream().map(move |chunk| {
@@ -261,8 +267,7 @@ async fn parse_stream(
     });
     let mut events = limited.eventsource();
     let mut text = String::new();
-    let mut tool_name = String::new();
-    let mut tool_arguments = String::new();
+    let mut tool_call = None::<AccumulatedToolCall>;
 
     while let Some(event) = events.next().await {
         let event =
@@ -273,21 +278,43 @@ async fn parse_stream(
         let chunk: StreamChunk = serde_json::from_str(&event.data)
             .map_err(|error| ModelError::new(format!("invalid model stream JSON: {error}")))?;
         for choice in chunk.choices {
+            if choice.index != 0 {
+                return Err(ModelError::new(
+                    "multiple model response choices are unsupported",
+                ));
+            }
             if let Some(content) = choice.delta.content {
                 text.push_str(&content);
             }
             for tool in choice.delta.tool_calls {
+                let index = tool.index.unwrap_or(0);
+                let accumulated = tool_call.get_or_insert_with(|| AccumulatedToolCall {
+                    index,
+                    id: String::new(),
+                    kind: String::new(),
+                    name: String::new(),
+                    arguments: String::new(),
+                });
+                if accumulated.index != index {
+                    return Err(ModelError::new("multiple tool calls are unsupported"));
+                }
+                if let Some(id) = tool.id {
+                    append_once(&mut accumulated.id, &id, "tool call ID")?;
+                }
+                if let Some(kind) = tool.kind {
+                    append_once(&mut accumulated.kind, &kind, "tool call type")?;
+                }
                 if let Some(name) = tool.function.name {
-                    tool_name.push_str(&name);
+                    accumulated.name.push_str(&name);
                 }
                 if let Some(arguments) = tool.function.arguments {
-                    tool_arguments.push_str(&arguments);
+                    accumulated.arguments.push_str(&arguments);
                 }
             }
         }
     }
 
-    output_from_accumulated(text, tool_name, tool_arguments)
+    output_from_accumulated(text, tool_call, tools)
 }
 
 async fn read_limited(
@@ -306,32 +333,112 @@ async fn read_limited(
     Ok(body)
 }
 
-fn output_from_parts(text: String, tool_calls: Vec<ToolCall>) -> Result<ModelOutput, ModelError> {
-    if let Some(tool) = tool_calls.into_iter().next() {
-        output_from_accumulated(text, tool.function.name, tool.function.arguments)
-    } else if text.is_empty() {
-        Err(ModelError::new("model response contained no content"))
-    } else {
-        Ok(ModelOutput::FinalText(text))
+fn output_from_parts(
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    tools: &[ModelTool],
+) -> Result<ModelOutput, ModelError> {
+    match tool_calls.as_slice() {
+        [] if text.is_empty() => Err(ModelError::new("model response contained no content")),
+        [] => Ok(ModelOutput::FinalText(text)),
+        [tool] => output_from_tool_call(tool, tools),
+        _ => Err(ModelError::new("multiple tool calls are unsupported")),
     }
 }
 
 fn output_from_accumulated(
     text: String,
-    tool_name: String,
-    tool_arguments: String,
+    tool_call: Option<AccumulatedToolCall>,
+    tools: &[ModelTool],
 ) -> Result<ModelOutput, ModelError> {
-    if !tool_name.is_empty() {
-        let arguments = serde_json::from_str::<CanonicalValue>(&tool_arguments)
-            .map_err(|error| ModelError::new(format!("invalid tool arguments: {error}")))?;
-        Ok(ModelOutput::Action(ActionProposal::new(
-            tool_name, arguments,
-        )))
-    } else if text.is_empty() {
-        Err(ModelError::new("model response contained no content"))
-    } else {
-        Ok(ModelOutput::FinalText(text))
+    match tool_call {
+        Some(tool_call) => output_from_tool_call(
+            &ToolCall {
+                id: Some(tool_call.id),
+                kind: Some(tool_call.kind),
+                function: ToolFunction {
+                    name: tool_call.name,
+                    arguments: tool_call.arguments,
+                },
+            },
+            tools,
+        ),
+        None if text.is_empty() => Err(ModelError::new("model response contained no content")),
+        None => Ok(ModelOutput::FinalText(text)),
     }
+}
+
+fn output_from_tool_call(tool: &ToolCall, tools: &[ModelTool]) -> Result<ModelOutput, ModelError> {
+    if tool.kind.as_deref() != Some("function") {
+        return Err(ModelError::new("unsupported tool call type"));
+    }
+    let id = tool
+        .id
+        .as_deref()
+        .filter(|id| valid_call_id(id))
+        .ok_or_else(|| ModelError::new("tool call ID is missing or invalid"))?;
+    let definition = tools
+        .iter()
+        .find(|definition| definition.name() == tool.function.name)
+        .ok_or_else(|| ModelError::new(format!("unknown tool: {}", tool.function.name)))?;
+    let arguments = serde_json::from_str::<CanonicalValue>(&tool.function.arguments)
+        .map_err(|error| ModelError::new(format!("invalid tool arguments: {error}")))?;
+    let call = ModelToolCall::new(id, definition.name(), arguments.clone());
+    Ok(ModelOutput::Action(
+        ActionProposal::new(definition.action_kind(), arguments).with_tool_call(call),
+    ))
+}
+
+fn append_once(target: &mut String, value: &str, field: &str) -> Result<(), ModelError> {
+    if target.is_empty() {
+        target.push_str(value);
+    } else if target != value {
+        return Err(ModelError::new(format!("conflicting streamed {field}")));
+    }
+    Ok(())
+}
+
+fn request_tools(tools: &[ModelTool]) -> Result<Vec<RequestTool>, ModelError> {
+    let mut names = BTreeSet::new();
+    tools
+        .iter()
+        .map(|tool| {
+            if !valid_tool_name(tool.name()) || !names.insert(tool.name()) {
+                return Err(ModelError::new("model tool name is invalid or duplicated"));
+            }
+            if tool.description().is_empty()
+                || tool.description().len() > 1024
+                || tool.description().chars().any(char::is_control)
+            {
+                return Err(ModelError::new("model tool description is invalid"));
+            }
+            match tool.input_schema() {
+                CanonicalValue::Object(schema)
+                    if schema.get("type") == Some(&CanonicalValue::from("object")) => {}
+                _ => return Err(ModelError::new("model tool schema must describe an object")),
+            }
+            Ok(RequestTool {
+                kind: "function",
+                function: RequestToolDefinition {
+                    name: tool.name().to_owned(),
+                    description: tool.description().to_owned(),
+                    parameters: tool.input_schema().clone(),
+                },
+            })
+        })
+        .collect()
+}
+
+fn valid_tool_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_call_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
 fn request_error(error: reqwest::Error) -> ModelError {
@@ -347,12 +454,46 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<RequestMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<RequestTool>,
+}
+
+#[derive(Serialize)]
+struct RequestTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: RequestToolDefinition,
+}
+
+#[derive(Serialize)]
+struct RequestToolDefinition {
+    name: String,
+    description: String,
+    parameters: CanonicalValue,
 }
 
 #[derive(Serialize)]
 struct RequestMessage {
     role: &'static str,
-    content: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<RequestToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RequestToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: RequestToolFunction,
+}
+
+#[derive(Serialize)]
+struct RequestToolFunction {
+    name: String,
+    arguments: String,
 }
 
 impl From<&ModelMessage> for RequestMessage {
@@ -368,7 +509,26 @@ impl From<&ModelMessage> for RequestMessage {
                 serde_json::to_string(value).expect("canonical value serialization cannot fail")
             }
         };
-        Self { role, content }
+        let tool_calls = message
+            .tool_call()
+            .map(|call| {
+                vec![RequestToolCall {
+                    id: call.id().to_owned(),
+                    kind: "function",
+                    function: RequestToolFunction {
+                        name: call.name().to_owned(),
+                        arguments: serde_json::to_string(call.arguments())
+                            .expect("canonical tool arguments serialization cannot fail"),
+                    },
+                }]
+            })
+            .unwrap_or_default();
+        Self {
+            role,
+            content: message.tool_call().is_none().then_some(content),
+            tool_calls,
+            tool_call_id: message.tool_call_id().map(str::to_owned),
+        }
     }
 }
 
@@ -391,6 +551,9 @@ struct ResponseMessage {
 
 #[derive(Deserialize)]
 struct ToolCall {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
     function: ToolFunction,
 }
 
@@ -407,6 +570,7 @@ struct StreamChunk {
 
 #[derive(Deserialize)]
 struct StreamChoice {
+    index: usize,
     delta: StreamDelta,
 }
 
@@ -419,6 +583,10 @@ struct StreamDelta {
 
 #[derive(Deserialize)]
 struct StreamToolCall {
+    index: Option<usize>,
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
     function: StreamToolFunction,
 }
 
@@ -426,6 +594,14 @@ struct StreamToolCall {
 struct StreamToolFunction {
     name: Option<String>,
     arguments: Option<String>,
+}
+
+struct AccumulatedToolCall {
+    index: usize,
+    id: String,
+    kind: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Error)]
