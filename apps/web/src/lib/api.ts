@@ -238,6 +238,9 @@ export type SkillReview = {
 	reviewed_by?: PrincipalSummary | null;
 	created_at: number;
 	reviewed_at?: number | null;
+	required: boolean;
+	load_status: 'loaded' | 'excluded' | 'disabled';
+	exclusion_reason?: string | null;
 };
 
 export type WorkflowCaptureDraft = {

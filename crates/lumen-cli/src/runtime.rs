@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{
         Arc, RwLock,
@@ -28,7 +28,7 @@ use lumen_core::{
         ActionFuture, ActionNormalizer, ActionPort, ActionPortError, ApprovalFuture, ApprovalPort,
         ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError, Clock,
         LoadedSkillMetadata, NormalizationError, RunBudget, RunContext, RunOrchestrator,
-        RunOutcome, RunState, SystemClock,
+        RunOutcome, RunState, SkillLoadMetadata, SystemClock,
     },
     secret::SecretRefId,
 };
@@ -108,6 +108,7 @@ pub(crate) struct LocalRuntimeService {
     ambient_capabilities: CapabilitySet,
     capabilities: EffectiveCapabilities,
     budget: RunBudget,
+    required_skills: BTreeSet<(SkillId, SkillVersion)>,
     scheduled_execution_lease_millis: u64,
     runs: Arc<Mutex<BTreeMap<RunId, StoredRun>>>,
     cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
@@ -284,6 +285,7 @@ impl LocalRuntimeService {
                 Duration::from_secs(config.runtime.max_wall_time_seconds),
                 config.runtime.max_captured_result_bytes,
             ),
+            required_skills: config.required_skills(),
             scheduled_execution_lease_millis: config
                 .runtime
                 .max_wall_time_seconds
@@ -662,7 +664,9 @@ impl LocalRuntimeService {
         let reviewed_skills = self
             .prompt_with_reviewed_skills(request.workspace_id, &request.prompt)
             .await?;
-        context = context.with_loaded_skills(reviewed_skills.loaded_skills);
+        context = context
+            .with_loaded_skills(reviewed_skills.loaded_skills)
+            .with_skill_loads(reviewed_skills.skill_loads);
         let state = RunState::new(context, reviewed_skills.prompt, request.budget)
             .with_data_class(request.data_class);
         Ok(StoredRun {
@@ -692,6 +696,20 @@ impl LocalRuntimeService {
 
     async fn install_and_spawn_run(&self, run_id: RunId, stored: StoredRun) {
         let workspace_id = stored.workspace_id;
+        for skill in stored
+            .state
+            .context()
+            .skill_loads()
+            .iter()
+            .filter(|skill| skill.status() == "excluded")
+        {
+            let _ = self.events.publish(
+                workspace_id,
+                run_id,
+                "skill.excluded",
+                skill_load_value(skill),
+            );
+        }
         self.runs.lock().await.insert(run_id, stored);
         let cancellation = CancellationToken::new();
         if self.shutting_down.load(Ordering::SeqCst) {
@@ -717,24 +735,48 @@ impl LocalRuntimeService {
             .map_err(repository_service_error)?;
         let mut rendered = Vec::new();
         let mut loaded_skills = Vec::new();
+        let mut skill_loads = Vec::new();
+        let mut selected = BTreeSet::new();
         for skill in skills {
-            if let Some(context) = self
-                .load_reviewed_skill_context(workspace_id, &skill)
-                .await?
-            {
+            selected.insert((skill.skill_id(), skill.version().clone()));
+            let result = self.load_reviewed_skill_context(workspace_id, &skill).await;
+            skill_loads.push(result.metadata);
+            if let Some(context) = result.loaded {
                 loaded_skills.push(context.metadata);
                 rendered.push(context.rendered);
             }
+        }
+        for (skill_id, version) in self.required_skills.difference(&selected) {
+            let record = self
+                .database
+                .skill_version(workspace_id, *skill_id, version)
+                .await
+                .map_err(repository_service_error)?;
+            skill_loads.push(SkillLoadMetadata::excluded(
+                skill_id.to_string(),
+                version.as_str(),
+                record
+                    .as_ref()
+                    .map_or("", SkillVersionRecord::source_digest),
+                if record.is_some() {
+                    "disabled"
+                } else {
+                    "not_eligible"
+                },
+                true,
+            ));
         }
         if rendered.is_empty() {
             return Ok(ReviewedSkillPrompt {
                 prompt: prompt.to_owned(),
                 loaded_skills,
+                skill_loads,
             });
         }
         Ok(ReviewedSkillPrompt {
             prompt: format!("{}\n\nUser request:\n{}", rendered.join("\n\n"), prompt),
             loaded_skills,
+            skill_loads,
         })
     }
 
@@ -742,9 +784,28 @@ impl LocalRuntimeService {
         &self,
         workspace_id: lumen_core::identity::WorkspaceId,
         skill: &SkillVersionRecord,
-    ) -> Result<Option<LoadedReviewedSkill>, ServiceError> {
-        if !skill.reviewed() || skill.workspace_id() != workspace_id {
-            return Ok(None);
+    ) -> SkillLoadResult {
+        let required = self
+            .required_skills
+            .contains(&(skill.skill_id(), skill.version().clone()));
+        let excluded = |reason| SkillLoadResult {
+            metadata: SkillLoadMetadata::excluded(
+                skill.skill_id().to_string(),
+                skill.version().as_str(),
+                skill.source_digest(),
+                reason,
+                required,
+            ),
+            loaded: None,
+        };
+        if skill.workspace_id() != workspace_id {
+            return excluded("not_eligible");
+        }
+        if !skill.reviewed() {
+            return excluded("unreviewed");
+        }
+        if skill.source_format() != "markdown" {
+            return excluded("unsupported_format");
         }
         let path = self
             .data_root
@@ -753,38 +814,48 @@ impl LocalRuntimeService {
             .join(format!("{}.md", skill.version().as_str()));
         let file = match tokio::fs::File::open(&path).await {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(ServiceError::Internal(error.to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return excluded("missing_source");
+            }
+            Err(_) => return excluded("read_failed"),
         };
-        let Some(source) = read_bounded_skill_source(file)
-            .await
-            .map_err(|error| ServiceError::Internal(error.to_string()))?
-        else {
-            return Ok(None);
+        let source = match read_bounded_skill_source(file).await {
+            Ok(Some(source)) => source,
+            Ok(None) => return excluded("oversized"),
+            Err(_) => return excluded("read_failed"),
         };
-        let source = String::from_utf8(source).map_err(|_| {
-            ServiceError::Internal("reviewed skill source is not valid UTF-8".into())
-        })?;
+        let source = match String::from_utf8(source) {
+            Ok(source) => source,
+            Err(_) => return excluded("unsupported_encoding"),
+        };
         if sha256_hex(source.as_bytes()) != skill.source_digest() {
-            return Ok(None);
+            return excluded("digest_mismatch");
         }
-        Ok(Some(LoadedReviewedSkill {
-            metadata: LoadedSkillMetadata::new(
+        SkillLoadResult {
+            metadata: SkillLoadMetadata::loaded(
                 skill.skill_id().to_string(),
                 skill.version().as_str(),
                 skill.source_digest(),
+                required,
             ),
-            rendered: format!(
-                "Reviewed Lumen skill\nid: {}\nversion: {}\ndigest: {}\nformat: {}\nname: {}\ndescription: {}\n\n{}",
-                skill.skill_id(),
-                skill.version().as_str(),
-                skill.source_digest(),
-                skill.source_format(),
-                skill.name(),
-                skill.description(),
-                source
-            ),
-        }))
+            loaded: Some(LoadedReviewedSkill {
+                metadata: LoadedSkillMetadata::new(
+                    skill.skill_id().to_string(),
+                    skill.version().as_str(),
+                    skill.source_digest(),
+                ),
+                rendered: format!(
+                    "Reviewed Lumen skill\nid: {}\nversion: {}\ndigest: {}\nformat: {}\nname: {}\ndescription: {}\n\n{}",
+                    skill.skill_id(),
+                    skill.version().as_str(),
+                    skill.source_digest(),
+                    skill.source_format(),
+                    skill.name(),
+                    skill.description(),
+                    source
+                ),
+            }),
+        }
     }
 
     #[allow(dead_code)]
@@ -1500,45 +1571,21 @@ impl RuntimeService for LocalRuntimeService {
                 .await?;
             let state = RunState::new(
                 RunContext::new(run_id, command.workspace_id(), command.actor().clone())
-                    .with_loaded_skills(reviewed_skills.loaded_skills),
+                    .with_loaded_skills(reviewed_skills.loaded_skills)
+                    .with_skill_loads(reviewed_skills.skill_loads),
                 reviewed_skills.prompt,
                 service.budget,
             )
             .with_data_class(command.data_class());
-            service.runs.lock().await.insert(
-                run_id,
-                StoredRun {
-                    workspace_id: command.workspace_id(),
-                    state,
-                    model_override: None,
-                    capabilities_override: None,
-                    scheduled_handoff: None,
-                },
-            );
-            let cancellation = CancellationToken::new();
-            if service.shutting_down.load(Ordering::SeqCst) {
-                cancellation.cancel();
-            }
-            service
-                .cancellations
-                .lock()
-                .await
-                .insert(run_id, cancellation);
-            service
-                .run_workspaces
-                .lock()
-                .await
-                .insert(run_id, command.workspace_id());
-            service
-                .events
-                .publish(
-                    command.workspace_id(),
-                    run_id,
-                    "run.created",
-                    CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
-                )
-                .map_err(|error| ServiceError::Internal(error.to_string()))?;
-            service.spawn_advance(run_id).await;
+            let stored = StoredRun {
+                workspace_id: command.workspace_id(),
+                state,
+                model_override: None,
+                capabilities_override: None,
+                scheduled_handoff: None,
+            };
+            service.publish_run_created(run_id, command.workspace_id())?;
+            service.install_and_spawn_run(run_id, stored).await;
             Ok(RunCreated::new(run_id))
         })
     }
@@ -2296,6 +2343,7 @@ impl RuntimeService for LocalRuntimeService {
     }
 
     fn list_skills(&self, query: SkillReviewQuery) -> ServiceFuture<'_, Vec<SkillReview>> {
+        let service = self.clone();
         Box::pin(async move {
             let rows = sqlx::query(
                 "SELECT skill.skill_id, skill.workspace_id, skill.name, skill.description,
@@ -2317,7 +2365,35 @@ impl RuntimeService for LocalRuntimeService {
             .fetch_all(self.database.pool())
             .await
             .map_err(sql_service_error)?;
-            rows.into_iter().map(skill_review_from_row).collect()
+            let mut reviews = rows
+                .into_iter()
+                .map(skill_review_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let enabled = service
+                .database
+                .enabled_skill_versions(query.workspace_id())
+                .await
+                .map_err(repository_service_error)?;
+            for review in &mut reviews {
+                let required = service
+                    .required_skills
+                    .contains(&(review.skill_id(), review.version().clone()));
+                if !review.enabled() {
+                    review.set_load_status(required, "disabled", None);
+                    continue;
+                }
+                let Some(skill) = enabled.iter().find(|skill| {
+                    skill.skill_id() == review.skill_id() && skill.version() == review.version()
+                }) else {
+                    review.set_load_status(required, "excluded", Some("not_eligible"));
+                    continue;
+                };
+                let load = service
+                    .load_reviewed_skill_context(query.workspace_id(), skill)
+                    .await;
+                review.set_load_status(required, load.metadata.status(), load.metadata.reason());
+            }
+            Ok(reviews)
         })
     }
 
@@ -3608,11 +3684,36 @@ struct StoredRun {
 struct ReviewedSkillPrompt {
     prompt: String,
     loaded_skills: Vec<LoadedSkillMetadata>,
+    skill_loads: Vec<SkillLoadMetadata>,
 }
 
 struct LoadedReviewedSkill {
     rendered: String,
     metadata: LoadedSkillMetadata,
+}
+
+struct SkillLoadResult {
+    metadata: SkillLoadMetadata,
+    loaded: Option<LoadedReviewedSkill>,
+}
+
+fn skill_load_value(skill: &SkillLoadMetadata) -> CanonicalValue {
+    CanonicalValue::object([
+        ("skill_id", CanonicalValue::from(skill.skill_id())),
+        ("version", CanonicalValue::from(skill.version())),
+        (
+            "expected_digest",
+            CanonicalValue::from(skill.expected_digest()),
+        ),
+        ("status", CanonicalValue::from(skill.status())),
+        (
+            "reason",
+            skill
+                .reason()
+                .map_or(CanonicalValue::Null, CanonicalValue::from),
+        ),
+        ("required", CanonicalValue::from(skill.required())),
+    ])
 }
 
 struct StoredRunRequest {
@@ -3860,6 +3961,20 @@ fn terminal_event(outcome: &RunOutcome) -> (&'static str, &'static str, Canonica
             "failed",
             "run.timed_out",
             CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        ),
+        RunOutcome::RequiredSkillUnavailable {
+            skill_id,
+            version,
+            reason,
+        } => (
+            "failed",
+            "run.failed",
+            CanonicalValue::object([
+                ("code", CanonicalValue::from("required_skill_unavailable")),
+                ("skill_id", CanonicalValue::from(skill_id.clone())),
+                ("version", CanonicalValue::from(version.clone())),
+                ("reason", CanonicalValue::from(*reason)),
+            ]),
         ),
         other => (
             "failed",

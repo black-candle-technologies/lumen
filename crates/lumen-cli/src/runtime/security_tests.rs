@@ -278,13 +278,27 @@ struct Harness {
 
 impl Harness {
     async fn new(model: &MockServer, prepare_workspace: impl FnOnce(&std::path::Path)) -> Self {
-        Self::new_inner(model, prepare_workspace, None, None, None, None)
+        Self::new_inner(model, prepare_workspace, None, None, None, None, None)
             .await
             .0
     }
 
     async fn new_with_approval_ttl(model: &MockServer, approval_ttl_seconds: u64) -> Self {
-        Self::new_inner(model, |_| {}, None, None, None, Some(approval_ttl_seconds))
+        Self::new_inner(
+            model,
+            |_| {},
+            None,
+            None,
+            None,
+            Some(approval_ttl_seconds),
+            None,
+        )
+        .await
+        .0
+    }
+
+    async fn new_with_required_skill(model: &MockServer, skill: String) -> Self {
+        Self::new_inner(model, |_| {}, None, None, None, None, Some(skill))
             .await
             .0
     }
@@ -299,6 +313,7 @@ impl Harness {
             model,
             prepare_workspace,
             Some((max_wall_time_seconds, max_captured_result_bytes)),
+            None,
             None,
             None,
             None,
@@ -319,6 +334,7 @@ impl Harness {
             None,
             Some(RecordingSandbox::new().with_plugin_response(response)),
             None,
+            None,
         )
         .await
         .0
@@ -329,9 +345,17 @@ impl Harness {
         prepare_workspace: impl FnOnce(&std::path::Path),
         sandbox: RecordingSandbox,
     ) -> Self {
-        Self::new_inner(model, prepare_workspace, None, None, Some(sandbox), None)
-            .await
-            .0
+        Self::new_inner(
+            model,
+            prepare_workspace,
+            None,
+            None,
+            Some(sandbox),
+            None,
+            None,
+        )
+        .await
+        .0
     }
 
     async fn new_with_secret(
@@ -339,12 +363,13 @@ impl Harness {
         setup: SecretSetup,
     ) -> (Self, SecretReference, Arc<InMemorySecretStore>) {
         let (harness, reference, store) =
-            Self::new_inner(model, |_| {}, None, Some(setup), None, None).await;
+            Self::new_inner(model, |_| {}, None, Some(setup), None, None, None).await;
         (harness, reference.expect("secret reference"), store)
     }
 
     async fn new_with_cancellable_process(model: &MockServer) -> Self {
-        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None, None, None, None).await;
+        let (mut harness, _, _) =
+            Self::new_inner(model, |_| {}, None, None, None, None, None).await;
         let sandbox = RecordingSandbox::new().waiting_for_cancellation();
         let config = Config::parse(&format!(
             r#"
@@ -415,6 +440,7 @@ subject = "operator"
         secret: Option<SecretSetup>,
         sandbox_override: Option<RecordingSandbox>,
         approval_ttl_seconds: Option<u64>,
+        required_skill: Option<String>,
     ) -> (Self, Option<SecretReference>, Arc<InMemorySecretStore>) {
         let directory = tempfile::tempdir().expect("temporary runtime");
         let workspace = directory.path().join("workspace");
@@ -459,6 +485,9 @@ subject = "operator"
         .expect("security config");
         if let Some(approval_ttl_seconds) = approval_ttl_seconds {
             config.runtime.approval_ttl_seconds = approval_ttl_seconds;
+        }
+        if let Some(required_skill) = required_skill {
+            config.runtime.required_skills.insert(required_skill);
         }
         let database = Database::connect_in_memory().await.expect("database");
         database
@@ -2881,20 +2910,18 @@ async fn reviewed_skill_reader_accepts_exact_limit_and_rejects_one_more_byte() {
         .service
         .load_reviewed_skill_context(harness.workspace_id, &skill)
         .await
-        .expect("exact-limit source")
+        .loaded
         .expect("skill loaded");
     assert!(loaded.rendered.ends_with(&source));
 
     let path = skill_source_path(&harness, skill_id(), skill.version());
     std::fs::write(&path, format!("{source}x")).expect("oversized skill source");
-    assert!(
-        harness
-            .service
-            .load_reviewed_skill_context(harness.workspace_id, &skill)
-            .await
-            .expect("overflow is excluded")
-            .is_none()
-    );
+    let excluded = harness
+        .service
+        .load_reviewed_skill_context(harness.workspace_id, &skill)
+        .await;
+    assert!(excluded.loaded.is_none());
+    assert_eq!(excluded.metadata.reason(), Some("oversized"));
     harness.service.shutdown().await;
 }
 
@@ -2926,15 +2953,46 @@ async fn reviewed_skill_reader_bounds_an_unending_source_and_rejects_invalid_utf
     )
     .expect("invalid UTF-8 source");
 
-    let error = match harness
+    let excluded = harness
         .service
         .load_reviewed_skill_context(harness.workspace_id, &skill)
+        .await;
+    assert!(excluded.loaded.is_none());
+    assert_eq!(excluded.metadata.reason(), Some("unsupported_encoding"));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_reviewed_skill_is_attributed_and_loads_after_restoration() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let source = "restorable skill";
+    insert_skill_source(&harness, skill_id(), "1.0.0", true, source, None).await;
+    let skill = harness
+        .database
+        .enabled_skill_versions(harness.workspace_id)
         .await
-    {
-        Ok(_) => panic!("invalid UTF-8 was accepted"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("not valid UTF-8"));
+        .expect("enabled skills")
+        .remove(0);
+    let path = skill_source_path(&harness, skill_id(), skill.version());
+    std::fs::remove_file(&path).expect("remove skill source");
+
+    let missing = harness
+        .service
+        .load_reviewed_skill_context(harness.workspace_id, &skill)
+        .await;
+    assert_eq!(missing.metadata.reason(), Some("missing_source"));
+    assert_eq!(missing.metadata.skill_id(), skill_id().to_string());
+    assert_eq!(missing.metadata.version(), "1.0.0");
+    assert!(!format!("{:?}", missing.metadata).contains(path.to_string_lossy().as_ref()));
+
+    std::fs::write(path, source).expect("restore skill source");
+    let restored = harness
+        .service
+        .load_reviewed_skill_context(harness.workspace_id, &skill)
+        .await;
+    assert_eq!(restored.metadata.status(), "loaded");
+    assert!(restored.loaded.is_some());
     harness.service.shutdown().await;
 }
 
@@ -3006,6 +3064,109 @@ async fn unreviewed_or_digest_mismatched_skills_are_not_loaded_into_model_contex
             .map(|record| record.event())
             .filter(|event| event.kind() == AuditEventKind::RunCreated)
             .all(|event| canonical_object_get(event.payload(), "loaded_skills").is_none())
+    );
+    let run_created = records
+        .iter()
+        .map(|record| record.event())
+        .find(|event| {
+            event.kind() == AuditEventKind::RunCreated
+                && canonical_object_get(event.payload(), "run_id")
+                    == Some(&CanonicalValue::from(run_id.clone()))
+        })
+        .expect("run created audit");
+    let skill_loads =
+        canonical_object_get(run_created.payload(), "skill_loads").expect("skill exclusions");
+    assert!(canonical_array_contains_skill_reason(
+        skill_loads,
+        skill_id().to_string().as_str(),
+        "unreviewed"
+    ));
+    assert!(canonical_array_contains_skill_reason(
+        skill_loads,
+        "7b29fc40-ca47-4067-b31d-00dd010662da",
+        "digest_mismatch"
+    ));
+    let stream = harness.sse_until(&run_id, "run.completed").await;
+    assert!(stream.contains("event: skill.excluded"));
+    assert!(stream.contains("unreviewed"));
+    assert!(stream.contains("digest_mismatch"));
+    assert!(!stream.contains("UNREVIEWED_SKILL_SHOULD_NOT_APPEAR"));
+    let skills = response_json(harness.request("GET", "skills", "").await).await;
+    let skills = skills["skills"].as_array().expect("skills array");
+    assert!(skills.iter().any(|skill| {
+        skill["skill_id"] == skill_id().to_string()
+            && skill["load_status"] == "excluded"
+            && skill["exclusion_reason"] == "unreviewed"
+            && skill["required"] == false
+    }));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn unavailable_required_skill_fails_before_the_model_call() {
+    let model = MockServer::start().await;
+    let model_requests = Arc::new(StdMutex::new(Vec::new()));
+    mount_recording_response(&model, Arc::clone(&model_requests), "must not run").await;
+    let harness = Harness::new_with_required_skill(&model, format!("{}@1.0.0", skill_id())).await;
+    insert_skill_source(
+        &harness,
+        skill_id(),
+        "1.0.0",
+        true,
+        "tampered",
+        Some(format!("sha256:{}", "0".repeat(64))),
+    )
+    .await;
+
+    let run_id = harness.create_run("do not reach the model").await;
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    assert!(
+        model_requests
+            .lock()
+            .expect("model request lock")
+            .is_empty()
+    );
+    let stream = harness.sse_until(&run_id, "run.failed").await;
+    assert!(stream.contains("required_skill_unavailable"));
+    assert!(stream.contains("digest_mismatch"));
+    assert!(!stream.contains("tampered"));
+    let skills = response_json(harness.request("GET", "skills", "").await).await;
+    let skill = &skills["skills"][0];
+    assert_eq!(skill["load_status"], "excluded");
+    assert_eq!(skill["exclusion_reason"], "digest_mismatch");
+    assert_eq!(skill["required"], true);
+
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 50)
+        .await
+        .expect("audit records");
+    assert!(records.iter().any(|record| {
+        let event = record.event();
+        event.kind() == AuditEventKind::RunFailed
+            && canonical_object_get(event.payload(), "skill_loads").is_some()
+    }));
+
+    harness
+        .database
+        .set_skill_workspace_state(
+            harness.workspace_id,
+            skill_id(),
+            &SkillVersion::parse("1.0.0").expect("version"),
+            false,
+            TimestampMillis::new(2_000),
+        )
+        .await
+        .expect("disable required skill");
+    let disabled_run = harness.create_run("still do not reach the model").await;
+    wait_for_run_state(&harness, &disabled_run, "failed").await;
+    let stream = harness.sse_until(&disabled_run, "run.failed").await;
+    assert!(stream.contains("\"reason\":\"disabled\""));
+    assert!(
+        model_requests
+            .lock()
+            .expect("model request lock")
+            .is_empty()
     );
     harness.service.shutdown().await;
 }
@@ -3963,6 +4124,20 @@ fn canonical_array_contains_skill(value: &CanonicalValue, skill_id: &str, versio
                 Some(CanonicalValue::String(digest))
                     if digest.starts_with("sha256:") && digest.len() == 71
             )
+    })
+}
+
+fn canonical_array_contains_skill_reason(
+    value: &CanonicalValue,
+    skill_id: &str,
+    reason: &str,
+) -> bool {
+    let CanonicalValue::Array(skills) = value else {
+        return false;
+    };
+    skills.iter().any(|skill| {
+        canonical_object_get(skill, "skill_id") == Some(&CanonicalValue::from(skill_id))
+            && canonical_object_get(skill, "reason") == Some(&CanonicalValue::from(reason))
     })
 }
 

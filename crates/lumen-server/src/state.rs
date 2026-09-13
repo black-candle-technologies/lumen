@@ -1292,6 +1292,9 @@ pub struct SkillReview {
     reviewed_by: Option<PrincipalSummary>,
     created_at: TimestampMillis,
     reviewed_at: Option<TimestampMillis>,
+    required: bool,
+    load_status: &'static str,
+    exclusion_reason: Option<&'static str>,
 }
 
 impl SkillReview {
@@ -1325,7 +1328,33 @@ impl SkillReview {
             reviewed_by,
             created_at,
             reviewed_at,
+            required: false,
+            load_status: "disabled",
+            exclusion_reason: None,
         }
+    }
+
+    pub const fn skill_id(&self) -> SkillId {
+        self.skill_id
+    }
+
+    pub const fn version(&self) -> &SkillVersion {
+        &self.version
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn set_load_status(
+        &mut self,
+        required: bool,
+        status: &'static str,
+        reason: Option<&'static str>,
+    ) {
+        self.required = required;
+        self.load_status = status;
+        self.exclusion_reason = reason;
     }
 }
 

@@ -1284,7 +1284,7 @@ impl Database {
              JOIN agent_skills skill ON skill.skill_id = state.skill_id
              JOIN skill_versions version
                ON version.skill_id = state.skill_id AND version.version = state.version
-             WHERE state.workspace_id = ? AND state.enabled = 1 AND version.reviewed = 1
+             WHERE state.workspace_id = ? AND state.enabled = 1
              ORDER BY skill.name, version.version",
         )
         .bind(workspace_id.to_string())
@@ -1293,6 +1293,32 @@ impl Database {
         rows.into_iter()
             .map(|row| skill_version_from_row(workspace_id, &row))
             .collect()
+    }
+
+    pub async fn skill_version(
+        &self,
+        workspace_id: WorkspaceId,
+        skill_id: SkillId,
+        version: &SkillVersion,
+    ) -> Result<Option<SkillVersionRecord>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT skill.skill_id, skill.name, skill.description, version.version,
+                    version.source_format, version.source_digest, version.reviewed,
+                    version.created_provider, version.created_subject,
+                    version.reviewed_provider, version.reviewed_subject,
+                    version.created_at, version.reviewed_at
+             FROM agent_skills skill
+             JOIN skill_versions version ON version.skill_id = skill.skill_id
+             WHERE skill.workspace_id = ? AND skill.skill_id = ? AND version.version = ?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(skill_id.to_string())
+        .bind(version.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref()
+            .map(|row| skill_version_from_row(workspace_id, row))
+            .transpose()
     }
 
     pub async fn insert_workflow_capture_draft(
