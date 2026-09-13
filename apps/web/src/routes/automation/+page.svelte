@@ -4,7 +4,7 @@
 	import Play from '@lucide/svelte/icons/play';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import { ApiClient, ApiError, type JobReview, type ServiceIdentity } from '$lib/api';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	let identities = $state<ServiceIdentity[]>([]);
 	let jobs = $state<JobReview[]>([]);
@@ -16,7 +16,7 @@
 	onMount(load);
 
 	async function load() {
-		if (!isConfigured($connection)) { loading = false; return; }
+		if ($connectionState.kind !== 'connected') { loading = false; return; }
 		loading = true;
 		try {
 			const client = new ApiClient($connection);

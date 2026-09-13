@@ -3,7 +3,7 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Upload from '@lucide/svelte/icons/upload';
 	import { ApiClient, ApiError, type SkillReview, type WorkflowCaptureDraft } from '$lib/api';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	let skills = $state<SkillReview[]>([]);
 	let drafts = $state<WorkflowCaptureDraft[]>([]);
@@ -15,7 +15,7 @@
 	onMount(load);
 
 	async function load() {
-		if (!isConfigured($connection)) { loading = false; return; }
+		if ($connectionState.kind !== 'connected') { loading = false; return; }
 		loading = true;
 		try {
 			const client = new ApiClient($connection);

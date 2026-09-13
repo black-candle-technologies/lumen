@@ -3,7 +3,7 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import { ApiClient, ApiError, type PluginVersionDetails, type StagedPluginReview } from '$lib/api';
 	import PluginReview from '$lib/components/PluginReview.svelte';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	let staged = $state<StagedPluginReview[]>([]);
 	let selected = $state<StagedPluginReview | null>(null);
@@ -16,7 +16,7 @@
 	onMount(load);
 
 	async function load() {
-		if (!isConfigured($connection)) { loading = false; return; }
+		if ($connectionState.kind !== 'connected') { loading = false; return; }
 		loading = true;
 		try {
 			const client = new ApiClient($connection);

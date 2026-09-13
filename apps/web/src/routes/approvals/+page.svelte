@@ -3,7 +3,7 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import { ApiClient, ApiError, type Approval } from '$lib/api';
 	import ApprovalItem from '$lib/components/ApprovalItem.svelte';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	let approvals = $state<Approval[]>([]);
 	let loading = $state(true);
@@ -19,7 +19,7 @@
 	});
 
 	async function load() {
-		if (!isConfigured($connection)) { loading = false; return; }
+		if ($connectionState.kind !== 'connected') { loading = false; return; }
 		loading = true;
 		try {
 			const response = await new ApiClient($connection).listApprovals();

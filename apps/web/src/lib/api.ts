@@ -24,6 +24,12 @@ export type Approval = {
 	secret_references?: Array<{ id: string; label: string; environment: string }>;
 };
 
+let defaultRequestSignal: AbortSignal | undefined;
+
+export function setDefaultRequestSignal(signal: AbortSignal): void {
+	defaultRequestSignal = signal;
+}
+
 export type ApprovalList = {
 	approvals: Approval[];
 	server_time: number;
@@ -274,7 +280,8 @@ export class ApiClient {
 
 	constructor(
 		private readonly settings: ConnectionSettings,
-		private readonly fetcher: typeof fetch = fetch
+		private readonly fetcher: typeof fetch = fetch,
+		private readonly signal: AbortSignal | undefined = defaultRequestSignal
 	) {
 		this.baseUrl = settings.baseUrl.replace(/\/+$/, '');
 	}
@@ -289,6 +296,10 @@ export class ApiClient {
 
 	async listApprovals(): Promise<ApprovalList> {
 		return this.request('approvals');
+	}
+
+	async verifyConnection(): Promise<void> {
+		await this.request('runtime/capabilities');
 	}
 
 	async decideApproval(approvalId: string, decision: 'grant' | 'reject'): Promise<void> {
@@ -423,7 +434,7 @@ export class ApiClient {
 	): Promise<void> {
 		const response = await this.fetcher(this.url(`runs/${encodeURIComponent(runId)}/events`), {
 			headers: this.headers({ 'Last-Event-ID': String(after) }),
-			signal
+			signal: signal ?? this.signal
 		});
 		if (!response.ok) await this.throwResponse(response);
 		if (!response.body) throw new ApiError(0, 'stream_unavailable', 'Run event stream is unavailable');
@@ -452,7 +463,8 @@ export class ApiClient {
 	private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
 		const response = await this.fetcher(this.url(path), {
 			...init,
-			headers: this.headers(init.headers)
+			headers: this.headers(init.headers),
+			signal: init.signal ?? this.signal
 		});
 		if (!response.ok) await this.throwResponse(response);
 		if (response.status === 204) return undefined as T;

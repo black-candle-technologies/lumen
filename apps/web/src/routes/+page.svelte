@@ -4,7 +4,7 @@
 	import Square from '@lucide/svelte/icons/square';
 	import User from '@lucide/svelte/icons/user';
 	import { ApiClient, ApiError, type JsonValue, type RunEvent } from '$lib/api';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	type Message = { role: 'user' | 'assistant'; text: string };
 
@@ -18,7 +18,7 @@
 
 	async function send() {
 		const text = prompt.trim();
-		if (!text || running || !isConfigured($connection)) return;
+		if (!text || running || $connectionState.kind !== 'connected') return;
 		messages = [...messages, { role: 'user', text }];
 		prompt = '';
 		running = true;
@@ -104,13 +104,13 @@
 
 	<div class="composer-wrap">
 		<div class="composer">
-			<textarea bind:value={prompt} onkeydown={keydown} placeholder="Message Lumen" rows="1" disabled={running}></textarea>
+			<textarea bind:value={prompt} onkeydown={keydown} placeholder="Message Lumen" rows="1" disabled={running || $connectionState.kind !== 'connected'}></textarea>
 			{#if running}
 				<button class="stop-button" type="button" aria-label="Stop run" title="Stop run" onclick={stop} disabled={stopping}>
 					<Square size={15} fill="currentColor" />
 				</button>
 			{:else}
-				<button class="send-button" type="button" aria-label="Send message" title="Send" onclick={send} disabled={!prompt.trim() || !isConfigured($connection)}>
+				<button class="send-button" type="button" aria-label="Send message" title="Send" onclick={send} disabled={!prompt.trim() || $connectionState.kind !== 'connected'}>
 					<Send size={17} />
 				</button>
 			{/if}

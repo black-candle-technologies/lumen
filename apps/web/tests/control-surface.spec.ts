@@ -16,6 +16,9 @@ async function configure(page: Page) {
 
 test.beforeEach(async ({ page }) => {
 	await configure(page);
+	await page.route('**/api/v1/workspaces/*/runtime/capabilities', async (route) => {
+		await route.fulfill({ json: { sandbox: { platform: 'test', strength: 'kernel_enforced' } } });
+	});
 	await page.route('**/api/v1/workspaces/*/approvals', async (route) => {
 		await route.fulfill({
 			json: {
@@ -410,6 +413,105 @@ test.beforeEach(async ({ page }) => {
 			}
 		});
 	});
+});
+
+test('verifies connection identity and supports disconnect, reconnect, and refresh', async ({ page }) => {
+	await page.unroute('**/api/v1/workspaces/*/runtime/capabilities');
+	await page.route('**/api/v1/workspaces/*/runtime/capabilities', async (route) => {
+		const authorization = route.request().headers()['authorization'];
+		if (authorization !== 'Bearer local-test-token') {
+			await route.fulfill({
+				status: 401,
+				json: { error: { code: 'unauthorized', message: 'local authentication failed' } }
+			});
+			return;
+		}
+		if (!route.request().url().includes(workspaceId)) {
+			await route.fulfill({
+				status: 403,
+				json: { error: { code: 'workspace_forbidden', message: 'workspace is not allowlisted' } }
+			});
+			return;
+		}
+		await route.fulfill({ json: { sandbox: { platform: 'test', strength: 'kernel_enforced' } } });
+	});
+	await page.goto('/');
+	await expect(page.getByRole('button', { name: 'Local runtime' })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Open connection settings' }).click();
+	await page.getByLabel('Bearer token').fill('wrong-token');
+	await page.getByRole('button', { name: 'Connect', exact: true }).click();
+	await expect(page.getByText('Bearer token was rejected. Check it in connection settings.')).toBeVisible();
+
+	await page.getByLabel('Bearer token').fill('local-test-token');
+	await page.getByLabel('Workspace ID').fill('36db5a31-94f0-4e92-a9c9-4cdf19d71c31');
+	await page.getByRole('button', { name: 'Connect', exact: true }).click();
+	await expect(page.getByText('Workspace is not allowed by this runtime. Select the current workspace in connection settings.')).toBeVisible();
+
+	await page.getByLabel('Workspace ID').fill('not-a-uuid');
+	await page.getByRole('button', { name: 'Connect', exact: true }).click();
+	await expect(page.getByText('Workspace ID must be a canonical UUID.')).toBeVisible();
+
+	await page.getByLabel('Workspace ID').fill(workspaceId);
+	await page.getByRole('button', { name: 'Connect', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Local runtime' })).toBeVisible();
+	await page.reload();
+	await expect(page.getByRole('button', { name: 'Local runtime' })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Open connection settings' }).click();
+	await page.getByRole('button', { name: 'Disconnect' }).click();
+	await expect(page.getByRole('button', { name: 'Not connected' })).toBeVisible();
+	await page.getByRole('button', { name: 'Open connection settings' }).click();
+	await page.getByLabel('Workspace ID').fill(workspaceId);
+	await page.getByLabel('Bearer token').fill('local-test-token');
+	await page.getByRole('button', { name: 'Connect', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Local runtime' })).toBeVisible();
+});
+
+test('drops a late response from the previous workspace generation', async ({ page }) => {
+	const nextWorkspace = '36db5a31-94f0-4e92-a9c9-4cdf19d71c31';
+	let markOldRequest = () => {};
+	const oldRequest = new Promise<void>((resolve) => (markOldRequest = resolve));
+	await page.unroute('**/api/v1/workspaces/*/skills');
+	await page.route('**/api/v1/workspaces/*/skills', async (route) => {
+		const old = route.request().url().includes(workspaceId);
+		if (old) {
+			markOldRequest();
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+		await route.fulfill({
+			json: {
+				skills: [
+					{
+						skill_id: old ? '7f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763' : '8f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763',
+						version: '1.0.0',
+						workspace_id: old ? workspaceId : nextWorkspace,
+						name: old ? 'Stale workspace skill' : 'Current workspace skill',
+						description: 'generation test',
+						source_format: 'markdown',
+						source_digest: 'a'.repeat(64),
+						reviewed: true,
+						enabled: true,
+						required: false,
+						load_status: 'loaded',
+						exclusion_reason: null,
+						created_by: { provider: 'local', subject: 'operator' },
+						reviewed_by: { provider: 'local', subject: 'reviewer' },
+						created_at: 10,
+						reviewed_at: 20
+					}
+				]
+			}
+		});
+	});
+	await page.goto('/skills');
+	await oldRequest;
+	await page.getByRole('button', { name: 'Open connection settings' }).click();
+	await page.getByLabel('Workspace ID').fill(nextWorkspace);
+	await page.getByRole('button', { name: 'Connect', exact: true }).click();
+	await expect(page.getByText('Current workspace skill')).toBeVisible();
+	await page.waitForTimeout(600);
+	await expect(page.getByText('Stale workspace skill')).toHaveCount(0);
 });
 
 test('streams a local chat result and can request cancellation', async ({ page }, testInfo) => {

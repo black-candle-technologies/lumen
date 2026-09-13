@@ -4,7 +4,7 @@
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import { ApiClient, ApiError, type AuditEvent } from '$lib/api';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	let events = $state<AuditEvent[]>([]);
 	let expanded = $state<number | null>(null);
@@ -14,7 +14,7 @@
 	onMount(load);
 
 	async function load() {
-		if (!isConfigured($connection)) { loading = false; return; }
+		if ($connectionState.kind !== 'connected') { loading = false; return; }
 		loading = true;
 		try { events = await new ApiClient($connection).listAudit(); error = ''; }
 		catch (cause) { error = cause instanceof ApiError ? cause.message : 'Audit events could not be loaded.'; }
