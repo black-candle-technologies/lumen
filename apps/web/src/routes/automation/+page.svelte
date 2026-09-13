@@ -8,7 +8,10 @@
 
 	let identities = $state<ServiceIdentity[]>([]);
 	let jobs = $state<JobReview[]>([]);
-	let loading = $state(true);
+	let loadState = $state<'loading' | 'success' | 'error'>('loading');
+	let loadError = $state('');
+	let lastLoadedAt = $state('');
+	let loadedWorkspace = $state('');
 	let busyKey = $state('');
 	let error = $state('');
 	let notice = $state('');
@@ -16,15 +19,24 @@
 	onMount(load);
 
 	async function load() {
-		if ($connectionState.kind !== 'connected') { loading = false; return; }
-		loading = true;
+		if ($connectionState.kind !== 'connected') {
+			loadState = 'error';
+			loadError = 'Runtime connection is not verified. Open connection settings.';
+			return;
+		}
+		loadState = 'loading';
 		try {
 			const client = new ApiClient($connection);
 			[identities, jobs] = await Promise.all([client.listServiceIdentities(), client.listJobs()]);
+			loadError = '';
 			error = '';
+			lastLoadedAt = new Date().toLocaleString();
+			loadedWorkspace = $connection.workspaceId;
+			loadState = 'success';
 		} catch (cause) {
-			error = cause instanceof ApiError ? cause.message : 'Automation controls could not be loaded.';
-		} finally { loading = false; }
+			loadError = cause instanceof ApiError ? cause.message : 'Automation controls could not be loaded.';
+			loadState = 'error';
+		}
 	}
 
 	async function setJobEnabled(job: JobReview, enabled: boolean) {
@@ -56,19 +68,27 @@
 
 <section class="page automation-page">
 	<header class="page-heading">
-		<div><h1>Automation</h1><p>{jobs.length} jobs, {identities.length} service identities</p></div>
-		<button class="icon-button" type="button" aria-label="Refresh automation controls" title="Refresh" onclick={load} disabled={loading}><RefreshCw size={17} /></button>
+		<div><h1>Automation</h1><p>{lastLoadedAt ? `${jobs.length} jobs, ${identities.length} service identities${loadState === 'error' ? ' (stale)' : ''}` : 'Counts unavailable'}</p></div>
+		<button class="icon-button" type="button" aria-label="Refresh automation controls" title="Refresh" onclick={load} disabled={loadState === 'loading'}><RefreshCw size={17} /></button>
 	</header>
+	{#if loadError}
+		<div class="notice error" role="alert">{loadError} <button type="button" onclick={load}>Retry</button></div>
+	{/if}
+	{#if loadState === 'error' && lastLoadedAt}
+		<div class="notice" role="status">Showing stale data for workspace {loadedWorkspace} from {lastLoadedAt}.</div>
+	{/if}
 	{#if error}<div class="notice error">{error}</div>{/if}
 	{#if notice}<div class="notice">{notice}</div>{/if}
 
-	{#if loading}
+	{#if loadState === 'loading' && !lastLoadedAt}
 		<div class="empty">Loading automation controls...</div>
+	{:else if loadState === 'error' && !lastLoadedAt}
+		<div class="empty">Automation data is unavailable.</div>
 	{:else}
 		<section class="automation-section">
 			<h2>Jobs</h2>
 			{#if jobs.length === 0}
-				<div class="subtle-empty">No scheduled jobs.</div>
+				<div class="subtle-empty">{loadState === 'error' ? 'The previously loaded job list was empty.' : 'No scheduled jobs.'}</div>
 			{:else}
 				<div class="automation-table" role="table" aria-label="Scheduled jobs">
 					<div class="automation-header job-row" role="row"><span>Prompt</span><span>Schedule</span><span>Service</span><span>Status</span><span></span></div>
@@ -94,7 +114,7 @@
 		<section class="automation-section">
 			<h2>Service Identities</h2>
 			{#if identities.length === 0}
-				<div class="subtle-empty">No service identities.</div>
+				<div class="subtle-empty">{loadState === 'error' ? 'The previously loaded service identity list was empty.' : 'No service identities.'}</div>
 			{:else}
 				<div class="automation-table" role="table" aria-label="Service identities">
 					<div class="automation-header identity-row" role="row"><span>Identity</span><span>Owner</span><span>Grants</span><span>Status</span></div>

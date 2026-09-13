@@ -16,7 +16,10 @@
 	let providers = $state<ProviderPolicy[]>([]);
 	let destinations = $state<DestinationPolicy[]>([]);
 	let mappings = $state<ChannelMapping[]>([]);
-	let loading = $state(true);
+	let loadState = $state<'loading' | 'success' | 'error'>('loading');
+	let loadError = $state('');
+	let lastLoadedAt = $state('');
+	let loadedWorkspace = $state('');
 	let busyKey = $state('');
 	let error = $state('');
 	let notice = $state('');
@@ -24,8 +27,12 @@
 	onMount(load);
 
 	async function load() {
-		if ($connectionState.kind !== 'connected') { loading = false; return; }
-		loading = true;
+		if ($connectionState.kind !== 'connected') {
+			loadState = 'error';
+			loadError = 'Runtime connection is not verified. Open connection settings.';
+			return;
+		}
+		loadState = 'loading';
 		try {
 			const client = new ApiClient($connection);
 			[providers, destinations, mappings] = await Promise.all([
@@ -33,10 +40,15 @@
 				client.listDestinationPolicies(),
 				client.listChannelMappings()
 			]);
+			loadError = '';
 			error = '';
+			lastLoadedAt = new Date().toLocaleString();
+			loadedWorkspace = $connection.workspaceId;
+			loadState = 'success';
 		} catch (cause) {
-			error = cause instanceof ApiError ? cause.message : 'Egress controls could not be loaded.';
-		} finally { loading = false; }
+			loadError = cause instanceof ApiError ? cause.message : 'Egress controls could not be loaded.';
+			loadState = 'error';
+		}
 	}
 
 	async function setDestinationEnabled(policy: DestinationPolicy, enabled: boolean) {
@@ -135,21 +147,29 @@
 
 <section class="page egress-page">
 	<header class="page-heading">
-		<div><h1>Egress</h1><p>{providers.length} providers, {destinations.length} destinations, {mappings.length} channel identities</p></div>
-		<button class="icon-button" type="button" aria-label="Refresh egress controls" title="Refresh" onclick={load} disabled={loading}><RefreshCw size={17} /></button>
+		<div><h1>Egress</h1><p>{lastLoadedAt ? `${providers.length} providers, ${destinations.length} destinations, ${mappings.length} channel identities${loadState === 'error' ? ' (stale)' : ''}` : 'Counts unavailable'}</p></div>
+		<button class="icon-button" type="button" aria-label="Refresh egress controls" title="Refresh" onclick={load} disabled={loadState === 'loading'}><RefreshCw size={17} /></button>
 	</header>
+	{#if loadError}
+		<div class="notice error" role="alert">{loadError} <button type="button" onclick={load}>Retry</button></div>
+	{/if}
+	{#if loadState === 'error' && lastLoadedAt}
+		<div class="notice" role="status">Showing stale data for workspace {loadedWorkspace} from {lastLoadedAt}.</div>
+	{/if}
 	{#if error}<div class="notice error">{error}</div>{/if}
 	{#if notice}<div class="notice">{notice}</div>{/if}
 
-	{#if loading}
+	{#if loadState === 'loading' && !lastLoadedAt}
 		<div class="empty">Loading egress controls...</div>
+	{:else if loadState === 'error' && !lastLoadedAt}
+		<div class="empty">Egress data is unavailable.</div>
 	{:else if providers.length === 0 && destinations.length === 0 && mappings.length === 0}
-		<div class="empty">No egress policies.</div>
+		<div class="empty">{loadState === 'error' ? 'The previously loaded egress policy lists were empty.' : 'No egress policies.'}</div>
 	{:else}
 		<section class="egress-section">
 			<h2>Providers</h2>
 			{#if providers.length === 0}
-				<div class="subtle-empty">No provider policies.</div>
+				<div class="subtle-empty">{loadState === 'error' ? 'The previously loaded provider list was empty.' : 'No provider policies.'}</div>
 			{:else}
 				<div class="egress-table" role="table" aria-label="Provider egress policies">
 					<div class="egress-header provider-header" role="row"><span>Provider</span><span>Endpoint</span><span>Workspace classes</span><span>Status</span><span></span></div>
@@ -201,7 +221,7 @@
 		<section class="egress-section">
 			<h2>Destinations</h2>
 			{#if destinations.length === 0}
-				<div class="subtle-empty">No destination policies.</div>
+				<div class="subtle-empty">{loadState === 'error' ? 'The previously loaded destination list was empty.' : 'No destination policies.'}</div>
 			{:else}
 				<div class="egress-table" role="table" aria-label="Destination egress policies">
 					<div class="egress-header destination-header" role="row"><span>Destination</span><span>Data classes</span><span>Revision</span><span>Status</span><span></span></div>
@@ -238,7 +258,7 @@
 		<section class="egress-section">
 			<h2>Channels</h2>
 			{#if mappings.length === 0}
-				<div class="subtle-empty">No channel mappings.</div>
+				<div class="subtle-empty">{loadState === 'error' ? 'The previously loaded channel mapping list was empty.' : 'No channel mappings.'}</div>
 			{:else}
 				<div class="egress-table" role="table" aria-label="Channel egress mappings">
 					<div class="egress-header" role="row"><span>Channel</span><span>External user</span><span>Lumen identity</span><span>Status</span><span></span></div>

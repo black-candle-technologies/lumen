@@ -415,6 +415,94 @@ test.beforeEach(async ({ page }) => {
 	});
 });
 
+test('separates unavailable approval data from a successful empty queue and recovers on retry', async ({ page }) => {
+	let response: number | 'network' | 'empty' | 'data' = 401;
+	await page.unroute('**/api/v1/workspaces/*/approvals');
+	await page.route('**/api/v1/workspaces/*/approvals', async (route) => {
+		if (response === 'network') {
+			await route.abort('connectionrefused');
+			return;
+		}
+		if (typeof response === 'number') {
+			await route.fulfill({
+				status: response,
+				json: { error: { code: 'load_failed', message: `approval load failed with ${response}` } }
+			});
+			return;
+		}
+		await route.fulfill({
+			json: {
+				server_time: 1000,
+				approvals: response === 'empty' ? [] : [{
+					approval_id: 'retained-approval',
+					run_id: 'retained-run',
+					kind: 'process.spawn',
+					arguments: { program: '/bin/echo', args: ['retained'], environment: {} },
+					capabilities: [],
+					fingerprint: 'd'.repeat(64),
+					created_at: 10,
+					expires_at: 9999999999999
+				}]
+			}
+		});
+	});
+
+	for (const failure of [401, 403, 404, 500, 'network'] as const) {
+		response = failure;
+		await page.goto('/approvals');
+		await expect(page.getByText('Pending count unavailable')).toBeVisible();
+		await expect(page.getByText('Approval data is unavailable.')).toBeVisible();
+		await expect(page.getByText('No actions are waiting for approval.')).toHaveCount(0);
+		await expect(page.getByRole('alert')).toContainText(
+			failure === 'network' ? 'Approval requests could not be loaded.' : `approval load failed with ${failure}`
+		);
+	}
+
+	response = 'empty';
+	await page.goto('/approvals');
+	await expect(page.getByText('0 pending')).toBeVisible();
+	await expect(page.getByText('No actions are waiting for approval.')).toBeVisible();
+	response = 500;
+	await page.getByRole('button', { name: 'Refresh approvals' }).click();
+	await expect(page.getByText('0 pending (stale)')).toBeVisible();
+	await expect(page.getByText('The previously loaded approval queue was empty.')).toBeVisible();
+	await expect(page.getByText('No actions are waiting for approval.')).toHaveCount(0);
+
+	response = 'data';
+	await page.getByRole('button', { name: 'Retry' }).click();
+	await expect(page.locator('article').getByText('retained', { exact: true })).toBeVisible();
+	response = 500;
+	await page.getByRole('button', { name: 'Refresh approvals' }).click();
+	await expect(page.getByRole('status')).toContainText(`Showing stale data for workspace ${workspaceId} from`);
+	await expect(page.locator('article').getByText('retained', { exact: true })).toBeVisible();
+	response = 'empty';
+	await page.getByRole('button', { name: 'Retry' }).click();
+	await expect(page.getByRole('status')).toHaveCount(0);
+	await expect(page.getByText('No actions are waiting for approval.')).toBeVisible();
+});
+
+test('does not show empty success claims on adjacent list-screen failures', async ({ page }) => {
+	const cases = [
+		{ path: '/automation', pattern: '**/api/v1/workspaces/*/automation/jobs', unavailable: 'Automation data is unavailable.', empty: ['No scheduled jobs.', 'No service identities.'], count: 'Counts unavailable' },
+		{ path: '/skills', pattern: '**/api/v1/workspaces/*/skills', unavailable: 'Skill data is unavailable.', empty: ['No skill versions.', 'No capture drafts.'], count: 'Counts unavailable' },
+		{ path: '/audit', pattern: '**/api/v1/workspaces/*/audit*', unavailable: 'Audit data is unavailable.', empty: ['No audit events.'] },
+		{ path: '/plugins', pattern: '**/api/v1/workspaces/*/plugins/staged*', unavailable: 'Plugin data is unavailable.', empty: ['No staged plugins.'], count: 'Count unavailable' },
+		{ path: '/egress', pattern: '**/api/v1/workspaces/*/egress/providers', unavailable: 'Egress data is unavailable.', empty: ['No egress policies.', 'No provider policies.', 'No destination policies.', 'No channel mappings.'], count: 'Counts unavailable' }
+	] as const;
+
+	for (const screen of cases) {
+		await page.unroute(screen.pattern);
+		await page.route(screen.pattern, async (route) => {
+			await route.fulfill({ status: 500, json: { error: { code: 'unavailable', message: 'controlled load failure' } } });
+		});
+		await page.goto(screen.path);
+		await expect(page.getByRole('alert')).toContainText('controlled load failure');
+		await expect(page.getByText(screen.unavailable)).toBeVisible();
+		if ('count' in screen) await expect(page.getByText(screen.count)).toBeVisible();
+		for (const empty of screen.empty) await expect(page.getByText(empty)).toHaveCount(0);
+	}
+});
+
 test('verifies connection identity and supports disconnect, reconnect, and refresh', async ({ page }) => {
 	await page.unroute('**/api/v1/workspaces/*/runtime/capabilities');
 	await page.route('**/api/v1/workspaces/*/runtime/capabilities', async (route) => {
