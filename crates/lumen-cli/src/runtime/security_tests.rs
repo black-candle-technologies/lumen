@@ -276,9 +276,26 @@ struct Harness {
 
 impl Harness {
     async fn new(model: &MockServer, prepare_workspace: impl FnOnce(&std::path::Path)) -> Self {
-        Self::new_inner(model, prepare_workspace, None, None)
+        Self::new_inner(model, prepare_workspace, None, None, None)
             .await
             .0
+    }
+
+    async fn new_with_runtime_limits(
+        model: &MockServer,
+        prepare_workspace: impl FnOnce(&std::path::Path),
+        max_wall_time_seconds: u64,
+        max_captured_result_bytes: usize,
+    ) -> Self {
+        Self::new_inner(
+            model,
+            prepare_workspace,
+            Some((max_wall_time_seconds, max_captured_result_bytes)),
+            None,
+            None,
+        )
+        .await
+        .0
     }
 
     async fn new_with_plugin_response(
@@ -289,6 +306,7 @@ impl Harness {
         Self::new_inner(
             model,
             prepare_workspace,
+            None,
             None,
             Some(RecordingSandbox::new().with_plugin_response(response)),
         )
@@ -301,7 +319,7 @@ impl Harness {
         prepare_workspace: impl FnOnce(&std::path::Path),
         sandbox: RecordingSandbox,
     ) -> Self {
-        Self::new_inner(model, prepare_workspace, None, Some(sandbox))
+        Self::new_inner(model, prepare_workspace, None, None, Some(sandbox))
             .await
             .0
     }
@@ -310,12 +328,13 @@ impl Harness {
         model: &MockServer,
         setup: SecretSetup,
     ) -> (Self, SecretReference, Arc<InMemorySecretStore>) {
-        let (harness, reference, store) = Self::new_inner(model, |_| {}, Some(setup), None).await;
+        let (harness, reference, store) =
+            Self::new_inner(model, |_| {}, None, Some(setup), None).await;
         (harness, reference.expect("secret reference"), store)
     }
 
     async fn new_with_cancellable_process(model: &MockServer) -> Self {
-        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None, None).await;
+        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None, None, None).await;
         let sandbox = RecordingSandbox::new().waiting_for_cancellation();
         let config = Config::parse(&format!(
             r#"
@@ -381,6 +400,7 @@ subject = "operator"
     async fn new_inner(
         model: &MockServer,
         prepare_workspace: impl FnOnce(&std::path::Path),
+        runtime_limits: Option<(u64, usize)>,
         secret: Option<SecretSetup>,
         sandbox_override: Option<RecordingSandbox>,
     ) -> (Self, Option<SecretReference>, Arc<InMemorySecretStore>) {
@@ -389,6 +409,9 @@ subject = "operator"
         std::fs::create_dir(&workspace).expect("workspace directory");
         std::fs::create_dir(directory.path().join("runtime")).expect("runtime directory");
         prepare_workspace(&workspace);
+        let runtime_limits = runtime_limits.map_or_else(String::new, |(wall_time, captured)| {
+            format!("max_wall_time_seconds = {wall_time}\nmax_captured_result_bytes = {captured}")
+        });
         let config = Config::parse(&format!(
             r#"
 [database]
@@ -401,6 +424,7 @@ streaming = false
 
 [runtime]
 data_directory = {}
+{}
 
 [process]
 allowed_programs = [{}]
@@ -416,6 +440,7 @@ subject = "operator"
 "#,
             model.uri(),
             path_toml(directory.path().join("runtime")),
+            runtime_limits,
             toml_string(test_program_string()),
             path_toml(&workspace)
         ))
@@ -1575,6 +1600,144 @@ async fn scheduled_due_once_job_creates_one_service_attributed_run() {
         canonical_object_get(run_created.payload(), "occurrence_key"),
         Some(&CanonicalValue::from(occurrence.as_str()))
     );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn interactive_and_scheduled_runs_share_the_runtime_wall_time_limit() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        final_response("too late").set_delay(Duration::from_secs(5)),
+    )
+    .await;
+    let harness = Harness::new_with_runtime_limits(&model, |_| {}, 1, 1024).await;
+
+    let interactive_run = harness.create_run("delayed workload").await;
+    wait_for_run_state(&harness, &interactive_run, "failed").await;
+
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        8,
+        8,
+    )
+    .await;
+    let scheduled_run = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")
+        .into_iter()
+        .next()
+        .expect("scheduled run");
+    wait_for_run_state(&harness, &scheduled_run.to_string(), "failed").await;
+
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 200)
+        .await
+        .expect("audit records");
+    for run_id in [interactive_run, scheduled_run.to_string()] {
+        assert!(records.iter().any(|record| {
+            let event = record.event();
+            event.kind() == AuditEventKind::RunBudgetExhausted
+                && canonical_object_get(event.payload(), "run_id")
+                    == Some(&CanonicalValue::from(run_id.as_str()))
+                && canonical_object_get(event.payload(), "budget")
+                    == Some(&CanonicalValue::from("wall_clock"))
+        }));
+    }
+    let occurrence_state: String =
+        sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE run_id = ?")
+            .bind(scheduled_run.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("scheduled occurrence state");
+    assert_eq!(occurrence_state, "failed");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_results_share_the_runtime_aggregate_capture_limit() {
+    let model = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turns = Arc::clone(&turns);
+            move |_request: &MockRequest| {
+                if turns.fetch_add(1, Ordering::SeqCst) < 2 {
+                    action_response("filesystem.read", serde_json::json!({"path": "quota.txt"}))
+                } else {
+                    final_response("must not run")
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new_with_runtime_limits(
+        &model,
+        |workspace| std::fs::write(workspace.join("quota.txt"), "0123456789").expect("fixture"),
+        10,
+        30,
+    )
+    .await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsRead,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        3,
+        2,
+    )
+    .await;
+
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")
+        .into_iter()
+        .next()
+        .expect("scheduled run");
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+
+    assert_eq!(turns.load(Ordering::SeqCst), 2);
+    let occurrence_state: String =
+        sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("scheduled occurrence state");
+    assert_eq!(occurrence_state, "failed");
+    let records = harness
+        .database
+        .list_audit_records(harness.workspace_id, 0, 200)
+        .await
+        .expect("audit records");
+    assert!(records.iter().any(|record| {
+        let event = record.event();
+        event.kind() == AuditEventKind::RunBudgetExhausted
+            && canonical_object_get(event.payload(), "run_id")
+                == Some(&CanonicalValue::from(run_id.to_string()))
+            && canonical_object_get(event.payload(), "budget")
+                == Some(&CanonicalValue::from("captured_result_bytes"))
+    }));
     harness.service.shutdown().await;
 }
 

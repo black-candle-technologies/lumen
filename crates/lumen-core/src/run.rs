@@ -165,7 +165,22 @@ pub struct RunBudget {
 }
 
 impl RunBudget {
-    pub const fn new(max_model_turns: u32, max_actions: u32) -> Self {
+    /// Sets whole-run quotas. Wall time starts with `RunState` and includes approval waits.
+    pub const fn limited(
+        max_model_turns: u32,
+        max_actions: u32,
+        max_wall_time: Duration,
+        max_captured_result_bytes: usize,
+    ) -> Self {
+        Self {
+            max_model_turns,
+            max_actions,
+            max_wall_time: Some(max_wall_time),
+            max_captured_result_bytes,
+        }
+    }
+
+    pub const fn unlimited(max_model_turns: u32, max_actions: u32) -> Self {
         Self {
             max_model_turns,
             max_actions,
@@ -174,14 +189,12 @@ impl RunBudget {
         }
     }
 
-    pub const fn with_quotas(
-        mut self,
-        max_wall_time: Duration,
-        max_captured_result_bytes: usize,
-    ) -> Self {
-        self.max_wall_time = Some(max_wall_time);
-        self.max_captured_result_bytes = max_captured_result_bytes;
-        self
+    pub fn with_step_limits(self, max_model_turns: u32, max_actions: u32) -> Self {
+        Self {
+            max_model_turns: self.max_model_turns.min(max_model_turns),
+            max_actions: self.max_actions.min(max_actions),
+            ..self
+        }
     }
 }
 

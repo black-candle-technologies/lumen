@@ -258,11 +258,12 @@ impl LocalRuntimeService {
             policy_version: PolicyVersion::new("local-policy-v1").expect("static policy version"),
             capabilities: EffectiveCapabilities::new([ambient_capabilities.clone()]),
             ambient_capabilities,
-            budget: RunBudget::new(config.runtime.max_model_turns, config.runtime.max_actions)
-                .with_quotas(
-                    Duration::from_secs(config.runtime.max_wall_time_seconds),
-                    config.runtime.max_captured_result_bytes,
-                ),
+            budget: RunBudget::limited(
+                config.runtime.max_model_turns,
+                config.runtime.max_actions,
+                Duration::from_secs(config.runtime.max_wall_time_seconds),
+                config.runtime.max_captured_result_bytes,
+            ),
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -377,7 +378,9 @@ impl LocalRuntimeService {
                 workspace_id: job.workspace_id(),
                 actor: job.service().clone(),
                 prompt: job.prompt().to_owned(),
-                budget: RunBudget::new(job.max_model_turns(), job.max_actions()),
+                budget: self
+                    .budget
+                    .with_step_limits(job.max_model_turns(), job.max_actions()),
                 data_class: job.data_class(),
                 model_override: None,
                 capabilities_override: Some(EffectiveCapabilities::new([

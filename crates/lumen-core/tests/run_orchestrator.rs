@@ -426,7 +426,7 @@ async fn extension_proposal_reenters_action_budget_policy_approval_and_audit() {
     let approvals = FakeApprovals::pending_then_grant();
     let audit = FakeAudit::default();
     let actions = RecordingActions::default();
-    let mut state = RunState::new(run_context(), "invoke", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "invoke", RunBudget::unlimited(3, 2));
     let capabilities = EffectiveCapabilities::new([CapabilitySet::new([
         Capability::new(
             CapabilityName::FsRead,
@@ -521,7 +521,7 @@ async fn extension_child_broader_than_effective_grants_is_persisted_but_not_exec
     let approvals = FakeApprovals::pending_then_grant();
     let audit = FakeAudit::default();
     let actions = RecordingActions::default();
-    let mut state = RunState::new(run_context(), "invoke", RunBudget::new(2, 2));
+    let mut state = RunState::new(run_context(), "invoke", RunBudget::unlimited(2, 2));
     let capabilities = EffectiveCapabilities::new([CapabilitySet::new([
         Capability::new(
             CapabilityName::FsRead,
@@ -584,7 +584,7 @@ async fn text_completion_finishes_without_executing_an_action() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "hello", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
         .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
@@ -611,7 +611,7 @@ async fn model_input_from_run_state_is_workspace_classified() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "hello", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
         .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
@@ -635,7 +635,7 @@ async fn model_input_from_run_state_can_be_public_classified() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "hello", RunBudget::new(3, 2))
+    let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(3, 2))
         .with_data_class(DataClass::Public);
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
@@ -660,7 +660,7 @@ async fn terminal_run_outcome_is_sticky_and_does_not_repeat_work() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "hello", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(3, 2));
     let orchestrator = orchestrator(&model, &executor, &approvals, &audit);
 
     let first = orchestrator
@@ -686,7 +686,7 @@ async fn denied_action_never_reaches_the_executor() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
         .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
@@ -710,7 +710,7 @@ async fn normalized_action_is_persisted_before_policy_denial() {
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
     let actions = CountingActions::default();
-    let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
     let orchestrator = RunOrchestrator::new(
         &model,
         &NORMALIZER,
@@ -741,7 +741,7 @@ async fn pending_approval_pauses_and_resume_does_not_repeat_the_model_call() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::pending_then_grant();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "write", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "write", RunBudget::unlimited(3, 2));
     let orchestrator = orchestrator(&model, &executor, &approvals, &audit);
 
     let first = orchestrator
@@ -785,7 +785,7 @@ async fn tool_call_identity_and_result_are_preserved_after_approval() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::pending_then_grant();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "write", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "write", RunBudget::unlimited(3, 2));
     let orchestrator = orchestrator(&model, &executor, &approvals, &audit);
     let capabilities = capabilities(CapabilityName::FsWrite);
 
@@ -832,7 +832,7 @@ async fn exhausted_model_budget_stops_before_calling_the_model() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "hello", RunBudget::new(0, 2));
+    let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(0, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
         .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
@@ -843,13 +843,53 @@ async fn exhausted_model_budget_stops_before_calling_the_model() {
     assert_eq!(model.call_count(), 0);
 }
 
+#[test]
+fn job_step_limits_preserve_runtime_quotas_and_only_tighten() {
+    let runtime = RunBudget::limited(4, 3, Duration::from_secs(5), 128);
+
+    assert_eq!(
+        runtime.with_step_limits(2, 8),
+        RunBudget::limited(2, 3, Duration::from_secs(5), 128)
+    );
+}
+
+#[tokio::test]
+async fn approval_waiting_counts_toward_the_wall_clock_budget() {
+    let model = FakeModel::new([proposal("filesystem.write")]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::pending_then_grant();
+    let audit = FakeAudit::default();
+    let budget = RunBudget::limited(3, 2, Duration::from_millis(10), 1024);
+    let mut state = RunState::new(run_context(), "write", budget);
+    let orchestrator = orchestrator(&model, &executor, &approvals, &audit);
+    let capabilities = capabilities(CapabilityName::FsWrite);
+
+    assert!(matches!(
+        orchestrator
+            .run_until_blocked(&mut state, &capabilities, NOW)
+            .await
+            .expect("run pauses"),
+        RunOutcome::AwaitingApproval { .. }
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        orchestrator
+            .run_until_blocked(&mut state, &capabilities, NOW)
+            .await
+            .expect("budget exhaustion is a run outcome"),
+        RunOutcome::BudgetExhausted(BudgetKind::WallClock)
+    );
+    assert_eq!(executor.call_count(), 0);
+}
+
 #[tokio::test]
 async fn cancelled_run_stops_before_model_or_executor_work() {
     let model = FakeModel::new([ModelOutput::FinalText("unused".to_owned())]);
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "hello", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(3, 2));
     state.cancel();
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
@@ -868,7 +908,7 @@ async fn executor_failure_is_distinct_from_an_unknown_outcome() {
     let executor = FakeExecutor::new([Ok(ExecutionOutcome::Failed("exit 1".into()))]);
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
         .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
@@ -890,7 +930,7 @@ async fn executor_unknown_outcome_is_preserved_for_reconciliation() {
     let executor = FakeExecutor::new([Ok(ExecutionOutcome::Unknown("connection lost".into()))]);
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
         .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
@@ -912,7 +952,7 @@ async fn audit_failure_before_dispatch_fails_closed() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::failing_on(AuditEventKind::ExecutionStarted);
-    let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+    let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let result = orchestrator(&model, &executor, &approvals, &audit)
         .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
@@ -931,7 +971,7 @@ async fn elapsed_wall_clock_budget_stops_before_model_or_executor_work() {
     let executor = FakeExecutor::succeeding();
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let budget = RunBudget::new(3, 2).with_quotas(Duration::from_millis(1), 1024);
+    let budget = RunBudget::limited(3, 2, Duration::from_millis(1), 1024);
     let mut state = RunState::new(run_context(), "hello", budget);
     tokio::time::sleep(Duration::from_millis(5)).await;
 
@@ -962,7 +1002,7 @@ async fn cumulative_captured_result_budget_stops_before_another_model_turn() {
     )))]);
     let approvals = FakeApprovals::always_pending();
     let audit = FakeAudit::default();
-    let budget = RunBudget::new(3, 2).with_quotas(Duration::from_secs(10), 4);
+    let budget = RunBudget::limited(3, 2, Duration::from_secs(10), 4);
     let mut state = RunState::new(run_context(), "read", budget);
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
@@ -994,7 +1034,7 @@ async fn executor_cancellation_and_timeout_remain_distinct_run_outcomes() {
         let executor = FakeExecutor::new([Ok(execution)]);
         let approvals = FakeApprovals::always_pending();
         let audit = FakeAudit::default();
-        let mut state = RunState::new(run_context(), "read", RunBudget::new(3, 2));
+        let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
         let outcome = orchestrator(&model, &executor, &approvals, &audit)
             .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
