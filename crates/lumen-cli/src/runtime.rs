@@ -11,8 +11,8 @@ use std::{
 use lumen_core::{
     action::{ActionEnvelope, CanonicalValue, RunId},
     approval::{
-        ApprovalId, ApprovalRequest, ApprovalState, DispatchAuthorization, ExecutionAttemptId,
-        TimestampMillis,
+        ApprovalError, ApprovalId, ApprovalRequest, ApprovalState, DispatchAuthorization,
+        ExecutionAttemptId, TimestampMillis, authorize_dispatch,
     },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     automation::{
@@ -23,7 +23,7 @@ use lumen_core::{
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
     extension::{PluginComponentId, PluginId, PluginVersion},
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort, ModelTool},
-    policy::{Policy, PolicyVersion},
+    policy::{Policy, PolicyDecision, PolicyVersion},
     run::{
         ActionFuture, ActionNormalizer, ActionPort, ActionPortError, ApprovalFuture, ApprovalPort,
         ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError, Clock,
@@ -48,15 +48,16 @@ use lumen_integrations::{
     secrets::SecretStore,
 };
 use lumen_server::{
-    ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
-    ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested, CancelRunCommand,
-    CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview,
-    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview,
-    EventBroker, JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand,
-    PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
-    PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
-    ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated,
-    RuntimeService, ServiceError, ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery,
+    ApprovalConflict, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
+    ApprovalRenewal, ApprovalRenewalCommand, ApprovalResult, ApprovalSecretReference, AuditEntry,
+    AuditQuery, AutomationActionRequested, CancelRunCommand, CaptureWorkflowCommand,
+    ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview, CreateRunCommand,
+    DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview, EventBroker,
+    JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand, PluginActionRequested,
+    PluginComponentReview, PluginDetailsQuery, PluginFailureReview, PluginReviewQuery,
+    PluginSettingReview, PluginVersionDetails, PrincipalSummary, ProviderPolicyCommand,
+    ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated, RuntimeService,
+    ServiceError, ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery,
     ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
     WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
 };
@@ -1570,6 +1571,77 @@ impl RuntimeService for LocalRuntimeService {
         })
     }
 
+    fn renew_approval(
+        &self,
+        command: ApprovalRenewalCommand,
+    ) -> ServiceFuture<'_, ApprovalRenewal> {
+        let service = self.clone();
+        Box::pin(async move {
+            service.ensure_accepting_work()?;
+            let previous = command.approval_id();
+            let mut runs = service.runs.lock().await;
+            let run_id = runs
+                .iter()
+                .find_map(|(run_id, stored)| {
+                    stored
+                        .state
+                        .is_awaiting_approval(previous)
+                        .then_some(*run_id)
+                })
+                .ok_or(ServiceError::ApprovalConflict(ApprovalConflict::Stale))?;
+            let (_, approval_id) = service
+                .approvals
+                .renew(command.workspace_id(), previous, run_id, now())
+                .await?;
+            let updated = runs
+                .get_mut(&run_id)
+                .is_some_and(|stored| stored.state.renew_pending_approval(previous, approval_id));
+            if !updated {
+                return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+            }
+            drop(runs);
+            service
+                .audit
+                .record(AuditEvent::new(
+                    AuditEventId::new(),
+                    now(),
+                    AuditEventKind::ApprovalCreated,
+                    AuditOutcome::Pending,
+                    Some(command.workspace_id()),
+                    CanonicalValue::object([
+                        ("run_id", CanonicalValue::from(run_id.to_string())),
+                        (
+                            "previous_approval_id",
+                            CanonicalValue::from(previous.to_string()),
+                        ),
+                        ("approval_id", CanonicalValue::from(approval_id.to_string())),
+                        (
+                            "renewed_by",
+                            CanonicalValue::from(command.actor().subject()),
+                        ),
+                    ]),
+                ))
+                .await
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            service
+                .events
+                .publish(
+                    command.workspace_id(),
+                    run_id,
+                    "approval.renewed",
+                    CanonicalValue::object([
+                        (
+                            "previous_approval_id",
+                            CanonicalValue::from(previous.to_string()),
+                        ),
+                        ("approval_id", CanonicalValue::from(approval_id.to_string())),
+                    ]),
+                )
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            Ok(ApprovalRenewal::new(previous, approval_id, run_id))
+        })
+    }
+
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>> {
         Box::pin(async move {
             let records = self
@@ -1602,7 +1674,7 @@ impl RuntimeService for LocalRuntimeService {
         Box::pin(async move {
             let approvals = self
                 .database
-                .list_pending_approvals(query.workspace_id())
+                .list_pending_approvals(query.workspace_id(), now())
                 .await
                 .map_err(repository_service_error)?;
             let references = self
@@ -3812,6 +3884,7 @@ struct ApprovalRecord {
     action: lumen_core::action::ActionEnvelope,
     request: ApprovalRequest,
     attempt_id: Option<ExecutionAttemptId>,
+    renewed: bool,
 }
 
 struct ApprovalRegistry {
@@ -3840,22 +3913,135 @@ impl ApprovalRegistry {
         if record.workspace_id != command.workspace_id() {
             return Err(ServiceError::NotFound);
         }
+        if record.renewed {
+            return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+        }
         let now = now();
         let mut request = record.request.clone();
-        match command.decision() {
+        let decision = match command.decision() {
             ApprovalDecision::Grant => request.grant(command.actor().clone(), now),
             ApprovalDecision::Reject => request.reject(command.actor().clone(), now),
+        };
+        if let Err(error) = decision {
+            if request.state() == ApprovalState::Expired {
+                self.database
+                    .expire_pending_approvals(command.workspace_id(), now)
+                    .await
+                    .map_err(repository_service_error)?;
+                record.request = request;
+            }
+            return Err(ServiceError::ApprovalConflict(approval_conflict(error)));
         }
-        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
         self.database
             .update_approval_decision(command.workspace_id(), &request)
             .await
-            .map_err(repository_service_error)?;
+            .map_err(|error| match error {
+                lumen_db::RepositoryError::ApprovalStale => {
+                    ServiceError::ApprovalConflict(ApprovalConflict::Stale)
+                }
+                lumen_db::RepositoryError::ApprovalActionChanged => {
+                    ServiceError::ApprovalConflict(ApprovalConflict::ActionChanged)
+                }
+                lumen_db::RepositoryError::ApprovalExpired => {
+                    ServiceError::ApprovalConflict(ApprovalConflict::Expired)
+                }
+                lumen_db::RepositoryError::ApprovalConsumed => {
+                    ServiceError::ApprovalConflict(ApprovalConflict::Consumed)
+                }
+                lumen_db::RepositoryError::ApprovalDecisionConflict => {
+                    ServiceError::ApprovalConflict(ApprovalConflict::AlreadyDecided)
+                }
+                error => repository_service_error(error),
+            })?;
         record.request = request;
         Ok((
             record.run_id,
             ApprovalResult::new(command.approval_id(), command.decision()),
         ))
+    }
+
+    async fn renew(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        approval_id: ApprovalId,
+        expected_run_id: RunId,
+        now: TimestampMillis,
+    ) -> Result<(RunId, ApprovalId), ServiceError> {
+        let mut records = self.records.lock().await;
+        let (run_id, action, policy_version) = {
+            let record = records
+                .get_mut(&approval_id)
+                .ok_or(ServiceError::NotFound)?;
+            if record.workspace_id != workspace_id {
+                return Err(ServiceError::NotFound);
+            }
+            if record.run_id != expected_run_id {
+                return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+            }
+            if record.renewed {
+                return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+            }
+            if record.request.expire(now) {
+                self.database
+                    .expire_pending_approvals(workspace_id, now)
+                    .await
+                    .map_err(repository_service_error)?;
+            }
+            match record.request.state() {
+                ApprovalState::Expired => {}
+                ApprovalState::Pending => {
+                    return Err(ServiceError::ApprovalConflict(
+                        ApprovalConflict::NotRenewable,
+                    ));
+                }
+                ApprovalState::Granted | ApprovalState::Rejected => {
+                    return Err(ServiceError::ApprovalConflict(
+                        ApprovalConflict::AlreadyDecided,
+                    ));
+                }
+                ApprovalState::Consumed => {
+                    return Err(ServiceError::ApprovalConflict(ApprovalConflict::Consumed));
+                }
+                ApprovalState::Invalidated => {
+                    return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+                }
+            }
+            (
+                record.run_id,
+                record.action.clone(),
+                record.request.policy_version().clone(),
+            )
+        };
+        let replacement = ApprovalId::new();
+        let ttl_millis = u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX);
+        let request = ApprovalRequest::new(
+            replacement,
+            action.fingerprint(),
+            policy_version,
+            now,
+            TimestampMillis::new(now.as_u64().saturating_add(ttl_millis)),
+        )
+        .map_err(|error| ServiceError::ApprovalConflict(approval_conflict(error)))?;
+        self.database
+            .insert_approval(&request)
+            .await
+            .map_err(repository_service_error)?;
+        records
+            .get_mut(&approval_id)
+            .expect("renewed approval remains registered")
+            .renewed = true;
+        records.insert(
+            replacement,
+            ApprovalRecord {
+                workspace_id,
+                run_id,
+                action,
+                request,
+                attempt_id: None,
+                renewed: false,
+            },
+        );
+        Ok((run_id, replacement))
     }
 
     async fn reserve(
@@ -3883,6 +4069,16 @@ impl ApprovalRegistry {
                         "approved action cannot be reserved",
                     ));
                 }
+                let mut consumed_request = record.request.clone();
+                let policy_version = consumed_request.policy_version().clone();
+                authorize_dispatch(
+                    &PolicyDecision::RequireApproval,
+                    action.action(),
+                    &policy_version,
+                    Some(&mut consumed_request),
+                    now,
+                )
+                .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
                 self.database
                     .reserve_execution(DispatchReservation::new(
                         attempt_id,
@@ -3894,6 +4090,7 @@ impl ApprovalRegistry {
                     ))
                     .await
                     .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+                record.request = consumed_request;
                 record.attempt_id = Some(attempt_id);
             }
         }
@@ -3910,10 +4107,9 @@ impl ApprovalPort for ApprovalRegistry {
     ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             let mut records = self.records.lock().await;
-            if let Some((approval_id, record)) = records
-                .iter_mut()
-                .find(|(_, record)| record.action.fingerprint() == action.fingerprint())
-            {
+            if let Some((approval_id, record)) = records.iter_mut().find(|(_, record)| {
+                !record.renewed && record.action.fingerprint() == action.fingerprint()
+            }) {
                 return match record.request.state() {
                     ApprovalState::Pending => Ok(ApprovalResolution::Pending(*approval_id)),
                     ApprovalState::Rejected => Ok(ApprovalResolution::Rejected(*approval_id)),
@@ -3949,6 +4145,7 @@ impl ApprovalPort for ApprovalRegistry {
                     action: action.clone(),
                     request,
                     attempt_id: None,
+                    renewed: false,
                 },
             );
             Ok(ApprovalResolution::Pending(approval_id))
@@ -3999,6 +4196,20 @@ impl AuditPort for DatabaseAudit {
 
 fn repository_service_error(error: lumen_db::RepositoryError) -> ServiceError {
     ServiceError::Internal(error.to_string())
+}
+
+fn approval_conflict(error: ApprovalError) -> ApprovalConflict {
+    match error {
+        ApprovalError::Expired => ApprovalConflict::Expired,
+        ApprovalError::AlreadyGranted | ApprovalError::Rejected => ApprovalConflict::AlreadyDecided,
+        ApprovalError::AlreadyConsumed => ApprovalConflict::Consumed,
+        ApprovalError::ActionFingerprintMismatch => ApprovalConflict::ActionChanged,
+        ApprovalError::PolicyVersionMismatch
+        | ApprovalError::Invalidated
+        | ApprovalError::InvalidDecisionTime
+        | ApprovalError::InvalidTimeRange
+        | ApprovalError::NotGranted => ApprovalConflict::Stale,
+    }
 }
 
 pub(crate) fn now() -> TimestampMillis {

@@ -16,15 +16,16 @@ use lumen_core::{
     egress::{DataClass, DestinationScope, ProviderId},
     extension::{PluginId, PluginVersion, Sha256Digest},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
+    run::{Clock, SystemClock},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
-    CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery,
-    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, JobActionCommand,
-    JobReviewQuery, PluginActionCommand, PluginDetailsQuery, PluginReviewQuery,
+    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, ApprovalRenewalCommand,
+    AuditQuery, CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand,
+    ChannelMappingQuery, CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery,
+    JobActionCommand, JobReviewQuery, PluginActionCommand, PluginDetailsQuery, PluginReviewQuery,
     ProviderPolicyCommand, ProviderPolicyQuery, ServiceError, ServiceIdentityCommand,
     ServiceIdentityQuery, SkillActionCommand, SkillReviewQuery,
 };
@@ -35,6 +36,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/decision",
             post(decide_approval),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/renew",
+            post(renew_approval),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/approvals",
@@ -638,9 +643,30 @@ async fn decide_approval(
     Ok(Json(result))
 }
 
+async fn renew_approval(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path((workspace, approval)): Path<(String, String)>,
+) -> Result<Json<crate::ApprovalRenewal>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let approval_id = parse_approval(&approval)?;
+    Ok(Json(
+        state
+            .service
+            .renew_approval(ApprovalRenewalCommand::new(
+                workspace_id,
+                approval_id,
+                actor,
+            ))
+            .await?,
+    ))
+}
+
 #[derive(Serialize)]
 struct ApprovalListResponse {
     approvals: Vec<crate::ApprovalPreview>,
+    server_time: lumen_core::approval::TimestampMillis,
 }
 
 async fn list_approvals(
@@ -654,7 +680,10 @@ async fn list_approvals(
         .service
         .list_approvals(ApprovalQuery::new(workspace_id, actor))
         .await?;
-    Ok(Json(ApprovalListResponse { approvals }))
+    Ok(Json(ApprovalListResponse {
+        approvals,
+        server_time: SystemClock.now(),
+    }))
 }
 
 async fn cancel_run(
@@ -931,6 +960,11 @@ impl IntoResponse for ApiError {
             Self::Service(ServiceError::Conflict(message)) => {
                 (StatusCode::CONFLICT, "conflict", message)
             }
+            Self::Service(ServiceError::ApprovalConflict(reason)) => (
+                StatusCode::CONFLICT,
+                reason.code(),
+                reason.message().to_owned(),
+            ),
             Self::Service(ServiceError::Unavailable(message)) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
             }

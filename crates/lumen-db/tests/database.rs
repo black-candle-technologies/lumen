@@ -609,6 +609,67 @@ async fn policy_denied_actions_transition_out_of_normalized_state() {
     ));
 }
 
+#[tokio::test]
+async fn pending_approval_listing_expires_due_rows_without_deleting_history() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let action = action();
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let approval = ApprovalRequest::new(
+        approval_id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(2_000),
+    )
+    .expect("approval");
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+
+    assert_eq!(
+        database
+            .list_pending_approvals(workspace_id(), TimestampMillis::new(1_999))
+            .await
+            .expect("pending before expiry")
+            .len(),
+        1
+    );
+    assert!(
+        database
+            .list_pending_approvals(workspace_id(), TimestampMillis::new(2_000))
+            .await
+            .expect("pending after expiry")
+            .is_empty()
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM approval_requests WHERE id = ?")
+        .bind(approval_id().to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("approval history");
+    assert_eq!(state, "expired");
+    let mut crossed_expiry = approval;
+    crossed_expiry
+        .grant(
+            PrincipalId::new("local", "admin").expect("valid principal"),
+            TimestampMillis::new(1_999),
+        )
+        .expect("decision began before expiry");
+    assert!(matches!(
+        database
+            .update_approval_decision(workspace_id(), &crossed_expiry)
+            .await,
+        Err(RepositoryError::ApprovalExpired)
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_consumption_and_execution_reservation_are_atomic() {
     let directory = tempdir().expect("temporary directory created");

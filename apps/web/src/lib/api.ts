@@ -24,6 +24,18 @@ export type Approval = {
 	secret_references?: Array<{ id: string; label: string; environment: string }>;
 };
 
+export type ApprovalList = {
+	approvals: Approval[];
+	server_time: number;
+};
+
+export type ApprovalRenewal = {
+	previous_approval_id: string;
+	approval_id: string;
+	run_id: string;
+	state: 'pending';
+};
+
 export type AuditEvent = {
 	sequence: number;
 	event_id: string;
@@ -272,9 +284,8 @@ export class ApiClient {
 		return this.request(`runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
 	}
 
-	async listApprovals(): Promise<Approval[]> {
-		const response = await this.request<{ approvals: Approval[] }>('approvals');
-		return response.approvals;
+	async listApprovals(): Promise<ApprovalList> {
+		return this.request('approvals');
 	}
 
 	async decideApproval(approvalId: string, decision: 'grant' | 'reject'): Promise<void> {
@@ -282,6 +293,10 @@ export class ApiClient {
 			method: 'POST',
 			body: JSON.stringify({ decision })
 		});
+	}
+
+	async renewApproval(approvalId: string): Promise<ApprovalRenewal> {
+		return this.request(`approvals/${encodeURIComponent(approvalId)}/renew`, { method: 'POST' });
 	}
 
 	async listAudit(after = 0, limit = 100): Promise<AuditEvent[]> {

@@ -71,6 +71,14 @@ pub enum RepositoryError {
     MissingAction,
     #[error("approval decision conflicts with its stored state or workspace")]
     ApprovalDecisionConflict,
+    #[error("approval decision uses a stale fingerprint or policy revision")]
+    ApprovalStale,
+    #[error("approval action changed after review")]
+    ApprovalActionChanged,
+    #[error("approval expired before the decision completed")]
+    ApprovalExpired,
+    #[error("approval was already consumed")]
+    ApprovalConsumed,
     #[error("run state is invalid: {0}")]
     InvalidRunState(String),
     #[error("execution attempt conflicts with its stored action or state")]

@@ -715,10 +715,13 @@ impl Database {
             "UPDATE approval_requests
              SET state = ?, decided_by_provider = ?, decided_by_subject = ?, decided_at = ?
              WHERE id = ? AND state = 'pending'
+               AND action_fingerprint = ?
+               AND policy_version = ?
                AND EXISTS (
                    SELECT 1 FROM actions
                    WHERE actions.id = approval_requests.action_id
                      AND actions.workspace_id = ?
+                     AND actions.fingerprint = approval_requests.action_fingerprint
                )",
         )
         .bind(approval.state().as_str())
@@ -726,10 +729,47 @@ impl Database {
         .bind(approver.subject())
         .bind(timestamp_to_i64(decided_at)?)
         .bind(approval.id().to_string())
+        .bind(approval.action_fingerprint().as_str())
+        .bind(approval.policy_version().as_str())
         .bind(workspace_id.to_string())
         .execute(&mut *transaction)
         .await?;
         if result.rows_affected() != 1 {
+            let current = sqlx::query(
+                "SELECT approval_requests.state,
+                        approval_requests.action_fingerprint AS approval_fingerprint,
+                        approval_requests.policy_version,
+                        actions.fingerprint AS action_fingerprint
+                 FROM approval_requests
+                 JOIN actions ON actions.id = approval_requests.action_id
+                 WHERE approval_requests.id = ? AND actions.workspace_id = ?",
+            )
+            .bind(approval.id().to_string())
+            .bind(workspace_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(current) = current {
+                match current.try_get::<String, _>("state")?.as_str() {
+                    "expired" => return Err(RepositoryError::ApprovalExpired),
+                    "consumed" => return Err(RepositoryError::ApprovalConsumed),
+                    "invalidated" => return Err(RepositoryError::ApprovalStale),
+                    "pending" => {
+                        if current.try_get::<String, _>("action_fingerprint")?
+                            != approval.action_fingerprint().as_str()
+                        {
+                            return Err(RepositoryError::ApprovalActionChanged);
+                        }
+                        if current.try_get::<String, _>("approval_fingerprint")?
+                            != approval.action_fingerprint().as_str()
+                            || current.try_get::<String, _>("policy_version")?
+                                != approval.policy_version().as_str()
+                        {
+                            return Err(RepositoryError::ApprovalStale);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             return Err(RepositoryError::ApprovalDecisionConflict);
         }
         transaction.commit().await?;
@@ -739,7 +779,9 @@ impl Database {
     pub async fn list_pending_approvals(
         &self,
         workspace_id: WorkspaceId,
+        now: TimestampMillis,
     ) -> Result<Vec<PendingApprovalView>, RepositoryError> {
+        self.expire_pending_approvals(workspace_id, now).await?;
         let rows = sqlx::query(
             "SELECT approvals.id AS approval_id, actions.run_id, actions.kind,
                     actions.arguments_json, actions.capabilities_json,
@@ -777,6 +819,24 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    pub async fn expire_pending_approvals(
+        &self,
+        workspace_id: WorkspaceId,
+        now: TimestampMillis,
+    ) -> Result<u64, RepositoryError> {
+        sqlx::query(
+            "UPDATE approval_requests SET state = 'expired'
+             WHERE state = 'pending' AND expires_at <= ?
+               AND action_id IN (SELECT id FROM actions WHERE workspace_id = ?)",
+        )
+        .bind(timestamp_to_i64(now)?)
+        .bind(workspace_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(Into::into)
     }
 
     pub async fn reserve_execution(

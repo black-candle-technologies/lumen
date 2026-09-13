@@ -19,6 +19,7 @@ test.beforeEach(async ({ page }) => {
 	await page.route('**/api/v1/workspaces/*/approvals', async (route) => {
 		await route.fulfill({
 			json: {
+				server_time: 1000,
 				approvals: [
 					{
 						approval_id: 'approval-write',
@@ -439,7 +440,7 @@ test('shows exact approval details and handles a changed action conflict', async
 	await page.route('**/approvals/approval-write/decision', async (route) => {
 		await route.fulfill({
 			status: 409,
-			json: { error: { code: 'conflict', message: 'action fingerprint changed' } }
+			json: { error: { code: 'approval_action_changed', message: 'action fingerprint changed' } }
 		});
 	});
 	await page.goto('/approvals');
@@ -465,7 +466,7 @@ test('shows exact approval details and handles a changed action conflict', async
 	}
 
 	await fileApproval.getByRole('button', { name: 'Grant approval' }).click();
-	await expect(page.getByText('Action changed. Review the refreshed request.')).toBeVisible();
+	await expect(page.getByText('The action changed. Refresh and review it again.')).toBeVisible();
 	await page.screenshot({ path: testInfo.outputPath('approval.png') });
 	const controls = fileApproval.locator('footer');
 	await controls.scrollIntoViewIfNeeded();
@@ -473,6 +474,59 @@ test('shows exact approval details and handles a changed action conflict', async
 	await expect(controls.getByRole('button', { name: 'Grant approval' })).toBeVisible();
 	expect(await controls.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
 	await page.screenshot({ path: testInfo.outputPath('approval-controls.png') });
+});
+
+test('expires an in-flight approval and renews it with disabled stale controls', async ({ page }) => {
+	let renewed = false;
+	await page.unroute('**/api/v1/workspaces/*/approvals');
+	await page.route('**/api/v1/workspaces/*/approvals', async (route) => {
+		await route.fulfill({
+			json: {
+				server_time: renewed ? 2100 : 1001,
+				approvals: [
+					{
+						approval_id: renewed ? 'approval-new' : 'approval-expiring',
+						run_id: 'run-expiring',
+						kind: 'process.spawn',
+						arguments: { program: '/bin/echo', args: ['hello'], environment: {} },
+						capabilities: [],
+						fingerprint: 'e'.repeat(64),
+						created_at: 1,
+						expires_at: renewed ? 62100 : 2000
+					}
+				]
+			}
+		});
+	});
+	await page.route('**/approvals/approval-expiring/decision', async (route) => {
+		await route.fulfill({
+			status: 409,
+			json: { error: { code: 'approval_expired', message: 'approval expired' } }
+		});
+	});
+	await page.route('**/approvals/approval-expiring/renew', async (route) => {
+		renewed = true;
+		await route.fulfill({
+			json: {
+				previous_approval_id: 'approval-expiring',
+				approval_id: 'approval-new',
+				run_id: 'run-expiring',
+				state: 'pending'
+			}
+		});
+	});
+
+	await page.goto('/approvals');
+	await page.getByRole('button', { name: 'Grant approval' }).click();
+	await expect(page.getByText('This approval expired before the decision completed. Renew it to review a new request.')).toBeVisible();
+	await expect(page.getByText('Expired')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Grant approval' })).toBeDisabled();
+	await expect(page.getByRole('button', { name: 'Reject approval' })).toBeDisabled();
+	await expect(page.getByText('0 pending')).toBeVisible();
+	await page.getByRole('button', { name: 'Renew approval' }).click();
+	await expect(page.getByText('1 pending')).toBeVisible();
+	await expect(page.getByText('Expires in 1m 0s')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Grant approval' })).toBeEnabled();
 });
 
 test('opens audit event details without losing the list', async ({ page }, testInfo) => {

@@ -2,6 +2,7 @@
 	import Check from '@lucide/svelte/icons/check';
 	import FilePenLine from '@lucide/svelte/icons/file-pen-line';
 	import KeyRound from '@lucide/svelte/icons/key-round';
+	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Terminal from '@lucide/svelte/icons/terminal';
 	import X from '@lucide/svelte/icons/x';
 
@@ -24,16 +25,25 @@
 
 	let {
 		approval,
+		now = 0,
 		onDecision,
+		onRenew = () => {},
 		busy = false
 	}: {
 		approval: Approval;
+		now?: number;
 		onDecision: (id: string, decision: 'grant' | 'reject') => void;
+		onRenew?: (id: string) => void;
 		busy?: boolean;
 	} = $props();
 
 	let filePreview = $derived(readFilePreview(approval));
 	let processPreview = $derived(readProcessPreview(approval));
+	let remainingSeconds = $derived(Math.max(0, Math.ceil((approval.expires_at - now) / 1000)));
+	let expired = $derived(remainingSeconds === 0);
+	let expiryLabel = $derived(expired
+		? 'Expired'
+		: `Expires in ${Math.floor(remainingSeconds / 60)}m ${remainingSeconds % 60}s`);
 
 	function object(value: JsonValue | undefined): JsonObject | undefined {
 		return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined;
@@ -115,9 +125,7 @@
 				<h2>{approval.kind}</h2>
 			</div>
 		</div>
-		<time datetime={new Date(approval.expires_at).toISOString()}>
-			Expires {new Date(approval.expires_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-		</time>
+		<time datetime={new Date(approval.expires_at).toISOString()}>{expiryLabel}</time>
 	</header>
 
 	{#if filePreview}
@@ -223,7 +231,7 @@
 		<button
 			class="secondary danger"
 			type="button"
-			disabled={busy}
+			disabled={busy || expired}
 			onclick={() => onDecision(approval.approval_id, 'reject')}
 			aria-label="Reject approval"
 		>
@@ -232,12 +240,17 @@
 		<button
 			class="primary"
 			type="button"
-			disabled={busy}
+			disabled={busy || expired}
 			onclick={() => onDecision(approval.approval_id, 'grant')}
 			aria-label="Grant approval"
 		>
 			<Check size={16} /> Grant
 		</button>
+		{#if expired}
+			<button class="primary" type="button" disabled={busy} onclick={() => onRenew(approval.approval_id)} aria-label="Renew approval">
+				<RefreshCw size={16} /> Renew approval
+			</button>
+		{/if}
 	</footer>
 </article>
 

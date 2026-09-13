@@ -269,6 +269,32 @@ impl RunState {
         self.pending_action.is_some()
     }
 
+    pub fn is_awaiting_approval(&self, approval_id: ApprovalId) -> bool {
+        self.terminal_outcome.is_none()
+            && self
+                .pending_action
+                .as_ref()
+                .is_some_and(|pending| pending.approval_id == approval_id)
+    }
+
+    pub fn renew_pending_approval(
+        &mut self,
+        previous: ApprovalId,
+        replacement: ApprovalId,
+    ) -> bool {
+        if self.terminal_outcome.is_some() {
+            return false;
+        }
+        let Some(pending) = self.pending_action.as_mut() else {
+            return false;
+        };
+        if pending.approval_id != previous {
+            return false;
+        }
+        pending.approval_id = replacement;
+        true
+    }
+
     pub const fn context(&self) -> &RunContext {
         &self.context
     }

@@ -198,12 +198,19 @@ impl ApprovalRequest {
         Ok(())
     }
 
+    pub fn expire(&mut self, now: TimestampMillis) -> bool {
+        if self.state == ApprovalState::Pending && now >= self.expires_at {
+            self.state = ApprovalState::Expired;
+            return true;
+        }
+        false
+    }
+
     fn ensure_pending(&mut self, now: TimestampMillis) -> Result<(), ApprovalError> {
         if now < self.created_at {
             return Err(ApprovalError::InvalidDecisionTime);
         }
-        if now >= self.expires_at {
-            self.state = ApprovalState::Expired;
+        if self.expire(now) {
             return Err(ApprovalError::Expired);
         }
 

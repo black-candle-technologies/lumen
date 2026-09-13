@@ -24,12 +24,48 @@ use crate::EventBroker;
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalConflict {
+    Expired,
+    Stale,
+    AlreadyDecided,
+    Consumed,
+    ActionChanged,
+    NotRenewable,
+}
+
+impl ApprovalConflict {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Expired => "approval_expired",
+            Self::Stale => "approval_stale",
+            Self::AlreadyDecided => "approval_already_decided",
+            Self::Consumed => "approval_consumed",
+            Self::ActionChanged => "approval_action_changed",
+            Self::NotRenewable => "approval_not_renewable",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Expired => "approval expired",
+            Self::Stale => "approval is stale",
+            Self::AlreadyDecided => "approval was already decided",
+            Self::Consumed => "approval was already consumed",
+            Self::ActionChanged => "action changed after approval review",
+            Self::NotRenewable => "approval is not eligible for renewal",
+        }
+    }
+}
+
 pub trait RuntimeService: Send + Sync {
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated>;
     fn decide_approval(
         &self,
         command: ApprovalDecisionCommand,
     ) -> ServiceFuture<'_, ApprovalResult>;
+    fn renew_approval(&self, command: ApprovalRenewalCommand)
+    -> ServiceFuture<'_, ApprovalRenewal>;
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>>;
     fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>>;
     fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation>;
@@ -1482,6 +1518,62 @@ pub struct ApprovalResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalRenewalCommand {
+    workspace_id: WorkspaceId,
+    approval_id: ApprovalId,
+    actor: PrincipalId,
+}
+
+impl ApprovalRenewalCommand {
+    pub const fn new(
+        workspace_id: WorkspaceId,
+        approval_id: ApprovalId,
+        actor: PrincipalId,
+    ) -> Self {
+        Self {
+            workspace_id,
+            approval_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn approval_id(&self) -> ApprovalId {
+        self.approval_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ApprovalRenewal {
+    previous_approval_id: ApprovalId,
+    approval_id: ApprovalId,
+    run_id: RunId,
+    state: &'static str,
+}
+
+impl ApprovalRenewal {
+    pub const fn new(
+        previous_approval_id: ApprovalId,
+        approval_id: ApprovalId,
+        run_id: RunId,
+    ) -> Self {
+        Self {
+            previous_approval_id,
+            approval_id,
+            run_id,
+            state: "pending",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalQuery {
     workspace_id: WorkspaceId,
     actor: PrincipalId,
@@ -1690,6 +1782,8 @@ pub enum ServiceError {
     NotFound,
     #[error("request conflicts with current runtime state: {0}")]
     Conflict(String),
+    #[error("approval request conflicts with current runtime state: {}", .0.message())]
+    ApprovalConflict(ApprovalConflict),
     #[error("runtime prerequisite is unavailable: {0}")]
     Unavailable(String),
     #[error("runtime service failed: {0}")]

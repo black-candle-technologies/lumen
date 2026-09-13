@@ -19,18 +19,18 @@ use lumen_core::{
     secret::SecretRefId,
 };
 use lumen_server::{
-    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
-    ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested,
-    CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery,
-    ChannelMappingReview, CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery,
-    DestinationPolicyReview, EventBroker, JobActionCommand, JobReview, JobReviewQuery,
-    PluginActionCommand, PluginActionRequested, PluginComponentReview, PluginDetailsQuery,
-    PluginFailureReview, PluginReviewQuery, PluginSettingReview, PluginVersionDetails,
-    PrincipalSummary, ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview,
-    RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceError,
-    ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery, ServiceIdentityReview,
-    SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
-    WorkflowCaptureDraftReview, WorkspaceModelPolicyReview, router,
+    ApiState, ApprovalConflict, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview,
+    ApprovalQuery, ApprovalRenewal, ApprovalRenewalCommand, ApprovalResult,
+    ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested, CancelRunCommand,
+    CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview,
+    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview,
+    EventBroker, JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand,
+    PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
+    PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
+    ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated,
+    RuntimeService, SandboxCapabilityReport, ServiceError, ServiceFuture, ServiceIdentityCommand,
+    ServiceIdentityQuery, ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery,
+    StagedPluginReview, WorkflowCaptureDraftReview, WorkspaceModelPolicyReview, router,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -41,6 +41,8 @@ const TOKEN: &str = "local-test-token";
 struct FakeService {
     run_commands: Mutex<Vec<CreateRunCommand>>,
     approval_commands: Mutex<Vec<ApprovalDecisionCommand>>,
+    approval_conflict: Mutex<Option<ApprovalConflict>>,
+    renewal_commands: Mutex<Vec<ApprovalRenewalCommand>>,
     audit_queries: Mutex<Vec<AuditQuery>>,
     audit_entries: Mutex<Vec<AuditEntry>>,
     approval_queries: Mutex<Vec<ApprovalQuery>>,
@@ -90,7 +92,31 @@ impl RuntimeService for FakeService {
             .lock()
             .expect("approval commands")
             .push(command);
-        Box::pin(async move { Ok(ApprovalResult::new(approval_id, decision)) })
+        let conflict = *self.approval_conflict.lock().expect("approval conflict");
+        Box::pin(async move {
+            match conflict {
+                Some(conflict) => Err(ServiceError::ApprovalConflict(conflict)),
+                None => Ok(ApprovalResult::new(approval_id, decision)),
+            }
+        })
+    }
+
+    fn renew_approval(
+        &self,
+        command: ApprovalRenewalCommand,
+    ) -> ServiceFuture<'_, ApprovalRenewal> {
+        let previous = command.approval_id();
+        self.renewal_commands
+            .lock()
+            .expect("renewal commands")
+            .push(command);
+        Box::pin(async move {
+            Ok(ApprovalRenewal::new(
+                previous,
+                ApprovalId::new(),
+                RunId::new(),
+            ))
+        })
     }
 
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>> {
@@ -1290,6 +1316,60 @@ async fn approval_grant_and_reject_are_forwarded_as_decisions_not_dispatches() {
 }
 
 #[tokio::test]
+async fn approval_conflicts_preserve_machine_readable_reasons() {
+    let workspace_id = WorkspaceId::new();
+    let approval_id = ApprovalId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    for (conflict, code) in [
+        (ApprovalConflict::Expired, "approval_expired"),
+        (ApprovalConflict::Stale, "approval_stale"),
+        (ApprovalConflict::AlreadyDecided, "approval_already_decided"),
+        (ApprovalConflict::Consumed, "approval_consumed"),
+        (ApprovalConflict::ActionChanged, "approval_action_changed"),
+    ] {
+        *service.approval_conflict.lock().expect("approval conflict") = Some(conflict);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                format!("/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/decision"),
+                Body::from(r#"{"decision":"grant"}"#),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(response).await["error"]["code"], code);
+    }
+}
+
+#[tokio::test]
+async fn approval_renewal_is_scoped_and_attributed() {
+    let workspace_id = WorkspaceId::new();
+    let approval_id = ApprovalId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/renew"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["previous_approval_id"], approval_id.to_string());
+    assert_eq!(body["state"], "pending");
+    assert!(body["approval_id"].as_str().is_some());
+    let commands = service.renewal_commands.lock().expect("renewal commands");
+    assert_eq!(commands[0].workspace_id(), workspace_id);
+    assert_eq!(commands[0].approval_id(), approval_id);
+    assert_eq!(commands[0].actor().subject(), "operator");
+}
+
+#[tokio::test]
 async fn sse_replays_events_after_last_event_id() {
     let workspace_id = WorkspaceId::new();
     let run_id = RunId::new();
@@ -1434,6 +1514,7 @@ async fn approval_listing_returns_exact_action_previews() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
+    assert!(body["server_time"].as_u64().is_some());
     assert_eq!(body["approvals"][0]["kind"], "process.spawn");
     assert_eq!(body["approvals"][0]["arguments"]["program"], "/bin/echo");
     assert_eq!(body["approvals"][0]["fingerprint"], "a".repeat(64));

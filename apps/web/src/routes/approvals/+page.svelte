@@ -9,14 +9,22 @@
 	let loading = $state(true);
 	let busyId = $state('');
 	let error = $state('');
+	let serverNow = $state(0);
+	let pendingCount = $derived(approvals.filter((approval) => approval.expires_at > serverNow).length);
 
-	onMount(load);
+	onMount(() => {
+		load();
+		const timer = setInterval(() => serverNow += 1000, 1000);
+		return () => clearInterval(timer);
+	});
 
 	async function load() {
 		if (!isConfigured($connection)) { loading = false; return; }
 		loading = true;
 		try {
-			approvals = await new ApiClient($connection).listApprovals();
+			const response = await new ApiClient($connection).listApprovals();
+			approvals = response.approvals;
+			serverNow = response.server_time;
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Approval requests could not be loaded.';
@@ -31,16 +39,37 @@
 			error = '';
 		} catch (cause) {
 			if (cause instanceof ApiError && cause.status === 409) {
-				await load();
-				error = 'Action changed. Review the refreshed request.';
+				if (cause.code !== 'approval_expired') await load();
+				error = conflictMessage(cause);
 			} else error = cause instanceof ApiError ? cause.message : 'Approval decision failed.';
 		} finally { busyId = ''; }
+	}
+
+	async function renew(id: string) {
+		busyId = id;
+		try {
+			await new ApiClient($connection).renewApproval(id);
+			await load();
+		} catch (cause) {
+			error = cause instanceof ApiError ? cause.message : 'Approval renewal failed.';
+		} finally { busyId = ''; }
+	}
+
+	function conflictMessage(cause: ApiError): string {
+		switch (cause.code) {
+			case 'approval_expired': return 'This approval expired before the decision completed. Renew it to review a new request.';
+			case 'approval_stale': return 'This approval is stale. Refresh and review the current request.';
+			case 'approval_already_decided': return 'This approval was already decided.';
+			case 'approval_consumed': return 'This approval was already used.';
+			case 'approval_action_changed': return 'The action changed. Refresh and review it again.';
+			default: return cause.message;
+		}
 	}
 </script>
 
 <section class="page">
 	<header class="page-heading">
-		<div><h1>Approvals</h1><p>{approvals.length} pending</p></div>
+		<div><h1>Approvals</h1><p>{pendingCount} pending</p></div>
 		<button class="icon-button" type="button" aria-label="Refresh approvals" title="Refresh" onclick={load} disabled={loading}><RefreshCw size={17} /></button>
 	</header>
 	{#if error}<div class="notice error">{error}</div>{/if}
@@ -51,7 +80,7 @@
 	{:else}
 		<div class="approval-list">
 			{#each approvals as approval (approval.approval_id)}
-				<ApprovalItem {approval} onDecision={decide} busy={busyId === approval.approval_id} />
+				<ApprovalItem {approval} now={serverNow} onDecision={decide} onRenew={renew} busy={busyId === approval.approval_id} />
 			{/each}
 		</div>
 	{/if}

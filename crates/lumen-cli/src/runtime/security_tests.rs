@@ -278,7 +278,13 @@ struct Harness {
 
 impl Harness {
     async fn new(model: &MockServer, prepare_workspace: impl FnOnce(&std::path::Path)) -> Self {
-        Self::new_inner(model, prepare_workspace, None, None, None)
+        Self::new_inner(model, prepare_workspace, None, None, None, None)
+            .await
+            .0
+    }
+
+    async fn new_with_approval_ttl(model: &MockServer, approval_ttl_seconds: u64) -> Self {
+        Self::new_inner(model, |_| {}, None, None, None, Some(approval_ttl_seconds))
             .await
             .0
     }
@@ -293,6 +299,7 @@ impl Harness {
             model,
             prepare_workspace,
             Some((max_wall_time_seconds, max_captured_result_bytes)),
+            None,
             None,
             None,
         )
@@ -311,6 +318,7 @@ impl Harness {
             None,
             None,
             Some(RecordingSandbox::new().with_plugin_response(response)),
+            None,
         )
         .await
         .0
@@ -321,7 +329,7 @@ impl Harness {
         prepare_workspace: impl FnOnce(&std::path::Path),
         sandbox: RecordingSandbox,
     ) -> Self {
-        Self::new_inner(model, prepare_workspace, None, None, Some(sandbox))
+        Self::new_inner(model, prepare_workspace, None, None, Some(sandbox), None)
             .await
             .0
     }
@@ -331,12 +339,12 @@ impl Harness {
         setup: SecretSetup,
     ) -> (Self, SecretReference, Arc<InMemorySecretStore>) {
         let (harness, reference, store) =
-            Self::new_inner(model, |_| {}, None, Some(setup), None).await;
+            Self::new_inner(model, |_| {}, None, Some(setup), None, None).await;
         (harness, reference.expect("secret reference"), store)
     }
 
     async fn new_with_cancellable_process(model: &MockServer) -> Self {
-        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None, None, None).await;
+        let (mut harness, _, _) = Self::new_inner(model, |_| {}, None, None, None, None).await;
         let sandbox = RecordingSandbox::new().waiting_for_cancellation();
         let config = Config::parse(&format!(
             r#"
@@ -406,6 +414,7 @@ subject = "operator"
         runtime_limits: Option<(u64, usize)>,
         secret: Option<SecretSetup>,
         sandbox_override: Option<RecordingSandbox>,
+        approval_ttl_seconds: Option<u64>,
     ) -> (Self, Option<SecretReference>, Arc<InMemorySecretStore>) {
         let directory = tempfile::tempdir().expect("temporary runtime");
         let workspace = directory.path().join("workspace");
@@ -415,7 +424,7 @@ subject = "operator"
         let runtime_limits = runtime_limits.map_or_else(String::new, |(wall_time, captured)| {
             format!("max_wall_time_seconds = {wall_time}\nmax_captured_result_bytes = {captured}")
         });
-        let config = Config::parse(&format!(
+        let mut config = Config::parse(&format!(
             r#"
 [database]
 path = "ignored.sqlite3"
@@ -448,6 +457,9 @@ subject = "operator"
             path_toml(&workspace)
         ))
         .expect("security config");
+        if let Some(approval_ttl_seconds) = approval_ttl_seconds {
+            config.runtime.approval_ttl_seconds = approval_ttl_seconds;
+        }
         let database = Database::connect_in_memory().await.expect("database");
         database
             .bootstrap_workspace(
@@ -601,7 +613,7 @@ subject = "operator"
         for _ in 0..100 {
             let approvals = self
                 .database
-                .list_pending_approvals(self.workspace_id)
+                .list_pending_approvals(self.workspace_id, now())
                 .await
                 .expect("pending approvals");
             if let Some(approval) = approvals.first() {
@@ -4475,7 +4487,7 @@ subject = "operator"
         .expect("request");
     let approval = loop {
         let pending = database
-            .list_pending_approvals(config.workspace_id())
+            .list_pending_approvals(config.workspace_id(), now())
             .await
             .expect("pending approvals");
         if let Some(approval) = pending.first() {
@@ -5620,7 +5632,124 @@ async fn known_secrets_in_model_actions_are_rejected_before_persistence() {
 }
 
 #[tokio::test]
-async fn approval_policy_mutation_and_replay_never_dispatch_twice() {
+async fn expired_approval_is_hidden_and_can_be_renewed_without_losing_history() {
+    let model = MockServer::start().await;
+    let turn = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turn = Arc::clone(&turn);
+            move |_request: &MockRequest| {
+                if turn.fetch_add(1, Ordering::SeqCst) == 0 {
+                    action_response(
+                        "process.spawn",
+                        serde_json::json!({"program":test_program_string(),"args":["hello"],"environment":{}}),
+                    )
+                } else {
+                    final_response("done")
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new_with_approval_ttl(&model, 1).await;
+    harness.create_run("run echo").await;
+    let previous = harness.pending_approval_id().await;
+    let fingerprint: String =
+        sqlx::query_scalar("SELECT action_fingerprint FROM approval_requests WHERE id = ?")
+            .bind(&previous)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("approval fingerprint");
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let listed = harness.request("GET", "approvals", "").await;
+    let listed: serde_json::Value = serde_json::from_slice(
+        &listed
+            .into_body()
+            .collect()
+            .await
+            .expect("list body")
+            .to_bytes(),
+    )
+    .expect("list JSON");
+    assert_eq!(listed["approvals"].as_array().map(Vec::len), Some(0));
+    assert!(listed["server_time"].as_u64().is_some());
+
+    let expired = harness
+        .request(
+            "POST",
+            &format!("approvals/{previous}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(expired.status(), StatusCode::CONFLICT);
+    let expired: serde_json::Value = serde_json::from_slice(
+        &expired
+            .into_body()
+            .collect()
+            .await
+            .expect("error body")
+            .to_bytes(),
+    )
+    .expect("error JSON");
+    assert_eq!(expired["error"]["code"], "approval_expired");
+
+    let renewed = harness
+        .request("POST", &format!("approvals/{previous}/renew"), "")
+        .await;
+    assert_eq!(renewed.status(), StatusCode::OK);
+    let renewed: serde_json::Value = serde_json::from_slice(
+        &renewed
+            .into_body()
+            .collect()
+            .await
+            .expect("renew body")
+            .to_bytes(),
+    )
+    .expect("renew JSON");
+    let replacement = renewed["approval_id"]
+        .as_str()
+        .expect("replacement approval")
+        .to_owned();
+    assert_ne!(replacement, previous);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, state, action_fingerprint FROM approval_requests WHERE id IN (?, ?) ORDER BY created_at",
+    )
+    .bind(&previous)
+    .bind(&replacement)
+    .fetch_all(harness.database.pool())
+    .await
+    .expect("approval history");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|(id, state, stored)| id == &previous
+        && state == "expired"
+        && stored == &fingerprint));
+    assert!(rows.iter().any(|(id, state, stored)| id == &replacement
+        && state == "pending"
+        && stored == &fingerprint));
+
+    let duplicate = harness
+        .request("POST", &format!("approvals/{previous}/renew"), "")
+        .await;
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    let granted = harness
+        .request(
+            "POST",
+            &format!("approvals/{replacement}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    harness
+        .wait_for_audit(AuditEventKind::ExecutionSucceeded)
+        .await;
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 1);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn approval_revision_and_action_mutations_return_distinct_conflicts() {
     let model = MockServer::start().await;
     let turn = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -5645,7 +5774,7 @@ async fn approval_policy_mutation_and_replay_never_dispatch_twice() {
     let approval_id = loop {
         let approvals = harness
             .database
-            .list_pending_approvals(harness.workspace_id)
+            .list_pending_approvals(harness.workspace_id, now())
             .await
             .expect("pending approvals");
         if let Some(approval) = approvals.first() {
@@ -5654,6 +5783,12 @@ async fn approval_policy_mutation_and_replay_never_dispatch_twice() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
 
+    let policy_version: String =
+        sqlx::query_scalar("SELECT policy_version FROM approval_requests WHERE id = ?")
+            .bind(&approval_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("policy version");
     sqlx::query("UPDATE approval_requests SET policy_version = 'tampered' WHERE id = ?")
         .bind(&approval_id)
         .execute(harness.database.pool())
@@ -5666,18 +5801,61 @@ async fn approval_policy_mutation_and_replay_never_dispatch_twice() {
             r#"{"decision":"grant"}"#,
         )
         .await;
-    assert_eq!(first.status(), StatusCode::OK);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(first.status(), StatusCode::CONFLICT);
+    let first: serde_json::Value = serde_json::from_slice(
+        &first
+            .into_body()
+            .collect()
+            .await
+            .expect("error body")
+            .to_bytes(),
+    )
+    .expect("error JSON");
+    assert_eq!(first["error"]["code"], "approval_stale");
 
-    let replay = harness
+    sqlx::query("UPDATE approval_requests SET policy_version = ? WHERE id = ?")
+        .bind(policy_version)
+        .bind(&approval_id)
+        .execute(harness.database.pool())
+        .await
+        .expect("approval revision restored");
+    let mut connection = harness.database.pool().acquire().await.expect("connection");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .expect("foreign key check disabled for corruption fixture");
+    sqlx::query(
+        "UPDATE actions SET fingerprint = ? WHERE id = (SELECT action_id FROM approval_requests WHERE id = ?)",
+    )
+    .bind("d".repeat(64))
+    .bind(&approval_id)
+    .execute(&mut *connection)
+    .await
+    .expect("action mutated");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await
+        .expect("foreign key check restored");
+    drop(connection);
+    let changed = harness
         .request(
             "POST",
             &format!("approvals/{approval_id}/decision"),
             r#"{"decision":"grant"}"#,
         )
         .await;
-    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert_eq!(changed.status(), StatusCode::CONFLICT);
+    let changed: serde_json::Value = serde_json::from_slice(
+        &changed
+            .into_body()
+            .collect()
+            .await
+            .expect("error body")
+            .to_bytes(),
+    )
+    .expect("error JSON");
+    assert_eq!(changed["error"]["code"], "approval_action_changed");
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 0);
     let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
         .fetch_one(harness.database.pool())
         .await
@@ -5712,7 +5890,7 @@ async fn granted_approval_dispatches_once_and_http_replay_is_rejected() {
     let approval_id = loop {
         let approvals = harness
             .database
-            .list_pending_approvals(harness.workspace_id)
+            .list_pending_approvals(harness.workspace_id, now())
             .await
             .expect("pending approvals");
         if let Some(approval) = approvals.first() {
@@ -5742,6 +5920,16 @@ async fn granted_approval_dispatches_once_and_http_replay_is_rejected() {
         )
         .await;
     assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let replay: serde_json::Value = serde_json::from_slice(
+        &replay
+            .into_body()
+            .collect()
+            .await
+            .expect("replay body")
+            .to_bytes(),
+    )
+    .expect("replay JSON");
+    assert_eq!(replay["error"]["code"], "approval_consumed");
     let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
         .fetch_one(harness.database.pool())
         .await
@@ -5785,7 +5973,7 @@ async fn approved_file_write_uses_the_one_shot_runtime_dispatch_path() {
     let approval_id = loop {
         let approvals = harness
             .database
-            .list_pending_approvals(harness.workspace_id)
+            .list_pending_approvals(harness.workspace_id, now())
             .await
             .expect("pending approvals");
         if let Some(approval) = approvals.first() {
@@ -6156,7 +6344,7 @@ async fn another_workspaces_secret_reference_is_denied_before_approval() {
     assert!(
         harness
             .database
-            .list_pending_approvals(harness.workspace_id)
+            .list_pending_approvals(harness.workspace_id, now())
             .await
             .expect("pending approvals")
             .is_empty()
