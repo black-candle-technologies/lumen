@@ -39,8 +39,8 @@ use lumen_integrations::{
     secrets::{InMemorySecretStore, SecretStore},
 };
 use lumen_server::{
-    ApiState, ApprovalDecision, ApprovalDecisionCommand, EventBroker, RuntimeService,
-    SandboxCapabilityReport, router,
+    ApiState, ApprovalDecision, ApprovalDecisionCommand, CreateRunCommand, EventBroker,
+    RuntimeService, SandboxCapabilityReport, router,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -269,6 +269,7 @@ struct SecretSetup {
 struct Harness {
     _directory: TempDir,
     app: axum::Router,
+    events: EventBroker,
     service: Arc<LocalRuntimeService>,
     database: Database,
     sandbox: RecordingSandbox,
@@ -379,7 +380,7 @@ subject = "operator"
         );
         let state = ApiState::new(
             service.clone(),
-            events,
+            events.clone(),
             TOKEN,
             config.bootstrap_principal(),
             BTreeSet::from([config.workspace_id()]),
@@ -393,6 +394,7 @@ subject = "operator"
         .expect("API state");
         harness.service.shutdown().await;
         harness.app = router(state);
+        harness.events = events;
         harness.service = service;
         harness.sandbox = sandbox;
         harness
@@ -512,7 +514,7 @@ subject = "operator"
         );
         let state = ApiState::new(
             service.clone(),
-            events,
+            events.clone(),
             TOKEN,
             config.bootstrap_principal(),
             BTreeSet::from([config.workspace_id()]),
@@ -528,6 +530,7 @@ subject = "operator"
             Self {
                 _directory: directory,
                 app: router(state),
+                events,
                 service,
                 database,
                 sandbox,
@@ -1110,7 +1113,7 @@ subject = "operator"
     );
     let state = ApiState::new(
         service.clone(),
-        events,
+        events.clone(),
         TOKEN,
         config.bootstrap_principal(),
         BTreeSet::from([config.workspace_id()]),
@@ -1125,6 +1128,7 @@ subject = "operator"
     let harness = Harness {
         _directory: directory,
         app: router(state),
+        events,
         service,
         database,
         sandbox: RecordingSandbox::new(),
@@ -5344,6 +5348,205 @@ async fn cancellation_stops_an_in_flight_model_request_and_is_audited() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_an_active_run_and_rejects_new_work() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        final_response("too late").set_delay(Duration::from_secs(5)),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("slow request").await;
+    for _ in 0..100 {
+        if !model
+            .received_requests()
+            .await
+            .expect("model requests")
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), harness.service.shutdown())
+        .await
+        .expect("bounded shutdown");
+
+    let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("run state");
+    assert_eq!(state, "cancelled");
+    let error = harness
+        .service
+        .create_run(CreateRunCommand::new(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+            "late request".into(),
+        ))
+        .await
+        .expect_err("new work is rejected");
+    assert!(matches!(error, lumen_server::ServiceError::Unavailable(_)));
+    assert!(matches!(
+        harness
+            .service
+            .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+            .await,
+        Err(lumen_server::ServiceError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn shutdown_terminalizes_a_run_waiting_for_approval() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "process.spawn",
+            serde_json::json!({
+                "program": test_program_string(),
+                "args": ["waiting"],
+                "environment": {}
+            }),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("wait for approval").await;
+    wait_for_run_state(&harness, &run_id, "awaiting_approval").await;
+
+    tokio::time::timeout(Duration::from_secs(1), harness.service.shutdown())
+        .await
+        .expect("bounded shutdown");
+
+    let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("run state");
+    assert_eq!(state, "cancelled");
+}
+
+#[tokio::test]
+async fn forced_shutdown_marks_an_unresponsive_run_failed() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = RunId::new();
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    harness
+        .database
+        .create_run(run_id, harness.workspace_id, &actor, now())
+        .await
+        .expect("run");
+    harness
+        .database
+        .update_run_state(run_id, "running", None)
+        .await
+        .expect("running run");
+    harness
+        .service
+        .cancellations
+        .lock()
+        .await
+        .insert(run_id, tokio_util::sync::CancellationToken::new());
+    harness
+        .service
+        .run_workspaces
+        .lock()
+        .await
+        .insert(run_id, harness.workspace_id);
+    harness
+        .service
+        .tasks
+        .lock()
+        .await
+        .push(tokio::spawn(std::future::pending()));
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .service
+            .shutdown_with_timeout(Duration::from_millis(20)),
+    )
+    .await
+    .expect("forced shutdown deadline");
+
+    let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("run state");
+    assert_eq!(state, "failed");
+    harness
+        .wait_for_audit(AuditEventKind::RunReconciliationRequired)
+        .await;
+}
+
+#[tokio::test]
+async fn server_shutdown_closes_active_sse_and_releases_listener() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let address = listener.local_addr().expect("listener address");
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(crate::serve_listener_until_shutdown(
+        listener,
+        harness.app.clone(),
+        harness.events.clone(),
+        harness.service.clone(),
+        async move {
+            let _ = stopped.await;
+        },
+    ));
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("server connection");
+    stream
+        .write_all(
+            format!(
+                "GET /api/v1/workspaces/{}/runs/{}/events HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n",
+                harness.workspace_id,
+                RunId::new()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("SSE request");
+    let mut headers = vec![0_u8; 1024];
+    let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut headers))
+        .await
+        .expect("SSE response deadline")
+        .expect("SSE response");
+    assert!(String::from_utf8_lossy(&headers[..read]).contains("200 OK"));
+
+    stop.send(()).expect("shutdown signal");
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("bounded server shutdown")
+        .expect("server task")
+        .expect("server shutdown");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if stream.read(&mut headers).await.expect("SSE close") == 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("SSE close deadline");
+    drop(stream);
+    tokio::net::TcpListener::bind(address)
+        .await
+        .expect("listener port released");
+}
+
+#[tokio::test]
 async fn known_bootstrap_secrets_are_redacted_from_streamed_model_output() {
     let model = MockServer::start().await;
     mount_response(&model, final_response(&format!("echoed {TOKEN}"))).await;
@@ -6021,4 +6224,51 @@ async fn run_cancellation_reaches_an_executing_process_and_persists_cancelled() 
     assert_eq!(attempt_state, "cancelled");
     assert_eq!(run_state, "cancelled");
     harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_reaches_an_executing_process_and_persists_cancelled() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "process.spawn",
+            serde_json::json!({"program":test_program_string(),"args":["waiting"]}),
+        ),
+    )
+    .await;
+    let harness = Harness::new_with_cancellable_process(&model).await;
+    let run_id = harness.create_run("start a cancellable process").await;
+    let approval_id = harness.pending_approval_id().await;
+    let granted = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    for _ in 0..100 {
+        if harness.sandbox.calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.sandbox.calls.load(Ordering::SeqCst), 1);
+
+    tokio::time::timeout(Duration::from_secs(1), harness.service.shutdown())
+        .await
+        .expect("bounded shutdown");
+
+    let attempt_state: String = sqlx::query_scalar("SELECT state FROM execution_attempts LIMIT 1")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt state");
+    let run_state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("run state");
+    assert_eq!(attempt_state, "cancelled");
+    assert_eq!(run_state, "cancelled");
 }

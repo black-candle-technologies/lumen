@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -110,6 +113,7 @@ pub(crate) struct LocalRuntimeService {
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     scheduler_cancellation: CancellationToken,
+    shutting_down: Arc<AtomicBool>,
     redactor: Arc<SecretRedactor>,
 }
 
@@ -289,6 +293,7 @@ impl LocalRuntimeService {
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             scheduler_cancellation: CancellationToken::new(),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             redactor,
         };
         service
@@ -300,13 +305,24 @@ impl LocalRuntimeService {
     }
 
     async fn spawn_advance(&self, run_id: RunId) {
+        let mut tasks = self.tasks.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         let handle = tokio::spawn(self.clone().advance(run_id));
-        self.tasks.lock().await.push(handle);
+        tasks.push(handle);
     }
 
     async fn spawn_scheduler_loop(&self) {
         let handle = tokio::spawn(self.clone().scheduled_job_loop());
         self.tasks.lock().await.push(handle);
+    }
+
+    fn ensure_accepting_work(&self) -> Result<(), ServiceError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
+        Ok(())
     }
 
     async fn scheduled_job_loop(self) {
@@ -331,6 +347,7 @@ impl LocalRuntimeService {
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
+        self.ensure_accepting_work()?;
         let mut created = self.recover_scheduled_run_handoffs(timestamp).await?;
         let due = self
             .database
@@ -675,10 +692,11 @@ impl LocalRuntimeService {
     async fn install_and_spawn_run(&self, run_id: RunId, stored: StoredRun) {
         let workspace_id = stored.workspace_id;
         self.runs.lock().await.insert(run_id, stored);
-        self.cancellations
-            .lock()
-            .await
-            .insert(run_id, CancellationToken::new());
+        let cancellation = CancellationToken::new();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            cancellation.cancel();
+        }
+        self.cancellations.lock().await.insert(run_id, cancellation);
         self.run_workspaces
             .lock()
             .await
@@ -775,6 +793,7 @@ impl LocalRuntimeService {
         run_id: RunId,
         actor: lumen_core::identity::PrincipalId,
     ) -> Result<uuid::Uuid, ServiceError> {
+        self.ensure_accepting_work()?;
         self.database.verify_audit_chain().await.map_err(|error| {
             ServiceError::Conflict(format!("audit chain does not verify: {error}"))
         })?;
@@ -851,9 +870,56 @@ impl LocalRuntimeService {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.shutdown_with_timeout(Duration::from_secs(5)).await;
+    }
+
+    pub(crate) async fn drain_submitted_work(&self) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.scheduler_cancellation.cancel();
         let mut tasks = std::mem::take(&mut *self.tasks.lock().await);
-        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            for task in &mut tasks {
+                let _ = task.await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            for task in tasks {
+                if !task.is_finished() {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
+    }
+
+    async fn shutdown_with_timeout(&self, drain_timeout: Duration) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.scheduler_cancellation.cancel();
+        for cancellation in self.cancellations.lock().await.values() {
+            cancellation.cancel();
+        }
+        let waiting = {
+            let mut runs = self.runs.lock().await;
+            runs.iter_mut()
+                .map(|(run_id, stored)| {
+                    stored.state.cancel();
+                    *run_id
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().await);
+        tasks.extend(
+            waiting
+                .into_iter()
+                .map(|run_id| tokio::spawn(self.clone().advance(run_id))),
+        );
+        let completed = tokio::time::timeout(drain_timeout, async {
             for task in &mut tasks {
                 let _ = task.await;
             }
@@ -862,9 +928,46 @@ impl LocalRuntimeService {
         .is_ok();
         if !completed {
             for task in tasks {
+                if task.is_finished() {
+                    continue;
+                }
                 task.abort();
                 let _ = task.await;
             }
+        }
+        let remaining = self.run_workspaces.lock().await.clone();
+        if !remaining.is_empty() {
+            eprintln!(
+                "event=runtime_shutdown_forced remaining_runs={}",
+                remaining.len()
+            );
+        }
+        for (run_id, workspace_id) in remaining {
+            match self
+                .database
+                .force_fail_run_on_shutdown(run_id, now())
+                .await
+            {
+                Ok(true) => {
+                    self.record_run_reconciliation_required(
+                        workspace_id,
+                        run_id,
+                        "shutdown_forced",
+                        &"graceful drain deadline exceeded",
+                        now(),
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "event=runtime_shutdown_forced run_id={run_id} diagnostic={:?}",
+                        self.bounded_diagnostic(&error)
+                    );
+                }
+            }
+            self.runs.lock().await.remove(&run_id);
+            self.finish_run(run_id).await;
         }
     }
 
@@ -1200,6 +1303,7 @@ impl LocalRuntimeService {
         proposal: ActionProposal,
         capabilities: CapabilitySet,
     ) -> Result<RunId, ServiceError> {
+        self.ensure_accepting_work()?;
         let run_id = RunId::new();
         self.database
             .create_run(run_id, workspace_id, &actor, now())
@@ -1220,10 +1324,11 @@ impl LocalRuntimeService {
                 scheduled_handoff: None,
             },
         );
-        self.cancellations
-            .lock()
-            .await
-            .insert(run_id, CancellationToken::new());
+        let cancellation = CancellationToken::new();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            cancellation.cancel();
+        }
+        self.cancellations.lock().await.insert(run_id, cancellation);
         self.run_workspaces
             .lock()
             .await
@@ -1381,6 +1486,7 @@ impl RuntimeService for LocalRuntimeService {
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated> {
         let service = self.clone();
         Box::pin(async move {
+            service.ensure_accepting_work()?;
             let run_id = RunId::new();
             service
                 .database
@@ -1407,11 +1513,15 @@ impl RuntimeService for LocalRuntimeService {
                     scheduled_handoff: None,
                 },
             );
+            let cancellation = CancellationToken::new();
+            if service.shutting_down.load(Ordering::SeqCst) {
+                cancellation.cancel();
+            }
             service
                 .cancellations
                 .lock()
                 .await
-                .insert(run_id, CancellationToken::new());
+                .insert(run_id, cancellation);
             service
                 .run_workspaces
                 .lock()
@@ -1437,6 +1547,7 @@ impl RuntimeService for LocalRuntimeService {
     ) -> ServiceFuture<'_, ApprovalResult> {
         let service = self.clone();
         Box::pin(async move {
+            service.ensure_accepting_work()?;
             let (run_id, result) = service.approvals.decide(&command, now()).await?;
             service
                 .events

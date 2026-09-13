@@ -528,6 +528,48 @@ impl Database {
         Ok(())
     }
 
+    pub async fn force_fail_run_on_shutdown(
+        &self,
+        run_id: lumen_core::action::RunId,
+        completed_at: TimestampMillis,
+    ) -> Result<bool, RepositoryError> {
+        let completed_at = timestamp_to_i64(completed_at)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(state) = state else {
+            return Err(RepositoryError::ExecutionStateConflict);
+        };
+        let active = matches!(state.as_str(), "created" | "running" | "awaiting_approval");
+        if active {
+            let updated = sqlx::query(
+                "UPDATE agent_runs SET state = 'failed', completed_at = ?
+                 WHERE id = ? AND state IN ('created', 'running', 'awaiting_approval')",
+            )
+            .bind(completed_at)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if updated != 1 {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+        }
+        let occurrence = sqlx::query(
+            "UPDATE scheduled_job_runs SET state = 'unknown', updated_at = ?
+             WHERE run_id = ? AND state = 'running'",
+        )
+        .bind(completed_at)
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        Ok(active || occurrence == 1)
+    }
+
     pub async fn insert_workspace(
         &self,
         id: WorkspaceId,

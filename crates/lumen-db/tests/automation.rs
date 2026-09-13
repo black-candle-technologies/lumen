@@ -746,6 +746,66 @@ async fn scheduled_terminalization_rolls_back_both_records_on_write_failure() {
 }
 
 #[tokio::test]
+async fn forced_shutdown_marks_active_scheduled_work_unknown() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let job = database
+        .latest_scheduled_job_revision(job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+    let lease = Uuid::new_v4();
+    let run_id = RunId::new();
+    database
+        .claim_job_occurrence(
+            &key,
+            lease,
+            TimestampMillis::new(2_100),
+            TimestampMillis::new(3_000),
+        )
+        .await
+        .expect("claim");
+    database
+        .persist_scheduled_run_handoff(&job, &key, lease, run_id, None, TimestampMillis::new(2_200))
+        .await
+        .expect("handoff");
+    database
+        .start_scheduled_run(
+            &key,
+            lease,
+            run_id,
+            TimestampMillis::new(2_300),
+            TimestampMillis::new(4_000),
+        )
+        .await
+        .expect("start");
+
+    assert!(
+        database
+            .force_fail_run_on_shutdown(run_id, TimestampMillis::new(2_400))
+            .await
+            .expect("forced shutdown")
+    );
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("shutdown states");
+    assert_eq!(states, ("failed".into(), "unknown".into()));
+    assert!(
+        !database
+            .force_fail_run_on_shutdown(run_id, TimestampMillis::new(2_500))
+            .await
+            .expect("idempotent shutdown")
+    );
+}
+
+#[tokio::test]
 async fn scheduled_handoff_rechecks_job_and_service_after_claim() {
     for change in ["new-revision", "service-disabled"] {
         let database = database().await;

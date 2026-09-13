@@ -4,6 +4,7 @@ mod runtime;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::{Future, IntoFuture},
     io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -28,6 +29,7 @@ use lumen_integrations::{
 use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
 use sha2::Digest as _;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 fn relative_storage_path(path: &Path) -> Option<String> {
     let segments = path
@@ -402,7 +404,7 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            service.shutdown().await;
+            service.drain_submitted_work().await;
             CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
         }
         command => {
@@ -431,7 +433,7 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            service.shutdown().await;
+            service.drain_submitted_work().await;
             CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
         }
     };
@@ -772,19 +774,68 @@ async fn serve(
     );
     let state = ApiState::new(
         service.clone(),
-        events,
+        events.clone(),
         token,
         config.bootstrap_principal(),
         BTreeSet::from([config.workspace_id()]),
         api_sandbox_report(&sandbox.report()),
     )?;
     let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    service.shutdown().await;
+    let server_result =
+        serve_listener_until_shutdown(listener, router(state), events, service, shutdown_signal())
+            .await;
     database.close().await;
+    server_result?;
     Ok(CommandOutput::ServerStopped)
+}
+
+async fn serve_listener_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    events: EventBroker,
+    service: Arc<runtime::LocalRuntimeService>,
+    signal: impl Future<Output = ()>,
+) -> Result<(), std::io::Error> {
+    let bind = listener.local_addr()?;
+    eprintln!(
+        "event=server_started bind={bind} pid={}",
+        std::process::id()
+    );
+    let stop_accepting = CancellationToken::new();
+    let server_result = {
+        let shutdown = stop_accepting.clone();
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+            })
+            .into_future();
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result,
+            () = signal => {
+                eprintln!("event=server_stopping bind={bind} pid={}", std::process::id());
+                stop_accepting.cancel();
+                events.close();
+                service.shutdown().await;
+                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        eprintln!("event=server_shutdown_forced bind={bind} pid={}", std::process::id());
+                        Ok(())
+                    }
+                }
+            }
+        }
+    };
+    stop_accepting.cancel();
+    events.close();
+    service.shutdown().await;
+    eprintln!(
+        "event=server_stopped bind={bind} pid={} result={}",
+        std::process::id(),
+        if server_result.is_ok() { "ok" } else { "error" }
+    );
+    server_result
 }
 
 fn api_sandbox_report(report: &SandboxReport) -> SandboxCapabilityReport {
@@ -810,7 +861,31 @@ fn prepare_directories(config: &Config) -> Result<(), CliError> {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            eprintln!("event=shutdown_signal_failed signal=ctrl_c diagnostic={error:?}");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                eprintln!("event=shutdown_signal_failed signal=terminate diagnostic={error:?}");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    eprintln!("event=shutdown_signal_failed signal=ctrl_c diagnostic={error:?}");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("event=shutdown_signal_failed signal=ctrl_c diagnostic={error:?}");
+    }
 }
 
 #[derive(Debug, Error)]

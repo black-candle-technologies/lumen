@@ -14,7 +14,7 @@ use lumen_core::{
     identity::WorkspaceId,
 };
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 #[derive(Clone)]
 pub struct EventBroker {
@@ -25,14 +25,20 @@ impl EventBroker {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let (sender, _) = broadcast::channel(capacity);
+        let (shutdown, _) = watch::channel(false);
         Self {
             inner: Arc::new(EventBrokerInner {
                 capacity,
                 next_id: AtomicU64::new(1),
                 events: RwLock::new(VecDeque::with_capacity(capacity)),
                 sender,
+                shutdown,
             }),
         }
+    }
+
+    pub fn close(&self) {
+        let _ = self.inner.shutdown.send(true);
     }
 
     pub fn publish(
@@ -84,9 +90,13 @@ impl EventBroker {
             cursor: after,
             pending,
             receiver,
+            shutdown: self.inner.shutdown.subscribe(),
         };
         stream::unfold(state, |mut state| async move {
             loop {
+                if *state.shutdown.borrow() {
+                    return None;
+                }
                 if let Some(event) = state.pending.pop_front() {
                     if event.id <= state.cursor {
                         continue;
@@ -94,7 +104,17 @@ impl EventBroker {
                     state.cursor = event.id;
                     return Some((Ok(event.into_sse()), state));
                 }
-                match state.receiver.recv().await {
+                let received = tokio::select! {
+                    biased;
+                    changed = state.shutdown.changed() => {
+                        if changed.is_err() || *state.shutdown.borrow() {
+                            return None;
+                        }
+                        continue;
+                    }
+                    received = state.receiver.recv() => received,
+                };
+                match received {
                     Ok(event)
                         if event.workspace_id == state.workspace_id
                             && event.run_id == state.run_id
@@ -135,6 +155,7 @@ struct EventBrokerInner {
     next_id: AtomicU64,
     events: RwLock<VecDeque<RunEvent>>,
     sender: broadcast::Sender<RunEvent>,
+    shutdown: watch::Sender<bool>,
 }
 
 struct Subscription {
@@ -144,6 +165,7 @@ struct Subscription {
     cursor: u64,
     pending: VecDeque<RunEvent>,
     receiver: broadcast::Receiver<RunEvent>,
+    shutdown: watch::Receiver<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,4 +191,37 @@ impl RunEvent {
 pub enum EventBrokerError {
     #[error("event kind must be a bounded lowercase ASCII identifier")]
     InvalidEventKind,
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn close_ends_existing_and_future_subscriptions() {
+        let broker = EventBroker::new(4);
+        let workspace_id = WorkspaceId::new();
+        let run_id = RunId::new();
+        let existing = broker.subscribe(workspace_id, run_id, 0);
+        tokio::pin!(existing);
+
+        broker.close();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), existing.next())
+                .await
+                .expect("existing subscription closed")
+                .is_none()
+        );
+        let future = broker.subscribe(workspace_id, run_id, 0);
+        tokio::pin!(future);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), future.next())
+                .await
+                .expect("future subscription closed")
+                .is_none()
+        );
+    }
 }
