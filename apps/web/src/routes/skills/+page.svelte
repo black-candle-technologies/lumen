@@ -35,7 +35,7 @@
 				name: draft.title,
 				description: `Captured from ${draft.created_by.provider}/${draft.created_by.subject}`
 			});
-			notice = `Approval requested: ${result.run_id}`;
+			notice = `Publication approval requested: ${result.run_id}`;
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Skill publish request failed.';
@@ -77,7 +77,8 @@
 		</section>
 
 		<section class="skills-section">
-			<h2>Capture Drafts</h2>
+			<h2>Reviewable Capture Drafts</h2>
+			<p class="micro">Drafts preserve provenance, not historical raw inputs or outputs. Review every required variable and candidate step before requesting publication.</p>
 			{#if drafts.length === 0}
 				<div class="subtle-empty">No capture drafts.</div>
 			{:else}
@@ -86,7 +87,7 @@
 						<article>
 							<header>
 								<div><h3>{draft.title}</h3><p>{draft.created_by.provider}/{draft.created_by.subject} · {draft.created_at}</p></div>
-								<button class="icon-button" type="button" aria-label={`Publish capture draft ${draft.title}`} title="Publish draft" onclick={() => publishDraft(draft)} disabled={busyKey === draft.draft_id}><Upload size={17} /></button>
+								<button class="icon-button" type="button" aria-label={`Request publication approval for ${draft.title}`} title="Review and request approval" onclick={() => publishDraft(draft)} disabled={busyKey === draft.draft_id}><Upload size={17} /></button>
 							</header>
 							<pre>{draft.body}</pre>
 						</article>

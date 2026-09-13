@@ -891,21 +891,37 @@ impl LocalRuntimeService {
         .await
         .map_err(sql_service_error)?;
         let mut action_lines = Vec::new();
-        for action in actions {
+        let mut procedure_lines = Vec::new();
+        for (index, action) in actions.into_iter().enumerate() {
             let arguments: String = action
                 .try_get("arguments_json")
                 .map_err(sql_service_error)?;
+            let kind = action
+                .try_get::<String, _>("kind")
+                .map_err(sql_service_error)?;
+            let state = action
+                .try_get::<String, _>("state")
+                .map_err(sql_service_error)?;
             action_lines.push(format!(
                 "- kind: {}; state: {}; arguments_sha256: {}",
-                action
-                    .try_get::<String, _>("kind")
-                    .map_err(sql_service_error)?,
-                action
-                    .try_get::<String, _>("state")
-                    .map_err(sql_service_error)?,
+                kind,
+                state,
                 sha256_hex(arguments.as_bytes())
             ));
+            procedure_lines.push(format!(
+                "{}. Review whether `{kind}` is still appropriate, supply fresh operator-approved inputs, and verify its live result.",
+                index + 1
+            ));
         }
+        let capture_kind = if action_lines.is_empty() {
+            procedure_lines.push(
+                "- No tool procedure was observed; this is provenance only and is not evidence of learned reusable behavior."
+                    .to_owned(),
+            );
+            "provenance-only zero-action draft"
+        } else {
+            "review-required tool procedure draft"
+        };
         if action_lines.is_empty() {
             action_lines.push("- none".to_owned());
         }
@@ -919,15 +935,16 @@ impl LocalRuntimeService {
             .map(|record| record.event().kind().as_str())
             .collect::<Vec<_>>();
         let mut body = format!(
-            "# Captured Workflow\n\nsource_run_id: {run_id}\nsource_workspace_id: {workspace_id}\n\n## Actions\n{}\n\n## Audit Events\n{}\n\n## Required Variables\n- operator must review variables before publishing\n\n## Expected Outputs\n- source run completed successfully\n\n## Failure Notes\n- none captured",
+            "# Reviewable Workflow Capture Draft\n\nartifact_type: {capture_kind}\nsource_run_id: {run_id}\nsource_workspace_id: {workspace_id}\n\nThis draft preserves verified provenance, not replayable historical inputs or trusted automation.\n\n## Observed Actions\n{}\n\n## Candidate Procedure\n{}\n\n## Audit Events\n{}\n\n## Required Variables\n- Historical raw action inputs are deliberately unavailable; only their digests are retained.\n- Before publishing, the operator must define every fresh non-secret input required by each candidate step.\n\n## Expected Outputs\n- Verify each fresh action result during the new run; historical raw outputs are not reconstructed.\n- The source run completed successfully, which does not guarantee a changed-input run will succeed.\n\n## Operator Review Before Publishing\n1. Verify the source run, workspace, ordered actions, argument digests, and audit events.\n2. Confirm each action kind is still appropriate and document the current safe inputs outside this artifact.\n3. Reject the draft if a required variable, expected result, or failure condition is unclear.\n4. Publish only through the approval-bound skill publication path.\n\n## Capture Limitations\n- No historical raw inputs, tool outputs, or secret values are reconstructed.\n- Publication records review and integrity; it does not grant capabilities or bypass approval.\n\n## Failure Notes\n- No source-run failure was captured because only completed runs are eligible.",
             action_lines.join("\n"),
+            procedure_lines.join("\n"),
             event_kinds.join(", ")
         );
         self.redactor.redact_string(&mut body);
         let draft = WorkflowCaptureDraft::new(
             uuid::Uuid::new_v4(),
             workspace_id,
-            format!("Captured workflow {run_id}"),
+            format!("Reviewable workflow draft {run_id}"),
             body,
             actor,
             now(),

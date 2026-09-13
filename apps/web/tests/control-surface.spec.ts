@@ -398,6 +398,9 @@ test.beforeEach(async ({ page }) => {
 						source_digest: 'a'.repeat(64),
 						reviewed: true,
 						enabled: true,
+						required: false,
+						load_status: 'loaded',
+						exclusion_reason: null,
 						created_by: { provider: 'local', subject: 'operator' },
 						reviewed_by: { provider: 'local', subject: 'reviewer' },
 						created_at: 10,
@@ -619,7 +622,7 @@ test('shows skill reviews and publishes capture drafts without revealing secrets
 	await expect(page.getByText('[redacted]')).toBeVisible();
 	await expect(page.getByText('browser-secret-must-not-render')).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-	await page.getByRole('button', { name: 'Publish capture draft Captured triage workflow' }).click();
-	await expect(page.getByText('Approval requested: run-skill')).toBeVisible();
+	await page.getByRole('button', { name: 'Request publication approval for Captured triage workflow' }).click();
+	await expect(page.getByText('Publication approval requested: run-skill')).toBeVisible();
 	await page.screenshot({ path: testInfo.outputPath('skills.png') });
 });

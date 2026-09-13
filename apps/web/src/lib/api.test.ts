@@ -454,6 +454,9 @@ describe('ApiClient', () => {
 							source_digest: 'a'.repeat(64),
 							reviewed: true,
 							enabled: true,
+							required: false,
+							load_status: 'loaded',
+							exclusion_reason: null,
 							created_by: { provider: 'local', subject: 'operator' },
 							reviewed_by: { provider: 'local', subject: 'reviewer' },
 							created_at: 10,
@@ -499,6 +502,7 @@ describe('ApiClient', () => {
 		expect(jobs[0].next_due_at).toBe(2000);
 		expect(jobRequest.state).toBe('approval_requested');
 		expect(skills[0].source_digest).toBe('a'.repeat(64));
+		expect(skills[0].load_status).toBe('loaded');
 		expect(drafts[0].body).not.toContain('secret-value');
 		expect(draft.draft_id).toBe('00000000-0000-0000-0000-000000000000');
 		expect(publish.run_id).toBe('run-skill');

@@ -3425,6 +3425,161 @@ async fn workflow_capture_publish_creates_reviewed_skill_only_after_approval() {
     );
     let source = std::fs::read_to_string(source_path).expect("published skill source");
     assert!(source.contains(&format!("source_run_id: {run_id}")));
+    assert!(source.contains("artifact_type: provenance-only zero-action draft"));
+    assert!(source.contains("not evidence of learned reusable behavior"));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn reviewed_tool_capture_is_reused_with_changed_safe_input() {
+    let model = MockServer::start().await;
+    let turn = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turn = Arc::clone(&turn);
+            let requests = Arc::clone(&requests);
+            move |request: &MockRequest| {
+                requests
+                    .lock()
+                    .expect("model requests")
+                    .push(String::from_utf8_lossy(&request.body).into_owned());
+                match turn.fetch_add(1, Ordering::SeqCst) {
+                    0 => action_response(
+                        "process.spawn",
+                        serde_json::json!({"program": test_program_string(), "args": ["alpha"], "environment": {}}),
+                    ),
+                    1 => final_response("known source output"),
+                    2 => action_response(
+                        "process.spawn",
+                        serde_json::json!({"program": test_program_string(), "args": ["beta"], "environment": {}}),
+                    ),
+                    _ => final_response("known changed-input output"),
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new(&model, |_| {}).await;
+
+    let source_run = harness.create_run("run the harmless tool with alpha").await;
+    approve_pending(&harness).await;
+    wait_for_run_completed(&harness, &source_run).await;
+    let draft_id = harness
+        .service
+        .capture_workflow_draft(
+            harness.workspace_id,
+            RunId::from_uuid(source_run.parse().expect("source run ID")),
+            PrincipalId::new("local", "operator").expect("operator"),
+        )
+        .await
+        .expect("tool capture draft");
+    let draft = harness
+        .database
+        .get_workflow_capture_draft(draft_id)
+        .await
+        .expect("draft lookup")
+        .expect("draft");
+    assert!(
+        draft
+            .body()
+            .contains("review-required tool procedure draft")
+    );
+    assert!(draft.body().contains("process.spawn"));
+    assert!(
+        draft
+            .body()
+            .contains("supply fresh operator-approved inputs")
+    );
+    assert!(
+        draft
+            .body()
+            .contains("Historical raw action inputs are deliberately unavailable")
+    );
+    assert!(!draft.body().contains("alpha"));
+    assert!(!draft.body().contains("known source output"));
+
+    let published_skill = SkillId::from_uuid(
+        uuid::Uuid::parse_str("ab29fc40-ca47-4067-b31d-00dd010662da").expect("published skill ID"),
+    );
+    let publish_run = request_skill_publish(&harness, draft_id, published_skill).await;
+    approve_pending(&harness).await;
+    wait_for_run_completed(&harness, &publish_run.to_string()).await;
+
+    let reuse_run = harness
+        .create_run("reuse the reviewed procedure with changed safe input beta")
+        .await;
+    wait_for_run_state(&harness, &reuse_run, "awaiting_approval").await;
+    let model_requests = requests.lock().expect("model requests").join("\n");
+    assert!(model_requests.contains("Reviewable Workflow Capture Draft"));
+    assert!(model_requests.contains(&format!("source_run_id: {source_run}")));
+    assert!(model_requests.contains("changed safe input beta"));
+    approve_pending(&harness).await;
+    wait_for_run_completed(&harness, &reuse_run).await;
+    let arguments: String =
+        sqlx::query_scalar("SELECT arguments_json FROM actions WHERE run_id = ?")
+            .bind(&reuse_run)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("reused action arguments");
+    assert!(arguments.contains("beta"));
+    let stream = harness.sse_until(&reuse_run, "run.completed").await;
+    assert!(stream.contains("known changed-input output"));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn rejected_or_expired_capture_publication_never_creates_a_skill() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("source complete")).await;
+    let harness = Harness::new_with_approval_ttl(&model, 1).await;
+    let source_run = harness.create_run("capture publication controls").await;
+    wait_for_run_completed(&harness, &source_run).await;
+    let draft_id = harness
+        .service
+        .capture_workflow_draft(
+            harness.workspace_id,
+            RunId::from_uuid(source_run.parse().expect("source run ID")),
+            PrincipalId::new("local", "operator").expect("operator"),
+        )
+        .await
+        .expect("capture draft");
+
+    let rejected_run = request_skill_publish(&harness, draft_id, skill_id()).await;
+    let rejected_approval = harness.pending_approval_id().await;
+    let response = harness
+        .request(
+            "POST",
+            &format!("approvals/{rejected_approval}/decision"),
+            r#"{"decision":"reject"}"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &rejected_run.to_string(), "failed").await;
+
+    let expired_skill = SkillId::from_uuid(
+        uuid::Uuid::parse_str("bb29fc40-ca47-4067-b31d-00dd010662da").expect("expired skill ID"),
+    );
+    request_skill_publish(&harness, draft_id, expired_skill).await;
+    let expired_approval = harness.pending_approval_id().await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let response = harness
+        .request(
+            "POST",
+            &format!("approvals/{expired_approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        harness
+            .database
+            .enabled_skill_versions(harness.workspace_id)
+            .await
+            .expect("enabled skills")
+            .is_empty()
+    );
     harness.service.shutdown().await;
 }
 
