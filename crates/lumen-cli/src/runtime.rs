@@ -5,7 +5,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use lumen_core::{
@@ -26,9 +26,9 @@ use lumen_core::{
     policy::{Policy, PolicyVersion},
     run::{
         ActionFuture, ActionNormalizer, ActionPort, ActionPortError, ApprovalFuture, ApprovalPort,
-        ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError,
+        ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError, Clock,
         LoadedSkillMetadata, NormalizationError, RunBudget, RunContext, RunOrchestrator,
-        RunOutcome, RunState,
+        RunOutcome, RunState, SystemClock,
     },
     secret::SecretRefId,
 };
@@ -1045,6 +1045,7 @@ impl LocalRuntimeService {
             inner: model_inner,
             cancellation: cancellation.clone(),
         };
+        let clock = SystemClock;
         let orchestrator = RunOrchestrator::new(
             &model,
             self.normalizer.as_ref(),
@@ -1052,6 +1053,7 @@ impl LocalRuntimeService {
             self.approvals.as_ref(),
             self.audit.as_ref(),
             self.actions.as_ref(),
+            &clock,
             self.policy.clone(),
             self.policy_version.clone(),
         )
@@ -1063,7 +1065,6 @@ impl LocalRuntimeService {
                     .capabilities_override
                     .as_ref()
                     .unwrap_or(&self.capabilities),
-                now(),
             )
             .await
         {
@@ -1548,7 +1549,7 @@ impl RuntimeService for LocalRuntimeService {
         let service = self.clone();
         Box::pin(async move {
             service.ensure_accepting_work()?;
-            let (run_id, result) = service.approvals.decide(&command, now()).await?;
+            let (run_id, result) = service.approvals.decide(&command).await?;
             service
                 .events
                 .publish(
@@ -3831,7 +3832,6 @@ impl ApprovalRegistry {
     async fn decide(
         &self,
         command: &ApprovalDecisionCommand,
-        now: TimestampMillis,
     ) -> Result<(RunId, ApprovalResult), ServiceError> {
         let mut records = self.records.lock().await;
         let record = records
@@ -3840,6 +3840,7 @@ impl ApprovalRegistry {
         if record.workspace_id != command.workspace_id() {
             return Err(ServiceError::NotFound);
         }
+        let now = now();
         let mut request = record.request.clone();
         match command.decision() {
             ApprovalDecision::Grant => request.grant(command.actor().clone(), now),
@@ -4001,11 +4002,7 @@ fn repository_service_error(error: lumen_db::RepositoryError) -> ServiceError {
 }
 
 pub(crate) fn now() -> TimestampMillis {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    TimestampMillis::new(u64::try_from(millis).unwrap_or(u64::MAX))
+    SystemClock.now()
 }
 
 fn scheduled_lease_expiry(timestamp: TimestampMillis) -> TimestampMillis {

@@ -5348,6 +5348,40 @@ async fn cancellation_stops_an_in_flight_model_request_and_is_audited() {
 }
 
 #[tokio::test]
+async fn delayed_model_run_records_distinct_lifecycle_times_and_valid_audit_hashes() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        final_response("done").set_delay(Duration::from_millis(25)),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("delayed lifecycle").await;
+    wait_for_run_state(&harness, &run_id, "completed").await;
+
+    let events: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT event_type, timestamp FROM audit_events
+         WHERE event_type IN ('run_created', 'run_completed')
+           AND json_extract(payload_json, '$.run_id') = ?
+         ORDER BY sequence",
+    )
+    .bind(&run_id)
+    .fetch_all(harness.database.pool())
+    .await
+    .expect("lifecycle audit events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "run_created");
+    assert_eq!(events[1].0, "run_completed");
+    assert!(events[1].1 > events[0].1, "lifecycle time must advance");
+    harness
+        .database
+        .verify_audit_chain()
+        .await
+        .expect("audit hashes remain valid");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn shutdown_cancels_an_active_run_and_rejects_new_work() {
     let model = MockServer::start().await;
     mount_response(
