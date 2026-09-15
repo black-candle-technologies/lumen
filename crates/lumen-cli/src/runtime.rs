@@ -64,7 +64,7 @@ use lumen_server::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -1789,6 +1789,23 @@ impl RuntimeService for LocalRuntimeService {
         })
     }
 
+    fn run_status(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        run_id: RunId,
+    ) -> ServiceFuture<'_, String> {
+        let service = self.clone();
+        Box::pin(async move {
+            sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ? AND workspace_id = ?")
+                .bind(run_id.to_string())
+                .bind(workspace_id.to_string())
+                .fetch_optional(service.database.pool())
+                .await
+                .map_err(sql_service_error)?
+                .ok_or(ServiceError::NotFound)
+        })
+    }
+
     fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation> {
         let service = self.clone();
         Box::pin(async move {
@@ -2301,7 +2318,12 @@ impl RuntimeService for LocalRuntimeService {
                         revision.schedule_kind, revision.schedule_start_at,
                         revision.interval_millis, revision.prompt, revision.data_class,
                         revision.max_model_turns, revision.max_actions, revision.enabled,
-                        revision.next_due_at, revision.idempotent, revision.created_at
+                        revision.next_due_at, revision.idempotent, revision.created_at,
+                        (SELECT run.state FROM scheduled_job_runs run
+                         WHERE run.job_id = job.job_id
+                           AND run.revision = revision.revision
+                         ORDER BY run.scheduled_for DESC, run.updated_at DESC
+                         LIMIT 1) AS last_run_state
                  FROM scheduled_jobs job
                  JOIN (
                     SELECT job_id, MAX(revision) AS revision
@@ -2327,13 +2349,12 @@ impl RuntimeService for LocalRuntimeService {
     ) -> ServiceFuture<'_, AutomationActionRequested> {
         let service = self.clone();
         Box::pin(async move {
-            let kind = if service
+            let current = service
                 .database
                 .latest_scheduled_job_revision(command.job_id())
                 .await
-                .map_err(repository_service_error)?
-                .is_some()
-            {
+                .map_err(repository_service_error)?;
+            let kind = if current.is_some() {
                 "schedule.job.update"
             } else {
                 "schedule.job.create"
@@ -2351,7 +2372,7 @@ impl RuntimeService for LocalRuntimeService {
                 .request_extension_action(
                     command.workspace_id(),
                     command.actor().clone(),
-                    scheduled_job_action_proposal(&command, kind),
+                    scheduled_job_action_proposal(&command, kind, current.as_ref()),
                     CapabilitySet::new([capability]),
                 )
                 .await?;
@@ -2431,6 +2452,20 @@ impl RuntimeService for LocalRuntimeService {
             let draft_id = command
                 .draft_id()
                 .ok_or_else(|| ServiceError::Conflict("skill publish requires a draft".into()))?;
+            let draft = service
+                .database
+                .get_workflow_capture_draft(draft_id)
+                .await
+                .map_err(repository_service_error)?
+                .ok_or(ServiceError::NotFound)?;
+            if draft.workspace_id() != command.workspace_id() {
+                return Err(ServiceError::NotFound);
+            }
+            let source_digest = sha256_hex(draft.body().as_bytes());
+            let source_run_id = draft
+                .body()
+                .lines()
+                .find_map(|line| line.strip_prefix("source_run_id: "));
             let run_id = service
                 .request_extension_action(
                     command.workspace_id(),
@@ -2447,6 +2482,11 @@ impl RuntimeService for LocalRuntimeService {
                             ("name", CanonicalValue::from(command.name())),
                             ("description", CanonicalValue::from(command.description())),
                             ("source_format", CanonicalValue::from("markdown")),
+                            ("source_digest", CanonicalValue::from(source_digest)),
+                            (
+                                "source_run_id",
+                                source_run_id.map_or(CanonicalValue::Null, CanonicalValue::from),
+                            ),
                         ]),
                     ),
                     CapabilitySet::new([capability]),
@@ -2584,7 +2624,11 @@ fn provider_policy_update_proposal(
     )
 }
 
-fn scheduled_job_action_proposal(command: &JobActionCommand, kind: &str) -> ActionProposal {
+fn scheduled_job_action_proposal(
+    command: &JobActionCommand,
+    kind: &str,
+    current: Option<&ScheduledJobRevision>,
+) -> ActionProposal {
     let (schedule_kind, run_at, start_at, interval_millis) = match command.schedule() {
         ScheduleSpec::Once { run_at } => (
             CanonicalValue::from("once"),
@@ -2658,6 +2702,26 @@ fn scheduled_job_action_proposal(command: &JobActionCommand, kind: &str) -> Acti
                 }),
             ),
             ("idempotent", CanonicalValue::from(command.idempotent())),
+            (
+                "previous_revision",
+                current.map_or(CanonicalValue::Null, |job| {
+                    canonical_u64(job.revision().as_u64())
+                }),
+            ),
+            (
+                "previous_enabled",
+                current.map_or(CanonicalValue::Null, |job| {
+                    CanonicalValue::from(job.enabled())
+                }),
+            ),
+            (
+                "target_revision",
+                canonical_u64(
+                    current
+                        .map(|job| job.revision().as_u64().saturating_add(1))
+                        .unwrap_or(1),
+                ),
+            ),
         ]),
     )
 }
@@ -2709,6 +2773,9 @@ struct ScheduledJobAdminAction {
     enabled: bool,
     next_due_at: Option<i64>,
     idempotent: bool,
+    previous_revision: Option<i64>,
+    previous_enabled: Option<bool>,
+    target_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2732,6 +2799,9 @@ struct ParsedScheduledJobAdminAction {
     enabled: bool,
     next_due_at: Option<TimestampMillis>,
     idempotent: bool,
+    previous_revision: Option<JobRevision>,
+    previous_enabled: Option<bool>,
+    target_revision: Option<JobRevision>,
 }
 
 async fn apply_scheduled_job_action(
@@ -2744,6 +2814,24 @@ async fn apply_scheduled_job_action(
         .latest_scheduled_job_revision(parsed.job_id)
         .await
         .map_err(repository_service_error)?;
+    if let Some(expected_revision) = parsed.previous_revision {
+        let Some(current) = latest.as_ref() else {
+            return Err(ServiceError::Conflict(
+                "scheduled job changed since approval".into(),
+            ));
+        };
+        if current.revision() != expected_revision
+            || parsed.previous_enabled != Some(current.enabled())
+        {
+            return Err(ServiceError::Conflict(
+                "scheduled job changed since approval".into(),
+            ));
+        }
+    } else if parsed.previous_enabled.is_some() {
+        return Err(ServiceError::Conflict(
+            "scheduled job approval state is invalid".into(),
+        ));
+    }
     let revision = match (kind, latest.as_ref()) {
         ("schedule.job.create", None) => JobRevision::new(1),
         ("schedule.job.create", Some(_)) => {
@@ -2764,6 +2852,14 @@ async fn apply_scheduled_job_action(
         }
     }
     .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    if parsed
+        .target_revision
+        .is_some_and(|expected| expected != revision)
+    {
+        return Err(ServiceError::Conflict(
+            "scheduled job changed since approval".into(),
+        ));
+    }
     let created_at = now();
     let revision = ScheduledJobRevision::new(
         parsed.job_id,
@@ -2823,6 +2919,14 @@ fn parse_scheduled_job_action(
         lumen_core::executor::ExecutorError::new("scheduled job action budget is invalid")
     })?;
     let next_due_at = parsed.next_due_at.map(timestamp_from_i64).transpose()?;
+    let previous_revision = parsed
+        .previous_revision
+        .map(job_revision_from_i64)
+        .transpose()?;
+    let target_revision = parsed
+        .target_revision
+        .map(job_revision_from_i64)
+        .transpose()?;
     Ok(ParsedScheduledJobAdminAction {
         job_id,
         service,
@@ -2835,7 +2939,17 @@ fn parse_scheduled_job_action(
         enabled: parsed.enabled,
         next_due_at,
         idempotent: parsed.idempotent,
+        previous_revision,
+        previous_enabled: parsed.previous_enabled,
+        target_revision,
     })
+}
+
+fn job_revision_from_i64(value: i64) -> Result<JobRevision, lumen_core::executor::ExecutorError> {
+    JobRevision::new(u64::try_from(value).map_err(|_| {
+        lumen_core::executor::ExecutorError::new("scheduled job revision is invalid")
+    })?)
+    .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))
 }
 
 fn parse_scheduled_job_schedule(
@@ -2888,6 +3002,8 @@ struct SkillPublishAction {
     name: String,
     description: String,
     source_format: String,
+    source_digest: Option<String>,
+    source_run_id: Option<String>,
 }
 
 struct ParsedSkillPublishAction {
@@ -2897,6 +3013,7 @@ struct ParsedSkillPublishAction {
     name: String,
     description: String,
     source_format: String,
+    source_digest: Option<String>,
 }
 
 async fn apply_skill_publish_action(
@@ -2914,20 +3031,25 @@ async fn apply_skill_publish_action(
     if draft.workspace_id() != workspace_id {
         return Err(ServiceError::NotFound);
     }
-    let source_path = data_root
-        .join("skills")
-        .join(parsed.skill_id.to_string())
-        .join(format!("{}.md", parsed.version.as_str()));
-    tokio::fs::create_dir_all(
-        source_path
-            .parent()
-            .ok_or_else(|| ServiceError::Internal("invalid skill source path".into()))?,
-    )
-    .await
-    .map_err(|error| ServiceError::Internal(error.to_string()))?;
-    tokio::fs::write(&source_path, draft.body())
+    if parsed
+        .source_digest
+        .as_ref()
+        .is_some_and(|expected| expected != &sha256_hex(draft.body().as_bytes()))
+    {
+        return Err(ServiceError::Conflict(
+            "capture draft changed since approval".into(),
+        ));
+    }
+    if database
+        .skill_version(workspace_id, parsed.skill_id, &parsed.version)
         .await
-        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        .map_err(repository_service_error)?
+        .is_some()
+    {
+        return Err(ServiceError::Conflict(
+            "skill version already published".into(),
+        ));
+    }
     let digest = sha256_hex(draft.body().as_bytes());
     let created_at = now();
     let record = SkillVersionRecord::new(
@@ -2945,20 +3067,50 @@ async fn apply_skill_publish_action(
         Some(created_at),
     )
     .map_err(|error| ServiceError::Conflict(error.to_string()))?;
-    database
-        .insert_skill_version(&record)
+    let source_path = data_root
+        .join("skills")
+        .join(parsed.skill_id.to_string())
+        .join(format!("{}.md", parsed.version.as_str()));
+    tokio::fs::create_dir_all(
+        source_path
+            .parent()
+            .ok_or_else(|| ServiceError::Internal("invalid skill source path".into()))?,
+    )
+    .await
+    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let mut source_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&source_path)
         .await
-        .map_err(repository_service_error)?;
-    database
-        .set_skill_workspace_state(
-            workspace_id,
-            parsed.skill_id,
-            &parsed.version,
-            true,
-            created_at,
-        )
-        .await
-        .map_err(repository_service_error)?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ServiceError::Conflict("skill version source already exists".into())
+            } else {
+                ServiceError::Internal(error.to_string())
+            }
+        })?;
+    let source_write = source_file.write_all(draft.body().as_bytes()).await;
+    drop(source_file);
+    if let Err(error) = source_write {
+        let cleanup = tokio::fs::remove_file(&source_path).await;
+        return Err(ServiceError::Internal(match cleanup {
+            Ok(()) => error.to_string(),
+            Err(cleanup) => format!("{error}; source cleanup failed: {cleanup}"),
+        }));
+    }
+    if let Err(error) = database.publish_skill_version(&record, created_at).await {
+        let cleanup = tokio::fs::remove_file(&source_path).await;
+        return Err(match cleanup {
+            Ok(()) if matches!(error, lumen_db::RepositoryError::SkillMetadataConflict) => {
+                ServiceError::Conflict(error.to_string())
+            }
+            Ok(()) => repository_service_error(error),
+            Err(cleanup) => {
+                ServiceError::Internal(format!("{error}; source cleanup failed: {cleanup}"))
+            }
+        });
+    }
     Ok(parsed.skill_id)
 }
 
@@ -2991,6 +3143,21 @@ fn parse_skill_publish_action(
             "skill publish metadata is invalid",
         ));
     }
+    if parsed.source_digest.as_ref().is_some_and(|digest| {
+        digest.len() != 71
+            || !digest.starts_with("sha256:")
+            || !digest[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) || parsed
+        .source_run_id
+        .as_ref()
+        .is_some_and(|run_id| uuid::Uuid::parse_str(run_id).is_err())
+    {
+        return Err(lumen_core::executor::ExecutorError::new(
+            "skill publish provenance is invalid",
+        ));
+    }
     Ok(ParsedSkillPublishAction {
         draft_id,
         skill_id,
@@ -2998,6 +3165,7 @@ fn parse_skill_publish_action(
         name: parsed.name,
         description: parsed.description,
         source_format: parsed.source_format,
+        source_digest: parsed.source_digest,
     })
 }
 
@@ -3147,6 +3315,8 @@ fn job_review_from_row(row: sqlx::sqlite::SqliteRow) -> Result<JobReview, Servic
         row.try_get::<i64, _>("idempotent")
             .map_err(sql_service_error)?
             == 1,
+        row.try_get::<Option<String>, _>("last_run_state")
+            .map_err(sql_service_error)?,
         timestamp_from_sql_row(&row, "created_at")?,
     ))
 }

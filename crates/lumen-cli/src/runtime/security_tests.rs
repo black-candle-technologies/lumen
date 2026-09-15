@@ -28,7 +28,7 @@ use lumen_core::{
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, ModelEndpointClass,
     ModelProviderRevision, ScheduledJobRevision, SecretReference, ServiceIdentity,
-    SkillVersionRecord, StagedPluginPackage, WorkspaceModelEgressRevision,
+    SkillVersionRecord, StagedPluginPackage, WorkflowCaptureDraft, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     extension_package::PackageStager,
@@ -2544,6 +2544,83 @@ async fn schedule_job_creation_requires_approval_before_mutation() {
 }
 
 #[tokio::test]
+async fn job_reviews_report_the_latest_occurrence_state() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        None,
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO scheduled_job_runs (
+            occurrence_key, job_id, revision, scheduled_for, run_id, state, created_at, updated_at
+         ) VALUES (?, ?, 1, 1000, NULL, 'failed', 1000, 1001)",
+    )
+    .bind("review-state-occurrence")
+    .bind(scheduled_job_id().to_string())
+    .execute(harness.database.pool())
+    .await
+    .expect("occurrence");
+
+    let response = harness.request("GET", "automation/jobs", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reviews = response_json(response).await;
+    assert_eq!(reviews["jobs"][0]["last_run_state"], "failed");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn job_reviews_do_not_inherit_a_prior_revisions_failure() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        None,
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO scheduled_job_runs (
+            occurrence_key, job_id, revision, scheduled_for, run_id, state, created_at, updated_at
+         ) VALUES (?, ?, 1, 1000, NULL, 'failed', 1000, 1001)",
+    )
+    .bind("prior-revision-failure")
+    .bind(scheduled_job_id().to_string())
+    .execute(harness.database.pool())
+    .await
+    .expect("prior occurrence");
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(2_000)),
+        true,
+        Some(TimestampMillis::new(2_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+
+    let response = harness.request("GET", "automation/jobs", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reviews = response_json(response).await;
+    assert_eq!(reviews["jobs"][0]["revision"], 2);
+    assert!(reviews["jobs"][0]["last_run_state"].is_null());
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn schedule_job_update_requires_approval_and_preserves_existing_occurrence_revision() {
     let model = MockServer::start().await;
     mount_response(&model, final_response("admin done")).await;
@@ -2632,6 +2709,70 @@ async fn schedule_job_update_requires_approval_and_preserves_existing_occurrence
             .await
             .expect("occurrence revision");
     assert_eq!(occurrence_revision, 1);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_job_update_rejects_a_changed_pre_approval_revision() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("admin done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+
+    let response = harness
+        .request(
+            "POST",
+            &format!("automation/jobs/{}", scheduled_job_id()),
+            r#"{"service_subject":"daily-brief","schedule":{"kind":"once","run_at":2000},"prompt":"changed prompt","data_class":"workspace","max_model_turns":3,"max_actions":2,"enabled":false,"idempotent":true}"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run_id = response_json(response).await["run_id"]
+        .as_str()
+        .expect("run ID")
+        .to_owned();
+    wait_for_run_state(&harness, &run_id, "awaiting_approval").await;
+    let arguments: String =
+        sqlx::query_scalar("SELECT arguments_json FROM actions WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("approved arguments");
+    let arguments: serde_json::Value = serde_json::from_str(&arguments).expect("arguments JSON");
+    assert_eq!(arguments["previous_revision"], 1);
+    assert_eq!(arguments["previous_enabled"], true);
+    assert_eq!(arguments["target_revision"], 2);
+
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_500)),
+        true,
+        Some(TimestampMillis::new(1_500)),
+        DataClass::Public,
+        2,
+        1,
+    )
+    .await;
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    let latest = harness
+        .database
+        .latest_scheduled_job_revision(scheduled_job_id())
+        .await
+        .expect("latest job")
+        .expect("job");
+    assert_eq!(latest.revision(), JobRevision::new(2).expect("revision"));
+    assert_eq!(latest.prompt(), "scheduled prompt");
     harness.service.shutdown().await;
 }
 
@@ -3427,6 +3568,241 @@ async fn workflow_capture_publish_creates_reviewed_skill_only_after_approval() {
     assert!(source.contains(&format!("source_run_id: {run_id}")));
     assert!(source.contains("artifact_type: provenance-only zero-action draft"));
     assert!(source.contains("not evidence of learned reusable behavior"));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn skill_publication_rejects_a_draft_changed_after_approval_request() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("publish done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let draft_id = uuid::Uuid::new_v4();
+    let source_run = RunId::new();
+    let draft = WorkflowCaptureDraft::new(
+        draft_id,
+        harness.workspace_id,
+        "Captured workflow",
+        format!("# Captured workflow\n\nsource_run_id: {source_run}"),
+        PrincipalId::new("local", "operator").expect("operator"),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let published_skill = skill_id();
+    let response = harness
+        .request(
+            "POST",
+            &format!("skills/capture-drafts/{draft_id}/publish"),
+            &serde_json::json!({
+                "skill_id": published_skill,
+                "version": "1.0.0",
+                "name": "Captured workflow",
+                "description": "Reviewed captured workflow"
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run_id = response_json(response).await["run_id"]
+        .as_str()
+        .expect("run ID")
+        .to_owned();
+    wait_for_run_state(&harness, &run_id, "awaiting_approval").await;
+    let arguments: String =
+        sqlx::query_scalar("SELECT arguments_json FROM actions WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("approved arguments");
+    let arguments: serde_json::Value = serde_json::from_str(&arguments).expect("arguments JSON");
+    assert_eq!(arguments["source_run_id"], source_run.to_string());
+    assert_eq!(
+        arguments["source_digest"],
+        sha256_hex(draft.body().as_bytes())
+    );
+    sqlx::query("UPDATE workflow_capture_drafts SET body = body || ? WHERE draft_id = ?")
+        .bind("\ntampered")
+        .bind(draft_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("tampered draft");
+
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skill_versions WHERE skill_id = ?")
+        .bind(published_skill.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("skill count");
+    assert_eq!(count, 0);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_skill_publication_preserves_the_pinned_source() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("publish done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let published_skill = skill_id();
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    let first_draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "First capture",
+        "# First capture\n\nsource_run_id: 00000000-0000-4000-8000-000000000001",
+        actor.clone(),
+        TimestampMillis::new(1_000),
+    )
+    .expect("first draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&first_draft)
+        .await
+        .expect("stored first draft");
+    let first_run = request_skill_publish(&harness, first_draft.id(), published_skill).await;
+    wait_for_run_state(&harness, &first_run.to_string(), "awaiting_approval").await;
+    approve_pending(&harness).await;
+    wait_for_run_completed(&harness, &first_run.to_string()).await;
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    let source_path = skill_source_path(&harness, published_skill, &version);
+    let pinned_bytes = std::fs::read(&source_path).expect("pinned source");
+
+    let second_draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Second capture",
+        "# Second capture\n\nsource_run_id: 00000000-0000-4000-8000-000000000002",
+        actor,
+        TimestampMillis::new(2_000),
+    )
+    .expect("second draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&second_draft)
+        .await
+        .expect("stored second draft");
+    let second_run = request_skill_publish(&harness, second_draft.id(), published_skill).await;
+    wait_for_run_state(&harness, &second_run.to_string(), "awaiting_approval").await;
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &second_run.to_string(), "failed").await;
+
+    assert_eq!(
+        std::fs::read(&source_path).expect("pinned source after conflict"),
+        pinned_bytes
+    );
+    let stored = harness
+        .database
+        .skill_version(harness.workspace_id, published_skill, &version)
+        .await
+        .expect("stored version")
+        .expect("version exists");
+    assert_eq!(stored.source_digest(), sha256_hex(&pinned_bytes));
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_skill_metadata_leaves_no_unreviewed_source() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("publish done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture\n\nsource_run_id: 00000000-0000-4000-8000-000000000003",
+        PrincipalId::new("local", "operator").expect("operator"),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let published_skill = skill_id();
+    let publish_run = harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+            ActionProposal::new(
+                "skill.publish",
+                CanonicalValue::object([
+                    ("draft_id", CanonicalValue::from(draft.id().to_string())),
+                    (
+                        "skill_id",
+                        CanonicalValue::from(published_skill.to_string()),
+                    ),
+                    ("version", CanonicalValue::from("1.0.0")),
+                    ("name", CanonicalValue::from("Bad\nName")),
+                    ("description", CanonicalValue::from("Reviewed capture")),
+                    ("source_format", CanonicalValue::from("markdown")),
+                ]),
+            ),
+            CapabilitySet::new([Capability::new(
+                CapabilityName::SkillPublish,
+                ResourceScope::exact("skill", published_skill.to_string()).expect("skill scope"),
+            )]),
+        )
+        .await
+        .expect("publish request");
+    wait_for_run_state(&harness, &publish_run.to_string(), "awaiting_approval").await;
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &publish_run.to_string(), "failed").await;
+    let source_path = skill_source_path(
+        &harness,
+        published_skill,
+        &SkillVersion::parse("1.0.0").expect("version"),
+    );
+    assert!(!source_path.exists());
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_skill_enablement_rolls_back_version_and_source() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("publish done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture\n\nsource_run_id: 00000000-0000-4000-8000-000000000004",
+        PrincipalId::new("local", "operator").expect("operator"),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    sqlx::query(
+        "CREATE TRIGGER fail_skill_enable BEFORE INSERT ON skill_workspace_state
+         BEGIN SELECT RAISE(ABORT, 'fixture enable failure'); END",
+    )
+    .execute(harness.database.pool())
+    .await
+    .expect("fault trigger");
+    let published_skill = skill_id();
+    let publish_run = request_skill_publish(&harness, draft.id(), published_skill).await;
+    wait_for_run_state(&harness, &publish_run.to_string(), "awaiting_approval").await;
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &publish_run.to_string(), "failed").await;
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    assert!(
+        harness
+            .database
+            .skill_version(harness.workspace_id, published_skill, &version)
+            .await
+            .expect("version lookup")
+            .is_none()
+    );
+    assert!(!skill_source_path(&harness, published_skill, &version).exists());
     harness.service.shutdown().await;
 }
 

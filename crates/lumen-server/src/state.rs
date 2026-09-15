@@ -69,6 +69,7 @@ pub trait RuntimeService: Send + Sync {
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>>;
     fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>>;
     fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation>;
+    fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String>;
     fn list_staged_plugins(
         &self,
         query: PluginReviewQuery,
@@ -1147,6 +1148,7 @@ pub struct JobReview {
     enabled: bool,
     next_due_at: Option<TimestampMillis>,
     idempotent: bool,
+    last_run_state: Option<String>,
     created_at: TimestampMillis,
 }
 
@@ -1166,6 +1168,7 @@ impl JobReview {
         enabled: bool,
         next_due_at: Option<TimestampMillis>,
         idempotent: bool,
+        last_run_state: Option<String>,
         created_at: TimestampMillis,
     ) -> Self {
         Self {
@@ -1182,6 +1185,7 @@ impl JobReview {
             enabled,
             next_due_at,
             idempotent,
+            last_run_state,
             created_at,
         }
     }

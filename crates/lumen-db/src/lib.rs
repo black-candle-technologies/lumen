@@ -99,6 +99,8 @@ pub enum RepositoryError {
     InvalidEgressPolicy,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
+    #[error("skill version metadata conflicts with the pinned skill identity")]
+    SkillMetadataConflict,
 }
 
 pub(crate) fn timestamp_to_i64(

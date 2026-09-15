@@ -1208,7 +1208,37 @@ impl Database {
         &self,
         skill: &SkillVersionRecord,
     ) -> Result<(), RepositoryError> {
+        self.insert_skill_version_with_state(skill, None).await
+    }
+
+    pub async fn publish_skill_version(
+        &self,
+        skill: &SkillVersionRecord,
+        updated_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.insert_skill_version_with_state(skill, Some(updated_at))
+            .await
+    }
+
+    async fn insert_skill_version_with_state(
+        &self,
+        skill: &SkillVersionRecord,
+        enabled_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
         let mut transaction = self.pool().begin().await?;
+        let existing = sqlx::query(
+            "SELECT workspace_id, name, description FROM agent_skills WHERE skill_id = ?",
+        )
+        .bind(skill.skill_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(existing) = existing
+            && (existing.try_get::<String, _>("workspace_id")? != skill.workspace_id.to_string()
+                || existing.try_get::<String, _>("name")? != skill.name
+                || existing.try_get::<String, _>("description")? != skill.description)
+        {
+            return Err(RepositoryError::SkillMetadataConflict);
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO agent_skills (skill_id, workspace_id, name, description, created_at)
              VALUES (?, ?, ?, ?, ?)",
@@ -1240,6 +1270,22 @@ impl Database {
         .bind(skill.reviewed_at.map(timestamp_to_i64).transpose()?)
         .execute(&mut *transaction)
         .await?;
+        if let Some(updated_at) = enabled_at {
+            sqlx::query(
+                "INSERT INTO skill_workspace_state (workspace_id, skill_id, version, enabled, updated_at)
+                 VALUES (?, ?, ?, 1, ?)
+                 ON CONFLICT(workspace_id, skill_id) DO UPDATE SET
+                    version = excluded.version,
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(skill.workspace_id.to_string())
+            .bind(skill.skill_id.to_string())
+            .bind(skill.version.as_str())
+            .bind(timestamp_to_i64(updated_at)?)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }

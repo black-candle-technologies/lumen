@@ -216,6 +216,7 @@ export type JobReview = {
 	enabled: boolean;
 	next_due_at?: number | null;
 	idempotent: boolean;
+	last_run_state?: 'claimed' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown' | null;
 	created_at: number;
 };
 
@@ -424,6 +425,10 @@ export class ApiClient {
 			method: 'POST',
 			body: JSON.stringify(request)
 		});
+	}
+
+	async getRunStatus(runId: string): Promise<{ run_id: string; state: string }> {
+		return this.request(`runs/${encodeURIComponent(runId)}/status`);
 	}
 
 	async streamRunEvents(

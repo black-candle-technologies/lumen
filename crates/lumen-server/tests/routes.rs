@@ -40,6 +40,8 @@ const TOKEN: &str = "local-test-token";
 #[derive(Default)]
 struct FakeService {
     run_commands: Mutex<Vec<CreateRunCommand>>,
+    run_status_queries: Mutex<Vec<(WorkspaceId, RunId)>>,
+    run_status: Mutex<Option<String>>,
     approval_commands: Mutex<Vec<ApprovalDecisionCommand>>,
     approval_conflict: Mutex<Option<ApprovalConflict>>,
     renewal_commands: Mutex<Vec<ApprovalRenewalCommand>>,
@@ -80,6 +82,15 @@ impl RuntimeService for FakeService {
             .expect("run commands")
             .push(command);
         Box::pin(async { Ok(RunCreated::new(RunId::new())) })
+    }
+
+    fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String> {
+        self.run_status_queries
+            .lock()
+            .expect("queries")
+            .push((workspace_id, run_id));
+        let status = self.run_status.lock().expect("run status").clone();
+        Box::pin(async move { status.ok_or(ServiceError::NotFound) })
     }
 
     fn decide_approval(
@@ -922,6 +933,7 @@ async fn automation_control_routes_are_authenticated_scoped_and_validated() {
             true,
             Some(TimestampMillis::new(2_000)),
             true,
+            Some("succeeded".to_owned()),
             TimestampMillis::new(10),
         ));
     service
@@ -1010,6 +1022,7 @@ async fn automation_control_routes_are_authenticated_scoped_and_validated() {
     let body = json_body(jobs).await;
     assert_eq!(body["jobs"][0]["job_id"], job_id.to_string());
     assert_eq!(body["jobs"][0]["schedule"]["kind"], "interval");
+    assert_eq!(body["jobs"][0]["last_run_state"], "succeeded");
 
     let job_update = app
         .clone()
@@ -1538,6 +1551,46 @@ async fn approval_listing_returns_exact_action_previews() {
     let queries = service.approval_queries.lock().expect("approval queries");
     assert_eq!(queries[0].workspace_id(), workspace_id);
     assert_eq!(queries[0].actor().subject(), "operator");
+}
+
+#[tokio::test]
+async fn run_status_is_read_only_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let run_id = RunId::new();
+    let (app, service, _) = test_app(workspace_id);
+    *service.run_status.lock().expect("run status") = Some("completed".into());
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/runs/{run_id}/status"),
+            Body::empty(),
+        ))
+        .await
+        .expect("status response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["run_id"], run_id.to_string());
+    assert_eq!(body["state"], "completed");
+    assert_eq!(
+        service.run_status_queries.lock().expect("queries")[0],
+        (workspace_id, run_id)
+    );
+
+    let other = app
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{}/runs/{run_id}/status",
+                WorkspaceId::new()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("other workspace response");
+    assert_ne!(other.status(), StatusCode::OK);
+    assert_eq!(service.run_status_queries.lock().expect("queries").len(), 1);
 }
 
 #[tokio::test]

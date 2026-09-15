@@ -1177,3 +1177,51 @@ async fn skill_versions_and_capture_drafts_are_separate_immutable_records() {
         .expect("count");
     assert_eq!(skill_count, 1);
 }
+
+#[tokio::test]
+async fn a_new_skill_version_cannot_silently_change_the_pinned_name() {
+    let database = database().await;
+    let first = SkillVersionRecord::new(
+        skill_id(),
+        SkillVersion::parse("1.0.0").expect("version"),
+        workspace_id(),
+        "Daily Brief",
+        "Reviewed brief",
+        "markdown",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+        owner(),
+        Some(owner()),
+        TimestampMillis::new(1_000),
+        Some(TimestampMillis::new(1_000)),
+    )
+    .expect("first version");
+    database
+        .insert_skill_version(&first)
+        .await
+        .expect("first stored");
+    let changed = SkillVersionRecord::new(
+        skill_id(),
+        SkillVersion::parse("2.0.0").expect("version"),
+        workspace_id(),
+        "Different Name",
+        "Reviewed brief",
+        "markdown",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        true,
+        owner(),
+        Some(owner()),
+        TimestampMillis::new(2_000),
+        Some(TimestampMillis::new(2_000)),
+    )
+    .expect("changed version");
+
+    assert!(database.insert_skill_version(&changed).await.is_err());
+    assert!(
+        database
+            .skill_version(workspace_id(), skill_id(), changed.version())
+            .await
+            .expect("version lookup")
+            .is_none()
+    );
+}

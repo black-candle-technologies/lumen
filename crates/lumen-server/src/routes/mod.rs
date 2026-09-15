@@ -53,6 +53,10 @@ pub fn router(state: ApiState) -> Router {
             "/api/v1/workspaces/{workspace_id}/runs/{run_id}/events",
             get(run_events),
         )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/{run_id}/status",
+            get(run_status),
+        )
         .route("/api/v1/workspaces/{workspace_id}/audit", get(list_audit))
         .route(
             "/api/v1/workspaces/{workspace_id}/plugins/staged",
@@ -725,6 +729,26 @@ async fn run_events(
         run_id,
         after,
     )))
+}
+
+#[derive(Serialize)]
+struct RunStatusResponse {
+    run_id: RunId,
+    state: String,
+}
+
+async fn run_status(
+    State(state): State<ApiState>,
+    Path((workspace, run)): Path<(String, String)>,
+) -> Result<Json<RunStatusResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let run_id = parse_run(&run)?;
+    let run_state = state.service.run_status(workspace_id, run_id).await?;
+    Ok(Json(RunStatusResponse {
+        run_id,
+        state: run_state,
+    }))
 }
 
 #[derive(Deserialize)]
