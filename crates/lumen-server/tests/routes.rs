@@ -40,6 +40,8 @@ const TOKEN: &str = "local-test-token";
 #[derive(Default)]
 struct FakeService {
     run_commands: Mutex<Vec<CreateRunCommand>>,
+    model_probe_queries: Mutex<Vec<WorkspaceId>>,
+    model_probe_state: Mutex<String>,
     run_status_queries: Mutex<Vec<(WorkspaceId, RunId)>>,
     run_status: Mutex<Option<String>>,
     approval_commands: Mutex<Vec<ApprovalDecisionCommand>>,
@@ -82,6 +84,15 @@ impl RuntimeService for FakeService {
             .expect("run commands")
             .push(command);
         Box::pin(async { Ok(RunCreated::new(RunId::new())) })
+    }
+
+    fn model_readiness(&self, workspace_id: WorkspaceId) -> ServiceFuture<'_, String> {
+        self.model_probe_queries
+            .lock()
+            .expect("probe queries")
+            .push(workspace_id);
+        let state = self.model_probe_state.lock().expect("model state").clone();
+        Box::pin(async move { Ok(state) })
     }
 
     fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String> {
@@ -516,7 +527,7 @@ fn test_app(workspace_id: WorkspaceId) -> (axum::Router, Arc<FakeService>, Event
 #[tokio::test]
 async fn runtime_capability_report_is_authenticated_and_workspace_scoped() {
     let workspace_id = WorkspaceId::new();
-    let (app, _, _) = test_app(workspace_id);
+    let (app, service, _) = test_app(workspace_id);
 
     let response = app
         .clone()
@@ -532,9 +543,71 @@ async fn runtime_capability_report_is_authenticated_and_workspace_scoped() {
     let body = json_body(response).await;
     assert_eq!(body["sandbox"]["backend"], "test-sandbox");
     assert_eq!(body["sandbox"]["strength"], "kernel_enforced");
+    assert_eq!(body["server"], "listening");
+    assert_eq!(body["workspace"], "ready");
+    assert_eq!(body["model"], "not_checked");
+    assert!(
+        service
+            .model_probe_queries
+            .lock()
+            .expect("probe queries")
+            .is_empty()
+    );
     assert_eq!(
         body["sandbox"]["guarantees"],
         serde_json::json!(["filesystem_isolation", "network_isolation"])
+    );
+}
+
+#[tokio::test]
+async fn model_probe_is_explicit_authenticated_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    *service.model_probe_state.lock().expect("model state") = "listed".into();
+    let uri = format!("/api/v1/workspaces/{workspace_id}/runtime/capabilities?probe_model=true");
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", uri.clone(), Body::empty()))
+        .await
+        .expect("probe response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["model"], "listed");
+    assert_eq!(
+        *service.model_probe_queries.lock().expect("probe queries"),
+        vec![workspace_id]
+    );
+
+    let mut wrong_token = request("GET", uri, Body::empty());
+    wrong_token.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer wrong".parse().expect("header"),
+    );
+    let rejected = app
+        .clone()
+        .oneshot(wrong_token)
+        .await
+        .expect("bad token response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let other = app
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{}/runtime/capabilities?probe_model=true",
+                WorkspaceId::new()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("other workspace response");
+    assert_ne!(other.status(), StatusCode::OK);
+    assert_eq!(
+        service
+            .model_probe_queries
+            .lock()
+            .expect("probe queries")
+            .len(),
+        1
     );
 }
 

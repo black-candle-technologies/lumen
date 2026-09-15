@@ -17,6 +17,8 @@ use url::{Host, Url};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const MODEL_PROBE_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointPolicy {
@@ -164,6 +166,34 @@ impl OpenAiCompatibleClient {
 
     pub const fn identity(&self) -> &ProviderIdentity {
         &self.identity
+    }
+
+    pub async fn probe_local_model(&self) -> Result<bool, ModelError> {
+        if self.config.endpoint_class != EndpointClass::Local {
+            return Err(ModelError::new("remote model catalog probe is not allowed"));
+        }
+        tokio::time::timeout(MODEL_PROBE_TIMEOUT, async {
+            let url =
+                self.config.endpoint.join("models").map_err(|error| {
+                    ModelError::new(format!("invalid model catalog URL: {error}"))
+                })?;
+            let response = self.client.get(url).send().await.map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(ModelError::new(format!(
+                    "model catalog returned HTTP {}",
+                    response.status()
+                )));
+            }
+            let body = read_limited(response, MODEL_PROBE_MAX_RESPONSE_BYTES).await?;
+            let catalog: ModelCatalog = serde_json::from_slice(&body)
+                .map_err(|_| ModelError::new("model catalog response is invalid"))?;
+            Ok(catalog
+                .data
+                .iter()
+                .any(|model| model.id == self.config.model))
+        })
+        .await
+        .map_err(|_| ModelError::new("model catalog probe timed out"))?
     }
 
     pub async fn generate_cancellable(
@@ -588,6 +618,16 @@ struct StreamToolCall {
     #[serde(rename = "type")]
     kind: Option<String>,
     function: StreamToolFunction,
+}
+
+#[derive(Deserialize)]
+struct ModelCatalog {
+    data: Vec<ModelCatalogEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelCatalogEntry {
+    id: String,
 }
 
 #[derive(Deserialize)]

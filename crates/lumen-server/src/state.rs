@@ -60,6 +60,7 @@ impl ApprovalConflict {
 
 pub trait RuntimeService: Send + Sync {
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated>;
+    fn model_readiness(&self, workspace_id: WorkspaceId) -> ServiceFuture<'_, String>;
     fn decide_approval(
         &self,
         command: ApprovalDecisionCommand,

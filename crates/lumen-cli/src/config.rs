@@ -435,6 +435,8 @@ pub enum ConfigError {
 mod tests {
     use std::path::PathBuf;
 
+    use lumen_integrations::sandbox::{SandboxReport, SandboxStrength};
+
     use super::{Config, ConfigError, toml_string};
 
     fn config_with_runtime(runtime: &str) -> String {
@@ -470,6 +472,20 @@ subject = "operator"
         assert!(matches!(
             Config::parse(&config_with_runtime("required_skills = [\"not-a-skill\"]")),
             Err(ConfigError::InvalidRequiredSkill(value)) if value == "not-a-skill"
+        ));
+    }
+
+    #[test]
+    fn required_kernel_sandbox_stays_fail_closed_when_unavailable() {
+        let config = Config::parse(&config_with_runtime("")).expect("default config");
+        let report = SandboxReport::new(
+            "unavailable-host",
+            SandboxStrength::Unavailable,
+            Some("kernel backend not installed".into()),
+        );
+        assert!(matches!(
+            config.validate_sandbox(&report),
+            Err(ConfigError::SandboxUnavailable(detail)) if detail.contains("kernel backend not installed")
         ));
     }
 

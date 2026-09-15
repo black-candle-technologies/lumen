@@ -94,6 +94,7 @@ async fn read_bounded_skill_source(
 #[derive(Clone)]
 pub(crate) struct LocalRuntimeService {
     model: Arc<dyn ModelPort>,
+    model_probe: Arc<OpenAiCompatibleClient>,
     enforce_model_egress_policy: bool,
     normalizer: Arc<dyn ActionNormalizer>,
     executor: Arc<dyn ExecutorPort>,
@@ -156,8 +157,10 @@ impl LocalRuntimeService {
         .with_streaming(config.model.streaming)
         .with_timeout(Duration::from_secs(config.model.timeout_seconds))
         .with_max_response_bytes(config.model.max_response_bytes);
-        let model = OpenAiCompatibleClient::new(model_config)
-            .map_err(|error| CliError::Runtime(error.to_string()))?;
+        let model = Arc::new(
+            OpenAiCompatibleClient::new(model_config)
+                .map_err(|error| CliError::Runtime(error.to_string()))?,
+        );
         let allowed_programs: Vec<_> = config.process.allowed_programs.iter().cloned().collect();
         let secret_references = database
             .list_secret_references(config.workspace_id())
@@ -265,7 +268,8 @@ impl LocalRuntimeService {
         grants.extend(channel_send_capabilities);
         let ambient_capabilities = CapabilitySet::new(grants);
         let service = Self {
-            model: Arc::new(model),
+            model: model.clone(),
+            model_probe: model,
             enforce_model_egress_policy: config.model.allow_remote,
             normalizer: Arc::new(normalizer),
             executor: Arc::new(executor),
@@ -1573,6 +1577,25 @@ const fn remote_data_class(value: RemoteDataClass) -> DataClass {
 }
 
 impl RuntimeService for LocalRuntimeService {
+    fn model_readiness(
+        &self,
+        _workspace_id: lumen_core::identity::WorkspaceId,
+    ) -> ServiceFuture<'_, String> {
+        Box::pin(async move {
+            if self.model_probe.identity().endpoint_class()
+                == lumen_integrations::openai_compatible::EndpointClass::Remote
+            {
+                return Ok("remote_not_probed".into());
+            }
+            Ok(match self.model_probe.probe_local_model().await {
+                Ok(true) => "listed",
+                Ok(false) => "not_listed",
+                Err(_) => "unavailable",
+            }
+            .into())
+        })
+    }
+
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated> {
         let service = self.clone();
         Box::pin(async move {

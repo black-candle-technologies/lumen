@@ -2,6 +2,8 @@
 
 This directory preserves durable QA history tied to source revisions: acceptance evidence, regression findings, test methodology, known limitations, and mappings from findings to GitHub issues.
 
+The current M5 operator commands and status meanings are in [M5 local readiness acceptance guide](M5_ACCEPTANCE_GUIDE.md).
+
 ## Repository policy
 
 Commit:

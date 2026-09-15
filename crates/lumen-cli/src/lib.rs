@@ -201,6 +201,16 @@ pub struct PluginActionRequest {
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
+    if matches!(
+        &cli.command,
+        Command::Sandbox {
+            command: SandboxCommand::Report
+        }
+    ) {
+        return Ok(CommandOutput::SandboxReport(
+            SystemSandbox::detect().report(),
+        ));
+    }
     let secret_input = if matches!(
         &cli.command,
         Command::Secret {
@@ -225,6 +235,16 @@ pub async fn execute_with_secret_store(
     secret_store: Arc<dyn SecretStore>,
     secret_input: Option<Vec<u8>>,
 ) -> Result<CommandOutput, CliError> {
+    if matches!(
+        &cli.command,
+        Command::Sandbox {
+            command: SandboxCommand::Report
+        }
+    ) {
+        return Ok(CommandOutput::SandboxReport(
+            SystemSandbox::detect().report(),
+        ));
+    }
     let config = Config::load(&cli.config)?;
     prepare_directories(&config)?;
     match cli.command {
@@ -253,7 +273,7 @@ pub async fn execute_with_secret_store(
             execute_secret_command(&config, command, secret_store, secret_input).await
         }
         Command::Plugin { command } => execute_plugin_command(&config, command, secret_store).await,
-        Command::Serve => serve(config, secret_store).await,
+        Command::Serve => serve(config, secret_store, &cli.config).await,
     }
 }
 
@@ -716,9 +736,19 @@ fn validate_secret_input(value: &[u8]) -> Result<(), CliError> {
 async fn serve(
     config: Config,
     secret_store: Arc<dyn SecretStore>,
+    config_path: &Path,
 ) -> Result<CommandOutput, CliError> {
     let sandbox: Arc<dyn SandboxBackend> = Arc::new(SystemSandbox::detect());
-    config.validate_sandbox(&sandbox.report())?;
+    let sandbox_report = sandbox.report();
+    eprintln!(
+        "event=server_starting bind={} config={config_path:?} workspace={} backend={} strength={} pid={}",
+        config.server.bind,
+        config.workspace_id(),
+        sandbox_report.backend(),
+        sandbox_report.strength().as_str(),
+        std::process::id()
+    );
+    config.validate_sandbox(&sandbox_report)?;
     let token = std::env::var(&config.authentication.token_environment).map_err(|_| {
         CliError::MissingEnvironment(config.authentication.token_environment.clone())
     })?;
@@ -760,6 +790,20 @@ async fn serve(
             .await?;
     }
 
+    let listener = match tokio::net::TcpListener::bind(config.server.bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!(
+                "event=server_bind_failed bind={} config={config_path:?} workspace={} pid={} error={error}",
+                config.server.bind,
+                config.workspace_id(),
+                std::process::id()
+            );
+            database.close().await;
+            return Err(CliError::Io(error));
+        }
+    };
+
     let events = EventBroker::new(1024);
     let service = Arc::new(
         runtime::LocalRuntimeService::build_with_secret_store(
@@ -778,12 +822,21 @@ async fn serve(
         token,
         config.bootstrap_principal(),
         BTreeSet::from([config.workspace_id()]),
-        api_sandbox_report(&sandbox.report()),
+        api_sandbox_report(&sandbox_report),
     )?;
-    let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
-    let server_result =
-        serve_listener_until_shutdown(listener, router(state), events, service, shutdown_signal())
-            .await;
+    let server_result = serve_listener_until_shutdown(
+        listener,
+        router(state),
+        events,
+        service,
+        (
+            config_path,
+            &config.workspace_id().to_string(),
+            &sandbox_report,
+        ),
+        shutdown_signal(),
+    )
+    .await;
     database.close().await;
     server_result?;
     Ok(CommandOutput::ServerStopped)
@@ -794,11 +847,15 @@ async fn serve_listener_until_shutdown(
     app: axum::Router,
     events: EventBroker,
     service: Arc<runtime::LocalRuntimeService>,
+    diagnostics: (&Path, &str, &SandboxReport),
     signal: impl Future<Output = ()>,
 ) -> Result<(), std::io::Error> {
+    let (config_path, workspace_id, sandbox_report) = diagnostics;
     let bind = listener.local_addr()?;
     eprintln!(
-        "event=server_started bind={bind} pid={}",
+        "event=server_started bind={bind} config={config_path:?} workspace={workspace_id} backend={} strength={} pid={}",
+        sandbox_report.backend(),
+        sandbox_report.strength().as_str(),
         std::process::id()
     );
     let stop_accepting = CancellationToken::new();

@@ -113,17 +113,35 @@ pub fn router(state: ApiState) -> Router {
 
 #[derive(Serialize)]
 struct RuntimeCapabilitiesResponse {
+    server: &'static str,
+    workspace: &'static str,
     sandbox: crate::SandboxCapabilityReport,
+    model: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCapabilityParameters {
+    #[serde(default)]
+    probe_model: bool,
 }
 
 async fn runtime_capabilities(
     State(state): State<ApiState>,
     Path(workspace): Path<String>,
+    Query(parameters): Query<RuntimeCapabilityParameters>,
 ) -> Result<Json<RuntimeCapabilitiesResponse>, ApiError> {
     let workspace_id = parse_workspace(&workspace)?;
     ensure_workspace(&state, workspace_id)?;
     Ok(Json(RuntimeCapabilitiesResponse {
+        server: "listening",
+        workspace: "ready",
         sandbox: state.sandbox().clone(),
+        model: if parameters.probe_model {
+            state.service.model_readiness(workspace_id).await?
+        } else {
+            "not_checked".into()
+        },
     }))
 }
 

@@ -6247,15 +6247,28 @@ async fn server_shutdown_closes_active_sse_and_releases_listener() {
         .expect("test listener");
     let address = listener.local_addr().expect("listener address");
     let (stop, stopped) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(crate::serve_listener_until_shutdown(
-        listener,
-        harness.app.clone(),
-        harness.events.clone(),
-        harness.service.clone(),
-        async move {
-            let _ = stopped.await;
-        },
-    ));
+    let app = harness.app.clone();
+    let events = harness.events.clone();
+    let service = harness.service.clone();
+    let workspace_id = harness.workspace_id.to_string();
+    let sandbox_report = harness.sandbox.report();
+    let server = tokio::spawn(async move {
+        crate::serve_listener_until_shutdown(
+            listener,
+            app,
+            events,
+            service,
+            (
+                std::path::Path::new("test-lumen.toml"),
+                &workspace_id,
+                &sandbox_report,
+            ),
+            async move {
+                let _ = stopped.await;
+            },
+        )
+        .await
+    });
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("server connection");

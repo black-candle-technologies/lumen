@@ -62,6 +62,60 @@ fn config(server: &MockServer) -> OpenAiCompatibleConfig {
 }
 
 #[tokio::test]
+async fn opt_in_local_catalog_probe_distinguishes_listed_missing_and_unavailable_models() {
+    let listed = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list", "data": [{"id": "local-model", "object": "model"}]
+        })))
+        .mount(&listed)
+        .await;
+    let client = OpenAiCompatibleClient::new(config(&listed)).expect("listed client");
+    assert!(client.probe_local_model().await.expect("listed catalog"));
+
+    let missing = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list", "data": [{"id": "other-model", "object": "model"}]
+        })))
+        .mount(&missing)
+        .await;
+    let client = OpenAiCompatibleClient::new(config(&missing)).expect("missing client");
+    assert!(!client.probe_local_model().await.expect("missing catalog"));
+
+    let unavailable = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&unavailable)
+        .await;
+    let client = OpenAiCompatibleClient::new(config(&unavailable)).expect("unavailable client");
+    assert!(client.probe_local_model().await.is_err());
+}
+
+#[tokio::test]
+async fn catalog_probe_refuses_remote_egress_without_a_model_policy_decision() {
+    let config = OpenAiCompatibleConfig::new(
+        "http://example.invalid/v1/",
+        "remote-model",
+        EndpointPolicy::AllowRemote,
+    )
+    .expect("remote config");
+    let client = OpenAiCompatibleClient::new(config).expect("remote client");
+    let error = client
+        .probe_local_model()
+        .await
+        .expect_err("remote probe denied");
+    assert!(
+        error
+            .to_string()
+            .contains("remote model catalog probe is not allowed")
+    );
+}
+
+#[tokio::test]
 async fn sends_openai_request_and_parses_text_completion() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
