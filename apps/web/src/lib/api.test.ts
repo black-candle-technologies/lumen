@@ -9,6 +9,30 @@ const settings: ConnectionSettings = {
 };
 
 describe('ApiClient', () => {
+	it('does not treat a malformed successful audit body as an empty list', async () => {
+		const fetchMock = vi.fn(async () => new Response('{"error":{"code":"bad_request"}}', {
+			status: 200,
+			headers: { 'content-type': 'application/json' }
+		}));
+		const client = new ApiClient(settings, fetchMock as typeof fetch);
+
+		await expect(client.listAudit()).rejects.toMatchObject({ code: 'invalid_response' });
+	});
+
+	it('retains the audit API status and error code before selecting events', async () => {
+		const fetchMock = vi.fn(async () => new Response(
+			'{"error":{"code":"bad_request","message":"invalid audit page bounds"}}',
+			{ status: 400, headers: { 'content-type': 'application/json' } }
+		));
+		const client = new ApiClient(settings, fetchMock as typeof fetch);
+
+		await expect(client.listAudit()).rejects.toMatchObject({
+			status: 400,
+			code: 'bad_request',
+			message: 'invalid audit page bounds'
+		});
+	});
+
 	it('parses authenticated SSE frames and resumes from the last event ID', async () => {
 		const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
 			expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer local-test-token');

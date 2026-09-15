@@ -37,7 +37,7 @@
 
 <section class="page audit-page">
 	<header class="page-heading">
-		<div><h1>Audit</h1><p>Ordered runtime events</p></div>
+		<div><h1>Audit</h1><p>First 100 ordered runtime events; use the QA inspector for complete run provenance.</p></div>
 		<button class="icon-button" type="button" aria-label="Refresh audit events" title="Refresh" onclick={load} disabled={loadState === 'loading'}><RefreshCw size={17} /></button>
 	</header>
 	{#if loadError}

@@ -1557,6 +1557,104 @@ async fn audit_listing_is_workspace_scoped_and_bounded() {
 }
 
 #[tokio::test]
+async fn audit_query_contract_preserves_bounds_auth_and_error_status() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    let path = format!("/api/v1/workspaces/{workspace_id}/audit");
+
+    for (query, after, limit) in [
+        ("", 0, 100),
+        ("?limit=1", 0, 1),
+        ("?limit=200&after=7", 7, 200),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", format!("{path}{query}"), Body::empty()))
+            .await
+            .expect("valid audit page");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_body(response).await["events"].is_array());
+        let queries = service.audit_queries.lock().expect("audit queries");
+        let recorded = queries.last().expect("recorded query");
+        assert_eq!(recorded.after(), after);
+        assert_eq!(recorded.limit(), limit);
+    }
+    assert_eq!(
+        service.audit_queries.lock().expect("audit queries").len(),
+        3
+    );
+
+    for query in ["?limit=0", "?limit=201", "?limit=250", "?after=-1"] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", format!("{path}{query}"), Body::empty()))
+            .await
+            .expect("invalid bound response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "bad_request", "{query}");
+        assert!(body.get("events").is_none(), "{query}");
+    }
+
+    for query in ["?limit=oops", "?limit=-1", "?after=oops"] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", format!("{path}{query}"), Body::empty()))
+            .await
+            .expect("malformed query response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("query body")
+            .to_bytes();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_err(),
+            "{query}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("\"events\""),
+            "{query}"
+        );
+    }
+
+    let mut bad_token = request("GET", path.clone(), Body::empty());
+    bad_token.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer wrong".parse().expect("header"),
+    );
+    let unauthorized = app
+        .clone()
+        .oneshot(bad_token)
+        .await
+        .expect("bad token response");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_body(unauthorized).await["error"]["code"],
+        "unauthorized"
+    );
+
+    let forbidden = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{}/audit", WorkspaceId::new()),
+            Body::empty(),
+        ))
+        .await
+        .expect("wrong workspace response");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(forbidden).await["error"]["code"],
+        "workspace_forbidden"
+    );
+    assert_eq!(
+        service.audit_queries.lock().expect("audit queries").len(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn approval_listing_returns_exact_action_previews() {
     let workspace_id = WorkspaceId::new();
     let approval_id = ApprovalId::new();
