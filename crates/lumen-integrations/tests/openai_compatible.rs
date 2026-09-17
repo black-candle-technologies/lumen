@@ -1,6 +1,12 @@
 #![cfg(feature = "model-client")]
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use lumen_core::{
     action::CanonicalValue,
@@ -9,7 +15,7 @@ use lumen_core::{
     },
 };
 use lumen_integrations::openai_compatible::{
-    EndpointClass, EndpointPolicy, OpenAiCompatibleClient, OpenAiCompatibleConfig,
+    EndpointClass, EndpointPolicy, OllamaGpuPolicy, OpenAiCompatibleClient, OpenAiCompatibleConfig,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -59,6 +65,247 @@ fn config(server: &MockServer) -> OpenAiCompatibleConfig {
         EndpointPolicy::LoopbackOnly,
     )
     .expect("loopback config")
+}
+
+fn gpu_config(server: &MockServer, policy: OllamaGpuPolicy) -> OpenAiCompatibleConfig {
+    config(server)
+        .with_ollama_gpu_policy(policy)
+        .expect("local Ollama GPU policy")
+}
+
+fn loaded_model(size: u64, size_vram: u64) -> serde_json::Value {
+    json!({"models": [{"name": "local-model", "size": size, "size_vram": size_vram}]})
+}
+
+fn completion() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "choices": [{"message": {"content": "guarded answer"}}]
+    }))
+}
+
+#[tokio::test]
+async fn require_full_rejects_non_gpu_and_unknown_residency_before_user_content() {
+    for (label, response, expected) in [
+        (
+            "mixed",
+            ResponseTemplate::new(200).set_body_json(loaded_model(100, 60)),
+            "mixed",
+        ),
+        (
+            "cpu",
+            ResponseTemplate::new(200).set_body_json(loaded_model(100, 0)),
+            "CPU-only",
+        ),
+        ("unavailable", ResponseTemplate::new(503), "unavailable"),
+        (
+            "unknown",
+            ResponseTemplate::new(200).set_body_json(json!({"models": [{"name": "local-model"}]})),
+            "unknown",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(completion())
+            .mount(&server)
+            .await;
+        let client = OpenAiCompatibleClient::new(gpu_config(&server, OllamaGpuPolicy::RequireFull))
+            .expect("client");
+
+        let error = client.generate(input()).await.expect_err(label);
+        assert!(error.message().contains(expected), "{label}: {error}");
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1, "{label}: must not send user content");
+        assert_eq!(requests[0].url.path(), "/api/ps");
+    }
+}
+
+#[tokio::test]
+async fn require_full_accepts_full_residency_and_checks_after_completion() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(loaded_model(100, 100)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(completion())
+        .mount(&server)
+        .await;
+    let client = OpenAiCompatibleClient::new(gpu_config(&server, OllamaGpuPolicy::RequireFull))
+        .expect("client");
+
+    assert_eq!(
+        client.generate(input()).await.expect("full GPU"),
+        ModelOutput::FinalText("guarded answer".into())
+    );
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        ["/api/ps", "/v1/chat/completions", "/api/ps"]
+    );
+}
+
+#[tokio::test]
+async fn allow_mixed_accepts_partial_offload_but_not_cpu_only() {
+    for (size_vram, allowed) in [(60, true), (0, false)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(loaded_model(100, size_vram)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(completion())
+            .mount(&server)
+            .await;
+        let client = OpenAiCompatibleClient::new(gpu_config(&server, OllamaGpuPolicy::AllowMixed))
+            .expect("client");
+        let result = client.generate(input()).await;
+        assert_eq!(result.is_ok(), allowed);
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/v1/chat/completions")
+                .count(),
+            usize::from(allowed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn absent_model_is_preloaded_without_user_content_then_checked() {
+    let server = MockServer::start().await;
+    let probes = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&probes);
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(move |_: &wiremock::Request| {
+            let models = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                json!({"models": []})
+            } else {
+                loaded_model(100, 100)
+            };
+            ResponseTemplate::new(200).set_body_json(models)
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .and(body_json(
+            json!({"model": "local-model", "prompt": "", "stream": false}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"done": true})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(completion())
+        .mount(&server)
+        .await;
+    let client = OpenAiCompatibleClient::new(gpu_config(&server, OllamaGpuPolicy::RequireFull))
+        .expect("client");
+
+    assert!(client.generate(input()).await.is_ok());
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        [
+            "/api/ps",
+            "/api/generate",
+            "/api/ps",
+            "/v1/chat/completions",
+            "/api/ps"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn post_request_downgrade_withholds_model_output() {
+    let server = MockServer::start().await;
+    let probes = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&probes);
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(move |_: &wiremock::Request| {
+            let vram = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                100
+            } else {
+                0
+            };
+            ResponseTemplate::new(200).set_body_json(loaded_model(100, vram))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(completion())
+        .mount(&server)
+        .await;
+    let client = OpenAiCompatibleClient::new(gpu_config(&server, OllamaGpuPolicy::RequireFull))
+        .expect("client");
+
+    let error = client.generate(input()).await.expect_err("CPU downgrade");
+    assert!(error.message().contains("CPU-only"));
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        ["/api/ps", "/v1/chat/completions", "/api/ps"]
+    );
+}
+
+#[test]
+fn gpu_policy_is_limited_to_loopback_ollama_v1_endpoint() {
+    let normalized = OpenAiCompatibleConfig::new(
+        "http://127.0.0.1:11434/v1",
+        "model",
+        EndpointPolicy::LoopbackOnly,
+    )
+    .expect("local endpoint without trailing slash");
+    assert!(
+        normalized
+            .with_ollama_gpu_policy(OllamaGpuPolicy::RequireFull)
+            .is_ok()
+    );
+    let remote = OpenAiCompatibleConfig::new(
+        "https://models.example.com/v1/",
+        "model",
+        EndpointPolicy::AllowRemote,
+    )
+    .expect("remote opt-in config");
+    assert!(
+        remote
+            .with_ollama_gpu_policy(OllamaGpuPolicy::RequireFull)
+            .is_err()
+    );
+    let other_local = OpenAiCompatibleConfig::new(
+        "http://127.0.0.1:11434/other/",
+        "model",
+        EndpointPolicy::LoopbackOnly,
+    )
+    .expect("local config");
+    assert!(
+        other_local
+            .with_ollama_gpu_policy(OllamaGpuPolicy::RequireFull)
+            .is_err()
+    );
 }
 
 #[tokio::test]

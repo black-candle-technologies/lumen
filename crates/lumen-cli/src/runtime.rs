@@ -156,7 +156,9 @@ impl LocalRuntimeService {
         .map_err(|error| CliError::Runtime(error.to_string()))?
         .with_streaming(config.model.streaming)
         .with_timeout(Duration::from_secs(config.model.timeout_seconds))
-        .with_max_response_bytes(config.model.max_response_bytes);
+        .with_max_response_bytes(config.model.max_response_bytes)
+        .with_ollama_gpu_policy(config.model.gpu_policy)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
         let model = Arc::new(
             OpenAiCompatibleClient::new(model_config)
                 .map_err(|error| CliError::Runtime(error.to_string()))?,

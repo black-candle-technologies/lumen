@@ -8,7 +8,10 @@ use lumen_core::{
     automation::{SkillId, SkillVersion},
     identity::{PrincipalId, WorkspaceId},
 };
-use lumen_integrations::sandbox::{SandboxReport, SandboxStrength};
+use lumen_integrations::{
+    openai_compatible::OllamaGpuPolicy,
+    sandbox::{SandboxReport, SandboxStrength},
+};
 use serde::Deserialize;
 use thiserror::Error;
 use url::{Host, Url};
@@ -107,6 +110,16 @@ impl Config {
                 .as_ref()
                 .ok_or(ConfigError::RemoteModelPolicyRequired)?;
             validate_remote_provider(provider)?;
+        }
+        if self.model.gpu_policy != OllamaGpuPolicy::Off {
+            let url =
+                Url::parse(&self.model.endpoint).map_err(|_| ConfigError::InvalidModelEndpoint)?;
+            if endpoint_class != ModelEndpointClass::Local
+                || url.scheme() != "http"
+                || !matches!(url.path(), "/v1" | "/v1/")
+            {
+                return Err(ConfigError::InvalidOllamaGpuEndpoint);
+            }
         }
         if self.model.model.trim().is_empty() {
             return Err(ConfigError::InvalidModel);
@@ -268,6 +281,7 @@ pub struct ModelConfig {
     pub streaming: bool,
     pub timeout_seconds: u64,
     pub max_response_bytes: usize,
+    pub gpu_policy: OllamaGpuPolicy,
 }
 
 impl Default for ModelConfig {
@@ -280,6 +294,7 @@ impl Default for ModelConfig {
             streaming: true,
             timeout_seconds: 120,
             max_response_bytes: 4 * 1024 * 1024,
+            gpu_policy: OllamaGpuPolicy::Off,
         }
     }
 }
@@ -413,6 +428,8 @@ pub enum ConfigError {
     InvalidRemoteDataClass,
     #[error("model endpoint is invalid")]
     InvalidModelEndpoint,
+    #[error("Ollama GPU policy requires an HTTP loopback /v1/ endpoint")]
+    InvalidOllamaGpuEndpoint,
     #[error("model name must be non-empty")]
     InvalidModel,
     #[error("workspace ID must be a UUID")]

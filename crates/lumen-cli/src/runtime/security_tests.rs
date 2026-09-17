@@ -32,6 +32,7 @@ use lumen_db::{
 };
 use lumen_integrations::{
     extension_package::PackageStager,
+    openai_compatible::OllamaGpuPolicy,
     sandbox::{
         SandboxBackend, SandboxError, SandboxFuture, SandboxOutput, SandboxProfile, SandboxReport,
         SandboxRequest, SandboxStrength,
@@ -278,9 +279,17 @@ struct Harness {
 
 impl Harness {
     async fn new(model: &MockServer, prepare_workspace: impl FnOnce(&std::path::Path)) -> Self {
-        Self::new_inner(model, prepare_workspace, None, None, None, None, None)
-            .await
-            .0
+        Self::new_inner(
+            model,
+            prepare_workspace,
+            None,
+            None,
+            None,
+            None,
+            (None, None),
+        )
+        .await
+        .0
     }
 
     async fn new_with_approval_ttl(model: &MockServer, approval_ttl_seconds: u64) -> Self {
@@ -291,14 +300,20 @@ impl Harness {
             None,
             None,
             Some(approval_ttl_seconds),
-            None,
+            (None, None),
         )
         .await
         .0
     }
 
     async fn new_with_required_skill(model: &MockServer, skill: String) -> Self {
-        Self::new_inner(model, |_| {}, None, None, None, None, Some(skill))
+        Self::new_inner(model, |_| {}, None, None, None, None, (Some(skill), None))
+            .await
+            .0
+    }
+
+    async fn new_with_gpu_policy(model: &MockServer, policy: OllamaGpuPolicy) -> Self {
+        Self::new_inner(model, |_| {}, None, None, None, None, (None, Some(policy)))
             .await
             .0
     }
@@ -316,7 +331,7 @@ impl Harness {
             None,
             None,
             None,
-            None,
+            (None, None),
         )
         .await
         .0
@@ -334,7 +349,7 @@ impl Harness {
             None,
             Some(RecordingSandbox::new().with_plugin_response(response)),
             None,
-            None,
+            (None, None),
         )
         .await
         .0
@@ -352,7 +367,7 @@ impl Harness {
             None,
             Some(sandbox),
             None,
-            None,
+            (None, None),
         )
         .await
         .0
@@ -363,13 +378,13 @@ impl Harness {
         setup: SecretSetup,
     ) -> (Self, SecretReference, Arc<InMemorySecretStore>) {
         let (harness, reference, store) =
-            Self::new_inner(model, |_| {}, None, Some(setup), None, None, None).await;
+            Self::new_inner(model, |_| {}, None, Some(setup), None, None, (None, None)).await;
         (harness, reference.expect("secret reference"), store)
     }
 
     async fn new_with_cancellable_process(model: &MockServer) -> Self {
         let (mut harness, _, _) =
-            Self::new_inner(model, |_| {}, None, None, None, None, None).await;
+            Self::new_inner(model, |_| {}, None, None, None, None, (None, None)).await;
         let sandbox = RecordingSandbox::new().waiting_for_cancellation();
         let config = Config::parse(&format!(
             r#"
@@ -440,7 +455,7 @@ subject = "operator"
         secret: Option<SecretSetup>,
         sandbox_override: Option<RecordingSandbox>,
         approval_ttl_seconds: Option<u64>,
-        required_skill: Option<String>,
+        runtime_overrides: (Option<String>, Option<OllamaGpuPolicy>),
     ) -> (Self, Option<SecretReference>, Arc<InMemorySecretStore>) {
         let directory = tempfile::tempdir().expect("temporary runtime");
         let workspace = directory.path().join("workspace");
@@ -486,8 +501,11 @@ subject = "operator"
         if let Some(approval_ttl_seconds) = approval_ttl_seconds {
             config.runtime.approval_ttl_seconds = approval_ttl_seconds;
         }
-        if let Some(required_skill) = required_skill {
+        if let Some(required_skill) = runtime_overrides.0 {
             config.runtime.required_skills.insert(required_skill);
+        }
+        if let Some(gpu_policy) = runtime_overrides.1 {
+            config.model.gpu_policy = gpu_policy;
         }
         let database = Database::connect_in_memory().await.expect("database");
         database
@@ -3308,6 +3326,41 @@ async fn unavailable_required_skill_fails_before_the_model_call() {
             .lock()
             .expect("model request lock")
             .is_empty()
+    );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn authenticated_run_fails_before_model_content_when_gpu_policy_sees_cpu_only() {
+    let model = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [{"name": "local-model", "size": 100, "size_vram": 0}]
+        })))
+        .mount(&model)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "would have answered"}}]
+        })))
+        .mount(&model)
+        .await;
+    let harness = Harness::new_with_gpu_policy(&model, OllamaGpuPolicy::RequireFull).await;
+
+    let run_id = harness.create_run("guarded request").await;
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    let requests = model.received_requests().await.expect("model requests");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path() == "/api/ps")
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path() == "/v1/chat/completions")
     );
     harness.service.shutdown().await;
 }
