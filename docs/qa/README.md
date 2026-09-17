@@ -8,6 +8,7 @@ The current Windows/WSL build-cache procedure and measurements are in [M5 Cargo 
 The current Windows/WSL pnpm dependency procedure is in [M5 JavaScript dependencies guide](M5_JS_DEPENDENCIES_GUIDE.md).
 The scoped Ollama GPU residency policy and issue #28 evidence are in [M5 GPU policy guide](M5_GPU_POLICY_GUIDE.md).
 The measured WSL memory triage and shutdown procedure for issue #26 are in [M5 WSL memory guide](M5_WSL_MEMORY_GUIDE.md).
+The reproducible disposable fixture and evidence lifecycle for issue #21 are in [M5 QA launcher guide](M5_QA_LAUNCHER_GUIDE.md).
 
 ## Repository policy
 
