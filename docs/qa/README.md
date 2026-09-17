@@ -4,6 +4,7 @@ This directory preserves durable QA history tied to source revisions: acceptance
 
 The current M5 operator commands and status meanings are in [M5 local readiness acceptance guide](M5_ACCEPTANCE_GUIDE.md).
 The current audit cursor and full-run QA procedure is in [M5 audit pagination acceptance guide](M5_AUDIT_ACCEPTANCE_GUIDE.md).
+The current Windows/WSL build-cache procedure and measurements are in [M5 Cargo cache guide](M5_CARGO_CACHE_GUIDE.md).
 
 ## Repository policy
 
