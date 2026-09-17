@@ -1,11 +1,9 @@
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 
-const suffix = process.arch === 'x64'
-  ? process.platform === 'win32' ? 'win32-x64-msvc'
-    : process.platform === 'linux' && process.report.getReport().header.glibcVersionRuntime ? 'linux-x64-gnu'
-      : null
-  : null;
+let suffix;
+if (process.arch === 'x64' && process.platform === 'win32') suffix = 'win32-x64-msvc';
+else if (process.arch === 'x64' && process.platform === 'linux' && process.report.getReport().header.glibcVersionRuntime) suffix = 'linux-x64-gnu';
 
 if (!suffix) {
   console.error(`Unsupported native dependency host: ${process.platform}/${process.arch}. Tested hosts: Windows x64 and Linux x64/glibc.`);
