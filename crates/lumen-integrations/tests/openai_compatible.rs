@@ -235,6 +235,45 @@ async fn absent_model_is_preloaded_without_user_content_then_checked() {
 }
 
 #[tokio::test]
+async fn failed_ollama_preload_never_sends_user_content() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .and(body_json(
+            json!({"model": "local-model", "prompt": "", "stream": false}),
+        ))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(completion())
+        .mount(&server)
+        .await;
+    let client = OpenAiCompatibleClient::new(gpu_config(&server, OllamaGpuPolicy::RequireFull))
+        .expect("client");
+
+    let error = client
+        .generate(input())
+        .await
+        .expect_err("backend unavailable");
+    assert!(error.message().contains("preload unavailable: HTTP 503"));
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        ["/api/ps", "/api/generate"]
+    );
+}
+
+#[tokio::test]
 async fn post_request_downgrade_withholds_model_output() {
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));

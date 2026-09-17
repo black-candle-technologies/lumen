@@ -6,6 +6,7 @@ The current M5 operator commands and status meanings are in [M5 local readiness 
 The current audit cursor and full-run QA procedure is in [M5 audit pagination acceptance guide](M5_AUDIT_ACCEPTANCE_GUIDE.md).
 The current Windows/WSL build-cache procedure and measurements are in [M5 Cargo cache guide](M5_CARGO_CACHE_GUIDE.md).
 The current Windows/WSL pnpm dependency procedure is in [M5 JavaScript dependencies guide](M5_JS_DEPENDENCIES_GUIDE.md).
+The scoped Ollama GPU residency policy and issue #28 evidence are in [M5 GPU policy guide](M5_GPU_POLICY_GUIDE.md).
 
 ## Repository policy
 
