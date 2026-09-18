@@ -116,7 +116,7 @@ async fn empty_database_runs_the_initial_migration() {
         .fetch_one(database.pool())
         .await
         .expect("migration metadata loads");
-    assert_eq!(migration_count, 10);
+    assert_eq!(migration_count, 11);
 }
 
 #[tokio::test]
@@ -142,7 +142,7 @@ async fn file_database_reopens_without_reapplying_migrations() {
         .expect("migration count loads");
 
     assert_eq!(workspace_count, 1);
-    assert_eq!(migration_count, 10);
+    assert_eq!(migration_count, 11);
 }
 
 #[tokio::test]
@@ -1975,4 +1975,102 @@ async fn reservation_one_millisecond_before_expiry_records_the_protected_sample(
     .await
     .expect("reserved state loads");
     assert_eq!(row, ("consumed".into(), "running".into(), 1_999, 1));
+}
+
+#[tokio::test]
+async fn approval_renewal_is_one_durable_replacement_for_an_awaiting_run() {
+    let database = Database::connect_in_memory().await.expect("database");
+    let action = action();
+    let run_id = action.run_id();
+    let owner = Uuid::new_v4();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            action.actor(),
+            owner,
+            TimestampMillis::new(1_000),
+        )
+        .await
+        .expect("run");
+    database
+        .start_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            false,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("start");
+    database
+        .pause_owned_run_for_approval(run_id, workspace_id(), owner, TimestampMillis::new(1_200))
+        .await
+        .expect("pause");
+    database
+        .insert_action(&action, TimestampMillis::new(1_100))
+        .await
+        .expect("action");
+    let mut old = ApprovalRequest::new(
+        approval_id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(2_000),
+    )
+    .expect("old request");
+    assert!(old.expire(TimestampMillis::new(2_001)));
+    database.insert_approval(&old).await.expect("old approval");
+    let replacement = ApprovalRequest::new(
+        ApprovalId::new(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(2_001),
+        TimestampMillis::new(3_001),
+    )
+    .expect("replacement");
+    let replacement2 = ApprovalRequest::new(
+        ApprovalId::new(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(2_001),
+        TimestampMillis::new(3_001),
+    )
+    .expect("second replacement");
+    let (first, second) = tokio::join!(
+        database.renew_expired_approval(
+            workspace_id(),
+            run_id,
+            old.id(),
+            &replacement,
+            TimestampMillis::new(2_001)
+        ),
+        database.renew_expired_approval(
+            workspace_id(),
+            run_id,
+            old.id(),
+            &replacement2,
+            TimestampMillis::new(2_001)
+        ),
+    );
+    assert_ne!(first.is_ok(), second.is_ok(), "exactly one renewal commits");
+    let winner = if first.is_ok() {
+        replacement.id()
+    } else {
+        replacement2.id()
+    };
+    let relation: (Option<String>, i64) = sqlx::query_as(
+        "SELECT replacement_approval_id,
+                (SELECT COUNT(*) FROM approval_requests other WHERE other.action_id = old.action_id AND other.state = 'pending')
+         FROM approval_requests old WHERE old.id = ?",
+    )
+    .bind(old.id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("durable relation");
+    assert_eq!(relation, (Some(winner.to_string()), 1));
 }

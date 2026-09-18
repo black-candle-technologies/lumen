@@ -4968,12 +4968,9 @@ impl ApprovalRegistry {
             if record.renewed {
                 return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
             }
-            if record.request.expire(now) {
-                self.database
-                    .expire_pending_approvals(workspace_id, now)
-                    .await
-                    .map_err(repository_service_error)?;
-            }
+            // The repository performs expiry and replacement together under
+            // one SQLite writer transaction below.
+            record.request.expire(now);
             match record.request.state() {
                 ApprovalState::Expired => {}
                 ApprovalState::Pending => {
@@ -5010,9 +5007,14 @@ impl ApprovalRegistry {
         )
         .map_err(|error| ServiceError::ApprovalConflict(approval_conflict(error)))?;
         self.database
-            .insert_approval(&request)
+            .renew_expired_approval(workspace_id, run_id, approval_id, &request, now)
             .await
-            .map_err(repository_service_error)?;
+            .map_err(|error| match error {
+                lumen_db::RepositoryError::ApprovalStale => {
+                    ServiceError::ApprovalConflict(ApprovalConflict::Stale)
+                }
+                error => repository_service_error(error),
+            })?;
         records
             .get_mut(&approval_id)
             .expect("renewed approval remains registered")

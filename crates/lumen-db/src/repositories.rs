@@ -889,6 +889,94 @@ impl Database {
         Ok(())
     }
 
+    pub async fn renew_expired_approval(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        old_id: ApprovalId,
+        replacement: &ApprovalRequest,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        if replacement.state() != lumen_core::approval::ApprovalState::Pending
+            || replacement.created_at() != now
+            || replacement.expires_at() <= now
+        {
+            return Err(RepositoryError::ApprovalStale);
+        }
+        let now_i64 = timestamp_to_i64(now)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE approval_requests SET state = 'expired'
+             WHERE id = ? AND state = 'pending' AND expires_at <= ?
+               AND action_id IN (
+                   SELECT id FROM actions WHERE workspace_id = ? AND run_id = ?
+               )",
+        )
+        .bind(old_id.to_string())
+        .bind(now_i64)
+        .bind(workspace_id.to_string())
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let action_id: Option<String> = sqlx::query_scalar(
+            "SELECT action.id FROM approval_requests old
+             JOIN actions action ON action.id = old.action_id
+             JOIN agent_runs run ON run.id = action.run_id
+             JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id
+             WHERE old.id = ? AND old.state = 'expired'
+               AND old.expires_at <= ? AND old.replacement_approval_id IS NULL
+               AND old.action_fingerprint = ? AND old.policy_version = ?
+               AND action.fingerprint = old.action_fingerprint
+               AND action.state = 'normalized' AND action.workspace_id = ?
+               AND run.id = ? AND run.workspace_id = ?
+               AND run.state = 'awaiting_approval'
+               AND lifecycle.phase = 'awaiting_approval'
+               AND NOT EXISTS (
+                   SELECT 1 FROM approval_requests other
+                   WHERE other.action_id = action.id AND other.id <> old.id
+                     AND other.state IN ('pending', 'granted')
+               )",
+        )
+        .bind(old_id.to_string())
+        .bind(now_i64)
+        .bind(replacement.action_fingerprint().as_str())
+        .bind(replacement.policy_version().as_str())
+        .bind(workspace_id.to_string())
+        .bind(run_id.to_string())
+        .bind(workspace_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let action_id = action_id.ok_or(RepositoryError::ApprovalStale)?;
+        sqlx::query(
+            "INSERT INTO approval_requests (
+                id, action_id, action_fingerprint, policy_version, state,
+                created_at, expires_at
+             ) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(replacement.id().to_string())
+        .bind(action_id)
+        .bind(replacement.action_fingerprint().as_str())
+        .bind(replacement.policy_version().as_str())
+        .bind(now_i64)
+        .bind(timestamp_to_i64(replacement.expires_at())?)
+        .execute(&mut *transaction)
+        .await?;
+        let changed = sqlx::query(
+            "UPDATE approval_requests SET replacement_approval_id = ?
+             WHERE id = ? AND state = 'expired' AND replacement_approval_id IS NULL",
+        )
+        .bind(replacement.id().to_string())
+        .bind(old_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(RepositoryError::ApprovalStale);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_approval_decision(
         &self,
         workspace_id: WorkspaceId,
