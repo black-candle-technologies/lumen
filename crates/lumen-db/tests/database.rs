@@ -1,8 +1,10 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+use std::task::Poll;
 
+use futures_util::poll;
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
@@ -937,8 +939,9 @@ async fn reservation_samples_expiry_clock_after_waiting_for_a_sqlite_writer() {
         .expect("writer lock acquired");
 
     let clock = Arc::new(AtomicU64::new(1_500));
-    let reservation_database = database.clone();
     let reservation_clock = Arc::clone(&clock);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reservation_calls = Arc::clone(&calls);
     let reservation = DispatchReservation::new(
         ExecutionAttemptId::new(),
         action_id(),
@@ -947,13 +950,13 @@ async fn reservation_samples_expiry_clock_after_waiting_for_a_sqlite_writer() {
         policy_version(),
         TimestampMillis::new(1_500),
     );
-    let reservation_task = tokio::spawn(async move {
-        reservation_database
-            .reserve_execution_with_clock(reservation, move || {
-                TimestampMillis::new(reservation_clock.load(Ordering::SeqCst))
-            })
-            .await
+    let pending = database.reserve_execution_with_clock(reservation, move || {
+        reservation_calls.fetch_add(1, Ordering::SeqCst);
+        TimestampMillis::new(reservation_clock.load(Ordering::SeqCst))
     });
+    tokio::pin!(pending);
+    assert!(matches!(poll!(pending.as_mut()), Poll::Pending));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 
     // The reservation cannot acquire its transaction while this writer is held.
     // Advancing before release therefore distinguishes a fresh post-lock sample
@@ -964,10 +967,11 @@ async fn reservation_samples_expiry_clock_after_waiting_for_a_sqlite_writer() {
         .await
         .expect("writer lock released");
 
-    assert!(matches!(
-        reservation_task.await.expect("reservation task joins"),
-        Err(RepositoryError::ApprovalNotAvailable)
-    ));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+        .await
+        .expect("reservation completes after writer release");
+    assert!(matches!(result, Err(RepositoryError::ApprovalNotAvailable)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     let row = sqlx::query(
         "SELECT
             (SELECT state FROM approval_requests WHERE id = ?) AS approval_state,
