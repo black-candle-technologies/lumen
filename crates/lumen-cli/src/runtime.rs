@@ -316,6 +316,16 @@ impl LocalRuntimeService {
             redactor,
         };
         service
+            .database
+            .reconcile_abandoned_owned_runs(service.owner_instance_id, now())
+            .await?;
+        for (workspace_id, run_id) in service.database.list_pending_terminal_audits().await? {
+            service
+                .database
+                .flush_terminal_audit(workspace_id, run_id)
+                .await?;
+        }
+        service
             .recover_scheduled_run_handoffs(now())
             .await
             .map_err(|error| CliError::Runtime(error.to_string()))?;
@@ -541,7 +551,7 @@ impl LocalRuntimeService {
                 ServiceError::Internal(format!("start recovered scheduled run: {error}"))
             })?;
         stored.start_disposition = StartDisposition::ScheduledStartCommitted;
-        self.install_and_spawn_run(run_id, stored).await;
+        self.install_and_spawn_run(run_id, stored).await?;
         Ok(true)
     }
 
@@ -626,7 +636,7 @@ impl LocalRuntimeService {
             .await
             .map_err(|error| ServiceError::Internal(format!("start scheduled run: {error}")))?;
         stored.start_disposition = StartDisposition::ScheduledStartCommitted;
-        self.install_and_spawn_run(run_id, stored).await;
+        self.install_and_spawn_run(run_id, stored).await?;
         Ok(Some(run_id))
     }
 
@@ -716,7 +726,11 @@ impl LocalRuntimeService {
             .map_err(|error| ServiceError::Internal(error.to_string()))
     }
 
-    async fn install_and_spawn_run(&self, run_id: RunId, stored: StoredRun) {
+    async fn install_and_spawn_run(
+        &self,
+        run_id: RunId,
+        stored: StoredRun,
+    ) -> Result<(), ServiceError> {
         let workspace_id = stored.workspace_id;
         for skill in stored
             .state
@@ -742,7 +756,37 @@ impl LocalRuntimeService {
             .lock()
             .await
             .insert(run_id, workspace_id);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            let timestamp = now();
+            let terminal = TerminalSpec::new(
+                TerminalState::Cancelled,
+                EffectCertainty::NoEffect,
+                "admission_shutdown",
+                Some("runtime shut down during admission".into()),
+            )
+            .expect("static shutdown terminal specification");
+            let result = self
+                .database
+                .terminalize_owned_run(
+                    run_id,
+                    workspace_id,
+                    self.owner_instance_id,
+                    &terminal,
+                    AuditEventId::new(),
+                    timestamp,
+                )
+                .await;
+            self.runs.lock().await.remove(&run_id);
+            self.finish_run(run_id).await;
+            result.map_err(repository_service_error)?;
+            self.database
+                .flush_terminal_audit(workspace_id, run_id)
+                .await
+                .map_err(repository_service_error)?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
         self.spawn_advance(run_id).await;
+        Ok(())
     }
 
     async fn prompt_with_reviewed_skills(
@@ -1475,30 +1519,18 @@ impl LocalRuntimeService {
             .await
             .map_err(repository_service_error)?;
         let model: Arc<dyn ModelPort> = Arc::new(ActionRequestModel { proposal });
-        self.runs.lock().await.insert(
-            run_id,
-            StoredRun {
-                workspace_id,
-                state: RunState::new(
-                    RunContext::new(run_id, workspace_id, actor),
-                    "authenticated extension administration request",
-                    self.budget,
-                ),
-                model_override: Some(model),
-                capabilities_override: Some(EffectiveCapabilities::new([capabilities])),
-                scheduled_handoff: None,
-                start_disposition: StartDisposition::Created,
-            },
-        );
-        let cancellation = CancellationToken::new();
-        if self.shutting_down.load(Ordering::SeqCst) {
-            cancellation.cancel();
-        }
-        self.cancellations.lock().await.insert(run_id, cancellation);
-        self.run_workspaces
-            .lock()
-            .await
-            .insert(run_id, workspace_id);
+        let stored = StoredRun {
+            workspace_id,
+            state: RunState::new(
+                RunContext::new(run_id, workspace_id, actor),
+                "authenticated extension administration request",
+                self.budget,
+            ),
+            model_override: Some(model),
+            capabilities_override: Some(EffectiveCapabilities::new([capabilities])),
+            scheduled_handoff: None,
+            start_disposition: StartDisposition::Created,
+        };
         self.events
             .publish(
                 workspace_id,
@@ -1507,7 +1539,7 @@ impl LocalRuntimeService {
                 CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
             )
             .map_err(|error| ServiceError::Internal(error.to_string()))?;
-        self.spawn_advance(run_id).await;
+        self.install_and_spawn_run(run_id, stored).await?;
         Ok(run_id)
     }
 
@@ -1704,7 +1736,7 @@ impl RuntimeService for LocalRuntimeService {
                 start_disposition: StartDisposition::Created,
             };
             service.publish_run_created(run_id, command.workspace_id())?;
-            service.install_and_spawn_run(run_id, stored).await;
+            service.install_and_spawn_run(run_id, stored).await?;
             Ok(RunCreated::new(run_id))
         })
     }

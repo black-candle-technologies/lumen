@@ -969,6 +969,7 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn persist_owned_scheduled_run_handoff(
         &self,
         job: &ScheduledJobRevision,

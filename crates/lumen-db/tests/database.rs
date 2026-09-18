@@ -992,6 +992,421 @@ async fn owned_start_and_approval_pause_change_run_and_phase_atomically() {
 }
 
 #[tokio::test]
+async fn owned_terminal_quarantines_an_in_flight_attempt_without_retry() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    let run_id = action.run_id();
+    let owner = Uuid::new_v4();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            action.actor(),
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("run");
+    database
+        .start_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            false,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("start");
+    database
+        .insert_action(&action, TimestampMillis::new(1_300))
+        .await
+        .expect("action");
+    let approval = granted_approval(&action);
+    database.insert_approval(&approval).await.expect("approval");
+    let reservation = DispatchReservation::new(
+        ExecutionAttemptId::new(),
+        action.id(),
+        approval.id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_400),
+    );
+    database
+        .reserve_execution_with_clock(reservation, || TimestampMillis::new(1_400))
+        .await
+        .expect("reserved");
+    let terminal = TerminalSpec::new(
+        TerminalState::Failed,
+        EffectCertainty::NoEffect,
+        "shutdown_forced",
+        None,
+    )
+    .expect("terminal");
+    database
+        .terminalize_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            &terminal,
+            AuditEventId::new(),
+            TimestampMillis::new(1_500),
+        )
+        .await
+        .expect("terminalized");
+    let row: (String, String) = sqlx::query_as(
+        "SELECT action.state, attempt.state FROM actions action
+         JOIN execution_attempts attempt ON attempt.action_id = action.id
+         WHERE action.id = ?",
+    )
+    .bind(action.id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("states");
+    assert_eq!(row, ("unknown".into(), "unknown".into()));
+    let lifecycle = database
+        .get_run_lifecycle(workspace_id(), run_id)
+        .await
+        .expect("lookup")
+        .expect("lifecycle");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert_eq!(lifecycle.effect_certainty(), EffectCertainty::Unknown);
+}
+
+#[tokio::test]
+async fn pending_terminal_audit_is_discoverable_after_reopen() {
+    let directory = tempdir().expect("directory");
+    let path = directory.path().join("pending-audit.sqlite3");
+    let database = Database::connect(&path).await.expect("database opens");
+    let run_id = RunId::new();
+    let owner = Uuid::new_v4();
+    let actor = PrincipalId::new("local", "operator").expect("principal");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            &actor,
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("run");
+    let terminal = TerminalSpec::new(
+        TerminalState::Failed,
+        EffectCertainty::NoEffect,
+        "model_unavailable",
+        None,
+    )
+    .expect("terminal");
+    database
+        .terminalize_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            &terminal,
+            AuditEventId::new(),
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("terminalized");
+    database.close().await;
+
+    let reopened = Database::connect(&path).await.expect("reopened");
+    assert_eq!(
+        reopened
+            .list_pending_terminal_audits()
+            .await
+            .expect("pending"),
+        vec![(workspace_id(), run_id)]
+    );
+    reopened
+        .flush_terminal_audit(workspace_id(), run_id)
+        .await
+        .expect("repaired");
+    assert!(
+        reopened
+            .list_pending_terminal_audits()
+            .await
+            .expect("pending")
+            .is_empty()
+    );
+    reopened.verify_audit_chain().await.expect("chain valid");
+}
+
+#[tokio::test]
+async fn crash_recovery_freezes_unknown_owned_lifecycle_and_audit_intent() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    let run_id = action.run_id();
+    let owner = Uuid::new_v4();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            action.actor(),
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("run");
+    database
+        .start_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            false,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("start");
+    database
+        .insert_action(&action, TimestampMillis::new(1_300))
+        .await
+        .expect("action");
+    let approval = granted_approval(&action);
+    database.insert_approval(&approval).await.expect("approval");
+    database
+        .reserve_execution_with_clock(
+            DispatchReservation::new(
+                ExecutionAttemptId::new(),
+                action.id(),
+                approval.id(),
+                action.fingerprint(),
+                policy_version(),
+                TimestampMillis::new(1_400),
+            ),
+            || TimestampMillis::new(1_400),
+        )
+        .await
+        .expect("reserved");
+    assert_eq!(
+        database
+            .recover_incomplete_executions(TimestampMillis::new(1_500))
+            .await
+            .expect("recovered")
+            .len(),
+        1
+    );
+    let lifecycle = database
+        .get_run_lifecycle(workspace_id(), run_id)
+        .await
+        .expect("lookup")
+        .expect("lifecycle");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert_eq!(lifecycle.effect_certainty(), EffectCertainty::Unknown);
+    assert!(lifecycle.terminal_audit_pending());
+    database
+        .flush_terminal_audit(workspace_id(), run_id)
+        .await
+        .expect("audited");
+    let records = database
+        .list_audit_records_for_run(workspace_id(), run_id)
+        .await
+        .expect("records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].event().kind(),
+        AuditEventKind::RunReconciliationRequired
+    );
+    assert!(
+        database
+            .recover_incomplete_executions(TimestampMillis::new(1_600))
+            .await
+            .expect("replay")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn new_owner_reconciles_abandoned_active_run_without_touching_current_run() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let old_owner = Uuid::new_v4();
+    let current_owner = Uuid::new_v4();
+    let abandoned = RunId::new();
+    let current = RunId::new();
+    let actor = PrincipalId::new("local", "operator").expect("principal");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            abandoned,
+            workspace_id(),
+            &actor,
+            old_owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("old run");
+    database
+        .start_owned_run(
+            abandoned,
+            workspace_id(),
+            old_owner,
+            false,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("old start");
+    database
+        .create_owned_run(
+            current,
+            workspace_id(),
+            &actor,
+            current_owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("current run");
+    assert_eq!(
+        database
+            .reconcile_abandoned_owned_runs(current_owner, TimestampMillis::new(1_300))
+            .await
+            .expect("reconciled"),
+        vec![abandoned]
+    );
+    let lifecycle = database
+        .get_run_lifecycle(workspace_id(), abandoned)
+        .await
+        .expect("lookup")
+        .expect("lifecycle");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert!(lifecycle.terminal_audit_pending());
+    assert_eq!(
+        database
+            .get_run_lifecycle(workspace_id(), current)
+            .await
+            .expect("lookup")
+            .expect("lifecycle")
+            .phase(),
+        "admitted"
+    );
+    assert!(
+        database
+            .reconcile_abandoned_owned_runs(current_owner, TimestampMillis::new(1_400))
+            .await
+            .expect("replay")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn terminal_replay_accepts_derived_known_effect_certainty() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    let run_id = action.run_id();
+    let owner = Uuid::new_v4();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            action.actor(),
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("run");
+    database
+        .start_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            false,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("start");
+    database
+        .insert_action(&action, TimestampMillis::new(1_300))
+        .await
+        .expect("action");
+    let approval = granted_approval(&action);
+    database.insert_approval(&approval).await.expect("approval");
+    database
+        .reserve_execution_with_clock(
+            DispatchReservation::new(
+                ExecutionAttemptId::new(),
+                action.id(),
+                approval.id(),
+                action.fingerprint(),
+                policy_version(),
+                TimestampMillis::new(1_400),
+            ),
+            || TimestampMillis::new(1_400),
+        )
+        .await
+        .expect("reserved");
+    sqlx::query(
+        "UPDATE execution_attempts SET state = 'succeeded', completed_at = 1450
+                 WHERE action_id = ?",
+    )
+    .bind(action.id().to_string())
+    .execute(database.pool())
+    .await
+    .expect("effect known");
+    sqlx::query("UPDATE actions SET state = 'succeeded' WHERE id = ?")
+        .bind(action.id().to_string())
+        .execute(database.pool())
+        .await
+        .expect("action complete");
+    let terminal = TerminalSpec::new(
+        TerminalState::Completed,
+        EffectCertainty::NoEffect,
+        "run_completed",
+        None,
+    )
+    .expect("terminal");
+    let audit_id = AuditEventId::new();
+    database
+        .terminalize_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            &terminal,
+            audit_id,
+            TimestampMillis::new(1_500),
+        )
+        .await
+        .expect("terminalized");
+    database
+        .terminalize_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            &terminal,
+            audit_id,
+            TimestampMillis::new(1_500),
+        )
+        .await
+        .expect("same request replay");
+    assert_eq!(
+        database
+            .get_run_lifecycle(workspace_id(), run_id)
+            .await
+            .expect("lookup")
+            .expect("lifecycle")
+            .effect_certainty(),
+        EffectCertainty::Known
+    );
+}
+
+#[tokio::test]
 async fn rejected_approval_terminalizes_its_normalized_action_before_run_completion() {
     let database = Database::connect_in_memory().await.expect("database opens");
     let action = action();

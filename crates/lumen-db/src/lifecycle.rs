@@ -152,6 +152,84 @@ impl RunLifecycleView {
 }
 
 impl Database {
+    pub async fn reconcile_abandoned_owned_runs(
+        &self,
+        current_owner: Uuid,
+        now: TimestampMillis,
+    ) -> Result<Vec<RunId>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT lifecycle.run_id, lifecycle.workspace_id, lifecycle.owner_instance_id
+             FROM run_lifecycle lifecycle JOIN agent_runs run ON run.id = lifecycle.run_id
+             LEFT JOIN scheduled_job_runs scheduled ON scheduled.run_id = lifecycle.run_id
+             WHERE lifecycle.owner_instance_id <> ?
+               AND lifecycle.phase IN ('admitted', 'preparing', 'running',
+                                       'awaiting_approval', 'reserving_effect')
+               AND run.state IN ('created', 'running', 'awaiting_approval')
+               AND (scheduled.run_id IS NULL OR scheduled.state = 'running')
+             ORDER BY lifecycle.created_at, lifecycle.run_id",
+        )
+        .bind(current_owner.to_string())
+        .fetch_all(self.pool())
+        .await?;
+        let terminal = TerminalSpec::new(
+            TerminalState::Failed,
+            EffectCertainty::Unknown,
+            "owner_lost",
+            Some("run owner unavailable after restart".into()),
+        )?;
+        let mut reconciled = Vec::new();
+        for row in rows {
+            let run_id = RunId::from_uuid(
+                Uuid::parse_str(&row.try_get::<String, _>("run_id")?)
+                    .map_err(|_| RepositoryError::ExecutionStateConflict)?,
+            );
+            let workspace_id = WorkspaceId::from_uuid(
+                Uuid::parse_str(&row.try_get::<String, _>("workspace_id")?)
+                    .map_err(|_| RepositoryError::ExecutionStateConflict)?,
+            );
+            let previous_owner = Uuid::parse_str(&row.try_get::<String, _>("owner_instance_id")?)
+                .map_err(|_| RepositoryError::ExecutionStateConflict)?;
+            self.terminalize_owned_run(
+                run_id,
+                workspace_id,
+                previous_owner,
+                &terminal,
+                AuditEventId::new(),
+                now,
+            )
+            .await?;
+            reconciled.push(run_id);
+        }
+        Ok(reconciled)
+    }
+
+    pub async fn list_pending_terminal_audits(
+        &self,
+    ) -> Result<Vec<(WorkspaceId, RunId)>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT workspace_id, run_id FROM run_lifecycle
+             WHERE terminal_audit_pending = 1 ORDER BY created_at, run_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let workspace: String = row.try_get("workspace_id")?;
+                let run: String = row.try_get("run_id")?;
+                Ok((
+                    WorkspaceId::from_uuid(
+                        Uuid::parse_str(&workspace)
+                            .map_err(|_| RepositoryError::ExecutionStateConflict)?,
+                    ),
+                    RunId::from_uuid(
+                        Uuid::parse_str(&run)
+                            .map_err(|_| RepositoryError::ExecutionStateConflict)?,
+                    ),
+                ))
+            })
+            .collect()
+    }
+
     pub async fn start_owned_run(
         &self,
         run_id: RunId,
@@ -296,9 +374,24 @@ impl Database {
         .await?
         .ok_or(RepositoryError::ExecutionStateConflict)?;
         let phase: String = current.try_get("phase")?;
+        let attempt_state: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(CASE
+                 WHEN attempts.state IN ('reserved', 'running', 'unknown') THEN 2
+                 ELSE 1 END)
+             FROM execution_attempts attempts JOIN actions ON actions.id = attempts.action_id
+             WHERE actions.run_id = ?",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let certainty = match (spec.certainty, attempt_state.unwrap_or(0)) {
+            (EffectCertainty::Unknown, _) | (_, 2) => EffectCertainty::Unknown,
+            (EffectCertainty::Known, _) | (_, 1) => EffectCertainty::Known,
+            _ => EffectCertainty::NoEffect,
+        };
         if matches!(phase.as_str(), "terminal" | "reconciliation_required") {
             let matching = current.try_get::<String, _>("state")? == spec.state.as_str()
-                && current.try_get::<String, _>("effect_certainty")? == spec.certainty.as_str()
+                && current.try_get::<String, _>("effect_certainty")? == certainty.as_str()
                 && current
                     .try_get::<Option<String>, _>("terminal_code")?
                     .as_deref()
@@ -325,23 +418,30 @@ impl Database {
         ) {
             return Err(RepositoryError::ExecutionStateConflict);
         }
-        let attempt_state: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(CASE
-                 WHEN attempts.state IN ('reserved', 'running', 'unknown') THEN 2
-                 ELSE 1 END)
-             FROM execution_attempts attempts JOIN actions ON actions.id = attempts.action_id
-             WHERE actions.run_id = ?",
-        )
-        .bind(run_id.to_string())
-        .fetch_one(&mut *transaction)
-        .await?;
-        let certainty = match (spec.certainty, attempt_state.unwrap_or(0)) {
-            (EffectCertainty::Unknown, _) | (_, 2) => EffectCertainty::Unknown,
-            (EffectCertainty::Known, _) | (_, 1) => EffectCertainty::Known,
-            _ => EffectCertainty::NoEffect,
-        };
         if spec.state == TerminalState::Completed && certainty == EffectCertainty::Unknown {
             return Err(RepositoryError::ExecutionStateConflict);
+        }
+        if certainty == EffectCertainty::Unknown {
+            sqlx::query(
+                "UPDATE actions SET state = 'unknown'
+                 WHERE run_id = ? AND state = 'running'
+                   AND id IN (
+                       SELECT action_id FROM execution_attempts
+                       WHERE state IN ('reserved', 'running', 'unknown')
+                   )",
+            )
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE execution_attempts SET state = 'unknown', completed_at = ?
+                 WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)
+                   AND state IN ('reserved', 'running')",
+            )
+            .bind(occurred_at)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
         }
         let updated = sqlx::query(
             "UPDATE agent_runs SET state = ?, completed_at = ?

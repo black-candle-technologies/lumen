@@ -360,6 +360,42 @@ impl Database {
             .bind(recovered_at)
             .execute(&mut *transaction)
             .await?;
+            for execution in &recovered {
+                let payload = serde_json::json!({
+                    "run_id": execution.run_id().to_string(),
+                    "terminal_code": "execution_interrupted",
+                    "effect_certainty": "unknown",
+                    "primary_diagnostic": "execution outcome lost during restart",
+                })
+                .to_string();
+                sqlx::query(
+                    "UPDATE run_lifecycle SET phase = 'reconciliation_required',
+                        effect_certainty = 'unknown', terminal_code = 'execution_interrupted',
+                        primary_diagnostic = 'execution outcome lost during restart',
+                        terminal_audit_id = ?, terminal_audit_pending = 1,
+                        terminal_audit_occurred_at = ?, terminal_audit_payload_json = ?,
+                        updated_at = ?
+                     WHERE run_id = ? AND workspace_id = ?
+                       AND phase IN ('admitted', 'preparing', 'running',
+                                     'awaiting_approval', 'reserving_effect')",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(recovered_at)
+                .bind(payload)
+                .bind(recovered_at)
+                .bind(execution.run_id().to_string())
+                .bind(execution.workspace_id().to_string())
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE scheduled_job_runs SET state = 'unknown', updated_at = ?
+                     WHERE run_id = ? AND state = 'running'",
+                )
+                .bind(recovered_at)
+                .bind(execution.run_id().to_string())
+                .execute(&mut *transaction)
+                .await?;
+            }
         }
         transaction.commit().await?;
         Ok(recovered)

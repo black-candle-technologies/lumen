@@ -6744,6 +6744,65 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
 }
 
 #[tokio::test]
+async fn admission_that_crosses_shutdown_is_terminalized_without_a_stranded_run() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = RunId::new();
+    let actor = PrincipalId::new("local", "operator").expect("actor");
+    harness
+        .database
+        .create_owned_run(
+            run_id,
+            harness.workspace_id,
+            &actor,
+            harness.service.owner_instance_id,
+            now(),
+        )
+        .await
+        .expect("accepted row");
+    harness.service.shutting_down.store(true, Ordering::SeqCst);
+    let admission = harness
+        .service
+        .install_and_spawn_run(
+            run_id,
+            super::StoredRun {
+                workspace_id: harness.workspace_id,
+                state: lumen_core::run::RunState::new(
+                    lumen_core::run::RunContext::new(run_id, harness.workspace_id, actor),
+                    "shutdown race",
+                    harness.service.budget,
+                ),
+                model_override: None,
+                capabilities_override: None,
+                scheduled_handoff: None,
+                start_disposition: super::StartDisposition::Created,
+            },
+        )
+        .await;
+    assert!(matches!(
+        admission,
+        Err(lumen_server::ServiceError::Unavailable(_))
+    ));
+    let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("state");
+    assert_eq!(state, "cancelled");
+    assert!(!harness.service.runs.lock().await.contains_key(&run_id));
+    assert!(
+        !harness
+            .service
+            .run_workspaces
+            .lock()
+            .await
+            .contains_key(&run_id)
+    );
+    harness.service.shutting_down.store(false, Ordering::SeqCst);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn server_shutdown_closes_active_sse_and_releases_listener() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
