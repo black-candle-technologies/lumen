@@ -960,8 +960,22 @@ impl Database {
         &self,
         reservation: DispatchReservation,
     ) -> Result<(), RepositoryError> {
-        let reserved_at = timestamp_to_i64(reservation.reserved_at)?;
+        let reserved_at = reservation.reserved_at;
+        self.reserve_execution_with_clock(reservation, move || reserved_at)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn reserve_execution_with_clock<F>(
+        &self,
+        reservation: DispatchReservation,
+        clock: F,
+    ) -> Result<TimestampMillis, RepositoryError>
+    where
+        F: FnOnce() -> TimestampMillis,
+    {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let reserved_at = timestamp_to_i64(clock())?;
         let updated = sqlx::query(
             "UPDATE approval_requests
              SET state = 'consumed', consumed_at = ?
@@ -1003,7 +1017,9 @@ impl Database {
             .await?;
 
         transaction.commit().await?;
-        Ok(())
+        Ok(TimestampMillis::new(
+            u64::try_from(reserved_at).map_err(|_| RepositoryError::TimestampOutOfRange)?,
+        ))
     }
 
     pub async fn reserve_allowed_execution(

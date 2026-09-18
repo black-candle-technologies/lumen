@@ -835,3 +835,52 @@ async fn approval_consumption_and_execution_reservation_are_atomic() {
     assert_eq!(row.get::<String, _>("approval_state"), "consumed");
     assert_eq!(row.get::<i64, _>("attempt_count"), 1);
 }
+
+#[tokio::test]
+async fn reservation_uses_the_clock_sampled_inside_its_transaction() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let approval = granted_approval(&action);
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+
+    let reservation = DispatchReservation::new(
+        ExecutionAttemptId::new(),
+        action.id(),
+        approval.id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_500),
+    );
+    assert!(matches!(
+        database
+            .reserve_execution_with_clock(reservation, || TimestampMillis::new(2_000))
+            .await,
+        Err(RepositoryError::ApprovalNotAvailable)
+    ));
+
+    let approval_state: String =
+        sqlx::query_scalar("SELECT state FROM approval_requests WHERE id = ?")
+            .bind(approval.id().to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("approval state");
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id = ?")
+            .bind(action.id().to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("attempt count");
+    assert_eq!(approval_state, "granted");
+    assert_eq!(attempts, 0);
+}
