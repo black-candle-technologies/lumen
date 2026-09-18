@@ -800,6 +800,46 @@ async fn refuses_conflicting_streamed_tool_id_and_multiple_indices() {
 }
 
 #[tokio::test]
+async fn streamed_byte_limit_and_unknown_tool_do_not_produce_actions() {
+    let oversized = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":"x".repeat(1024)},"finish_reason":"stop"}]})
+    );
+    let unknown = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+            "index":0,"id":"call-unknown","type":"function",
+            "function":{"name":"unknown_tool","arguments":"{}"}
+        }]},"finish_reason":"tool_calls"}]})
+    );
+    for (body, limit, expected) in [
+        (oversized, 128, "response byte limit"),
+        (unknown, 4096, "unknown tool"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenAiCompatibleClient::new(
+            config(&server)
+                .with_streaming(true)
+                .with_max_response_bytes(limit),
+        )
+        .expect("client");
+        let error = client
+            .generate(tool_input())
+            .await
+            .expect_err("stream refused");
+        assert!(error.message().contains(expected), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn cancellation_stops_an_in_flight_request() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
