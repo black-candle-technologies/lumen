@@ -128,4 +128,3 @@ Commit: `fix(approvals): sample expiry clock at reservation boundary`.
 - [ ] **Step 1: Record exact revision and verification**
 
 Comment on #11 and #12 with branch, commit(s), named tests, precise PASS/FAIL/BLOCKED distinction and remaining dependent validation. Do not close either issue unless every packet closure condition is independently satisfied.
-
