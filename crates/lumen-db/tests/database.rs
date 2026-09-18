@@ -113,7 +113,7 @@ async fn empty_database_runs_the_initial_migration() {
         .fetch_one(database.pool())
         .await
         .expect("migration metadata loads");
-    assert_eq!(migration_count, 8);
+    assert_eq!(migration_count, 9);
 }
 
 #[tokio::test]
@@ -139,7 +139,7 @@ async fn file_database_reopens_without_reapplying_migrations() {
         .expect("migration count loads");
 
     assert_eq!(workspace_count, 1);
-    assert_eq!(migration_count, 8);
+    assert_eq!(migration_count, 9);
 }
 
 #[tokio::test]
@@ -709,6 +709,19 @@ async fn rejected_approval_terminalizes_its_normalized_action_before_run_complet
     assert_eq!(action_row.0, "denied");
     assert_eq!(action_row.1.as_deref(), Some("approval_rejected"));
     assert_eq!(attempts, 0);
+    assert!(
+        sqlx::query("UPDATE actions SET state = 'normalized' WHERE id = ?")
+            .bind(action.id().to_string())
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        database
+            .reject_approval_and_action(workspace_id(), &approval)
+            .await,
+        Err(RepositoryError::ApprovalDecisionConflict)
+    ));
 }
 
 #[tokio::test]
