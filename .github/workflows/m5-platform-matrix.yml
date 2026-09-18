@@ -47,33 +47,41 @@ jobs:
 
   linux-server-sandbox:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.M5_HEAD_SHA }}
-      - name: Install Linux sandbox prerequisite
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap
-      - name: Record platform and run named non-desktop suite
+      - name: Run named non-desktop suite in privileged sandbox test container
         shell: bash
         run: |
           mkdir -p evidence
-          { git rev-parse HEAD; rustc -vV; cargo --version; uname -a; bwrap --version; printf '%s\n' 'features=workspace defaults; excluded=lumen-desktop; CARGO_INCREMENTAL=0'; } > evidence/context.txt
-          printf '%s\n' 'cargo test --workspace --exclude lumen-desktop --locked -- --list' 'cargo test --workspace --exclude lumen-desktop --locked' 'bash scripts/verify-linux-plugin-sandbox.sh' > evidence/commands.txt
-          if cargo test --workspace --exclude lumen-desktop --locked -- --list > evidence/inventory.txt 2>&1; then code=0; else code=$?; fi
-          echo "inventory_exit=$code" >> evidence/exit-codes.txt
-          tail -n 20 evidence/inventory.txt
-          if (( code != 0 )); then exit "$code"; fi
-          if cargo test --workspace --exclude lumen-desktop --locked > evidence/run.txt 2>&1; then code=0; else code=$?; fi
-          echo "run_exit=$code" >> evidence/exit-codes.txt
-          tail -n 30 evidence/run.txt
-          if (( code != 0 )); then exit "$code"; fi
-          if bash scripts/verify-linux-plugin-sandbox.sh > evidence/sandbox-run.txt 2>&1; then code=0; else code=$?; fi
-          echo "sandbox_run_exit=$code" >> evidence/exit-codes.txt
-          tail -n 30 evidence/sandbox-run.txt
+          { git rev-parse HEAD; uname -a; printf '%s\n' 'runner=ubuntu-24.04; container=rust:slim --privileged; features=workspace defaults; excluded=lumen-desktop; CARGO_INCREMENTAL=0'; } > evidence/context.txt
+          printf '%s\n' 'docker run --rm --privileged rust:slim' 'cargo test --workspace --exclude lumen-desktop --locked -- --list' 'cargo test --workspace --exclude lumen-desktop --locked' 'bash scripts/verify-linux-plugin-sandbox.sh' > evidence/commands.txt
+          if docker run --rm --privileged \
+            --volume "$PWD:/workspace" --workdir /workspace \
+            --env CARGO_INCREMENTAL=0 --env CARGO_TARGET_DIR=/tmp/lumen-target \
+            rust:slim bash -lc '
+              set -u
+              apt-get update > evidence/setup.txt 2>&1 || exit $?
+              apt-get install -y --no-install-recommends bubblewrap ca-certificates pkg-config >> evidence/setup.txt 2>&1 || exit $?
+              { rustc -vV; cargo --version; bwrap --version; } >> evidence/context.txt
+              if cargo test --workspace --exclude lumen-desktop --locked -- --list > evidence/inventory.txt 2>&1; then code=0; else code=$?; fi
+              echo "inventory_exit=$code" >> evidence/exit-codes.txt
+              tail -n 20 evidence/inventory.txt
+              if (( code != 0 )); then exit "$code"; fi
+              if cargo test --workspace --exclude lumen-desktop --locked > evidence/run.txt 2>&1; then code=0; else code=$?; fi
+              echo "run_exit=$code" >> evidence/exit-codes.txt
+              tail -n 30 evidence/run.txt
+              if (( code != 0 )); then exit "$code"; fi
+              if bash scripts/verify-linux-plugin-sandbox.sh > evidence/sandbox-run.txt 2>&1; then code=0; else code=$?; fi
+              echo "sandbox_run_exit=$code" >> evidence/exit-codes.txt
+              tail -n 30 evidence/sandbox-run.txt
+              exit "$code"
+            '; then code=0; else code=$?; fi
+          echo "container_exit=$code" >> evidence/exit-codes.txt
           exit "$code"
       - uses: actions/upload-artifact@v4
         if: always()
