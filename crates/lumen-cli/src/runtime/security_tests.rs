@@ -2217,6 +2217,82 @@ async fn expired_scheduled_lease_cannot_reserve_an_approved_write() {
 }
 
 #[tokio::test]
+async fn superseded_scheduled_revision_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"superseded-revision.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query(
+        "INSERT INTO scheduled_job_revisions (
+            job_id, revision, schedule_kind, schedule_start_at, interval_millis,
+            prompt, data_class, max_model_turns, max_actions, enabled,
+            next_due_at, idempotent, created_at
+         ) SELECT job_id, 2, schedule_kind, schedule_start_at, interval_millis,
+                  prompt, data_class, max_model_turns, max_actions, enabled,
+                  next_due_at, idempotent, created_at
+           FROM scheduled_job_revisions WHERE job_id = ? AND revision = 1",
+    )
+    .bind(scheduled_job_id().to_string())
+    .execute(harness.database.pool())
+    .await
+    .expect("new revision");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/superseded-revision.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn scheduled_provider_failure_terminalizes_both_records() {
     let model = MockServer::start().await;
     mount_response(&model, ResponseTemplate::new(500)).await;
