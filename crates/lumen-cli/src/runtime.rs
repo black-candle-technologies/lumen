@@ -57,8 +57,8 @@ use lumen_server::{
     JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand, PluginActionRequested,
     PluginComponentReview, PluginDetailsQuery, PluginFailureReview, PluginReviewQuery,
     PluginSettingReview, PluginVersionDetails, PrincipalSummary, ProviderPolicyCommand,
-    ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated, RuntimeService,
-    ServiceError, ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery,
+    ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated, RunReconciliation,
+    RuntimeService, ServiceError, ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery,
     ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
     WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
 };
@@ -1934,6 +1934,35 @@ impl RuntimeService for LocalRuntimeService {
                 .await
                 .map_err(sql_service_error)?
                 .ok_or(ServiceError::NotFound)
+        })
+    }
+
+    fn list_reconciliation_runs(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+    ) -> ServiceFuture<'_, Vec<RunReconciliation>> {
+        let service = self.clone();
+        Box::pin(async move {
+            let runs = service
+                .database
+                .list_reconciliation_required_runs(workspace_id)
+                .await
+                .map_err(repository_service_error)?;
+            runs.into_iter()
+                .map(|(run_id, lifecycle)| {
+                    let code = lifecycle.terminal_code().ok_or_else(|| {
+                        ServiceError::Internal("reconciliation run missing terminal code".into())
+                    })?;
+                    Ok(RunReconciliation::new(
+                        run_id,
+                        lifecycle.effect_certainty().as_str(),
+                        code,
+                        lifecycle.primary_diagnostic().map(str::to_owned),
+                        lifecycle.secondary_diagnostic().map(str::to_owned),
+                        lifecycle.terminal_audit_pending(),
+                    ))
+                })
+                .collect()
         })
     }
 

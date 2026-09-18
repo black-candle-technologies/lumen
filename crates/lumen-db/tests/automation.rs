@@ -675,6 +675,23 @@ async fn owned_scheduled_handoff_commits_run_occurrence_and_lifecycle_together()
             recovered_owner.to_string()
         )
     );
+    let next_owner = Uuid::new_v4();
+    assert_eq!(
+        database
+            .reconcile_abandoned_owned_runs(next_owner, TimestampMillis::new(3_200))
+            .await
+            .expect("owner loss"),
+        vec![run_id]
+    );
+    let reconciled: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state FROM agent_runs run
+         JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("reconciled state");
+    assert_eq!(reconciled, ("failed".into(), "unknown".into()));
 }
 
 #[tokio::test]

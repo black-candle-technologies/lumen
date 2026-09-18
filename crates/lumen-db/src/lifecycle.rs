@@ -152,6 +152,33 @@ impl RunLifecycleView {
 }
 
 impl Database {
+    pub async fn list_reconciliation_required_runs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<(RunId, RunLifecycleView)>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT run_id FROM run_lifecycle
+             WHERE workspace_id = ? AND phase = 'reconciliation_required'
+             ORDER BY updated_at, run_id",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(self.pool())
+        .await?;
+        let mut listed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("run_id")?;
+            let run_id = RunId::from_uuid(
+                Uuid::parse_str(&id).map_err(|_| RepositoryError::ExecutionStateConflict)?,
+            );
+            let lifecycle = self
+                .get_run_lifecycle(workspace_id, run_id)
+                .await?
+                .ok_or(RepositoryError::ExecutionStateConflict)?;
+            listed.push((run_id, lifecycle));
+        }
+        Ok(listed)
+    }
+
     pub async fn reconcile_abandoned_owned_runs(
         &self,
         current_owner: Uuid,

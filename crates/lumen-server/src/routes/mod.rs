@@ -57,6 +57,10 @@ pub fn router(state: ApiState) -> Router {
             "/api/v1/workspaces/{workspace_id}/runs/{run_id}/status",
             get(run_status),
         )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/reconciliation",
+            get(list_reconciliation_runs),
+        )
         .route("/api/v1/workspaces/{workspace_id}/audit", get(list_audit))
         .route(
             "/api/v1/workspaces/{workspace_id}/plugins/staged",
@@ -767,6 +771,21 @@ async fn run_status(
         run_id,
         state: run_state,
     }))
+}
+
+#[derive(Serialize)]
+struct ReconciliationRunsResponse {
+    runs: Vec<crate::RunReconciliation>,
+}
+
+async fn list_reconciliation_runs(
+    State(state): State<ApiState>,
+    Path(workspace): Path<String>,
+) -> Result<Json<ReconciliationRunsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let runs = state.service.list_reconciliation_runs(workspace_id).await?;
+    Ok(Json(ReconciliationRunsResponse { runs }))
 }
 
 #[derive(Deserialize)]

@@ -1407,6 +1407,74 @@ async fn terminal_replay_accepts_derived_known_effect_certainty() {
 }
 
 #[tokio::test]
+async fn reconciliation_listing_is_workspace_scoped_and_excludes_ordinary_terminals() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let foreign = WorkspaceId::new();
+    let actor = PrincipalId::new("local", "operator").expect("principal");
+    let owner = Uuid::new_v4();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .insert_workspace(foreign, "Foreign", TimestampMillis::new(1_000))
+        .await
+        .expect("foreign workspace");
+    let unknown = RunId::new();
+    let completed = RunId::new();
+    let foreign_unknown = RunId::new();
+    for (run_id, scope) in [
+        (unknown, workspace_id()),
+        (completed, workspace_id()),
+        (foreign_unknown, foreign),
+    ] {
+        database
+            .create_owned_run(run_id, scope, &actor, owner, TimestampMillis::new(1_100))
+            .await
+            .expect("run");
+    }
+    let uncertain = TerminalSpec::new(
+        TerminalState::Failed,
+        EffectCertainty::Unknown,
+        "owner_lost",
+        Some("redacted".into()),
+    )
+    .expect("terminal");
+    let finished = TerminalSpec::new(
+        TerminalState::Completed,
+        EffectCertainty::NoEffect,
+        "run_completed",
+        None,
+    )
+    .expect("terminal");
+    for (run_id, scope, spec) in [
+        (unknown, workspace_id(), &uncertain),
+        (completed, workspace_id(), &finished),
+        (foreign_unknown, foreign, &uncertain),
+    ] {
+        database
+            .terminalize_owned_run(
+                run_id,
+                scope,
+                owner,
+                spec,
+                AuditEventId::new(),
+                TimestampMillis::new(1_200),
+            )
+            .await
+            .expect("terminalized");
+    }
+    let listed = database
+        .list_reconciliation_required_runs(workspace_id())
+        .await
+        .expect("listing");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, unknown);
+    assert_eq!(listed[0].1.effect_certainty(), EffectCertainty::Unknown);
+    assert_eq!(listed[0].1.primary_diagnostic(), Some("redacted"));
+}
+
+#[tokio::test]
 async fn rejected_approval_terminalizes_its_normalized_action_before_run_completion() {
     let database = Database::connect_in_memory().await.expect("database opens");
     let action = action();

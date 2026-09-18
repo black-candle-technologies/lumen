@@ -6741,6 +6741,17 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
     harness
         .wait_for_audit(AuditEventKind::RunReconciliationRequired)
         .await;
+    let response = harness.request("GET", "runs/reconciliation", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("reconciliation JSON");
+    assert_eq!(body["runs"][0]["run_id"], run_id.to_string());
+    assert_eq!(body["runs"][0]["effect_certainty"], "unknown");
 }
 
 #[tokio::test]
