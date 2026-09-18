@@ -9,6 +9,7 @@ The current Windows/WSL pnpm dependency procedure is in [M5 JavaScript dependenc
 The scoped Ollama GPU residency policy and issue #28 evidence are in [M5 GPU policy guide](M5_GPU_POLICY_GUIDE.md).
 The measured WSL memory triage and shutdown procedure for issue #26 are in [M5 WSL memory guide](M5_WSL_MEMORY_GUIDE.md).
 The reproducible disposable fixture and evidence lifecycle for issue #21 are in [M5 QA launcher guide](M5_QA_LAUNCHER_GUIDE.md).
+The named Windows/WSL/web inventories, first failures, and native desktop CI status for issue #27 are in [M5 platform matrix](M5_PLATFORM_MATRIX_2026-09-17.md).
 
 ## Repository policy
 
