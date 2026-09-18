@@ -447,23 +447,140 @@ impl Database {
         state: &str,
         completed_at: Option<TimestampMillis>,
     ) -> Result<(), RepositoryError> {
+        let expected_states = match state {
+            "running" => &["created", "awaiting_approval"][..],
+            "awaiting_approval" => &["running"][..],
+            "completed" | "failed" | "cancelled" => {
+                &["created", "running", "awaiting_approval"][..]
+            }
+            _ => return Err(RepositoryError::InvalidRunState(state.to_owned())),
+        };
+        self.transition_run_state(run_id, expected_states, state, completed_at)
+            .await
+    }
+
+    pub async fn transition_run_state(
+        &self,
+        run_id: lumen_core::action::RunId,
+        expected_states: &[&str],
+        state: &str,
+        completed_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
         if !matches!(
             state,
             "running" | "awaiting_approval" | "completed" | "failed" | "cancelled"
-        ) {
+        ) || expected_states.is_empty()
+            || expected_states.iter().any(|expected| {
+                !matches!(
+                    *expected,
+                    "created"
+                        | "running"
+                        | "awaiting_approval"
+                        | "completed"
+                        | "failed"
+                        | "cancelled"
+                )
+            })
+        {
             return Err(RepositoryError::InvalidRunState(state.to_owned()));
         }
-        let updated = sqlx::query("UPDATE agent_runs SET state = ?, completed_at = ? WHERE id = ?")
-            .bind(state)
-            .bind(completed_at.map(timestamp_to_i64).transpose()?)
-            .bind(run_id.to_string())
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        let mut query = sqlx::QueryBuilder::new("UPDATE agent_runs SET state = ");
+        query.push_bind(state);
+        query.push(", completed_at = ");
+        query.push_bind(completed_at.map(timestamp_to_i64).transpose()?);
+        query.push(" WHERE id = ");
+        query.push_bind(run_id.to_string());
+        query.push(" AND state IN (");
+        let mut separated = query.separated(", ");
+        for expected_state in expected_states {
+            separated.push_bind(*expected_state);
+        }
+        separated.push_unseparated(")");
+        let updated = query.build().execute(&self.pool).await?.rows_affected();
         if updated != 1 {
             return Err(RepositoryError::ExecutionStateConflict);
         }
         Ok(())
+    }
+
+    pub async fn reject_approval_and_action(
+        &self,
+        workspace_id: WorkspaceId,
+        approval: &ApprovalRequest,
+    ) -> Result<RunId, RepositoryError> {
+        if approval.state() != lumen_core::approval::ApprovalState::Rejected {
+            return Err(RepositoryError::ApprovalDecisionConflict);
+        }
+        let approver = approval
+            .decided_by()
+            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
+        let decided_at = approval
+            .decided_at()
+            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO identities (provider, subject, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(approver.provider())
+        .bind(approver.subject())
+        .bind(timestamp_to_i64(decided_at)?)
+        .execute(&mut *transaction)
+        .await?;
+
+        let run_id: Option<String> = sqlx::query_scalar(
+            "SELECT actions.run_id
+             FROM approval_requests
+             JOIN actions ON actions.id = approval_requests.action_id
+             WHERE approval_requests.id = ?
+               AND approval_requests.state = 'pending'
+               AND approval_requests.action_fingerprint = ?
+               AND approval_requests.policy_version = ?
+               AND actions.workspace_id = ?
+               AND actions.fingerprint = approval_requests.action_fingerprint
+               AND actions.state = 'normalized'",
+        )
+        .bind(approval.id().to_string())
+        .bind(approval.action_fingerprint().as_str())
+        .bind(approval.policy_version().as_str())
+        .bind(workspace_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let run_id = run_id.ok_or(RepositoryError::ApprovalDecisionConflict)?;
+
+        let approval_updated = sqlx::query(
+            "UPDATE approval_requests
+             SET state = 'rejected', decided_by_provider = ?, decided_by_subject = ?, decided_at = ?
+             WHERE id = ? AND state = 'pending' AND action_fingerprint = ? AND policy_version = ?",
+        )
+        .bind(approver.provider())
+        .bind(approver.subject())
+        .bind(timestamp_to_i64(decided_at)?)
+        .bind(approval.id().to_string())
+        .bind(approval.action_fingerprint().as_str())
+        .bind(approval.policy_version().as_str())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if approval_updated != 1 {
+            return Err(RepositoryError::ApprovalDecisionConflict);
+        }
+        let action_updated = sqlx::query(
+            "UPDATE actions
+             SET state = 'denied', terminal_reason = 'approval_rejected'
+             WHERE id = (
+                 SELECT action_id FROM approval_requests WHERE id = ?
+             ) AND workspace_id = ? AND state = 'normalized'",
+        )
+        .bind(approval.id().to_string())
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if action_updated != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        transaction.commit().await?;
+        parse_uuid(run_id, RunId::from_uuid)
     }
 
     pub async fn terminalize_run(

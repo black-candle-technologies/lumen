@@ -4037,6 +4037,21 @@ async fn rejected_or_expired_capture_publication_never_creates_a_skill() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     wait_for_run_state(&harness, &rejected_run.to_string(), "failed").await;
+    let rejected_action: (String, Option<String>) =
+        sqlx::query_as("SELECT state, terminal_reason FROM actions WHERE run_id = ?")
+            .bind(rejected_run.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("rejected action state");
+    let rejected_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+            .bind(rejected_run.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("rejected execution attempts");
+    assert_eq!(rejected_action.0, "denied");
+    assert_eq!(rejected_action.1.as_deref(), Some("approval_rejected"));
+    assert_eq!(rejected_attempts, 0);
 
     let expired_skill = SkillId::from_uuid(
         uuid::Uuid::parse_str("bb29fc40-ca47-4067-b31d-00dd010662da").expect("expired skill ID"),

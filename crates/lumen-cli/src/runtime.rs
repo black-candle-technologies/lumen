@@ -4279,27 +4279,42 @@ impl ApprovalRegistry {
             }
             return Err(ServiceError::ApprovalConflict(approval_conflict(error)));
         }
-        self.database
-            .update_approval_decision(command.workspace_id(), &request)
-            .await
-            .map_err(|error| match error {
-                lumen_db::RepositoryError::ApprovalStale => {
-                    ServiceError::ApprovalConflict(ApprovalConflict::Stale)
-                }
-                lumen_db::RepositoryError::ApprovalActionChanged => {
-                    ServiceError::ApprovalConflict(ApprovalConflict::ActionChanged)
-                }
-                lumen_db::RepositoryError::ApprovalExpired => {
-                    ServiceError::ApprovalConflict(ApprovalConflict::Expired)
-                }
-                lumen_db::RepositoryError::ApprovalConsumed => {
-                    ServiceError::ApprovalConflict(ApprovalConflict::Consumed)
-                }
-                lumen_db::RepositoryError::ApprovalDecisionConflict => {
-                    ServiceError::ApprovalConflict(ApprovalConflict::AlreadyDecided)
-                }
-                error => repository_service_error(error),
-            })?;
+        let persisted = match command.decision() {
+            ApprovalDecision::Grant => self
+                .database
+                .update_approval_decision(command.workspace_id(), &request)
+                .await
+                .map(|_| ()),
+            ApprovalDecision::Reject => self
+                .database
+                .reject_approval_and_action(command.workspace_id(), &request)
+                .await
+                .and_then(|persisted_run_id| {
+                    if persisted_run_id == record.run_id {
+                        Ok(())
+                    } else {
+                        Err(lumen_db::RepositoryError::ApprovalDecisionConflict)
+                    }
+                }),
+        };
+        persisted.map_err(|error| match error {
+            lumen_db::RepositoryError::ApprovalStale => {
+                ServiceError::ApprovalConflict(ApprovalConflict::Stale)
+            }
+            lumen_db::RepositoryError::ApprovalActionChanged => {
+                ServiceError::ApprovalConflict(ApprovalConflict::ActionChanged)
+            }
+            lumen_db::RepositoryError::ApprovalExpired => {
+                ServiceError::ApprovalConflict(ApprovalConflict::Expired)
+            }
+            lumen_db::RepositoryError::ApprovalConsumed => {
+                ServiceError::ApprovalConflict(ApprovalConflict::Consumed)
+            }
+            lumen_db::RepositoryError::ApprovalDecisionConflict => {
+                ServiceError::ApprovalConflict(ApprovalConflict::AlreadyDecided)
+            }
+            error => repository_service_error(error),
+        })?;
         record.request = request;
         Ok((
             record.run_id,

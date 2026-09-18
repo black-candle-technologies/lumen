@@ -108,7 +108,7 @@ async fn empty_database_runs_the_initial_migration() {
         .fetch_one(database.pool())
         .await
         .expect("migration metadata loads");
-    assert_eq!(migration_count, 7);
+    assert_eq!(migration_count, 8);
 }
 
 #[tokio::test]
@@ -134,7 +134,7 @@ async fn file_database_reopens_without_reapplying_migrations() {
         .expect("migration count loads");
 
     assert_eq!(workspace_count, 1);
-    assert_eq!(migration_count, 7);
+    assert_eq!(migration_count, 8);
 }
 
 #[tokio::test]
@@ -607,6 +607,103 @@ async fn policy_denied_actions_transition_out_of_normalized_state() {
             .await,
         Err(RepositoryError::ExecutionStateConflict)
     ));
+}
+
+#[tokio::test]
+async fn stale_run_start_cannot_resurrect_a_terminal_row() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let actor = PrincipalId::new("local", "operator").expect("valid principal");
+    let run_id = action().run_id();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    database
+        .create_run(run_id, workspace_id(), &actor, TimestampMillis::new(1_000))
+        .await
+        .expect("run stored");
+
+    database
+        .terminalize_run(run_id, "cancelled", None, TimestampMillis::new(1_100))
+        .await
+        .expect("terminal transition succeeds");
+
+    assert!(matches!(
+        database
+            .transition_run_state(run_id, &["created"], "running", None)
+            .await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+
+    let row: (String, Option<i64>) =
+        sqlx::query_as("SELECT state, completed_at FROM agent_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("run row loads");
+    assert_eq!(row.0, "cancelled");
+    assert_eq!(row.1, Some(1_100));
+}
+
+#[tokio::test]
+async fn rejected_approval_terminalizes_its_normalized_action_before_run_completion() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let mut approval = ApprovalRequest::new(
+        approval_id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(2_000),
+    )
+    .expect("approval request");
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+    approval
+        .reject(
+            PrincipalId::new("local", "admin").expect("valid principal"),
+            TimestampMillis::new(1_100),
+        )
+        .expect("approval can be rejected");
+
+    let rejected_run = database
+        .reject_approval_and_action(workspace_id(), &approval)
+        .await
+        .expect("rejection/action transition succeeds");
+    assert_eq!(rejected_run, action.run_id());
+
+    let approval_state: String =
+        sqlx::query_scalar("SELECT state FROM approval_requests WHERE id = ?")
+            .bind(approval.id().to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("approval state");
+    let action_row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, terminal_reason FROM actions WHERE id = ?")
+            .bind(action.id().to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("action state");
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id = ?")
+            .bind(action.id().to_string())
+            .fetch_one(database.pool())
+            .await
+            .expect("attempt count");
+    assert_eq!(approval_state, "rejected");
+    assert_eq!(action_row.0, "denied");
+    assert_eq!(action_row.1.as_deref(), Some("approval_rejected"));
+    assert_eq!(attempts, 0);
 }
 
 #[tokio::test]
