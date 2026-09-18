@@ -4991,6 +4991,25 @@ async fn publication_recovery_finishes_only_owned_synced_sources() {
                 .await
                 .expect("intent state");
         assert_eq!(state, "committed");
+        std::fs::hard_link(&final_path, &stage).expect("simulate crash before stage cleanup");
+        recover_skill_publications(&harness.database, &data_root)
+            .await
+            .expect("post-commit cleanup recovery");
+        assert!(!stage.exists());
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("retained published source"),
+            draft.body()
+        );
+        std::fs::hard_link(&final_path, &stage).expect("simulate retained stage");
+        std::fs::remove_file(&final_path).expect("simulate lost final directory entry");
+        recover_skill_publications(&harness.database, &data_root)
+            .await
+            .expect("committed source recovery");
+        assert!(!stage.exists());
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("restored committed source"),
+            draft.body()
+        );
     }
     harness.service.shutdown().await;
 }

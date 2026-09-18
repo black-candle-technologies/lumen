@@ -3812,6 +3812,10 @@ async fn write_skill_stage(stage_path: &Path, bytes: &[u8]) -> Result<(), Servic
         .await
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
     stage_file
+        .flush()
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    stage_file
         .sync_all()
         .await
         .map_err(|error| ServiceError::Internal(error.to_string()))?;
@@ -3917,7 +3921,7 @@ async fn recover_skill_publications(
     data_root: &Path,
 ) -> Result<(), ServiceError> {
     for intent in database
-        .pending_skill_publications()
+        .recoverable_skill_publications()
         .await
         .map_err(repository_service_error)?
     {
@@ -3929,6 +3933,46 @@ async fn recover_skill_publications(
             .join("skills")
             .join(intent.skill.skill_id().to_string())
             .join(format!("{}.md", intent.skill.version().as_str()));
+        if intent.state == "committed" {
+            if !stage_path.exists() {
+                continue;
+            }
+            let staged = read_bounded_skill_source(
+                tokio::fs::File::open(&stage_path)
+                    .await
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            if staged.as_deref().map(sha256_hex).as_deref() != Some(intent.skill.source_digest()) {
+                return Err(ServiceError::Conflict(
+                    "committed publication stage digest mismatch".into(),
+                ));
+            }
+            if !source_path.exists() {
+                tokio::fs::create_dir_all(
+                    source_path.parent().ok_or_else(|| {
+                        ServiceError::Internal("invalid skill source path".into())
+                    })?,
+                )
+                .await
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+                match tokio::fs::hard_link(&stage_path, &source_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(ServiceError::Internal(error.to_string())),
+                }
+            }
+            if !same_file::is_same_file(&stage_path, &source_path).unwrap_or(false) {
+                return Err(ServiceError::Conflict(
+                    "committed publication final path has foreign ownership".into(),
+                ));
+            }
+            tokio::fs::remove_file(&stage_path)
+                .await
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            continue;
+        }
         if !stage_path.exists() {
             let (state, diagnostic) = if source_path.exists() {
                 (
@@ -3947,14 +3991,35 @@ async fn recover_skill_publications(
                 .map_err(repository_service_error)?;
             continue;
         }
-        let _ = finalize_skill_publication(
+        if let Err(error) = finalize_skill_publication(
             database,
             intent.intent_id,
             &intent.skill,
             &stage_path,
             &source_path,
         )
-        .await;
+        .await
+        {
+            let still_unsettled = database
+                .recoverable_skill_publications()
+                .await
+                .map_err(repository_service_error)?
+                .into_iter()
+                .any(|current| {
+                    current.intent_id == intent.intent_id
+                        && matches!(current.state.as_str(), "prepared" | "materialized")
+                });
+            if still_unsettled {
+                database
+                    .mark_skill_publication_state(
+                        intent.intent_id,
+                        "reconciliation_required",
+                        Some(&error.to_string()),
+                    )
+                    .await
+                    .map_err(repository_service_error)?;
+            }
+        }
     }
     Ok(())
 }

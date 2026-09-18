@@ -1578,7 +1578,8 @@ impl Database {
     ) -> Result<(), RepositoryError> {
         let mut transaction = self.pool().begin().await?;
         let row = sqlx::query(
-            "SELECT workspace_id, skill_id, version, source_digest, state
+            "SELECT workspace_id, skill_id, version, name, description, source_format,
+                    source_digest, created_provider, created_subject, created_at, state
              FROM skill_publication_intents WHERE intent_id = ?",
         )
         .bind(intent_id.to_string())
@@ -1587,7 +1588,13 @@ impl Database {
         if row.try_get::<String, _>("workspace_id")? != skill.workspace_id.to_string()
             || row.try_get::<String, _>("skill_id")? != skill.skill_id.to_string()
             || row.try_get::<String, _>("version")? != skill.version.as_str()
+            || row.try_get::<String, _>("name")? != skill.name
+            || row.try_get::<String, _>("description")? != skill.description
+            || row.try_get::<String, _>("source_format")? != skill.source_format
             || row.try_get::<String, _>("source_digest")? != skill.source_digest
+            || row.try_get::<String, _>("created_provider")? != skill.created_by.provider()
+            || row.try_get::<String, _>("created_subject")? != skill.created_by.subject()
+            || row.try_get::<i64, _>("created_at")? != timestamp_to_i64(skill.created_at)?
             || row.try_get::<String, _>("state")? != "materialized"
         {
             return Err(RepositoryError::InvalidAutomationState);
@@ -1602,11 +1609,11 @@ impl Database {
         Ok(())
     }
 
-    pub async fn pending_skill_publications(
+    pub async fn recoverable_skill_publications(
         &self,
     ) -> Result<Vec<SkillPublicationIntent>, RepositoryError> {
         let rows = sqlx::query(
-            "SELECT * FROM skill_publication_intents WHERE state NOT IN ('committed', 'abandoned') ORDER BY created_at, intent_id",
+            "SELECT * FROM skill_publication_intents WHERE state != 'abandoned' ORDER BY created_at, intent_id",
         )
         .fetch_all(self.pool())
         .await?;
