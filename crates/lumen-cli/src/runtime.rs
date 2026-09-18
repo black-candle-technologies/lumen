@@ -516,7 +516,7 @@ impl LocalRuntimeService {
         if !claimed {
             return Ok(false);
         }
-        let stored = self
+        let mut stored = self
             .prepare_stored_run(
                 run_id,
                 self.scheduled_run_request(job, occurrence, lease_id)
@@ -536,6 +536,7 @@ impl LocalRuntimeService {
             .map_err(|error| {
                 ServiceError::Internal(format!("start recovered scheduled run: {error}"))
             })?;
+        stored.start_disposition = StartDisposition::ScheduledStartCommitted;
         self.install_and_spawn_run(run_id, stored).await;
         Ok(true)
     }
@@ -593,7 +594,7 @@ impl LocalRuntimeService {
             .scheduled_run_request(&job, &occurrence, lease_id)
             .await?;
         let run_id = RunId::new();
-        let stored = self.prepare_stored_run(run_id, request).await?;
+        let mut stored = self.prepare_stored_run(run_id, request).await?;
         self.database
             .persist_scheduled_run_handoff(
                 &job,
@@ -618,6 +619,7 @@ impl LocalRuntimeService {
             )
             .await
             .map_err(|error| ServiceError::Internal(format!("start scheduled run: {error}")))?;
+        stored.start_disposition = StartDisposition::ScheduledStartCommitted;
         self.install_and_spawn_run(run_id, stored).await;
         Ok(Some(run_id))
     }
@@ -688,6 +690,7 @@ impl LocalRuntimeService {
             model_override: request.model_override,
             capabilities_override: request.capabilities_override,
             scheduled_handoff: request.scheduled_handoff,
+            start_disposition: StartDisposition::Created,
         })
     }
 
@@ -1113,11 +1116,15 @@ impl LocalRuntimeService {
                 return;
             }
         }
-        if let Err(error) = self
-            .database
-            .update_run_state(run_id, "running", None)
-            .await
-        {
+        let start = match stored.start_disposition {
+            StartDisposition::Created => {
+                self.database
+                    .update_run_state(run_id, "running", None)
+                    .await
+            }
+            StartDisposition::ScheduledStartCommitted => Ok(()),
+        };
+        if let Err(error) = start {
             self.record_run_reconciliation_required(
                 stored.workspace_id,
                 run_id,
@@ -1438,6 +1445,7 @@ impl LocalRuntimeService {
                 model_override: Some(model),
                 capabilities_override: Some(EffectiveCapabilities::new([capabilities])),
                 scheduled_handoff: None,
+                start_disposition: StartDisposition::Created,
             },
         );
         let cancellation = CancellationToken::new();
@@ -1645,6 +1653,7 @@ impl RuntimeService for LocalRuntimeService {
                 model_override: None,
                 capabilities_override: None,
                 scheduled_handoff: None,
+                start_disposition: StartDisposition::Created,
             };
             service.publish_run_created(run_id, command.workspace_id())?;
             service.install_and_spawn_run(run_id, stored).await;
@@ -3911,6 +3920,13 @@ struct StoredRun {
     model_override: Option<Arc<dyn ModelPort>>,
     capabilities_override: Option<EffectiveCapabilities>,
     scheduled_handoff: Option<(OccurrenceKey, uuid::Uuid)>,
+    start_disposition: StartDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartDisposition {
+    Created,
+    ScheduledStartCommitted,
 }
 
 struct ReviewedSkillPrompt {

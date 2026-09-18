@@ -1828,6 +1828,22 @@ async fn scheduled_due_once_job_creates_one_service_attributed_run() {
         canonical_object_get(run_created.payload(), "occurrence_key"),
         Some(&CanonicalValue::from(occurrence.as_str()))
     );
+    assert_eq!(
+        model
+            .received_requests()
+            .await
+            .expect("provider requests")
+            .len(),
+        1,
+        "the committed scheduled start reaches exactly one model call"
+    );
+    assert!(
+        !records.iter().any(|record| {
+            canonical_object_get(record.event().payload(), "stage")
+                == Some(&CanonicalValue::from("run_start"))
+        }),
+        "scheduled start must not report the old generic-start conflict"
+    );
     harness.service.shutdown().await;
 }
 
