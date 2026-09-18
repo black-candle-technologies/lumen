@@ -993,6 +993,7 @@ impl LocalRuntimeService {
         TimestampMillis::new(
             timestamp
                 .as_u64()
+                .max(now().as_u64())
                 .saturating_add(self.scheduled_execution_lease_millis),
         )
     }
@@ -1621,7 +1622,18 @@ impl LocalRuntimeService {
                 }
             };
             if !current {
-                self.finish_run(run_id).await;
+                self.terminalize_stored_run(
+                    run_id,
+                    &stored,
+                    "failed",
+                    "failed",
+                    "run.failed",
+                    CanonicalValue::from("scheduled lease is no longer current"),
+                    None,
+                    Some("scheduled lease is no longer current".into()),
+                    now(),
+                )
+                .await;
                 return;
             }
         }

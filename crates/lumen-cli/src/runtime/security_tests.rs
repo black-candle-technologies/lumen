@@ -1948,6 +1948,275 @@ async fn scheduled_run_resumes_two_approval_required_actions() {
 }
 
 #[tokio::test]
+async fn disabled_scheduled_service_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"revoked-service.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("UPDATE service_identities SET enabled = 0 WHERE workspace_id = ?")
+        .bind(harness.workspace_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("disable service");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/revoked-service.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn revoked_scheduled_grant_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"revoked-grant.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("DELETE FROM service_identity_grants WHERE workspace_id = ?")
+        .bind(harness.workspace_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("revoke grant");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/revoked-grant.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn replaced_scheduled_lease_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"replaced-lease.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("UPDATE scheduled_job_leases SET lease_id = ? WHERE occurrence_key IN (SELECT occurrence_key FROM scheduled_job_runs WHERE run_id = ?)")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(run_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("replace lease");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/replaced-lease.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn expired_scheduled_lease_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"expired-lease.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("UPDATE scheduled_job_leases SET expires_at = 3000 WHERE occurrence_key IN (SELECT occurrence_key FROM scheduled_job_runs WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("expire lease");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/expired-lease.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn scheduled_provider_failure_terminalizes_both_records() {
     let model = MockServer::start().await;
     mount_response(&model, ResponseTemplate::new(500)).await;

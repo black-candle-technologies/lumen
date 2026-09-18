@@ -140,7 +140,7 @@ async fn migration_adds_durable_automation_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 11);
+    assert_eq!(migrations, 12);
 }
 
 #[tokio::test]

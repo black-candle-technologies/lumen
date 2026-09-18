@@ -3,6 +3,7 @@ use std::path::Path;
 use lumen_core::{
     action::{ActionEnvelope, ActionFingerprint, ActionId, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
+    capability::{Capability, CapabilityName, CapabilitySet, ResourceScope, WorkspacePath},
     identity::PrincipalId,
     identity::WorkspaceId,
     policy::PolicyVersion,
@@ -1308,6 +1309,92 @@ async fn transition_action_lifecycle(
     next: &str,
     timestamp: i64,
 ) -> Result<(), RepositoryError> {
+    let scheduled: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM scheduled_job_runs occurrence
+             JOIN actions action ON action.run_id = occurrence.run_id
+             WHERE action.id = ?
+         )",
+    )
+    .bind(action_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if expected == "running" && scheduled == 1 {
+        let authorized: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM actions action
+                 JOIN scheduled_job_runs occurrence ON occurrence.run_id = action.run_id
+                 JOIN scheduled_job_leases lease
+                   ON lease.occurrence_key = occurrence.occurrence_key
+                 JOIN scheduled_jobs job ON job.job_id = occurrence.job_id
+                 JOIN scheduled_job_revisions revision
+                   ON revision.job_id = job.job_id AND revision.revision = occurrence.revision
+                 JOIN service_identities service
+                   ON service.provider = job.service_provider
+                  AND service.subject = job.service_subject
+                  AND service.workspace_id = job.workspace_id
+                 WHERE action.id = ? AND occurrence.state = 'running'
+                   AND occurrence.start_lease_id = lease.lease_id
+                   AND lease.expires_at > ?
+                   AND job.workspace_id = action.workspace_id
+                   AND action.actor_provider = service.provider
+                   AND action.actor_subject = service.subject
+                   AND service.enabled = 1 AND revision.enabled = 1
+                   AND revision.revision = (
+                       SELECT MAX(latest.revision) FROM scheduled_job_revisions latest
+                       WHERE latest.job_id = job.job_id
+                   )
+             )",
+        )
+        .bind(action_id.to_string())
+        .bind(timestamp)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if authorized != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        let (required_json, provider, subject, workspace): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT action.capabilities_json, job.service_provider,
+                        job.service_subject, job.workspace_id
+                 FROM actions action
+                 JOIN scheduled_job_runs occurrence ON occurrence.run_id = action.run_id
+                 JOIN scheduled_jobs job ON job.job_id = occurrence.job_id
+                 WHERE action.id = ?",
+            )
+            .bind(action_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT capability_name, scope_kind, scope_workspace_id, scope_path,
+                    scope_resource_type, scope_resource_value
+             FROM service_identity_grants
+             WHERE provider = ? AND subject = ? AND workspace_id = ?",
+        )
+        .bind(provider)
+        .bind(subject)
+        .bind(workspace)
+        .fetch_all(&mut **transaction)
+        .await?;
+        let grants = CapabilitySet::new(
+            rows.into_iter()
+                .map(|row| {
+                    let name = CapabilityName::parse(&row.try_get::<String, _>("capability_name")?)
+                        .ok_or(RepositoryError::InvalidAutomationState)?;
+                    Ok(Capability::new(
+                        name,
+                        crate::automation::scope_from_row(&row)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, RepositoryError>>()?,
+        );
+        if !required_capabilities_from_json(&required_json)?
+            .iter()
+            .all(|capability| grants.allows(capability))
+        {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+    }
     let current: Option<String> = sqlx::query_scalar(
         "SELECT lifecycle.phase FROM run_lifecycle lifecycle
          JOIN actions action ON action.run_id = lifecycle.run_id
@@ -1339,6 +1426,68 @@ async fn transition_action_lifecycle(
         return Err(RepositoryError::ExecutionStateConflict);
     }
     Ok(())
+}
+
+fn required_capabilities_from_json(value: &str) -> Result<Vec<Capability>, RepositoryError> {
+    let parsed: serde_json::Value = serde_json::from_str(value)?;
+    let items = parsed
+        .as_array()
+        .ok_or(RepositoryError::InvalidAutomationState)?;
+    items
+        .iter()
+        .map(|item| {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .and_then(CapabilityName::parse)
+                .ok_or(RepositoryError::InvalidAutomationState)?;
+            let scope = item
+                .get("scope")
+                .ok_or(RepositoryError::InvalidAutomationState)?;
+            let kind = scope
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(RepositoryError::InvalidAutomationState)?;
+            let resource = match kind {
+                "workspace" | "path" => {
+                    let workspace = scope
+                        .get("workspace_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(RepositoryError::InvalidAutomationState)?;
+                    let workspace = WorkspaceId::from_uuid(
+                        Uuid::parse_str(workspace)
+                            .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    );
+                    if kind == "workspace" {
+                        ResourceScope::workspace(workspace)
+                    } else {
+                        let path = scope
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or(RepositoryError::InvalidAutomationState)?;
+                        ResourceScope::path(
+                            workspace,
+                            WorkspacePath::parse(path)
+                                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                        )
+                    }
+                }
+                "exact" => ResourceScope::exact(
+                    scope
+                        .get("resource_type")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(RepositoryError::InvalidAutomationState)?,
+                    scope
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(RepositoryError::InvalidAutomationState)?,
+                )
+                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                _ => return Err(RepositoryError::InvalidAutomationState),
+            };
+            Ok(Capability::new(name, resource))
+        })
+        .collect()
 }
 
 fn secret_reference_from_row(

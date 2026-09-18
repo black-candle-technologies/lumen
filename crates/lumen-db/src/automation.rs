@@ -1250,7 +1250,7 @@ impl Database {
         let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let occurrence = sqlx::query(
             "UPDATE scheduled_job_runs
-             SET state = 'running', updated_at = ?
+             SET state = 'running', start_lease_id = ?, updated_at = ?
              WHERE occurrence_key = ? AND run_id = ? AND state = 'claimed'
                AND EXISTS (
                    SELECT 1 FROM scheduled_job_leases lease
@@ -1258,6 +1258,7 @@ impl Database {
                      AND lease.lease_id = ? AND lease.expires_at > ?
                )",
         )
+        .bind(lease_id.to_string())
         .bind(now_i64)
         .bind(key.as_str())
         .bind(run_id.to_string())
@@ -1343,6 +1344,7 @@ impl Database {
                   AND occurrence.run_id = ?
                   AND occurrence.state = 'running'
                   AND lease.lease_id = ?
+                  AND occurrence.start_lease_id = lease.lease_id
              )",
         )
         .bind(key.as_str())
@@ -1664,7 +1666,9 @@ fn grant_scope_parts(scope: &ResourceScope) -> Result<ScopeParts, RepositoryErro
     })
 }
 
-fn scope_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ResourceScope, RepositoryError> {
+pub(crate) fn scope_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ResourceScope, RepositoryError> {
     match row.try_get::<String, _>("scope_kind")?.as_str() {
         "workspace" => Ok(ResourceScope::workspace(WorkspaceId::from_uuid(
             row.try_get::<String, _>("scope_workspace_id")?
