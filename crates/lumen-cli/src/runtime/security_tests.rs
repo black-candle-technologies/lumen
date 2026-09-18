@@ -7168,6 +7168,94 @@ async fn approved_file_write_uses_the_one_shot_runtime_dispatch_path() {
 }
 
 #[tokio::test]
+async fn rejected_file_write_route_leaves_no_effect_and_refuses_replay_or_foreign_scope() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"rejected.txt","content":"must not exist"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("write a file for rejection").await;
+    wait_for_run_state(&harness, &run_id, "awaiting_approval").await;
+    let approval_id = harness.pending_approval_id().await;
+    let target = harness._directory.path().join("workspace/rejected.txt");
+    assert!(!target.exists());
+
+    let foreign = WorkspaceId::new();
+    let foreign_response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/workspaces/{foreign}/approvals/{approval_id}/decision"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"decision":"reject"}"#))
+                .expect("foreign decision request"),
+        )
+        .await
+        .expect("foreign decision response");
+    assert_ne!(foreign_response.status(), StatusCode::OK);
+    let pending: String = sqlx::query_scalar("SELECT state FROM approval_requests WHERE id = ?")
+        .bind(&approval_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("pending state");
+    assert_eq!(pending, "pending");
+
+    let response = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"reject"}"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    let row: (String, String, Option<String>, String, i64) = sqlx::query_as(
+        "SELECT approval.state, action.state, action.terminal_reason, run.state,
+                (SELECT COUNT(*) FROM execution_attempts WHERE action_id = action.id)
+         FROM approval_requests approval
+         JOIN actions action ON action.id = approval.action_id
+         JOIN agent_runs run ON run.id = action.run_id
+         WHERE approval.id = ?",
+    )
+    .bind(&approval_id)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("rejection facts");
+    assert_eq!(
+        row,
+        (
+            "rejected".into(),
+            "denied".into(),
+            Some("approval_rejected".into()),
+            "failed".into(),
+            0
+        )
+    );
+    assert!(!target.exists());
+
+    let replay = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"reject"}"#,
+        )
+        .await;
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert!(!target.exists());
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn file_write_decision_mutation_and_concurrent_change_fail_closed_end_to_end() {
     let model = MockServer::start().await;
     let turn = Arc::new(AtomicUsize::new(0));

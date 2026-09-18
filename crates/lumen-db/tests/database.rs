@@ -727,6 +727,117 @@ async fn rejected_approval_terminalizes_its_normalized_action_before_run_complet
 }
 
 #[tokio::test]
+async fn rejected_action_update_failure_rolls_back_the_approval_decision() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action");
+    let mut approval = ApprovalRequest::new(
+        approval_id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(2_000),
+    )
+    .expect("approval");
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+    approval
+        .reject(
+            PrincipalId::new("local", "admin").expect("principal"),
+            TimestampMillis::new(1_100),
+        )
+        .expect("rejected request");
+    sqlx::query(
+        "CREATE TRIGGER reject_action_update_fault BEFORE UPDATE OF state ON actions
+         WHEN NEW.terminal_reason = 'approval_rejected'
+         BEGIN SELECT RAISE(ABORT, 'injected action failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("fault installed");
+
+    assert!(
+        database
+            .reject_approval_and_action(workspace_id(), &approval)
+            .await
+            .is_err()
+    );
+    let row: (String, String, i64) = sqlx::query_as(
+        "SELECT approval.state, action.state,
+                (SELECT COUNT(*) FROM execution_attempts WHERE action_id = action.id)
+         FROM approval_requests approval JOIN actions action ON action.id = approval.action_id
+         WHERE approval.id = ?",
+    )
+    .bind(approval.id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("state after rollback");
+    assert_eq!(row, ("pending".into(), "normalized".into(), 0));
+}
+
+#[tokio::test]
+async fn foreign_workspace_cannot_reject_approval_or_change_action() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    let foreign = WorkspaceId::new();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .insert_workspace(foreign, "Foreign", TimestampMillis::new(1_000))
+        .await
+        .expect("foreign workspace");
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action");
+    let mut approval = ApprovalRequest::new(
+        approval_id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_000),
+        TimestampMillis::new(2_000),
+    )
+    .expect("approval");
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+    approval
+        .reject(
+            PrincipalId::new("local", "admin").expect("principal"),
+            TimestampMillis::new(1_100),
+        )
+        .expect("rejected request");
+
+    assert!(matches!(
+        database
+            .reject_approval_and_action(foreign, &approval)
+            .await,
+        Err(RepositoryError::ApprovalDecisionConflict)
+    ));
+    let row: (String, String) = sqlx::query_as(
+        "SELECT approval.state, action.state FROM approval_requests approval
+         JOIN actions action ON action.id = approval.action_id WHERE approval.id = ?",
+    )
+    .bind(approval.id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("unchanged state");
+    assert_eq!(row, ("pending".into(), "normalized".into()));
+}
+
+#[tokio::test]
 async fn pending_approval_listing_expires_due_rows_without_deleting_history() {
     let database = Database::connect_in_memory().await.expect("database opens");
     database
@@ -984,4 +1095,53 @@ async fn reservation_samples_expiry_clock_after_waiting_for_a_sqlite_writer() {
     .expect("reservation state loads");
     assert_eq!(row.get::<String, _>("approval_state"), "granted");
     assert_eq!(row.get::<i64, _>("attempt_count"), 0);
+}
+
+#[tokio::test]
+async fn reservation_one_millisecond_before_expiry_records_the_protected_sample() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let action = action();
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let approval = granted_approval(&action);
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+
+    let clock = AtomicU64::new(1_999);
+    let reservation = DispatchReservation::new(
+        ExecutionAttemptId::new(),
+        action.id(),
+        approval.id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_500),
+    );
+    let reserved_at = database
+        .reserve_execution_with_clock(reservation, || {
+            TimestampMillis::new(clock.load(Ordering::SeqCst))
+        })
+        .await
+        .expect("approval is valid just before expiry");
+    assert_eq!(reserved_at, TimestampMillis::new(1_999));
+    let row: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT approval.state, action.state, attempt.reserved_at,
+                (SELECT COUNT(*) FROM execution_attempts WHERE action_id = action.id)
+         FROM approval_requests approval
+         JOIN actions action ON action.id = approval.action_id
+         JOIN execution_attempts attempt ON attempt.approval_id = approval.id
+         WHERE approval.id = ?",
+    )
+    .bind(approval.id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("reserved state loads");
+    assert_eq!(row, ("consumed".into(), "running".into(), 1_999, 1));
 }
