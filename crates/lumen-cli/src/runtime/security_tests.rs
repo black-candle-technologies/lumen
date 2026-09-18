@@ -2357,6 +2357,97 @@ async fn superseded_scheduled_revision_cannot_reserve_an_approved_write() {
 }
 
 #[tokio::test]
+async fn unpinned_scheduled_creation_is_rejected_before_approval() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+            ActionProposal::new(
+                "schedule.job.create",
+                scheduled_job_action_arguments("unpinned", DataClass::Public, 2, 1, true, true),
+            ),
+            CapabilitySet::new([Capability::new(
+                CapabilityName::ScheduleCreate,
+                ResourceScope::exact("scheduled_job", scheduled_job_id().to_string())
+                    .expect("job scope"),
+            )]),
+        )
+        .await
+        .expect("accepted run");
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("action count");
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approval count");
+    assert_eq!((actions, approvals), (0, 0));
+}
+
+#[tokio::test]
+async fn skill_publication_without_source_digest_is_rejected_before_approval() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Captured workflow",
+        format!("# Draft\nsource_run_id: {}", RunId::new()),
+        PrincipalId::new("local", "operator").expect("operator"),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = skill_id();
+    let run_id = harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+            ActionProposal::new(
+                "skill.publish",
+                CanonicalValue::object([
+                    ("draft_id", CanonicalValue::from(draft.id().to_string())),
+                    ("skill_id", CanonicalValue::from(skill_id.to_string())),
+                    ("version", CanonicalValue::from("1.0.0")),
+                    ("name", CanonicalValue::from("Captured workflow skill")),
+                    ("description", CanonicalValue::from("Reviewed capture")),
+                    ("source_format", CanonicalValue::from("markdown")),
+                ]),
+            ),
+            CapabilitySet::new([Capability::new(
+                CapabilityName::SkillPublish,
+                ResourceScope::exact("skill", skill_id.to_string()).expect("skill scope"),
+            )]),
+        )
+        .await
+        .expect("accepted run");
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("actions");
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approvals");
+    assert_eq!((actions, approvals), (0, 0));
+}
+
+#[tokio::test]
 async fn complete_streamed_tool_call_creates_one_pending_action() {
     let model = MockServer::start().await;
     let chunk = serde_json::json!({
@@ -4693,6 +4784,14 @@ async fn invalid_skill_metadata_leaves_no_unreviewed_source() {
                     ("name", CanonicalValue::from("Bad\nName")),
                     ("description", CanonicalValue::from("Reviewed capture")),
                     ("source_format", CanonicalValue::from("markdown")),
+                    (
+                        "source_digest",
+                        CanonicalValue::from(super::sha256_hex(draft.body().as_bytes())),
+                    ),
+                    (
+                        "source_run_id",
+                        CanonicalValue::from("00000000-0000-4000-8000-000000000003"),
+                    ),
                 ]),
             ),
             CapabilitySet::new([Capability::new(
@@ -5369,8 +5468,34 @@ async fn request_scheduled_job_admin_action(
     harness: &Harness,
     kind: &str,
     capability: CapabilityName,
-    arguments: CanonicalValue,
+    mut arguments: CanonicalValue,
 ) -> lumen_core::action::RunId {
+    let current = harness
+        .database
+        .latest_scheduled_job_revision(scheduled_job_id())
+        .await
+        .expect("latest scheduled revision");
+    let CanonicalValue::Object(object) = &mut arguments else {
+        panic!("scheduled arguments are an object");
+    };
+    object.insert(
+        "previous_revision".into(),
+        current.as_ref().map_or(CanonicalValue::Null, |job| {
+            CanonicalValue::from(i64::try_from(job.revision().as_u64()).expect("revision"))
+        }),
+    );
+    object.insert(
+        "previous_enabled".into(),
+        current.as_ref().map_or(CanonicalValue::Null, |job| {
+            CanonicalValue::from(job.enabled())
+        }),
+    );
+    object.insert(
+        "target_revision".into(),
+        CanonicalValue::from(
+            i64::try_from(current.map_or(1, |job| job.revision().as_u64() + 1)).expect("revision"),
+        ),
+    );
     harness
         .service
         .request_extension_action(
@@ -5392,6 +5517,17 @@ async fn request_skill_publish(
     draft_id: uuid::Uuid,
     skill_id: SkillId,
 ) -> lumen_core::action::RunId {
+    let draft = harness
+        .database
+        .get_workflow_capture_draft(draft_id)
+        .await
+        .expect("draft lookup")
+        .expect("draft exists");
+    let source_digest = super::sha256_hex(draft.body().as_bytes());
+    let source_run = draft
+        .body()
+        .lines()
+        .find_map(|line| line.strip_prefix("source_run_id: "));
     harness
         .service
         .request_extension_action(
@@ -5409,6 +5545,11 @@ async fn request_skill_publish(
                         CanonicalValue::from("A reviewed skill published from a captured workflow"),
                     ),
                     ("source_format", CanonicalValue::from("markdown")),
+                    ("source_digest", CanonicalValue::from(source_digest)),
+                    (
+                        "source_run_id",
+                        source_run.map_or(CanonicalValue::Null, CanonicalValue::from),
+                    ),
                 ]),
             ),
             CapabilitySet::new([Capability::new(

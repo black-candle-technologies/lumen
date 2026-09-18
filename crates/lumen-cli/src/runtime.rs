@@ -3474,6 +3474,21 @@ async fn apply_scheduled_job_action(
     workspace_id: lumen_core::identity::WorkspaceId,
     parsed: ParsedScheduledJobAdminAction,
 ) -> Result<(), ServiceError> {
+    match kind {
+        "schedule.job.create"
+            if parsed.previous_revision.is_none()
+                && parsed.previous_enabled.is_none()
+                && parsed.target_revision == JobRevision::new(1).ok() => {}
+        "schedule.job.update" | "schedule.job.enable"
+            if parsed.previous_revision.is_some()
+                && parsed.previous_enabled.is_some()
+                && parsed.target_revision.is_some() => {}
+        _ => {
+            return Err(ServiceError::Conflict(
+                "scheduled action approval pins are missing or invalid".into(),
+            ));
+        }
+    }
     let latest = database
         .latest_scheduled_job_revision(parsed.job_id)
         .await
@@ -3516,10 +3531,7 @@ async fn apply_scheduled_job_action(
         }
     }
     .map_err(|error| ServiceError::Conflict(error.to_string()))?;
-    if parsed
-        .target_revision
-        .is_some_and(|expected| expected != revision)
-    {
+    if parsed.target_revision != Some(revision) {
         return Err(ServiceError::Conflict(
             "scheduled job changed since approval".into(),
         ));
@@ -3666,7 +3678,7 @@ struct SkillPublishAction {
     name: String,
     description: String,
     source_format: String,
-    source_digest: Option<String>,
+    source_digest: String,
     source_run_id: Option<String>,
 }
 
@@ -3677,7 +3689,8 @@ struct ParsedSkillPublishAction {
     name: String,
     description: String,
     source_format: String,
-    source_digest: Option<String>,
+    source_digest: String,
+    source_run_id: Option<uuid::Uuid>,
 }
 
 async fn apply_skill_publish_action(
@@ -3695,13 +3708,22 @@ async fn apply_skill_publish_action(
     if draft.workspace_id() != workspace_id {
         return Err(ServiceError::NotFound);
     }
-    if parsed
-        .source_digest
-        .as_ref()
-        .is_some_and(|expected| expected != &sha256_hex(draft.body().as_bytes()))
-    {
+    let bytes = draft.body().as_bytes().to_vec();
+    if parsed.source_digest != sha256_hex(&bytes) {
         return Err(ServiceError::Conflict(
             "capture draft changed since approval".into(),
+        ));
+    }
+    let recorded_source_run = draft
+        .body()
+        .lines()
+        .find_map(|line| line.strip_prefix("source_run_id: "))
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ServiceError::Conflict("capture source run is invalid".into()))?;
+    if recorded_source_run != parsed.source_run_id {
+        return Err(ServiceError::Conflict(
+            "capture source run changed since approval".into(),
         ));
     }
     if database
@@ -3714,7 +3736,7 @@ async fn apply_skill_publish_action(
             "skill version already published".into(),
         ));
     }
-    let digest = sha256_hex(draft.body().as_bytes());
+    let digest = parsed.source_digest.clone();
     let created_at = now();
     let record = SkillVersionRecord::new(
         parsed.skill_id,
@@ -3754,7 +3776,7 @@ async fn apply_skill_publish_action(
                 ServiceError::Internal(error.to_string())
             }
         })?;
-    let source_write = source_file.write_all(draft.body().as_bytes()).await;
+    let source_write = source_file.write_all(&bytes).await;
     drop(source_file);
     if let Err(error) = source_write {
         let cleanup = tokio::fs::remove_file(&source_path).await;
@@ -3807,16 +3829,15 @@ fn parse_skill_publish_action(
             "skill publish metadata is invalid",
         ));
     }
-    if parsed.source_digest.as_ref().is_some_and(|digest| {
-        digest.len() != 71
-            || !digest.starts_with("sha256:")
-            || !digest[7..]
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) || parsed
-        .source_run_id
-        .as_ref()
-        .is_some_and(|run_id| uuid::Uuid::parse_str(run_id).is_err())
+    if parsed.source_digest.len() != 71
+        || !parsed.source_digest.starts_with("sha256:")
+        || !parsed.source_digest[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parsed
+            .source_run_id
+            .as_ref()
+            .is_some_and(|run_id| uuid::Uuid::parse_str(run_id).is_err())
     {
         return Err(lumen_core::executor::ExecutorError::new(
             "skill publish provenance is invalid",
@@ -3830,6 +3851,9 @@ fn parse_skill_publish_action(
         description: parsed.description,
         source_format: parsed.source_format,
         source_digest: parsed.source_digest,
+        source_run_id: parsed
+            .source_run_id
+            .map(|run_id| uuid::Uuid::parse_str(&run_id).expect("validated source run ID")),
     })
 }
 
@@ -4695,11 +4719,13 @@ impl ActionNormalizer for RoutingNormalizer {
         context: &RunContext,
         proposal: ActionProposal,
     ) -> Result<ActionEnvelope, NormalizationError> {
-        if is_extension_action(proposal.kind()) {
+        let action = if is_extension_action(proposal.kind()) {
             self.extension.normalize(context, proposal)
         } else {
             self.builtin.normalize(context, proposal)
-        }
+        }?;
+        validate_immutable_action_pins(&action)?;
+        Ok(action)
     }
 
     fn model_tools(&self, context: &RunContext) -> Vec<ModelTool> {
@@ -4707,6 +4733,73 @@ impl ActionNormalizer for RoutingNormalizer {
         tools.extend(self.extension.model_tools(context));
         tools
     }
+}
+
+fn validate_immutable_action_pins(action: &ActionEnvelope) -> Result<(), NormalizationError> {
+    let kind = action.kind().as_str();
+    if kind == "skill.publish" {
+        let CanonicalValue::Object(arguments) = action.arguments() else {
+            return Err(NormalizationError::new(
+                "skill publication arguments must be an object",
+            ));
+        };
+        let valid_digest = matches!(arguments.get("source_digest"), Some(CanonicalValue::String(digest))
+            if digest.len() == 71
+                && digest.starts_with("sha256:")
+                && digest[7..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        let valid_source = matches!(arguments.get("source_run_id"), Some(CanonicalValue::Null))
+            || matches!(arguments.get("source_run_id"), Some(CanonicalValue::String(run_id))
+                if uuid::Uuid::parse_str(run_id).is_ok());
+        if !valid_digest || !valid_source {
+            return Err(NormalizationError::new(
+                "skill publication requires immutable source pins",
+            ));
+        }
+        return Ok(());
+    }
+    if !is_scheduled_job_admin_action(kind) {
+        return Ok(());
+    }
+    let CanonicalValue::Object(arguments) = action.arguments() else {
+        return Err(NormalizationError::new(
+            "scheduled action arguments must be an object",
+        ));
+    };
+    let target = match arguments.get("target_revision") {
+        Some(CanonicalValue::Integer(value)) if *value > 0 => *value,
+        _ => {
+            return Err(NormalizationError::new(
+                "scheduled action requires target revision pin",
+            ));
+        }
+    };
+    if kind == "schedule.job.create" {
+        if arguments.get("previous_revision") != Some(&CanonicalValue::Null)
+            || arguments.get("previous_enabled") != Some(&CanonicalValue::Null)
+            || target != 1
+        {
+            return Err(NormalizationError::new("scheduled create pins are invalid"));
+        }
+    } else {
+        let previous = match arguments.get("previous_revision") {
+            Some(CanonicalValue::Integer(value)) if *value > 0 => *value,
+            _ => {
+                return Err(NormalizationError::new(
+                    "scheduled action requires previous revision pin",
+                ));
+            }
+        };
+        if !matches!(
+            arguments.get("previous_enabled"),
+            Some(CanonicalValue::Bool(_))
+        ) || previous.checked_add(1) != Some(target)
+        {
+            return Err(NormalizationError::new(
+                "scheduled action approval pins are invalid",
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct RoutingExecutor {
@@ -5049,6 +5142,8 @@ impl ApprovalRegistry {
         &self,
         action: &AuthorizedAction,
     ) -> Result<ExecutionAttemptId, lumen_core::executor::ExecutorError> {
+        validate_immutable_action_pins(action.action())
+            .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
         match action.authorization() {
             DispatchAuthorization::PolicyAllowed => {
                 let attempt_id = ExecutionAttemptId::new();
