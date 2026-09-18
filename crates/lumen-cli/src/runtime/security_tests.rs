@@ -6914,6 +6914,112 @@ async fn shutdown_deadline_includes_noncooperative_task_join() {
 }
 
 #[tokio::test]
+async fn cancelled_first_shutdown_waiter_does_not_abandon_settlement() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = RunId::new();
+    let actor = PrincipalId::new("local", "operator").expect("actor");
+    harness
+        .database
+        .create_owned_run(
+            run_id,
+            harness.workspace_id,
+            &actor,
+            harness.service.owner_instance_id,
+            now(),
+        )
+        .await
+        .expect("run");
+    harness
+        .database
+        .start_owned_run(
+            run_id,
+            harness.workspace_id,
+            harness.service.owner_instance_id,
+            false,
+            now(),
+        )
+        .await
+        .expect("start");
+    harness
+        .service
+        .admission
+        .register_owned(run_id)
+        .expect("owned");
+    harness
+        .service
+        .run_workspaces
+        .lock()
+        .await
+        .insert(run_id, harness.workspace_id);
+    harness
+        .service
+        .cancellations
+        .lock()
+        .await
+        .insert(run_id, tokio_util::sync::CancellationToken::new());
+    harness
+        .service
+        .admission
+        .submit(std::future::pending::<()>())
+        .expect("stalled driver");
+    let first_service = harness.service.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .shutdown_with_timeout(Duration::from_millis(100))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !harness.service.shutting_down.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown started");
+    first.abort();
+    let _ = first.await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .service
+            .shutdown_with_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .expect("second caller observes same settlement");
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lookup")
+        .expect("lifecycle");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert!(!lifecycle.terminal_audit_pending());
+}
+
+#[tokio::test]
+async fn two_shutdown_callers_receive_the_same_retained_report() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let first_service = harness.service.clone();
+    let second_service = harness.service.clone();
+    let (first, second) = tokio::join!(
+        async move {
+            first_service
+                .shutdown_with_timeout(Duration::from_millis(20))
+                .await
+        },
+        async move {
+            second_service
+                .shutdown_with_timeout(Duration::from_secs(5))
+                .await
+        },
+    );
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(!first.forced);
+    assert!(first.unresolved_runs.is_empty());
+}
+
+#[tokio::test]
 async fn server_shutdown_closes_active_sse_and_releases_listener() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -7977,4 +8083,21 @@ async fn shutdown_reaches_an_executing_process_and_persists_cancelled() {
         .expect("run state");
     assert_eq!(attempt_state, "cancelled");
     assert_eq!(run_state, "cancelled");
+}
+
+#[tokio::test]
+async fn shutdown_deadline_covers_contended_run_registry() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let held = harness.service.run_workspaces.lock().await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .service
+            .shutdown_with_timeout(Duration::from_millis(20)),
+    )
+    .await
+    .expect("shutdown must not wait indefinitely for the run registry");
+    assert!(!report.is_clean());
+    drop(held);
 }

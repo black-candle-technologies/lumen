@@ -98,6 +98,16 @@ impl AdmissionGate {
         Ok(())
     }
 
+    pub fn active_count(&self) -> usize {
+        self.state.lock().map_or(0, |state| {
+            state
+                .handles
+                .iter()
+                .filter(|handle| !handle.is_finished())
+                .count()
+        })
+    }
+
     pub fn close_tracker(&self) {
         self.tasks.close();
     }

@@ -470,6 +470,33 @@ impl Database {
             .execute(&mut *transaction)
             .await?;
         }
+        // An admitted action that never reached an execution attempt cannot remain
+        // dispatchable after its owning run has become terminal. Keep already
+        // denied actions (and their rejection reasons) untouched.
+        if spec.state != TerminalState::Completed {
+            let action_state = if spec.state == TerminalState::Cancelled {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            sqlx::query(
+                "UPDATE actions SET state = ?, terminal_reason = ?
+                 WHERE run_id = ? AND state = 'normalized'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM execution_attempts
+                       WHERE execution_attempts.action_id = actions.id
+                   )",
+            )
+            .bind(action_state)
+            .bind(if spec.state == TerminalState::Cancelled {
+                "run_cancelled"
+            } else {
+                "run_failed_before_dispatch"
+            })
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        }
         let updated = sqlx::query(
             "UPDATE agent_runs SET state = ?, completed_at = ?
              WHERE id = ? AND workspace_id = ?

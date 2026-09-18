@@ -424,7 +424,11 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            service.drain_submitted_work().await;
+            if !service.drain_submitted_work().await.is_clean() {
+                return Err(CliError::Runtime(
+                    "plugin invocation drain left unresolved work".into(),
+                ));
+            }
             CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
         }
         command => {
@@ -453,7 +457,11 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            service.drain_submitted_work().await;
+            if !service.drain_submitted_work().await.is_clean() {
+                return Err(CliError::Runtime(
+                    "plugin action drain left unresolved work".into(),
+                ));
+            }
             CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
         }
     };
@@ -814,7 +822,7 @@ async fn serve(
             Arc::clone(&sandbox),
             vec![token.clone()],
             secret_store,
-            owner_guard,
+            Arc::clone(&owner_guard),
         )
         .await?,
     );
@@ -839,8 +847,19 @@ async fn serve(
         shutdown_signal(),
     )
     .await;
-    database.close().await;
-    server_result?;
+    let close_result =
+        tokio::time::timeout(std::time::Duration::from_millis(500), database.close()).await;
+    let outcome = match (server_result, close_result) {
+        (Err(error), _) => Err(CliError::Io(error)),
+        (_, Err(_)) => Err(CliError::Runtime("database close deadline exceeded".into())),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    if outcome.is_err() {
+        // An aborted native worker may still be running until bounded Tokio teardown.
+        // Keep the process-held ownership lock until process exit in that case.
+        std::mem::forget(owner_guard);
+    }
+    outcome?;
     Ok(CommandOutput::ServerStopped)
 }
 
@@ -873,22 +892,33 @@ async fn serve_listener_until_shutdown(
             result = &mut server => result,
             () = signal => {
                 eprintln!("event=server_stopping bind={bind} pid={}", std::process::id());
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
                 stop_accepting.cancel();
                 events.close();
-                service.shutdown().await;
-                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
+                let report = service.shutdown().await;
+                let drained = match tokio::time::timeout_at(deadline, &mut server).await {
                     Ok(result) => result,
                     Err(_) => {
                         eprintln!("event=server_shutdown_forced bind={bind} pid={}", std::process::id());
-                        Ok(())
+                        Err(std::io::Error::other("HTTP drain deadline exceeded"))
                     }
-                }
+                };
+                if !report.is_clean() {
+                    Err(std::io::Error::other("runtime shutdown left unresolved work"))
+                } else { drained }
             }
         }
     };
     stop_accepting.cancel();
     events.close();
-    service.shutdown().await;
+    let report = service.shutdown().await;
+    let server_result = if report.is_clean() {
+        server_result
+    } else {
+        Err(std::io::Error::other(
+            "runtime shutdown left unresolved work",
+        ))
+    };
     eprintln!(
         "event=server_stopped bind={bind} pid={} result={}",
         std::process::id(),

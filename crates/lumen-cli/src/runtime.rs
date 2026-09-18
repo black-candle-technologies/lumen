@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -66,7 +66,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::extension_runtime::{
@@ -133,7 +133,34 @@ pub(crate) struct LocalRuntimeService {
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
     scheduler_cancellation: CancellationToken,
     shutting_down: Arc<AtomicBool>,
+    shutdown_deadline: Arc<StdMutex<Option<tokio::time::Instant>>>,
+    shutdown_report: Arc<watch::Sender<Option<Arc<ShutdownReport>>>>,
     redactor: Arc<SecretRedactor>,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownMode {
+    ServerCancel,
+    CliDrain,
+}
+
+const SHUTDOWN_SETTLEMENT_BUDGET: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Debug)]
+pub(crate) struct ShutdownReport {
+    forced: bool,
+    unresolved_runs: Vec<String>,
+    storage_errors: Vec<String>,
+    workers_still_running: usize,
+}
+
+impl ShutdownReport {
+    pub(crate) fn is_clean(&self) -> bool {
+        !self.forced
+            && self.unresolved_runs.is_empty()
+            && self.storage_errors.is_empty()
+            && self.workers_still_running == 0
+    }
 }
 
 struct PluginInvocationCommand {
@@ -521,6 +548,7 @@ impl LocalRuntimeService {
         grants.extend(network_egress_capabilities);
         grants.extend(channel_send_capabilities);
         let ambient_capabilities = CapabilitySet::new(grants);
+        let (shutdown_report, _) = watch::channel(None);
         let service = Self {
             model: model.clone(),
             model_probe: model,
@@ -566,6 +594,8 @@ impl LocalRuntimeService {
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
             scheduler_cancellation: CancellationToken::new(),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_deadline: Arc::new(StdMutex::new(None)),
+            shutdown_report: Arc::new(shutdown_report),
             redactor,
         };
         if service._owner_guard.is_some() {
@@ -1317,32 +1347,95 @@ impl LocalRuntimeService {
         Ok(draft_id)
     }
 
-    pub(crate) async fn shutdown(&self) {
-        self.shutdown_with_timeout(Duration::from_secs(5)).await;
-    }
-
-    pub(crate) async fn drain_submitted_work(&self) {
-        let _ = self.admission.seal();
-        if self.shutting_down.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        self.scheduler_cancellation.cancel();
-        self.admission.close_tracker();
-        if tokio::time::timeout(Duration::from_secs(5), self.admission.wait())
-            .await
-            .is_err()
+    pub(crate) async fn shutdown(&self) -> Arc<ShutdownReport> {
+        let report = self.shutdown_with_timeout(Duration::from_secs(5)).await;
+        if report.forced || !report.unresolved_runs.is_empty() || !report.storage_errors.is_empty()
         {
-            let _ = self.admission.abort_tracked();
+            eprintln!(
+                "event=runtime_shutdown_incomplete unresolved_runs={} storage_errors={} workers_still_running={}",
+                report.unresolved_runs.len(),
+                report.storage_errors.len(),
+                report.workers_still_running
+            );
+        }
+        report
+    }
+
+    pub(crate) async fn drain_submitted_work(&self) -> Arc<ShutdownReport> {
+        let report = self
+            .wait_for_shutdown(ShutdownMode::CliDrain, Duration::from_secs(5))
+            .await;
+        if report.forced || !report.unresolved_runs.is_empty() {
+            eprintln!(
+                "event=cli_drain_incomplete unresolved_runs={} workers_still_running={}",
+                report.unresolved_runs.len(),
+                report.workers_still_running
+            );
+        }
+        report
+    }
+
+    async fn shutdown_with_timeout(&self, drain_timeout: Duration) -> Arc<ShutdownReport> {
+        self.wait_for_shutdown(ShutdownMode::ServerCancel, drain_timeout)
+            .await
+    }
+
+    async fn wait_for_shutdown(&self, mode: ShutdownMode, total: Duration) -> Arc<ShutdownReport> {
+        let (mut receiver, deadline) = {
+            let mut state = self.shutdown_deadline.lock().expect("shutdown state lock");
+            let deadline = match *state {
+                Some(deadline) => deadline,
+                None => {
+                    let deadline = tokio::time::Instant::now() + total + SHUTDOWN_SETTLEMENT_BUDGET;
+                    let _ = self.admission.seal();
+                    self.shutting_down.store(true, Ordering::SeqCst);
+                    *state = Some(deadline);
+                    let service = self.clone();
+                    tokio::spawn(async move {
+                        let report = match tokio::time::timeout_at(
+                            deadline,
+                            service.shutdown_supervisor(mode, deadline),
+                        )
+                        .await
+                        {
+                            Ok(report) => report,
+                            Err(_) => service.shutdown_deadline_report(),
+                        };
+                        service.shutdown_report.send_replace(Some(Arc::new(report)));
+                    });
+                    deadline
+                }
+            };
+            (self.shutdown_report.subscribe(), deadline)
+        };
+        loop {
+            if let Some(report) = receiver.borrow().clone() {
+                return report;
+            }
+            if tokio::time::timeout_at(deadline, receiver.changed())
+                .await
+                .is_err()
+            {
+                return Arc::new(self.shutdown_deadline_report());
+            }
         }
     }
 
-    async fn shutdown_with_timeout(&self, drain_timeout: Duration) {
-        let _ = self.admission.seal();
-        if self.shutting_down.swap(true, Ordering::SeqCst) {
-            return;
+    fn shutdown_deadline_report(&self) -> ShutdownReport {
+        let unresolved_runs = self
+            .run_workspaces
+            .try_lock()
+            .map(|runs| runs.keys().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        ShutdownReport {
+            forced: true,
+            unresolved_runs,
+            storage_errors: vec!["shutdown supervisor deadline exceeded".into()],
+            workers_still_running: self.admission.active_count(),
         }
-        self.scheduler_cancellation.cancel();
-        self.admission.close_tracker();
+    }
+
+    async fn request_shutdown_cancellation(&self) -> Vec<tokio::task::JoinHandle<()>> {
         for cancellation in self.cancellations.lock().await.values() {
             cancellation.cancel();
         }
@@ -1355,19 +1448,48 @@ impl LocalRuntimeService {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut waiting_tasks: Vec<_> = waiting
+        waiting
             .into_iter()
             .map(|run_id| tokio::spawn(self.clone().advance(run_id)))
-            .collect();
-        let completed = tokio::time::timeout(drain_timeout, async {
+            .collect()
+    }
+
+    async fn shutdown_supervisor(
+        &self,
+        mode: ShutdownMode,
+        deadline: tokio::time::Instant,
+    ) -> ShutdownReport {
+        self.scheduler_cancellation.cancel();
+        self.admission.close_tracker();
+        let cooperative = deadline - SHUTDOWN_SETTLEMENT_BUDGET;
+        let mut waiting_tasks = if matches!(mode, ShutdownMode::ServerCancel) {
+            self.request_shutdown_cancellation().await
+        } else {
+            Vec::new()
+        };
+        let mut forced = tokio::time::timeout_at(cooperative, async {
             for task in &mut waiting_tasks {
                 let _ = task.await;
             }
             self.admission.wait().await;
         })
         .await
-        .is_ok();
-        if !completed {
+        .is_err();
+        if matches!(mode, ShutdownMode::CliDrain) {
+            waiting_tasks.extend(self.request_shutdown_cancellation().await);
+            if tokio::time::timeout_at(deadline, async {
+                for task in &mut waiting_tasks {
+                    let _ = task.await;
+                }
+                self.admission.wait().await;
+            })
+            .await
+            .is_err()
+            {
+                forced = true;
+            }
+        }
+        if forced {
             for task in &waiting_tasks {
                 if !task.is_finished() {
                     task.abort();
@@ -1375,6 +1497,11 @@ impl LocalRuntimeService {
             }
             let _ = self.admission.abort_tracked();
         }
+        let workers_still_running = self.admission.active_count()
+            + waiting_tasks
+                .iter()
+                .filter(|task| !task.is_finished())
+                .count();
         let remaining = self.run_workspaces.lock().await.clone();
         if !remaining.is_empty() {
             eprintln!(
@@ -1382,6 +1509,8 @@ impl LocalRuntimeService {
                 remaining.len()
             );
         }
+        let mut unresolved_runs = Vec::new();
+        let mut storage_errors = Vec::new();
         for (run_id, workspace_id) in remaining {
             let timestamp = now();
             let terminal = TerminalSpec::new(
@@ -1391,39 +1520,52 @@ impl LocalRuntimeService {
                 Some("graceful drain deadline exceeded".into()),
             )
             .expect("static shutdown terminal specification");
-            match self
-                .database
-                .terminalize_owned_run(
+            match tokio::time::timeout_at(
+                deadline,
+                self.database.terminalize_owned_run(
                     run_id,
                     workspace_id,
                     self.owner_instance_id,
                     &terminal,
                     AuditEventId::new(),
                     timestamp,
-                )
-                .await
+                ),
+            )
+            .await
             {
-                Ok(()) => {
-                    if let Err(error) = self
-                        .database
-                        .flush_terminal_audit(workspace_id, run_id)
-                        .await
+                Ok(Ok(())) => {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        self.database.flush_terminal_audit(workspace_id, run_id),
+                    )
+                    .await
                     {
-                        eprintln!(
-                            "event=runtime_shutdown_audit_pending run_id={run_id} diagnostic={:?}",
-                            self.bounded_diagnostic(&error)
-                        );
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => storage_errors.push(self.bounded_diagnostic(&error)),
+                        Err(_) => storage_errors.push("terminal audit deadline exceeded".into()),
                     }
+                    self.runs.lock().await.remove(&run_id);
+                    self.finish_run(run_id).await;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     eprintln!(
                         "event=runtime_shutdown_forced run_id={run_id} diagnostic={:?}",
                         self.bounded_diagnostic(&error)
                     );
+                    unresolved_runs.push(run_id.to_string());
+                    storage_errors.push(self.bounded_diagnostic(&error));
+                }
+                Err(_) => {
+                    unresolved_runs.push(run_id.to_string());
+                    storage_errors.push("terminal persistence deadline exceeded".into());
                 }
             }
-            self.runs.lock().await.remove(&run_id);
-            self.finish_run(run_id).await;
+        }
+        ShutdownReport {
+            forced: forced || workers_still_running > 0,
+            unresolved_runs,
+            storage_errors,
+            workers_still_running,
         }
     }
 
