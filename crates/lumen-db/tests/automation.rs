@@ -140,7 +140,7 @@ async fn migration_adds_durable_automation_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 7);
+    assert_eq!(migrations, 10);
 }
 
 #[tokio::test]
@@ -583,6 +583,98 @@ async fn scheduled_run_handoff_is_atomic_lease_fenced_and_terminal_idempotent() 
             .await,
         Err(RepositoryError::ExecutionStateConflict)
     ));
+}
+
+#[tokio::test]
+async fn owned_scheduled_handoff_commits_run_occurrence_and_lifecycle_together() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let job = database
+        .latest_scheduled_job_revision(job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+    let lease = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let run_id = RunId::new();
+    assert!(
+        database
+            .claim_job_occurrence(
+                &key,
+                lease,
+                TimestampMillis::new(2_100),
+                TimestampMillis::new(3_000)
+            )
+            .await
+            .expect("claim")
+    );
+    database
+        .persist_owned_scheduled_run_handoff(
+            &job,
+            &key,
+            lease,
+            run_id,
+            owner,
+            None,
+            TimestampMillis::new(2_200),
+        )
+        .await
+        .expect("owned handoff");
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT occurrence.run_id, lifecycle.phase, lifecycle.owner_instance_id
+         FROM scheduled_job_runs occurrence JOIN run_lifecycle lifecycle
+         ON lifecycle.run_id = occurrence.run_id WHERE occurrence.occurrence_key = ?",
+    )
+    .bind(key.as_str())
+    .fetch_one(database.pool())
+    .await
+    .expect("paired handoff");
+    assert_eq!(
+        row,
+        (run_id.to_string(), "admitted".into(), owner.to_string())
+    );
+    let recovered_owner = Uuid::new_v4();
+    let recovered_lease = Uuid::new_v4();
+    assert!(
+        database
+            .claim_ready_scheduled_run(
+                &key,
+                recovered_lease,
+                TimestampMillis::new(3_001),
+                TimestampMillis::new(4_000)
+            )
+            .await
+            .expect("recovery claim")
+    );
+    database
+        .start_owned_scheduled_run(
+            &key,
+            recovered_lease,
+            run_id,
+            recovered_owner,
+            TimestampMillis::new(3_100),
+            TimestampMillis::new(5_000),
+        )
+        .await
+        .expect("owned start");
+    let started: (String, String, String) = sqlx::query_as(
+        "SELECT run.state, lifecycle.phase, lifecycle.owner_instance_id
+         FROM agent_runs run JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("started state");
+    assert_eq!(
+        started,
+        (
+            "running".into(),
+            "running".into(),
+            recovered_owner.to_string()
+        )
+    );
 }
 
 #[tokio::test]

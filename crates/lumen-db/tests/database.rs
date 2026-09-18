@@ -14,6 +14,7 @@ use lumen_core::{
     policy::PolicyVersion,
 };
 use lumen_db::{Database, DispatchReservation, RepositoryError, SecretReference};
+use lumen_db::{EffectCertainty, TerminalSpec, TerminalState};
 use sqlx::Row;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -115,7 +116,7 @@ async fn empty_database_runs_the_initial_migration() {
         .fetch_one(database.pool())
         .await
         .expect("migration metadata loads");
-    assert_eq!(migration_count, 9);
+    assert_eq!(migration_count, 10);
 }
 
 #[tokio::test]
@@ -141,7 +142,7 @@ async fn file_database_reopens_without_reapplying_migrations() {
         .expect("migration count loads");
 
     assert_eq!(workspace_count, 1);
-    assert_eq!(migration_count, 9);
+    assert_eq!(migration_count, 10);
 }
 
 #[tokio::test]
@@ -650,6 +651,344 @@ async fn stale_run_start_cannot_resurrect_a_terminal_row() {
             .expect("run row loads");
     assert_eq!(row.0, "cancelled");
     assert_eq!(row.1, Some(1_100));
+}
+
+#[tokio::test]
+async fn owned_run_acceptance_and_lifecycle_marker_commit_together() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let run_id = RunId::new();
+    let owner = Uuid::new_v4();
+    let actor = PrincipalId::new("local", "operator").expect("principal");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            &actor,
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("owned run accepted");
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT run.state, lifecycle.phase, lifecycle.owner_instance_id
+         FROM agent_runs run JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("paired rows");
+    assert_eq!(
+        row,
+        ("created".into(), "admitted".into(), owner.to_string())
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER reject_lifecycle_insert BEFORE INSERT ON run_lifecycle
+                 BEGIN SELECT RAISE(ABORT, 'injected lifecycle failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("fault installed");
+    let rejected_run = RunId::new();
+    assert!(
+        database
+            .create_owned_run(
+                rejected_run,
+                workspace_id(),
+                &actor,
+                owner,
+                TimestampMillis::new(1_200)
+            )
+            .await
+            .is_err()
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE id = ?")
+        .bind(rejected_run.to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("run count");
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn owned_unknown_terminal_is_durable_scoped_and_idempotent() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let run_id = RunId::new();
+    let owner = Uuid::new_v4();
+    let actor = PrincipalId::new("local", "operator").expect("principal");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            &actor,
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("run");
+    let terminal = TerminalSpec::new(
+        TerminalState::Failed,
+        EffectCertainty::Unknown,
+        "execution_unknown",
+        Some("executor result lost".into()),
+    )
+    .expect("terminal");
+    let audit_id = AuditEventId::new();
+    database
+        .terminalize_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            &terminal,
+            audit_id,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("terminalized");
+    database
+        .terminalize_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            &terminal,
+            audit_id,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("identical replay");
+    let record = database
+        .get_run_lifecycle(workspace_id(), run_id)
+        .await
+        .expect("lookup")
+        .expect("lifecycle");
+    assert_eq!(record.phase(), "reconciliation_required");
+    assert_eq!(record.effect_certainty(), EffectCertainty::Unknown);
+    assert_eq!(record.primary_diagnostic(), Some("executor result lost"));
+    assert!(record.terminal_audit_pending());
+    let foreign = WorkspaceId::new();
+    assert!(
+        database
+            .get_run_lifecycle(foreign, run_id)
+            .await
+            .expect("scoped lookup")
+            .is_none()
+    );
+    let changed = TerminalSpec::new(
+        TerminalState::Completed,
+        EffectCertainty::Known,
+        "completed",
+        None,
+    )
+    .expect("different terminal");
+    assert!(matches!(
+        database
+            .terminalize_owned_run(
+                run_id,
+                workspace_id(),
+                owner,
+                &changed,
+                AuditEventId::new(),
+                TimestampMillis::new(1_300)
+            )
+            .await,
+        Err(RepositoryError::ExecutionStateConflict)
+    ));
+}
+
+#[tokio::test]
+async fn terminal_audit_repair_uses_frozen_id_and_payload_exactly_once() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let run_id = RunId::new();
+    let owner = Uuid::new_v4();
+    let actor = PrincipalId::new("local", "operator").expect("principal");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            &actor,
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("run");
+    let terminal = TerminalSpec::new(
+        TerminalState::Failed,
+        EffectCertainty::Unknown,
+        "execution_unknown",
+        Some("redacted diagnostic".into()),
+    )
+    .expect("terminal");
+    let audit_id = AuditEventId::new();
+    database
+        .terminalize_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            &terminal,
+            audit_id,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("terminalized");
+    sqlx::query(
+        "CREATE TRIGGER fail_terminal_audit BEFORE INSERT ON audit_events
+                 BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("fault installed");
+    assert!(
+        database
+            .flush_terminal_audit(workspace_id(), run_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .get_run_lifecycle(workspace_id(), run_id)
+            .await
+            .expect("lookup")
+            .expect("lifecycle")
+            .terminal_audit_pending()
+    );
+    sqlx::query("DROP TRIGGER fail_terminal_audit")
+        .execute(database.pool())
+        .await
+        .expect("fault removed");
+    database
+        .flush_terminal_audit(workspace_id(), run_id)
+        .await
+        .expect("repaired");
+    database
+        .flush_terminal_audit(workspace_id(), run_id)
+        .await
+        .expect("idempotent replay");
+    let records = database
+        .list_audit_records_for_run(workspace_id(), run_id)
+        .await
+        .expect("audit records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].event().id(), audit_id);
+    assert_eq!(records[0].event().timestamp(), TimestampMillis::new(1_200));
+    assert_eq!(
+        records[0].event().kind(),
+        AuditEventKind::RunReconciliationRequired
+    );
+    assert!(
+        !database
+            .get_run_lifecycle(workspace_id(), run_id)
+            .await
+            .expect("lookup")
+            .expect("lifecycle")
+            .terminal_audit_pending()
+    );
+    database
+        .verify_audit_chain()
+        .await
+        .expect("chain remains valid");
+}
+
+#[tokio::test]
+async fn owned_start_and_approval_pause_change_run_and_phase_atomically() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let run_id = RunId::new();
+    let owner = Uuid::new_v4();
+    let actor = PrincipalId::new("local", "operator").expect("principal");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace");
+    database
+        .create_owned_run(
+            run_id,
+            workspace_id(),
+            &actor,
+            owner,
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("run");
+    database
+        .start_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            false,
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("start");
+    database
+        .pause_owned_run_for_approval(run_id, workspace_id(), owner, TimestampMillis::new(1_300))
+        .await
+        .expect("pause");
+    sqlx::query(
+        "CREATE TRIGGER fail_resume_phase BEFORE UPDATE ON run_lifecycle
+                 WHEN NEW.phase = 'running' BEGIN SELECT RAISE(ABORT, 'phase failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("fault installed");
+    assert!(
+        database
+            .start_owned_run(
+                run_id,
+                workspace_id(),
+                owner,
+                true,
+                TimestampMillis::new(1_400)
+            )
+            .await
+            .is_err()
+    );
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, lifecycle.phase FROM agent_runs run
+         JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("states");
+    assert_eq!(
+        states,
+        ("awaiting_approval".into(), "awaiting_approval".into())
+    );
+    sqlx::query("DROP TRIGGER fail_resume_phase")
+        .execute(database.pool())
+        .await
+        .expect("fault removed");
+    database
+        .start_owned_run(
+            run_id,
+            workspace_id(),
+            owner,
+            true,
+            TimestampMillis::new(1_400),
+        )
+        .await
+        .expect("resume");
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, lifecycle.phase FROM agent_runs run
+         JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("states");
+    assert_eq!(states, ("running".into(), "running".into()));
 }
 
 #[tokio::test]

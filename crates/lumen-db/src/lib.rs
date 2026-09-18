@@ -4,6 +4,7 @@ mod audit;
 mod automation;
 mod egress;
 mod extensions;
+mod lifecycle;
 mod migrations;
 mod repositories;
 
@@ -23,6 +24,7 @@ pub use extensions::{
     InstallResult, InstalledPluginVersion, PluginGrantRevision, PluginGrantScope,
     PluginSettingRevision, PluginSettingScope, PluginWorkspaceState, StagedPluginPackage,
 };
+pub use lifecycle::{EffectCertainty, RunLifecycleView, TerminalSpec, TerminalState};
 pub use repositories::{
     DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
     SecretReferenceError,

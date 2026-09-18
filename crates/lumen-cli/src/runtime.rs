@@ -33,9 +33,10 @@ use lumen_core::{
     secret::SecretRefId,
 };
 use lumen_db::{
-    ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, ModelEndpointClass,
-    ModelProviderRevision, PluginGrantScope, PluginSettingScope, ScheduledJobRevision,
-    ServiceIdentity, SkillVersionRecord, WorkflowCaptureDraft, WorkspaceModelEgressRevision,
+    ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, EffectCertainty,
+    ModelEndpointClass, ModelProviderRevision, PluginGrantScope, PluginSettingScope,
+    ScheduledJobRevision, ServiceIdentity, SkillVersionRecord, TerminalSpec, TerminalState,
+    WorkflowCaptureDraft, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     filesystem::WorkspaceReader,
@@ -102,6 +103,7 @@ pub(crate) struct LocalRuntimeService {
     audit: Arc<DatabaseAudit>,
     actions: Arc<DatabaseActions>,
     database: Database,
+    owner_instance_id: uuid::Uuid,
     data_root: Arc<Path>,
     events: EventBroker,
     policy: Policy,
@@ -283,6 +285,7 @@ impl LocalRuntimeService {
             audit: Arc::new(DatabaseAudit(database.clone())),
             actions: Arc::new(DatabaseActions(database.clone())),
             database,
+            owner_instance_id: uuid::Uuid::new_v4(),
             data_root: Arc::from(data_root),
             events,
             policy: Policy::default(),
@@ -525,10 +528,11 @@ impl LocalRuntimeService {
             .await?;
         self.publish_run_created(run_id, stored.workspace_id)?;
         self.database
-            .start_scheduled_run(
+            .start_owned_scheduled_run(
                 occurrence,
                 lease_id,
                 run_id,
+                self.owner_instance_id,
                 timestamp,
                 self.scheduled_execution_lease_expiry(timestamp),
             )
@@ -596,11 +600,12 @@ impl LocalRuntimeService {
         let run_id = RunId::new();
         let mut stored = self.prepare_stored_run(run_id, request).await?;
         self.database
-            .persist_scheduled_run_handoff(
+            .persist_owned_scheduled_run_handoff(
                 &job,
                 &occurrence,
                 lease_id,
                 run_id,
+                self.owner_instance_id,
                 job.schedule().next_after(scheduled_for, job.enabled()),
                 timestamp,
             )
@@ -610,10 +615,11 @@ impl LocalRuntimeService {
             })?;
         self.publish_run_created(run_id, stored.workspace_id)?;
         self.database
-            .start_scheduled_run(
+            .start_owned_scheduled_run(
                 &occurrence,
                 lease_id,
                 run_id,
+                self.owner_instance_id,
                 timestamp,
                 self.scheduled_execution_lease_expiry(timestamp),
             )
@@ -1048,22 +1054,38 @@ impl LocalRuntimeService {
             );
         }
         for (run_id, workspace_id) in remaining {
+            let timestamp = now();
+            let terminal = TerminalSpec::new(
+                TerminalState::Failed,
+                EffectCertainty::Unknown,
+                "shutdown_forced",
+                Some("graceful drain deadline exceeded".into()),
+            )
+            .expect("static shutdown terminal specification");
             match self
                 .database
-                .force_fail_run_on_shutdown(run_id, now())
+                .terminalize_owned_run(
+                    run_id,
+                    workspace_id,
+                    self.owner_instance_id,
+                    &terminal,
+                    AuditEventId::new(),
+                    timestamp,
+                )
                 .await
             {
-                Ok(true) => {
-                    self.record_run_reconciliation_required(
-                        workspace_id,
-                        run_id,
-                        "shutdown_forced",
-                        &"graceful drain deadline exceeded",
-                        now(),
-                    )
-                    .await;
+                Ok(()) => {
+                    if let Err(error) = self
+                        .database
+                        .flush_terminal_audit(workspace_id, run_id)
+                        .await
+                    {
+                        eprintln!(
+                            "event=runtime_shutdown_audit_pending run_id={run_id} diagnostic={:?}",
+                            self.bounded_diagnostic(&error)
+                        );
+                    }
                 }
-                Ok(false) => {}
                 Err(error) => {
                     eprintln!(
                         "event=runtime_shutdown_forced run_id={run_id} diagnostic={:?}",
@@ -1119,12 +1141,24 @@ impl LocalRuntimeService {
         let start = match stored.start_disposition {
             StartDisposition::Created => {
                 self.database
-                    .transition_run_state(run_id, &["created"], "running", None)
+                    .start_owned_run(
+                        run_id,
+                        stored.workspace_id,
+                        self.owner_instance_id,
+                        false,
+                        now(),
+                    )
                     .await
             }
             StartDisposition::ResumeApproval => {
                 self.database
-                    .transition_run_state(run_id, &["awaiting_approval"], "running", None)
+                    .start_owned_run(
+                        run_id,
+                        stored.workspace_id,
+                        self.owner_instance_id,
+                        true,
+                        now(),
+                    )
                     .await
             }
             StartDisposition::ScheduledStartCommitted => Ok(()),
@@ -1196,7 +1230,12 @@ impl LocalRuntimeService {
             Ok(RunOutcome::AwaitingApproval { approval_id }) => {
                 if let Err(error) = self
                     .database
-                    .update_run_state(run_id, "awaiting_approval", None)
+                    .pause_owned_run_for_approval(
+                        run_id,
+                        stored.workspace_id,
+                        self.owner_instance_id,
+                        now(),
+                    )
                     .await
                 {
                     self.record_run_reconciliation_required(
@@ -1300,44 +1339,52 @@ impl LocalRuntimeService {
         prerequisite_failure: Option<(&'static str, String)>,
         timestamp: TimestampMillis,
     ) {
-        let scheduled_state = stored.scheduled_handoff.as_ref().map(|_| scheduled_state);
+        let terminal_state = match state {
+            "completed" if prerequisite_failure.is_none() => TerminalState::Completed,
+            "cancelled" => TerminalState::Cancelled,
+            _ => TerminalState::Failed,
+        };
+        let certainty = if scheduled_state == "unknown" || prerequisite_failure.is_some() {
+            EffectCertainty::Unknown
+        } else {
+            EffectCertainty::NoEffect
+        };
+        let code = prerequisite_failure.as_ref().map_or_else(
+            || match event_kind {
+                "run.completed" => "run_completed",
+                "run.cancelled" => "run_cancelled",
+                "run.timed_out" => "run_timed_out",
+                _ => "run_failed",
+            },
+            |(stage, _)| stage,
+        );
+        let diagnostic = prerequisite_failure
+            .as_ref()
+            .map(|(_, error)| self.bounded_diagnostic(error));
+        let terminal = TerminalSpec::new(terminal_state, certainty, code, diagnostic)
+            .expect("bounded terminal specification");
         match self
             .database
-            .terminalize_run(run_id, state, scheduled_state, timestamp)
+            .terminalize_owned_run(
+                run_id,
+                stored.workspace_id,
+                self.owner_instance_id,
+                &terminal,
+                AuditEventId::new(),
+                timestamp,
+            )
             .await
         {
-            Ok(()) if prerequisite_failure.is_none() => {
-                let terminal_audit = if state == "failed" {
-                    self.audit
-                        .record(AuditEvent::new(
-                            AuditEventId::new(),
-                            timestamp,
-                            AuditEventKind::RunFailed,
-                            if scheduled_state == Some("unknown") {
-                                AuditOutcome::Unknown
-                            } else {
-                                AuditOutcome::Failure
-                            },
-                            Some(stored.workspace_id),
-                            CanonicalValue::object([(
-                                "run_id",
-                                CanonicalValue::from(run_id.to_string()),
-                            )]),
-                        ))
-                        .await
-                        .map_err(|error| error.to_string())
-                } else {
-                    Ok(())
-                };
-                if let Err(error) = terminal_audit {
-                    self.record_run_reconciliation_required(
-                        stored.workspace_id,
-                        run_id,
-                        "terminal_audit",
-                        &error,
-                        timestamp,
-                    )
-                    .await;
+            Ok(()) => {
+                if let Err(error) = self
+                    .database
+                    .flush_terminal_audit(stored.workspace_id, run_id)
+                    .await
+                {
+                    eprintln!(
+                        "event=run_terminal_audit_pending run_id={run_id} diagnostic={:?}",
+                        self.bounded_diagnostic(&error)
+                    );
                 } else if let Err(error) =
                     self.events
                         .publish(stored.workspace_id, run_id, event_kind, payload)
@@ -1351,17 +1398,6 @@ impl LocalRuntimeService {
                     )
                     .await;
                 }
-            }
-            Ok(()) => {
-                let (stage, error) = prerequisite_failure.expect("checked as present");
-                self.record_run_reconciliation_required(
-                    stored.workspace_id,
-                    run_id,
-                    stage,
-                    &error,
-                    timestamp,
-                )
-                .await;
             }
             Err(error) => {
                 self.record_run_reconciliation_required(
@@ -1435,7 +1471,7 @@ impl LocalRuntimeService {
         self.ensure_accepting_work()?;
         let run_id = RunId::new();
         self.database
-            .create_run(run_id, workspace_id, &actor, now())
+            .create_owned_run(run_id, workspace_id, &actor, self.owner_instance_id, now())
             .await
             .map_err(repository_service_error)?;
         let model: Arc<dyn ModelPort> = Arc::new(ActionRequestModel { proposal });
@@ -1639,7 +1675,13 @@ impl RuntimeService for LocalRuntimeService {
             let run_id = RunId::new();
             service
                 .database
-                .create_run(run_id, command.workspace_id(), command.actor(), now())
+                .create_owned_run(
+                    run_id,
+                    command.workspace_id(),
+                    command.actor(),
+                    service.owner_instance_id,
+                    now(),
+                )
                 .await
                 .map_err(repository_service_error)?;
             let reviewed_skills = service

@@ -957,6 +957,51 @@ impl Database {
         next_due_at: Option<TimestampMillis>,
         now: TimestampMillis,
     ) -> Result<(), RepositoryError> {
+        self.persist_scheduled_run_handoff_with_owner(
+            job,
+            key,
+            lease_id,
+            run_id,
+            None,
+            next_due_at,
+            now,
+        )
+        .await
+    }
+
+    pub async fn persist_owned_scheduled_run_handoff(
+        &self,
+        job: &ScheduledJobRevision,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Uuid,
+        next_due_at: Option<TimestampMillis>,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.persist_scheduled_run_handoff_with_owner(
+            job,
+            key,
+            lease_id,
+            run_id,
+            Some(owner_instance_id),
+            next_due_at,
+            now,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_scheduled_run_handoff_with_owner(
+        &self,
+        job: &ScheduledJobRevision,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Option<Uuid>,
+        next_due_at: Option<TimestampMillis>,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
         if key.job_id() != job.job_id()
             || key.revision() != job.revision()
             || Some(key.scheduled_for()) != job.next_due_at()
@@ -1034,6 +1079,21 @@ impl Database {
         .bind(now_i64)
         .execute(&mut *transaction)
         .await?;
+        if let Some(owner_instance_id) = owner_instance_id {
+            sqlx::query(
+                "INSERT INTO run_lifecycle (
+                    run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, 'admitted', 'no_effect', ?, ?)",
+            )
+            .bind(run_id.to_string())
+            .bind(job.workspace_id().to_string())
+            .bind(owner_instance_id.to_string())
+            .bind(now_i64)
+            .bind(now_i64)
+            .execute(&mut *transaction)
+            .await?;
+        }
         let linked = sqlx::query(
             "UPDATE scheduled_job_runs
              SET run_id = ?, state = 'claimed', updated_at = ?
@@ -1073,6 +1133,39 @@ impl Database {
         key: &OccurrenceKey,
         lease_id: Uuid,
         run_id: lumen_core::action::RunId,
+        now: TimestampMillis,
+        expires_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.start_scheduled_run_with_owner(key, lease_id, run_id, None, now, expires_at)
+            .await
+    }
+
+    pub async fn start_owned_scheduled_run(
+        &self,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Uuid,
+        now: TimestampMillis,
+        expires_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.start_scheduled_run_with_owner(
+            key,
+            lease_id,
+            run_id,
+            Some(owner_instance_id),
+            now,
+            expires_at,
+        )
+        .await
+    }
+
+    async fn start_scheduled_run_with_owner(
+        &self,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Option<Uuid>,
         now: TimestampMillis,
         expires_at: TimestampMillis,
     ) -> Result<(), RepositoryError> {
@@ -1116,6 +1209,42 @@ impl Database {
         .rows_affected();
         if occurrence != 1 || run != 1 || lease != 1 {
             return Err(RepositoryError::ExecutionStateConflict);
+        }
+        if let Some(owner_instance_id) = owner_instance_id {
+            let existing: Option<String> =
+                sqlx::query_scalar("SELECT phase FROM run_lifecycle WHERE run_id = ?")
+                    .bind(run_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            let changed = if existing.is_some() {
+                sqlx::query(
+                    "UPDATE run_lifecycle SET owner_instance_id = ?, phase = 'running', updated_at = ?
+                     WHERE run_id = ? AND phase = 'admitted' AND effect_certainty = 'no_effect'",
+                )
+                .bind(owner_instance_id.to_string())
+                .bind(now_i64)
+                .bind(run_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+            } else {
+                sqlx::query(
+                    "INSERT INTO run_lifecycle (
+                        run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                        created_at, updated_at
+                     ) SELECT id, workspace_id, ?, 'running', 'no_effect', created_at, ?
+                       FROM agent_runs WHERE id = ?",
+                )
+                .bind(owner_instance_id.to_string())
+                .bind(now_i64)
+                .bind(run_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+            };
+            if changed != 1 {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
         }
         transaction.commit().await?;
         Ok(())

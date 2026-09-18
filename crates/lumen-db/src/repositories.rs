@@ -415,6 +415,36 @@ impl Database {
         actor: &PrincipalId,
         created_at: TimestampMillis,
     ) -> Result<(), RepositoryError> {
+        self.create_run_with_owner(run_id, workspace_id, actor, None, created_at)
+            .await
+    }
+
+    pub async fn create_owned_run(
+        &self,
+        run_id: RunId,
+        workspace_id: WorkspaceId,
+        actor: &PrincipalId,
+        owner_instance_id: uuid::Uuid,
+        created_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.create_run_with_owner(
+            run_id,
+            workspace_id,
+            actor,
+            Some(owner_instance_id),
+            created_at,
+        )
+        .await
+    }
+
+    async fn create_run_with_owner(
+        &self,
+        run_id: RunId,
+        workspace_id: WorkspaceId,
+        actor: &PrincipalId,
+        owner_instance_id: Option<uuid::Uuid>,
+        created_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
         let created_at = timestamp_to_i64(created_at)?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
@@ -437,6 +467,21 @@ impl Database {
         .bind(created_at)
         .execute(&mut *transaction)
         .await?;
+        if let Some(owner_instance_id) = owner_instance_id {
+            sqlx::query(
+                "INSERT INTO run_lifecycle (
+                    run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, 'admitted', 'no_effect', ?, ?)",
+            )
+            .bind(run_id.to_string())
+            .bind(workspace_id.to_string())
+            .bind(owner_instance_id.to_string())
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }

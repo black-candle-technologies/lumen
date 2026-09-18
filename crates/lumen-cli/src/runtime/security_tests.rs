@@ -2076,9 +2076,7 @@ async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
         .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
         .await
         .expect("scheduler pass")[0];
-    harness
-        .wait_for_audit(AuditEventKind::RunReconciliationRequired)
-        .await;
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
     let states: (String, String) = sqlx::query_as(
         "SELECT run.state, occurrence.state
          FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
@@ -2089,6 +2087,14 @@ async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
     .await
     .expect("terminal states");
     assert_eq!(states, ("failed".into(), "failed".into()));
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("lifecycle");
+    assert_eq!(lifecycle.phase(), "terminal");
+    assert!(lifecycle.terminal_audit_pending());
     let records = harness
         .database
         .list_audit_records_for_run(harness.workspace_id, run_id)
@@ -2099,12 +2105,41 @@ async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
             .iter()
             .any(|record| record.event().kind() == AuditEventKind::RunFailed)
     );
-    assert!(records.iter().any(|record| {
-        let event = record.event();
-        event.kind() == AuditEventKind::RunReconciliationRequired
-            && canonical_object_get(event.payload(), "stage")
-                == Some(&CanonicalValue::from("terminal_audit"))
-    }));
+    sqlx::query("DROP TRIGGER fail_run_failed_audit")
+        .execute(harness.database.pool())
+        .await
+        .expect("fault removed");
+    harness
+        .database
+        .flush_terminal_audit(harness.workspace_id, run_id)
+        .await
+        .expect("frozen audit repaired");
+    harness
+        .database
+        .flush_terminal_audit(harness.workspace_id, run_id)
+        .await
+        .expect("repair replay is idempotent");
+    let repaired = harness
+        .database
+        .list_audit_records_for_run(harness.workspace_id, run_id)
+        .await
+        .expect("repaired records");
+    assert_eq!(
+        repaired
+            .iter()
+            .filter(|record| record.event().kind() == AuditEventKind::RunFailed)
+            .count(),
+        1
+    );
+    assert!(
+        !harness
+            .database
+            .get_run_lifecycle(harness.workspace_id, run_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle")
+            .terminal_audit_pending()
+    );
     harness.service.shutdown().await;
 }
 
@@ -2543,6 +2578,13 @@ async fn committed_unstarted_scheduled_handoff_recovers_the_same_run() {
         vec![run_id]
     );
     wait_for_run_state(&harness, &run_id.to_string(), "completed").await;
+    let recovered = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("recovered lifecycle");
+    assert_eq!(recovered.phase(), "terminal");
     let occurrence_state: String =
         sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE occurrence_key = ?")
             .bind(occurrence.as_str())
@@ -6529,10 +6571,15 @@ async fn delayed_model_run_records_distinct_lifecycle_times_and_valid_audit_hash
     .fetch_all(harness.database.pool())
     .await
     .expect("lifecycle audit events");
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(events[0].0, "run_created");
     assert_eq!(events[1].0, "run_completed");
+    assert_eq!(events[2].0, "run_completed");
     assert!(events[1].1 > events[0].1, "lifecycle time must advance");
+    assert!(
+        events[2].1 >= events[1].1,
+        "durable terminal time cannot precede completion"
+    );
     harness
         .database
         .verify_audit_chain()
@@ -6631,7 +6678,13 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
     let actor = PrincipalId::new("local", "operator").expect("operator");
     harness
         .database
-        .create_run(run_id, harness.workspace_id, &actor, now())
+        .create_owned_run(
+            run_id,
+            harness.workspace_id,
+            &actor,
+            harness.service.owner_instance_id,
+            now(),
+        )
         .await
         .expect("run");
     harness
@@ -6673,6 +6726,18 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
         .await
         .expect("run state");
     assert_eq!(state, "failed");
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("owned lifecycle");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert_eq!(
+        lifecycle.effect_certainty(),
+        lumen_db::EffectCertainty::Unknown
+    );
+    assert!(!lifecycle.terminal_audit_pending());
     harness
         .wait_for_audit(AuditEventKind::RunReconciliationRequired)
         .await;
