@@ -1119,7 +1119,12 @@ impl LocalRuntimeService {
         let start = match stored.start_disposition {
             StartDisposition::Created => {
                 self.database
-                    .update_run_state(run_id, "running", None)
+                    .transition_run_state(run_id, &["created"], "running", None)
+                    .await
+            }
+            StartDisposition::ResumeApproval => {
+                self.database
+                    .transition_run_state(run_id, &["awaiting_approval"], "running", None)
                     .await
             }
             StartDisposition::ScheduledStartCommitted => Ok(()),
@@ -1205,6 +1210,7 @@ impl LocalRuntimeService {
                     self.finish_run(run_id).await;
                     return;
                 }
+                stored.start_disposition = StartDisposition::ResumeApproval;
                 if let Err(error) = self.events.publish(
                     stored.workspace_id,
                     run_id,
@@ -3927,6 +3933,7 @@ struct StoredRun {
 enum StartDisposition {
     Created,
     ScheduledStartCommitted,
+    ResumeApproval,
 }
 
 struct ReviewedSkillPrompt {

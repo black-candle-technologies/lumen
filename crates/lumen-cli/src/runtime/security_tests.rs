@@ -1848,6 +1848,106 @@ async fn scheduled_due_once_job_creates_one_service_attributed_run() {
 }
 
 #[tokio::test]
+async fn scheduled_run_resumes_two_approval_required_actions() {
+    let model = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turns = Arc::clone(&turns);
+            move |_request: &MockRequest| match turns.fetch_add(1, Ordering::SeqCst) {
+                0 => action_response(
+                    "filesystem.write",
+                    serde_json::json!({"path":"scheduled-a.txt","content":"A"}),
+                ),
+                1 => action_response(
+                    "filesystem.write",
+                    serde_json::json!({"path":"scheduled-b.txt","content":"B"}),
+                ),
+                _ => final_response("scheduled two-step done"),
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        3,
+        2,
+    )
+    .await;
+
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let first_approval = harness.pending_approval_id().await;
+    let root = harness._directory.path().join("workspace");
+    assert!(!root.join("scheduled-a.txt").exists());
+    assert!(!root.join("scheduled-b.txt").exists());
+
+    approve_pending(&harness).await;
+    let second_approval = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let approval = harness.pending_approval_id().await;
+            if approval != first_approval {
+                return approval;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second approval is parked");
+    assert_ne!(first_approval, second_approval);
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("scheduled-a.txt")).expect("first effect"),
+        "A"
+    );
+    assert!(!root.join("scheduled-b.txt").exists());
+    assert_eq!(turns.load(Ordering::SeqCst), 2);
+
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &run_id.to_string(), "completed").await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("scheduled-b.txt")).expect("second effect"),
+        "B"
+    );
+    assert_eq!(turns.load(Ordering::SeqCst), 3);
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("terminal states");
+    assert_eq!(states, ("completed".into(), "succeeded".into()));
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 2);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn scheduled_provider_failure_terminalizes_both_records() {
     let model = MockServer::start().await;
     mount_response(&model, ResponseTemplate::new(500)).await;
