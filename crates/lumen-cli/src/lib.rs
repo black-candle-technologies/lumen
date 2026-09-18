@@ -752,6 +752,7 @@ async fn serve(
     let token = std::env::var(&config.authentication.token_environment).map_err(|_| {
         CliError::MissingEnvironment(config.authentication.token_environment.clone())
     })?;
+    let owner_guard = Arc::new(acquire_runtime_ownership(&config.database.path)?);
     let database = Database::connect(&config.database.path).await?;
     database.verify_audit_chain().await?;
     let now = runtime::now();
@@ -806,13 +807,14 @@ async fn serve(
 
     let events = EventBroker::new(1024);
     let service = Arc::new(
-        runtime::LocalRuntimeService::build_with_secret_store(
+        runtime::LocalRuntimeService::build_with_runtime_owner(
             &config,
             database.clone(),
             events.clone(),
             Arc::clone(&sandbox),
             vec![token.clone()],
             secret_store,
+            owner_guard,
         )
         .await?,
     );
@@ -915,6 +917,59 @@ fn prepare_directories(config: &Config) -> Result<(), CliError> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn acquire_runtime_ownership(database_path: &Path) -> Result<std::fs::File, CliError> {
+    if std::fs::symlink_metadata(database_path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(CliError::Runtime(
+            "database path must not be a symlink".into(),
+        ));
+    }
+    let parent = database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent)?;
+    let name = database_path
+        .file_name()
+        .ok_or_else(|| CliError::Runtime("database path has no file name".into()))?;
+    let lock_path = parent.join(format!(".{}.lumen-owner.lock", name.to_string_lossy()));
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(CliError::Runtime(
+            "runtime lock path must not be a symlink".into(),
+        ));
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock.try_lock().map_err(|error| {
+        CliError::Runtime(format!(
+            "runtime ownership unavailable for {}: {error}",
+            database_path.display()
+        ))
+    })?;
+    Ok(lock)
+}
+
+#[cfg(test)]
+mod runtime_ownership_tests {
+    use super::acquire_runtime_ownership;
+
+    #[test]
+    fn a_second_runtime_cannot_own_the_same_database_until_the_first_releases_it() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("lumen.sqlite3");
+        let first = acquire_runtime_ownership(&database).expect("first owner");
+        assert!(acquire_runtime_ownership(&database).is_err());
+        drop(first);
+        acquire_runtime_ownership(&database).expect("owner after release");
+    }
 }
 
 async fn shutdown_signal() {

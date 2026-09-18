@@ -104,6 +104,7 @@ pub(crate) struct LocalRuntimeService {
     actions: Arc<DatabaseActions>,
     database: Database,
     owner_instance_id: uuid::Uuid,
+    _owner_guard: Option<Arc<std::fs::File>>,
     data_root: Arc<Path>,
     events: EventBroker,
     policy: Policy,
@@ -144,6 +145,48 @@ impl LocalRuntimeService {
         sandbox: Arc<dyn SandboxBackend>,
         secrets: Vec<String>,
         secret_store: Arc<dyn SecretStore>,
+    ) -> Result<Self, CliError> {
+        Self::build_with_secret_store_inner(
+            config,
+            database,
+            events,
+            sandbox,
+            secrets,
+            secret_store,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn build_with_runtime_owner(
+        config: &Config,
+        database: Database,
+        events: EventBroker,
+        sandbox: Arc<dyn SandboxBackend>,
+        secrets: Vec<String>,
+        secret_store: Arc<dyn SecretStore>,
+        owner_guard: Arc<std::fs::File>,
+    ) -> Result<Self, CliError> {
+        Self::build_with_secret_store_inner(
+            config,
+            database,
+            events,
+            sandbox,
+            secrets,
+            secret_store,
+            Some(owner_guard),
+        )
+        .await
+    }
+
+    async fn build_with_secret_store_inner(
+        config: &Config,
+        database: Database,
+        events: EventBroker,
+        sandbox: Arc<dyn SandboxBackend>,
+        secrets: Vec<String>,
+        secret_store: Arc<dyn SecretStore>,
+        owner_guard: Option<Arc<std::fs::File>>,
     ) -> Result<Self, CliError> {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
         std::fs::create_dir_all(&config.runtime.data_directory)?;
@@ -286,6 +329,7 @@ impl LocalRuntimeService {
             actions: Arc::new(DatabaseActions(database.clone())),
             database,
             owner_instance_id: uuid::Uuid::new_v4(),
+            _owner_guard: owner_guard,
             data_root: Arc::from(data_root),
             events,
             policy: Policy::default(),
@@ -315,10 +359,12 @@ impl LocalRuntimeService {
             shutting_down: Arc::new(AtomicBool::new(false)),
             redactor,
         };
-        service
-            .database
-            .reconcile_abandoned_owned_runs(service.owner_instance_id, now())
-            .await?;
+        if service._owner_guard.is_some() {
+            service
+                .database
+                .reconcile_abandoned_owned_runs(service.owner_instance_id, now())
+                .await?;
+        }
         for (workspace_id, run_id) in service.database.list_pending_terminal_audits().await? {
             service
                 .database
