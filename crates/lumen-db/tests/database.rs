@@ -1979,7 +1979,9 @@ async fn reservation_one_millisecond_before_expiry_records_the_protected_sample(
 
 #[tokio::test]
 async fn approval_renewal_is_one_durable_replacement_for_an_awaiting_run() {
-    let database = Database::connect_in_memory().await.expect("database");
+    let directory = tempdir().expect("temporary database directory");
+    let path = directory.path().join("renewal.db");
+    let database = Database::connect(&path).await.expect("database");
     let action = action();
     let run_id = action.run_id();
     let owner = Uuid::new_v4();
@@ -2073,4 +2075,159 @@ async fn approval_renewal_is_one_durable_replacement_for_an_awaiting_run() {
     .await
     .expect("durable relation");
     assert_eq!(relation, (Some(winner.to_string()), 1));
+    drop(database);
+    let restarted = Database::connect(&path).await.expect("restarted database");
+    let restarted_relation: (Option<String>, i64) = sqlx::query_as(
+        "SELECT replacement_approval_id,
+                (SELECT COUNT(*) FROM approval_requests other WHERE other.action_id = old.action_id AND other.state = 'pending')
+         FROM approval_requests old WHERE old.id = ?",
+    )
+    .bind(old.id().to_string())
+    .fetch_one(restarted.pool())
+    .await
+    .expect("restarted durable relation");
+    assert_eq!(restarted_relation, (Some(winner.to_string()), 1));
+}
+
+#[tokio::test]
+async fn approval_renewal_refuses_invalidated_fingerprint_or_terminal_old_decision() {
+    for case in [
+        "invalidated_action",
+        "changed_fingerprint",
+        "consumed",
+        "rejected",
+    ] {
+        let database = Database::connect_in_memory().await.expect("database");
+        let action = action();
+        let run_id = action.run_id();
+        let owner = Uuid::new_v4();
+        database
+            .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+            .await
+            .expect("workspace");
+        database
+            .create_owned_run(
+                run_id,
+                workspace_id(),
+                action.actor(),
+                owner,
+                TimestampMillis::new(1_000),
+            )
+            .await
+            .expect("run");
+        database
+            .start_owned_run(
+                run_id,
+                workspace_id(),
+                owner,
+                false,
+                TimestampMillis::new(1_100),
+            )
+            .await
+            .expect("start");
+        database
+            .pause_owned_run_for_approval(
+                run_id,
+                workspace_id(),
+                owner,
+                TimestampMillis::new(1_200),
+            )
+            .await
+            .expect("pause");
+        database
+            .insert_action(&action, TimestampMillis::new(1_100))
+            .await
+            .expect("action");
+        let mut old = ApprovalRequest::new(
+            approval_id(),
+            action.fingerprint(),
+            policy_version(),
+            TimestampMillis::new(1_000),
+            TimestampMillis::new(2_000),
+        )
+        .expect("old approval");
+        assert!(old.expire(TimestampMillis::new(2_001)));
+        database
+            .insert_approval(&old)
+            .await
+            .expect("old approval stored");
+        match case {
+            "invalidated_action" => {
+                sqlx::query("UPDATE actions SET state = 'denied', terminal_reason = 'approval_rejected' WHERE id = ?")
+                    .bind(action.id().to_string()).execute(database.pool()).await.expect("invalidate action");
+            }
+            "changed_fingerprint" => {
+                let changed = sqlx::query("UPDATE actions SET fingerprint = ? WHERE id = ?")
+                    .bind("0".repeat(64))
+                    .bind(action.id().to_string())
+                    .execute(database.pool())
+                    .await;
+                assert!(
+                    changed.is_err(),
+                    "approval FK must prevent fingerprint mutation"
+                );
+            }
+            "consumed" | "rejected" => {
+                sqlx::query("UPDATE approval_requests SET state = ?, consumed_at = ? WHERE id = ?")
+                    .bind(case)
+                    .bind((case == "consumed").then_some(2_001_i64))
+                    .bind(old.id().to_string())
+                    .execute(database.pool())
+                    .await
+                    .expect("terminal old approval");
+            }
+            _ => unreachable!(),
+        }
+        let replacement_fingerprint = if case == "changed_fingerprint" {
+            ActionEnvelope::new(
+                ActionId::from_uuid(Uuid::new_v4()),
+                run_id,
+                workspace_id(),
+                action.actor().clone(),
+                ComponentId::new("builtin.filesystem").expect("component"),
+                ActionKind::new("filesystem.write").expect("kind"),
+                CanonicalValue::object([("path", CanonicalValue::from("notes/other.md"))]),
+                vec![Capability::new(
+                    CapabilityName::FsWrite,
+                    ResourceScope::path(
+                        workspace_id(),
+                        WorkspacePath::parse("notes/other.md").expect("path"),
+                    ),
+                )],
+            )
+            .fingerprint()
+        } else {
+            action.fingerprint()
+        };
+        let replacement = ApprovalRequest::new(
+            ApprovalId::new(),
+            replacement_fingerprint,
+            policy_version(),
+            TimestampMillis::new(2_001),
+            TimestampMillis::new(3_001),
+        )
+        .expect("replacement");
+        assert!(
+            matches!(
+                database
+                    .renew_expired_approval(
+                        workspace_id(),
+                        run_id,
+                        old.id(),
+                        &replacement,
+                        TimestampMillis::new(2_001)
+                    )
+                    .await,
+                Err(RepositoryError::ApprovalStale)
+            ),
+            "unexpected renewal for {case}"
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE action_id = ?")
+                .bind(action.id().to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("approval count");
+        assert_eq!(count, 1, "replacement inserted for {case}");
+    }
 }

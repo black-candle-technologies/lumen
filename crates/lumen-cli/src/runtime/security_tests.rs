@@ -2393,6 +2393,64 @@ async fn unpinned_scheduled_creation_is_rejected_before_approval() {
 }
 
 #[tokio::test]
+async fn incomplete_scheduled_update_pins_are_rejected_before_approval() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    for case in [
+        "missing_previous",
+        "missing_enabled",
+        "missing_target",
+        "wrong_target",
+    ] {
+        let CanonicalValue::Object(mut arguments) =
+            scheduled_job_action_arguments("pinned", DataClass::Public, 2, 1, true, true)
+        else {
+            unreachable!()
+        };
+        if case != "missing_previous" {
+            arguments.insert("previous_revision".into(), CanonicalValue::from(1_i64));
+        }
+        if case != "missing_enabled" {
+            arguments.insert("previous_enabled".into(), CanonicalValue::from(true));
+        }
+        if case != "missing_target" {
+            arguments.insert(
+                "target_revision".into(),
+                CanonicalValue::from(if case == "wrong_target" { 1_i64 } else { 2_i64 }),
+            );
+        }
+        let run_id = harness
+            .service
+            .request_extension_action(
+                harness.workspace_id,
+                PrincipalId::new("local", "operator").expect("operator"),
+                ActionProposal::new("schedule.job.update", CanonicalValue::Object(arguments)),
+                CapabilitySet::new([Capability::new(
+                    CapabilityName::ScheduleModify,
+                    ResourceScope::exact("scheduled_job", scheduled_job_id().to_string())
+                        .expect("scope"),
+                )]),
+            )
+            .await
+            .expect("accepted run");
+        wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+        let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("actions");
+        assert_eq!(actions, 0, "action persisted for {case}");
+    }
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approvals");
+    assert_eq!(approvals, 0);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn skill_publication_without_source_digest_is_rejected_before_approval() {
     let model = MockServer::start().await;
     mount_response(&model, final_response("unused")).await;
