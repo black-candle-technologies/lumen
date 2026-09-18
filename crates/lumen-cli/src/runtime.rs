@@ -769,12 +769,28 @@ impl LocalRuntimeService {
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
-        self.database
+        let expired = self
+            .database
             .recover_expired_running_scheduled_runs(timestamp)
             .await
             .map_err(|error| {
                 ServiceError::Internal(format!("recover running scheduled runs: {error}"))
             })?;
+        if !expired.is_empty() {
+            for (workspace_id, run_id) in self
+                .database
+                .list_pending_terminal_audits()
+                .await
+                .map_err(repository_service_error)?
+            {
+                if expired.contains(&run_id) {
+                    self.database
+                        .flush_terminal_audit(workspace_id, run_id)
+                        .await
+                        .map_err(repository_service_error)?;
+                }
+            }
+        }
         let ready = self
             .database
             .ready_scheduled_run_handoffs()

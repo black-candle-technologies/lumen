@@ -754,6 +754,35 @@ async fn expired_started_handoff_recovers_as_unknown_without_redispatch() {
     .await
     .expect("recovered states");
     assert_eq!(states, ("unknown".into(), "failed".into()));
+    let lifecycle = database
+        .get_run_lifecycle(workspace_id(), run_id)
+        .await
+        .expect("recovery lifecycle lookup")
+        .expect("legacy active run receives durable reconciliation marker");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert_eq!(
+        lifecycle.effect_certainty(),
+        lumen_db::EffectCertainty::Unknown
+    );
+    assert_eq!(lifecycle.terminal_code(), Some("legacy_lease_expired"));
+    assert!(lifecycle.terminal_audit_pending());
+    database
+        .flush_terminal_audit(workspace_id(), run_id)
+        .await
+        .expect("legacy recovery audit is replayable");
+    assert_eq!(
+        database
+            .list_audit_records_for_run(workspace_id(), run_id)
+            .await
+            .expect("legacy audit")
+            .iter()
+            .filter(|record| {
+                record.event().kind()
+                    == lumen_core::audit::AuditEventKind::RunReconciliationRequired
+            })
+            .count(),
+        1
+    );
     assert!(
         database
             .recover_expired_running_scheduled_runs(TimestampMillis::new(4_000))

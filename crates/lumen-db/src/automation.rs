@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use crate::{Database, RepositoryError, timestamp_to_i64};
 
+type ExpiredRunRow = (String, String, String, Option<String>, Option<String>);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceIdentity {
     principal: PrincipalId,
@@ -888,26 +890,42 @@ impl Database {
     ) -> Result<Vec<lumen_core::action::RunId>, RepositoryError> {
         let now_i64 = timestamp_to_i64(now)?;
         let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT occurrence.run_id, run.state
+        let rows: Vec<ExpiredRunRow> = sqlx::query_as(
+            "SELECT occurrence.run_id, run.state, run.workspace_id,
+                    lifecycle.phase, lifecycle.effect_certainty
              FROM scheduled_job_runs occurrence
              JOIN scheduled_job_leases lease
                ON lease.occurrence_key = occurrence.occurrence_key
              JOIN agent_runs run ON run.id = occurrence.run_id
+             LEFT JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id
              WHERE occurrence.state = 'running' AND lease.expires_at <= ?
                AND occurrence.run_id IS NOT NULL",
         )
         .bind(now_i64)
         .fetch_all(&mut *transaction)
         .await?;
-        for (run_id, run_state) in &rows {
-            let (occurrence_state, fail_run) = match run_state.as_str() {
+        for (run_id, run_state, workspace_id, phase, certainty) in &rows {
+            if phase
+                .as_deref()
+                .is_some_and(|phase| !matches!(phase, "terminal" | "reconciliation_required"))
+            {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+            let (mut occurrence_state, fail_run) = match run_state.as_str() {
                 "completed" => ("succeeded", false),
                 "failed" => ("failed", false),
                 "cancelled" => ("cancelled", false),
                 "created" | "running" | "awaiting_approval" => ("unknown", true),
                 _ => return Err(RepositoryError::InvalidAutomationState),
             };
+            if phase.is_some() {
+                if fail_run {
+                    return Err(RepositoryError::ExecutionStateConflict);
+                }
+                if certainty.as_deref() == Some("unknown") {
+                    occurrence_state = "unknown";
+                }
+            }
             let occurrence = sqlx::query(
                 "UPDATE scheduled_job_runs SET state = ?, updated_at = ?
                  WHERE run_id = ? AND state = 'running'",
@@ -934,11 +952,69 @@ impl Database {
                 if run != 1 {
                     return Err(RepositoryError::ExecutionStateConflict);
                 }
+                sqlx::query(
+                    "UPDATE execution_attempts SET state = 'unknown', completed_at = ?
+                     WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)
+                       AND state IN ('reserved', 'running')",
+                )
+                .bind(now_i64)
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE actions SET state = 'unknown' WHERE run_id = ? AND state = 'running'",
+                )
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE actions SET state = 'failed', terminal_reason = 'run_failed_before_dispatch'
+                     WHERE run_id = ? AND state = 'normalized'",
+                )
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE approval_requests SET state = 'invalidated'
+                     WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)
+                       AND state IN ('pending', 'granted')",
+                )
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                let audit_id = Uuid::new_v4().to_string();
+                let payload = serde_json::json!({
+                    "run_id": run_id,
+                    "terminal_code": "legacy_lease_expired",
+                    "effect_certainty": "unknown",
+                    "primary_diagnostic": "legacy scheduled lease expired before durable ownership",
+                })
+                .to_string();
+                sqlx::query(
+                    "INSERT INTO run_lifecycle (
+                        run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                        terminal_code, primary_diagnostic, terminal_audit_id,
+                        terminal_audit_pending, terminal_audit_occurred_at,
+                        terminal_audit_payload_json, created_at, updated_at
+                     ) VALUES (?, ?, ?, 'reconciliation_required', 'unknown',
+                               'legacy_lease_expired', ?, ?, 1, ?, ?, ?, ?)",
+                )
+                .bind(run_id)
+                .bind(workspace_id)
+                .bind(Uuid::nil().to_string())
+                .bind("legacy scheduled lease expired before durable ownership")
+                .bind(audit_id)
+                .bind(now_i64)
+                .bind(payload)
+                .bind(now_i64)
+                .bind(now_i64)
+                .execute(&mut *transaction)
+                .await?;
             }
         }
         transaction.commit().await?;
         rows.into_iter()
-            .map(|(run_id, _)| {
+            .map(|(run_id, _, _, _, _)| {
                 Ok(lumen_core::action::RunId::from_uuid(
                     run_id
                         .parse()
