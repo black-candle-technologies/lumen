@@ -236,6 +236,14 @@ pub struct SkillVersionRecord {
     reviewed_at: Option<TimestampMillis>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SkillPublicationIntent {
+    pub intent_id: Uuid,
+    pub draft_id: Uuid,
+    pub skill: SkillVersionRecord,
+    pub state: String,
+}
+
 impl SkillVersionRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1434,11 +1442,21 @@ impl Database {
         enabled_at: Option<TimestampMillis>,
     ) -> Result<(), RepositoryError> {
         let mut transaction = self.pool().begin().await?;
+        Self::insert_skill_version_transaction(&mut transaction, skill, enabled_at).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_skill_version_transaction(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        skill: &SkillVersionRecord,
+        enabled_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
         let existing = sqlx::query(
             "SELECT workspace_id, name, description FROM agent_skills WHERE skill_id = ?",
         )
         .bind(skill.skill_id.to_string())
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if let Some(existing) = existing
             && (existing.try_get::<String, _>("workspace_id")? != skill.workspace_id.to_string()
@@ -1456,7 +1474,7 @@ impl Database {
         .bind(&skill.name)
         .bind(&skill.description)
         .bind(timestamp_to_i64(skill.created_at)?)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         sqlx::query(
             "INSERT INTO skill_versions (
@@ -1476,7 +1494,7 @@ impl Database {
         .bind(skill.reviewed_by.as_ref().map(PrincipalId::subject))
         .bind(timestamp_to_i64(skill.created_at)?)
         .bind(skill.reviewed_at.map(timestamp_to_i64).transpose()?)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if let Some(updated_at) = enabled_at {
             sqlx::query(
@@ -1491,11 +1509,153 @@ impl Database {
             .bind(skill.skill_id.to_string())
             .bind(skill.version.as_str())
             .bind(timestamp_to_i64(updated_at)?)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
         }
+        Ok(())
+    }
+
+    pub async fn prepare_skill_publication(
+        &self,
+        intent_id: Uuid,
+        draft_id: Uuid,
+        skill: &SkillVersionRecord,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO skill_publication_intents (
+                intent_id, draft_id, workspace_id, skill_id, version, name, description,
+                source_format, source_digest, created_provider, created_subject, created_at, state
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared')",
+        )
+        .bind(intent_id.to_string())
+        .bind(draft_id.to_string())
+        .bind(skill.workspace_id.to_string())
+        .bind(skill.skill_id.to_string())
+        .bind(skill.version.as_str())
+        .bind(&skill.name)
+        .bind(&skill.description)
+        .bind(&skill.source_format)
+        .bind(&skill.source_digest)
+        .bind(skill.created_by.provider())
+        .bind(skill.created_by.subject())
+        .bind(timestamp_to_i64(skill.created_at)?)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_skill_publication_state(
+        &self,
+        intent_id: Uuid,
+        state: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(
+            state,
+            "materialized" | "reconciliation_required" | "abandoned"
+        ) {
+            return Err(RepositoryError::InvalidAutomationState);
+        }
+        let updated = sqlx::query(
+            "UPDATE skill_publication_intents SET state = ?, diagnostic = ?
+             WHERE intent_id = ? AND state IN ('prepared', 'materialized', 'reconciliation_required')",
+        )
+        .bind(state)
+        .bind(diagnostic)
+        .bind(intent_id.to_string())
+        .execute(self.pool())
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::InvalidAutomationState);
+        }
+        Ok(())
+    }
+
+    pub async fn commit_skill_publication(
+        &self,
+        intent_id: Uuid,
+        skill: &SkillVersionRecord,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool().begin().await?;
+        let row = sqlx::query(
+            "SELECT workspace_id, skill_id, version, source_digest, state
+             FROM skill_publication_intents WHERE intent_id = ?",
+        )
+        .bind(intent_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if row.try_get::<String, _>("workspace_id")? != skill.workspace_id.to_string()
+            || row.try_get::<String, _>("skill_id")? != skill.skill_id.to_string()
+            || row.try_get::<String, _>("version")? != skill.version.as_str()
+            || row.try_get::<String, _>("source_digest")? != skill.source_digest
+            || row.try_get::<String, _>("state")? != "materialized"
+        {
+            return Err(RepositoryError::InvalidAutomationState);
+        }
+        Self::insert_skill_version_transaction(&mut transaction, skill, Some(skill.created_at))
+            .await?;
+        sqlx::query("UPDATE skill_publication_intents SET state = 'committed', diagnostic = NULL WHERE intent_id = ?")
+            .bind(intent_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn pending_skill_publications(
+        &self,
+    ) -> Result<Vec<SkillPublicationIntent>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT * FROM skill_publication_intents WHERE state NOT IN ('committed', 'abandoned') ORDER BY created_at, intent_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let workspace_id = WorkspaceId::from_uuid(
+                    row.try_get::<String, _>("workspace_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                );
+                let actor = PrincipalId::new(
+                    row.try_get::<String, _>("created_provider")?,
+                    row.try_get::<String, _>("created_subject")?,
+                )
+                .map_err(|_| RepositoryError::InvalidAutomationState)?;
+                let created_at = timestamp_from_row(&row, "created_at")?;
+                let skill = SkillVersionRecord::new(
+                    SkillId::from_uuid(
+                        row.try_get::<String, _>("skill_id")?
+                            .parse()
+                            .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    ),
+                    SkillVersion::parse(row.try_get::<String, _>("version")?)
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    workspace_id,
+                    row.try_get::<String, _>("name")?,
+                    row.try_get::<String, _>("description")?,
+                    row.try_get::<String, _>("source_format")?,
+                    row.try_get::<String, _>("source_digest")?,
+                    true,
+                    actor.clone(),
+                    Some(actor),
+                    created_at,
+                    Some(created_at),
+                )?;
+                Ok(SkillPublicationIntent {
+                    intent_id: row
+                        .try_get::<String, _>("intent_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    draft_id: row
+                        .try_get::<String, _>("draft_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    skill,
+                    state: row.try_get("state")?,
+                })
+            })
+            .collect()
     }
 
     pub async fn set_skill_workspace_state(

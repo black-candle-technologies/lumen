@@ -59,6 +59,7 @@ use wiremock::{
 use super::{
     ApprovalRegistry, EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand,
     REVIEWED_SKILL_SOURCE_MAX_BYTES, RedactingExecutor, now, read_bounded_skill_source,
+    recover_skill_publications, write_skill_stage,
 };
 use crate::{
     config::{Config, toml_string},
@@ -4854,6 +4855,278 @@ async fn failed_skill_enablement_rolls_back_version_and_source() {
             .is_none()
     );
     assert!(!skill_source_path(&harness, published_skill, &version).exists());
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn skill_publication_never_adopts_equal_bytes_at_a_foreign_final_path() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("publish done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        format!("# Capture\nsource_run_id: {}", RunId::new()),
+        PrincipalId::new("local", "operator").expect("operator"),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = skill_id();
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    let final_path = skill_source_path(&harness, skill_id, &version);
+    std::fs::create_dir_all(final_path.parent().expect("parent")).expect("skill directory");
+    std::fs::write(&final_path, draft.body()).expect("foreign equal-byte file");
+
+    let run_id = request_skill_publish(&harness, draft.id(), skill_id).await;
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    assert_eq!(
+        std::fs::read_to_string(&final_path).expect("foreign file"),
+        draft.body()
+    );
+    assert!(
+        harness
+            .database
+            .skill_version(harness.workspace_id, skill_id, &version)
+            .await
+            .expect("version lookup")
+            .is_none()
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM skill_publication_intents WHERE workspace_id = ? AND skill_id = ? AND version = ?",
+    )
+    .bind(harness.workspace_id.to_string())
+    .bind(skill_id.to_string())
+    .bind(version.as_str())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("reconciliation intent");
+    assert_eq!(state, "reconciliation_required");
+}
+
+#[tokio::test]
+async fn publication_recovery_finishes_only_owned_synced_sources() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture",
+        actor.clone(),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let data_root = harness._directory.path().join("runtime");
+    for already_linked in [false, true] {
+        let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+        let version = SkillVersion::parse("1.0.0").expect("version");
+        let record = SkillVersionRecord::new(
+            skill_id,
+            version.clone(),
+            harness.workspace_id,
+            "Captured",
+            "Captured description",
+            "markdown",
+            sha256_hex(draft.body().as_bytes()),
+            true,
+            actor.clone(),
+            Some(actor.clone()),
+            TimestampMillis::new(1_000),
+            Some(TimestampMillis::new(1_000)),
+        )
+        .expect("skill record");
+        let intent_id = uuid::Uuid::new_v4();
+        harness
+            .database
+            .prepare_skill_publication(intent_id, draft.id(), &record)
+            .await
+            .expect("prepared intent");
+        let stage = data_root
+            .join("skills")
+            .join(".staging")
+            .join(intent_id.to_string());
+        write_skill_stage(&stage, draft.body().as_bytes())
+            .await
+            .expect("synced stage");
+        let final_path = skill_source_path(&harness, skill_id, &version);
+        if already_linked {
+            std::fs::create_dir_all(final_path.parent().expect("parent")).expect("final directory");
+            std::fs::hard_link(&stage, &final_path).expect("owned final link");
+        }
+        recover_skill_publications(&harness.database, &data_root)
+            .await
+            .expect("recovered intent");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("published source"),
+            draft.body()
+        );
+        assert!(!stage.exists());
+        assert!(
+            harness
+                .database
+                .skill_version(harness.workspace_id, skill_id, &version)
+                .await
+                .expect("version lookup")
+                .is_some()
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM skill_publication_intents WHERE intent_id = ?")
+                .bind(intent_id.to_string())
+                .fetch_one(harness.database.pool())
+                .await
+                .expect("intent state");
+        assert_eq!(state, "committed");
+    }
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn publication_recovery_releases_missing_owned_stage_for_fresh_retry() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture",
+        actor.clone(),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    let record = SkillVersionRecord::new(
+        skill_id,
+        version.clone(),
+        harness.workspace_id,
+        "Captured",
+        "Captured description",
+        "markdown",
+        sha256_hex(draft.body().as_bytes()),
+        true,
+        actor.clone(),
+        Some(actor),
+        TimestampMillis::new(1_000),
+        Some(TimestampMillis::new(1_000)),
+    )
+    .expect("skill record");
+    let abandoned_id = uuid::Uuid::new_v4();
+    harness
+        .database
+        .prepare_skill_publication(abandoned_id, draft.id(), &record)
+        .await
+        .expect("prepared intent");
+    recover_skill_publications(
+        &harness.database,
+        &harness._directory.path().join("runtime"),
+    )
+    .await
+    .expect("recovery");
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM skill_publication_intents WHERE intent_id = ?")
+            .bind(abandoned_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("intent state");
+    assert_eq!(state, "abandoned");
+    assert!(!skill_source_path(&harness, skill_id, &version).exists());
+    harness
+        .database
+        .prepare_skill_publication(uuid::Uuid::new_v4(), draft.id(), &record)
+        .await
+        .expect("fresh retry intent");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn publication_recovery_cleans_partial_owned_stage_without_touching_final() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture",
+        actor.clone(),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    let record = SkillVersionRecord::new(
+        skill_id,
+        version.clone(),
+        harness.workspace_id,
+        "Captured",
+        "Captured description",
+        "markdown",
+        sha256_hex(draft.body().as_bytes()),
+        true,
+        actor.clone(),
+        Some(actor),
+        TimestampMillis::new(1_000),
+        Some(TimestampMillis::new(1_000)),
+    )
+    .expect("skill record");
+    let abandoned_id = uuid::Uuid::new_v4();
+    harness
+        .database
+        .prepare_skill_publication(abandoned_id, draft.id(), &record)
+        .await
+        .expect("prepared intent");
+    let data_root = harness._directory.path().join("runtime");
+    let stage = data_root
+        .join("skills")
+        .join(".staging")
+        .join(abandoned_id.to_string());
+    std::fs::create_dir_all(stage.parent().expect("stage parent")).expect("staging directory");
+    std::fs::write(&stage, b"partial").expect("partial stage");
+    recover_skill_publications(&harness.database, &data_root)
+        .await
+        .expect("recovery");
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM skill_publication_intents WHERE intent_id = ?")
+            .bind(abandoned_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("intent state");
+    assert_eq!(state, "abandoned");
+    assert!(!stage.exists());
+    assert!(!skill_source_path(&harness, skill_id, &version).exists());
+    harness
+        .database
+        .prepare_skill_publication(uuid::Uuid::new_v4(), draft.id(), &record)
+        .await
+        .expect("fresh retry intent");
     harness.service.shutdown().await;
 }
 

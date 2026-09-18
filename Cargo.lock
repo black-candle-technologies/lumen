@@ -3038,6 +3038,7 @@ dependencies = [
  "lumen-extension-sdk",
  "lumen-integrations",
  "lumen-server",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",

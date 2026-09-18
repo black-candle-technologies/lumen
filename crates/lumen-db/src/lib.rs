@@ -14,7 +14,8 @@ use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
 pub use automation::{
-    ScheduledJobRevision, ServiceIdentity, SkillVersionRecord, WorkflowCaptureDraft,
+    ScheduledJobRevision, ServiceIdentity, SkillPublicationIntent, SkillVersionRecord,
+    WorkflowCaptureDraft,
 };
 pub use egress::{
     ChannelIdentityMapping, DestinationRevision, ModelEndpointClass, ModelProviderRevision,

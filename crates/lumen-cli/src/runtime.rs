@@ -599,6 +599,9 @@ impl LocalRuntimeService {
             redactor,
         };
         if service._owner_guard.is_some() {
+            recover_skill_publications(&service.database, &service.data_root)
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
             service
                 .database
                 .reconcile_abandoned_owned_runs(service.owner_instance_id, now())
@@ -3757,6 +3760,95 @@ async fn apply_skill_publish_action(
         .join("skills")
         .join(parsed.skill_id.to_string())
         .join(format!("{}.md", parsed.version.as_str()));
+    let intent_id = uuid::Uuid::new_v4();
+    let stage_path = data_root
+        .join("skills")
+        .join(".staging")
+        .join(intent_id.to_string());
+    database
+        .prepare_skill_publication(intent_id, parsed.draft_id, &record)
+        .await
+        .map_err(repository_service_error)?;
+    if let Err(error) = write_skill_stage(&stage_path, &bytes).await {
+        let cleaned = match tokio::fs::remove_file(&stage_path).await {
+            Ok(()) => true,
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        database
+            .mark_skill_publication_state(
+                intent_id,
+                if cleaned {
+                    "abandoned"
+                } else {
+                    "reconciliation_required"
+                },
+                Some(&error.to_string()),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        return Err(error);
+    }
+    finalize_skill_publication(database, intent_id, &record, &stage_path, &source_path).await?;
+    Ok(parsed.skill_id)
+}
+
+async fn write_skill_stage(stage_path: &Path, bytes: &[u8]) -> Result<(), ServiceError> {
+    tokio::fs::create_dir_all(
+        stage_path
+            .parent()
+            .ok_or_else(|| ServiceError::Internal("invalid skill staging path".into()))?,
+    )
+    .await
+    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let mut stage_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(stage_path)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    stage_file
+        .write_all(bytes)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    stage_file
+        .sync_all()
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    Ok(())
+}
+
+async fn finalize_skill_publication(
+    database: &Database,
+    intent_id: uuid::Uuid,
+    record: &SkillVersionRecord,
+    stage_path: &Path,
+    source_path: &Path,
+) -> Result<(), ServiceError> {
+    let stage_file = tokio::fs::File::open(stage_path)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let staged_bytes = read_bounded_skill_source(stage_file)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    if staged_bytes.as_deref().map(sha256_hex).as_deref() != Some(record.source_digest()) {
+        let cleaned = !source_path.exists() && tokio::fs::remove_file(stage_path).await.is_ok();
+        database
+            .mark_skill_publication_state(
+                intent_id,
+                if cleaned {
+                    "abandoned"
+                } else {
+                    "reconciliation_required"
+                },
+                Some("staged source digest mismatch"),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        return Err(ServiceError::Conflict(
+            "staged source digest mismatch".into(),
+        ));
+    }
     tokio::fs::create_dir_all(
         source_path
             .parent()
@@ -3764,40 +3856,107 @@ async fn apply_skill_publish_action(
     )
     .await
     .map_err(|error| ServiceError::Internal(error.to_string()))?;
-    let mut source_file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&source_path)
+    match tokio::fs::hard_link(stage_path, source_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !same_file::is_same_file(stage_path, source_path).unwrap_or(false) {
+                database
+                    .mark_skill_publication_state(
+                        intent_id,
+                        "reconciliation_required",
+                        Some("foreign final source path"),
+                    )
+                    .await
+                    .map_err(repository_service_error)?;
+                return Err(ServiceError::Conflict(
+                    "skill version source already exists".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(ServiceError::Internal(error.to_string())),
+    }
+    database
+        .mark_skill_publication_state(intent_id, "materialized", None)
         .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                ServiceError::Conflict("skill version source already exists".into())
+        .map_err(repository_service_error)?;
+    if let Err(error) = database.commit_skill_publication(intent_id, record).await {
+        // A failed transaction has a known rollback only when the version lookup succeeds.
+        // Never remove a path that is not still linked to this intent's private stage.
+        let safe_to_clean = matches!(
+            database
+                .skill_version(record.workspace_id(), record.skill_id(), record.version())
+                .await,
+            Ok(None)
+        ) && same_file::is_same_file(stage_path, source_path).unwrap_or(false);
+        let cleaned = if safe_to_clean {
+            tokio::fs::remove_file(source_path).await.is_ok()
+                && tokio::fs::remove_file(stage_path).await.is_ok()
+        } else {
+            false
+        };
+        database
+            .mark_skill_publication_state(
+                intent_id,
+                if cleaned {
+                    "abandoned"
+                } else {
+                    "reconciliation_required"
+                },
+                Some(&error.to_string()),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        return Err(repository_service_error(error));
+    }
+    let _ = tokio::fs::remove_file(stage_path).await;
+    Ok(())
+}
+
+async fn recover_skill_publications(
+    database: &Database,
+    data_root: &Path,
+) -> Result<(), ServiceError> {
+    for intent in database
+        .pending_skill_publications()
+        .await
+        .map_err(repository_service_error)?
+    {
+        let stage_path = data_root
+            .join("skills")
+            .join(".staging")
+            .join(intent.intent_id.to_string());
+        let source_path = data_root
+            .join("skills")
+            .join(intent.skill.skill_id().to_string())
+            .join(format!("{}.md", intent.skill.version().as_str()));
+        if !stage_path.exists() {
+            let (state, diagnostic) = if source_path.exists() {
+                (
+                    "reconciliation_required",
+                    "staged source missing with final source present",
+                )
             } else {
-                ServiceError::Internal(error.to_string())
-            }
-        })?;
-    let source_write = source_file.write_all(&bytes).await;
-    drop(source_file);
-    if let Err(error) = source_write {
-        let cleanup = tokio::fs::remove_file(&source_path).await;
-        return Err(ServiceError::Internal(match cleanup {
-            Ok(()) => error.to_string(),
-            Err(cleanup) => format!("{error}; source cleanup failed: {cleanup}"),
-        }));
+                (
+                    "abandoned",
+                    "staged source missing; fresh approval required",
+                )
+            };
+            database
+                .mark_skill_publication_state(intent.intent_id, state, Some(diagnostic))
+                .await
+                .map_err(repository_service_error)?;
+            continue;
+        }
+        let _ = finalize_skill_publication(
+            database,
+            intent.intent_id,
+            &intent.skill,
+            &stage_path,
+            &source_path,
+        )
+        .await;
     }
-    if let Err(error) = database.publish_skill_version(&record, created_at).await {
-        let cleanup = tokio::fs::remove_file(&source_path).await;
-        return Err(match cleanup {
-            Ok(()) if matches!(error, lumen_db::RepositoryError::SkillMetadataConflict) => {
-                ServiceError::Conflict(error.to_string())
-            }
-            Ok(()) => repository_service_error(error),
-            Err(cleanup) => {
-                ServiceError::Internal(format!("{error}; source cleanup failed: {cleanup}"))
-            }
-        });
-    }
-    Ok(parsed.skill_id)
+    Ok(())
 }
 
 fn parse_skill_publish_action(
