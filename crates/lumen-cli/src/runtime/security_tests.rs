@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -15,14 +15,18 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use lumen_core::audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome};
 use lumen_core::{
-    action::{CanonicalValue, RunId},
+    action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion},
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
-    identity::{ChannelDestination, ExternalChannelIdentity, PrincipalId, WorkspaceId},
+    identity::{
+        ChannelDestination, ComponentId, ExternalChannelIdentity, PrincipalId, WorkspaceId,
+    },
     model::{ActionProposal, ModelFuture, ModelInput, ModelOutput, ModelPort},
+    policy::PolicyVersion,
+    run::{ApprovalPort, Clock},
     secret::SecretRefId,
 };
 use lumen_db::{
@@ -44,6 +48,7 @@ use lumen_server::{
     RuntimeService, SandboxCapabilityReport, router,
 };
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wiremock::{
@@ -52,7 +57,7 @@ use wiremock::{
 };
 
 use super::{
-    EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand,
+    ApprovalRegistry, EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand,
     REVIEWED_SKILL_SOURCE_MAX_BYTES, RedactingExecutor, now, read_bounded_skill_source,
 };
 use crate::{
@@ -64,6 +69,20 @@ use crate::{
 };
 
 const TOKEN: &str = "security-test-token";
+
+struct TestWallClock(AtomicU64);
+
+impl TestWallClock {
+    fn new(now: u64) -> Self {
+        Self(AtomicU64::new(now))
+    }
+}
+
+impl Clock for TestWallClock {
+    fn now(&self) -> TimestampMillis {
+        TimestampMillis::new(self.0.load(Ordering::SeqCst))
+    }
+}
 
 fn test_program() -> std::path::PathBuf {
     #[cfg(windows)]
@@ -97,6 +116,144 @@ fn path_toml(path: impl AsRef<std::path::Path>) -> String {
 fn stored_relative_path(path: &std::path::Path, root: &std::path::Path) -> String {
     crate::relative_storage_path(path.strip_prefix(root).expect("relative path"))
         .expect("portable relative path")
+}
+
+#[tokio::test]
+async fn approval_registry_uses_its_injected_clock_for_decisions() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let workspace_id = WorkspaceId::new();
+    let actor = PrincipalId::new("local", "operator").expect("valid principal");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let action = ActionEnvelope::new(
+        ActionId::new(),
+        RunId::new(),
+        workspace_id,
+        actor.clone(),
+        ComponentId::new("builtin.filesystem").expect("component"),
+        ActionKind::new("filesystem.write").expect("action kind"),
+        CanonicalValue::object([("path", CanonicalValue::from("probe.txt"))]),
+        vec![Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::path(
+                workspace_id,
+                lumen_core::capability::WorkspacePath::parse("probe.txt").expect("path"),
+            ),
+        )],
+    );
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let clock = Arc::new(TestWallClock::new(1_500));
+    let registry = ApprovalRegistry::with_clock(
+        database,
+        Duration::from_secs(1),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    );
+    let policy_version = PolicyVersion::new("policy-v1").expect("policy version");
+    let approval_id = match registry
+        .resolve(&action, &policy_version, TimestampMillis::new(1_000))
+        .await
+        .expect("approval is created")
+    {
+        lumen_core::run::ApprovalResolution::Pending(approval_id) => approval_id,
+        other => panic!("expected pending approval, got {other:?}"),
+    };
+
+    registry
+        .decide(&ApprovalDecisionCommand::new(
+            workspace_id,
+            approval_id,
+            actor,
+            ApprovalDecision::Grant,
+        ))
+        .await
+        .expect("clock-valid approval grants");
+}
+
+#[tokio::test]
+async fn approval_reservation_expires_after_waiting_for_the_registry_lock() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let workspace_id = WorkspaceId::new();
+    let actor = PrincipalId::new("local", "operator").expect("valid principal");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let action = ActionEnvelope::new(
+        ActionId::new(),
+        RunId::new(),
+        workspace_id,
+        actor.clone(),
+        ComponentId::new("builtin.filesystem").expect("component"),
+        ActionKind::new("filesystem.write").expect("action kind"),
+        CanonicalValue::object([("path", CanonicalValue::from("probe.txt"))]),
+        vec![Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::path(
+                workspace_id,
+                lumen_core::capability::WorkspacePath::parse("probe.txt").expect("path"),
+            ),
+        )],
+    );
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let clock = Arc::new(TestWallClock::new(1_500));
+    let registry = Arc::new(ApprovalRegistry::with_clock(
+        database.clone(),
+        Duration::from_secs(1),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ));
+    let policy_version = PolicyVersion::new("policy-v1").expect("policy version");
+    let approval_id = match registry
+        .resolve(&action, &policy_version, TimestampMillis::new(1_000))
+        .await
+        .expect("approval is created")
+    {
+        lumen_core::run::ApprovalResolution::Pending(approval_id) => approval_id,
+        other => panic!("expected pending approval, got {other:?}"),
+    };
+    registry
+        .decide(&ApprovalDecisionCommand::new(
+            workspace_id,
+            approval_id,
+            actor,
+            ApprovalDecision::Grant,
+        ))
+        .await
+        .expect("approval granted while valid");
+
+    let records = registry.records.lock().await;
+    let reservation_registry = Arc::clone(&registry);
+    let reservation_action = action.clone();
+    let reservation_waiting = registry.reservation_waiting.notified();
+    let reservation = tokio::spawn(async move {
+        reservation_registry
+            .reserve_approved(&reservation_action, approval_id)
+            .await
+    });
+    reservation_waiting.await;
+    clock.0.store(2_000, Ordering::SeqCst);
+    drop(records);
+
+    assert!(reservation.await.expect("reservation task joins").is_err());
+    let row = sqlx::query(
+        "SELECT
+            (SELECT state FROM approval_requests WHERE id = ?) AS approval_state,
+            (SELECT COUNT(*) FROM execution_attempts WHERE approval_id = ?) AS attempt_count",
+    )
+    .bind(approval_id.to_string())
+    .bind(approval_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("reservation state loads");
+    assert_eq!(row.get::<String, _>("approval_state"), "granted");
+    assert_eq!(row.get::<i64, _>("attempt_count"), 0);
 }
 
 #[cfg(not(unix))]

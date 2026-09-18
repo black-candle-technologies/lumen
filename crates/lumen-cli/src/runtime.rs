@@ -1700,7 +1700,7 @@ impl RuntimeService for LocalRuntimeService {
                 .ok_or(ServiceError::ApprovalConflict(ApprovalConflict::Stale))?;
             let (_, approval_id) = service
                 .approvals
-                .renew(command.workspace_id(), previous, run_id, now())
+                .renew(command.workspace_id(), previous, run_id)
                 .await?;
             let updated = runs
                 .get_mut(&run_id)
@@ -3782,7 +3782,7 @@ impl ExecutorPort for RedactingExecutor {
         cancellation: CancellationToken,
     ) -> ExecutorFuture<'a> {
         Box::pin(async move {
-            let attempt_id = self.approvals.reserve(action, now()).await?;
+            let attempt_id = self.approvals.reserve(action).await?;
             let outcome = match self.inner.execute(action, cancellation).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -4237,15 +4237,25 @@ struct ApprovalRecord {
 struct ApprovalRegistry {
     database: Database,
     ttl: Duration,
+    clock: Arc<dyn Clock>,
     records: Mutex<BTreeMap<ApprovalId, ApprovalRecord>>,
+    #[cfg(test)]
+    reservation_waiting: Arc<Notify>,
 }
 
 impl ApprovalRegistry {
     fn new(database: Database, ttl: Duration) -> Self {
+        Self::with_clock(database, ttl, Arc::new(SystemClock))
+    }
+
+    fn with_clock(database: Database, ttl: Duration, clock: Arc<dyn Clock>) -> Self {
         Self {
             database,
             ttl,
+            clock,
             records: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            reservation_waiting: Arc::new(Notify::new()),
         }
     }
 
@@ -4263,7 +4273,7 @@ impl ApprovalRegistry {
         if record.renewed {
             return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
         }
-        let now = now();
+        let now = self.clock.now();
         let mut request = record.request.clone();
         let decision = match command.decision() {
             ApprovalDecision::Grant => request.grant(command.actor().clone(), now),
@@ -4327,9 +4337,9 @@ impl ApprovalRegistry {
         workspace_id: lumen_core::identity::WorkspaceId,
         approval_id: ApprovalId,
         expected_run_id: RunId,
-        now: TimestampMillis,
     ) -> Result<(RunId, ApprovalId), ServiceError> {
         let mut records = self.records.lock().await;
+        let now = self.clock.now();
         let (run_id, action, policy_version) = {
             let record = records
                 .get_mut(&approval_id)
@@ -4409,53 +4419,76 @@ impl ApprovalRegistry {
     async fn reserve(
         &self,
         action: &AuthorizedAction,
-        now: TimestampMillis,
     ) -> Result<ExecutionAttemptId, lumen_core::executor::ExecutorError> {
-        let attempt_id = ExecutionAttemptId::new();
         match action.authorization() {
             DispatchAuthorization::PolicyAllowed => {
+                let attempt_id = ExecutionAttemptId::new();
                 self.database
-                    .reserve_allowed_execution(attempt_id, action.action().id(), now)
+                    .reserve_allowed_execution(attempt_id, action.action().id(), self.clock.now())
                     .await
                     .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+                Ok(attempt_id)
             }
             DispatchAuthorization::Approved { approval_id } => {
-                let mut records = self.records.lock().await;
-                let record = records.get_mut(&approval_id).ok_or_else(|| {
-                    lumen_core::executor::ExecutorError::new("approved action is not registered")
-                })?;
-                if record.action.fingerprint() != action.action().fingerprint()
-                    || record.attempt_id.is_some()
-                {
-                    return Err(lumen_core::executor::ExecutorError::new(
-                        "approved action cannot be reserved",
-                    ));
-                }
-                let mut consumed_request = record.request.clone();
-                let policy_version = consumed_request.policy_version().clone();
-                authorize_dispatch(
-                    &PolicyDecision::RequireApproval,
-                    action.action(),
-                    &policy_version,
-                    Some(&mut consumed_request),
-                    now,
-                )
-                .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
-                self.database
-                    .reserve_execution(DispatchReservation::new(
-                        attempt_id,
-                        action.action().id(),
-                        approval_id,
-                        action.action().fingerprint(),
-                        record.request.policy_version().clone(),
-                        now,
-                    ))
-                    .await
-                    .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
-                record.request = consumed_request;
-                record.attempt_id = Some(attempt_id);
+                self.reserve_approved(action.action(), approval_id).await
             }
         }
+    }
+
+    async fn reserve_approved(
+        &self,
+        action: &ActionEnvelope,
+        approval_id: ApprovalId,
+    ) -> Result<ExecutionAttemptId, lumen_core::executor::ExecutorError> {
+        let attempt_id = ExecutionAttemptId::new();
+        #[cfg(test)]
+        self.reservation_waiting.notify_waiters();
+        let mut records = self.records.lock().await;
+        let record = records.get_mut(&approval_id).ok_or_else(|| {
+            lumen_core::executor::ExecutorError::new("approved action is not registered")
+        })?;
+        if record.action.fingerprint() != action.fingerprint() || record.attempt_id.is_some() {
+            return Err(lumen_core::executor::ExecutorError::new(
+                "approved action cannot be reserved",
+            ));
+        }
+        let mut validated_request = record.request.clone();
+        let policy_version = validated_request.policy_version().clone();
+        authorize_dispatch(
+            &PolicyDecision::RequireApproval,
+            action,
+            &policy_version,
+            Some(&mut validated_request),
+            self.clock.now(),
+        )
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+        let clock = Arc::clone(&self.clock);
+        let reserved_at = self
+            .database
+            .reserve_execution_with_clock(
+                DispatchReservation::new(
+                    attempt_id,
+                    action.id(),
+                    approval_id,
+                    action.fingerprint(),
+                    record.request.policy_version().clone(),
+                    self.clock.now(),
+                ),
+                move || clock.now(),
+            )
+            .await
+            .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+        let mut consumed_request = record.request.clone();
+        authorize_dispatch(
+            &PolicyDecision::RequireApproval,
+            action,
+            &policy_version,
+            Some(&mut consumed_request),
+            reserved_at,
+        )
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+        record.request = consumed_request;
+        record.attempt_id = Some(attempt_id);
         Ok(attempt_id)
     }
 }

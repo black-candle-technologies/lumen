@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
@@ -883,4 +888,83 @@ async fn reservation_uses_the_clock_sampled_inside_its_transaction() {
             .expect("attempt count");
     assert_eq!(approval_state, "granted");
     assert_eq!(attempts, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reservation_samples_expiry_clock_after_waiting_for_a_sqlite_writer() {
+    let directory = tempdir().expect("temporary directory created");
+    let path = directory.path().join("reservation-clock-race.sqlite3");
+    let database = Database::connect(&path).await.expect("database opens");
+    let writer_database = Database::connect(&path)
+        .await
+        .expect("second database connection opens");
+    let action = action();
+    let approval = granted_approval(&action);
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    database
+        .insert_approval(&approval)
+        .await
+        .expect("approval stored");
+
+    let mut writer = writer_database
+        .pool()
+        .acquire()
+        .await
+        .expect("writer connection acquired");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .expect("writer lock acquired");
+
+    let clock = Arc::new(AtomicU64::new(1_500));
+    let reservation_database = database.clone();
+    let reservation_clock = Arc::clone(&clock);
+    let reservation = DispatchReservation::new(
+        ExecutionAttemptId::new(),
+        action_id(),
+        approval_id(),
+        action.fingerprint(),
+        policy_version(),
+        TimestampMillis::new(1_500),
+    );
+    let reservation_task = tokio::spawn(async move {
+        reservation_database
+            .reserve_execution_with_clock(reservation, move || {
+                TimestampMillis::new(reservation_clock.load(Ordering::SeqCst))
+            })
+            .await
+    });
+
+    // The reservation cannot acquire its transaction while this writer is held.
+    // Advancing before release therefore distinguishes a fresh post-lock sample
+    // from a timestamp captured at request arrival.
+    clock.store(2_000, Ordering::SeqCst);
+    sqlx::query("COMMIT")
+        .execute(&mut *writer)
+        .await
+        .expect("writer lock released");
+
+    assert!(matches!(
+        reservation_task.await.expect("reservation task joins"),
+        Err(RepositoryError::ApprovalNotAvailable)
+    ));
+    let row = sqlx::query(
+        "SELECT
+            (SELECT state FROM approval_requests WHERE id = ?) AS approval_state,
+            (SELECT COUNT(*) FROM execution_attempts WHERE approval_id = ?) AS attempt_count",
+    )
+    .bind(approval_id().to_string())
+    .bind(approval_id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("reservation state loads");
+    assert_eq!(row.get::<String, _>("approval_state"), "granted");
+    assert_eq!(row.get::<i64, _>("attempt_count"), 0);
 }
