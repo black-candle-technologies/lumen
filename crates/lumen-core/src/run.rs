@@ -783,11 +783,19 @@ impl<'a> RunOrchestrator<'a> {
                     outcome = &mut execution => outcome?,
                     () = tokio::time::sleep(remaining) => {
                         cancellation.cancel();
-                        let _ = execution.await;
-                        return Ok(Some(
-                            self.exhaust_budget(state, BudgetKind::WallClock)
-                                .await?,
-                        ));
+                        match tokio::time::timeout(Duration::from_millis(250), &mut execution).await {
+                            Ok(Ok(ExecutionOutcome::Succeeded(_)
+                                | ExecutionOutcome::Proposed(_))) => {
+                                self.audit(state, AuditEventKind::ExecutionSucceeded,
+                                    AuditOutcome::Success).await?;
+                                return Ok(Some(self.exhaust_budget(state, BudgetKind::WallClock)
+                                    .await?));
+                            }
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(_)) | Err(_) => ExecutionOutcome::Unknown(
+                                "executor did not provide a definitive result after cancellation".into(),
+                            ),
+                        }
                     }
                 }
             }

@@ -6802,6 +6802,32 @@ async fn admission_that_crosses_shutdown_is_terminalized_without_a_stranded_run(
     harness.service.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_deadline_includes_noncooperative_task_join() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_task = Arc::clone(&entered);
+    harness
+        .service
+        .tasks
+        .lock()
+        .await
+        .push(tokio::task::spawn_blocking(move || {
+            entered_task.notify_one();
+            std::thread::sleep(Duration::from_secs(2));
+        }));
+    entered.notified().await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .service
+            .shutdown_with_timeout(Duration::from_millis(20)),
+    )
+    .await
+    .expect("shutdown has a total deadline");
+}
+
 #[tokio::test]
 async fn server_shutdown_closes_active_sse_and_releases_listener() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

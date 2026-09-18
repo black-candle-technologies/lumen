@@ -1042,10 +1042,9 @@ impl LocalRuntimeService {
         .await
         .is_err()
         {
-            for task in tasks {
+            for task in &tasks {
                 if !task.is_finished() {
                     task.abort();
-                    let _ = task.await;
                 }
             }
         }
@@ -1082,12 +1081,10 @@ impl LocalRuntimeService {
         .await
         .is_ok();
         if !completed {
-            for task in tasks {
-                if task.is_finished() {
-                    continue;
+            for task in &tasks {
+                if !task.is_finished() {
+                    task.abort();
                 }
-                task.abort();
-                let _ = task.await;
             }
         }
         let remaining = self.run_workspaces.lock().await.clone();
