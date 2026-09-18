@@ -1981,6 +1981,18 @@ async fn scheduled_provider_failure_terminalizes_both_records() {
     .expect("terminal states");
     assert_eq!(states, ("failed".into(), "failed".into()));
     harness.wait_for_audit(AuditEventKind::RunFailed).await;
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle readback")
+        .expect("owned lifecycle");
+    assert!(
+        lifecycle
+            .primary_diagnostic()
+            .is_some_and(|diagnostic| diagnostic.contains("model")),
+        "provider cause must survive after transient runtime state is gone"
+    );
     harness.service.shutdown().await;
 }
 
@@ -2095,6 +2107,16 @@ async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
         .expect("lifecycle");
     assert_eq!(lifecycle.phase(), "terminal");
     assert!(lifecycle.terminal_audit_pending());
+    assert!(
+        lifecycle
+            .primary_diagnostic()
+            .is_some_and(|value| value.contains("model"))
+    );
+    assert!(
+        lifecycle
+            .secondary_diagnostic()
+            .is_some_and(|value| value.contains("injected audit failure"))
+    );
     let records = harness
         .database
         .list_audit_records_for_run(harness.workspace_id, run_id)

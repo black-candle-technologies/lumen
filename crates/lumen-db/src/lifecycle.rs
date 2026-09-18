@@ -374,6 +374,29 @@ impl Database {
         .transpose()
     }
 
+    pub async fn record_terminal_audit_failure(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        redacted_diagnostic: String,
+    ) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE run_lifecycle SET secondary_diagnostic = ?
+             WHERE workspace_id = ? AND run_id = ?
+               AND phase IN ('terminal', 'reconciliation_required')
+               AND terminal_audit_pending = 1",
+        )
+        .bind(truncate_utf8(redacted_diagnostic, 1024))
+        .bind(workspace_id.to_string())
+        .bind(run_id.to_string())
+        .execute(self.pool())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        Ok(())
+    }
+
     pub async fn terminalize_owned_run(
         &self,
         run_id: RunId,

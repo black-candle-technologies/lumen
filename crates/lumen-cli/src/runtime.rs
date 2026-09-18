@@ -1736,6 +1736,7 @@ impl LocalRuntimeService {
                         "run.cancelled",
                         CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
                         None,
+                        None,
                         now(),
                     )
                     .await;
@@ -1773,6 +1774,7 @@ impl LocalRuntimeService {
                             "run.cancelled",
                             CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
                             None,
+                            None,
                             now(),
                         )
                         .await;
@@ -1782,6 +1784,16 @@ impl LocalRuntimeService {
             Ok(outcome) => {
                 let (state, kind, mut payload) = terminal_event(&outcome);
                 self.redactor.redact_value(&mut payload);
+                let diagnostic = match &outcome {
+                    RunOutcome::ExecutionFailed { message }
+                    | RunOutcome::ExecutionUnknown { message } => {
+                        Some(self.bounded_diagnostic(message))
+                    }
+                    RunOutcome::RequiredSkillUnavailable { reason, .. } => {
+                        Some(self.bounded_diagnostic(reason))
+                    }
+                    _ => None,
+                };
                 self.terminalize_stored_run(
                     run_id,
                     &stored,
@@ -1790,6 +1802,7 @@ impl LocalRuntimeService {
                     kind,
                     payload,
                     None,
+                    diagnostic,
                     now(),
                 )
                 .await;
@@ -1828,6 +1841,7 @@ impl LocalRuntimeService {
                     },
                     CanonicalValue::from(self.bounded_diagnostic(&error)),
                     audit_failure,
+                    Some(self.bounded_diagnostic(&error)),
                     timestamp,
                 )
                 .await;
@@ -1845,6 +1859,7 @@ impl LocalRuntimeService {
         event_kind: &str,
         payload: CanonicalValue,
         prerequisite_failure: Option<(&'static str, String)>,
+        primary_diagnostic: Option<String>,
         timestamp: TimestampMillis,
     ) {
         let terminal_state = match state {
@@ -1862,13 +1877,16 @@ impl LocalRuntimeService {
                 "run.completed" => "run_completed",
                 "run.cancelled" => "run_cancelled",
                 "run.timed_out" => "run_timed_out",
+                "run.failed" if scheduled_state == "unknown" => "execution_unknown",
                 _ => "run_failed",
             },
             |(stage, _)| stage,
         );
-        let diagnostic = prerequisite_failure
-            .as_ref()
-            .map(|(_, error)| self.bounded_diagnostic(error));
+        let diagnostic = primary_diagnostic.or_else(|| {
+            prerequisite_failure
+                .as_ref()
+                .map(|(_, error)| self.bounded_diagnostic(error))
+        });
         let terminal = TerminalSpec::new(terminal_state, certainty, code, diagnostic)
             .expect("bounded terminal specification");
         match self
@@ -1889,9 +1907,24 @@ impl LocalRuntimeService {
                     .flush_terminal_audit(stored.workspace_id, run_id)
                     .await
                 {
+                    let diagnostic = self.bounded_diagnostic(&error);
+                    if let Err(persist_error) = self
+                        .database
+                        .record_terminal_audit_failure(
+                            stored.workspace_id,
+                            run_id,
+                            diagnostic.clone(),
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "event=run_terminal_audit_failure_record_failed run_id={run_id} diagnostic={:?}",
+                            self.bounded_diagnostic(&persist_error)
+                        );
+                    }
                     eprintln!(
                         "event=run_terminal_audit_pending run_id={run_id} diagnostic={:?}",
-                        self.bounded_diagnostic(&error)
+                        diagnostic
                     );
                 } else if let Err(error) =
                     self.events
