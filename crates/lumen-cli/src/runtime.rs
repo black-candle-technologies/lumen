@@ -65,7 +65,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::extension_runtime::{
@@ -112,6 +112,10 @@ pub(crate) struct LocalRuntimeService {
     required_skills: BTreeSet<(SkillId, SkillVersion)>,
     scheduled_execution_lease_millis: u64,
     runs: Arc<Mutex<BTreeMap<RunId, StoredRun>>>,
+    // ponytail: one shared wakeup; use per-run signals only if contention becomes measurable.
+    run_available: Arc<Notify>,
+    #[cfg(test)]
+    missing_run_observed: Arc<Notify>,
     cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -298,6 +302,9 @@ impl LocalRuntimeService {
                 .saturating_mul(1_000)
                 .saturating_add(30_000),
             runs: Arc::new(Mutex::new(BTreeMap::new())),
+            run_available: Arc::new(Notify::new()),
+            #[cfg(test)]
+            missing_run_observed: Arc::new(Notify::new()),
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -1067,8 +1074,19 @@ impl LocalRuntimeService {
     }
 
     async fn advance(self, run_id: RunId) {
-        let Some(mut stored) = self.runs.lock().await.remove(&run_id) else {
-            return;
+        let mut stored = loop {
+            let available = self.run_available.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            if let Some(stored) = self.runs.lock().await.remove(&run_id) {
+                break stored;
+            }
+            #[cfg(test)]
+            self.missing_run_observed.notify_one();
+            if !self.cancellations.lock().await.contains_key(&run_id) {
+                return;
+            }
+            available.await;
         };
         if let Some((occurrence, lease_id)) = &stored.scheduled_handoff {
             let current = match self
@@ -1199,6 +1217,7 @@ impl LocalRuntimeService {
                     .await;
                 }
                 self.runs.lock().await.insert(run_id, stored);
+                self.run_available.notify_waiters();
             }
             Ok(outcome) => {
                 let (state, kind, mut payload) = terminal_event(&outcome);
@@ -1390,6 +1409,7 @@ impl LocalRuntimeService {
     async fn finish_run(&self, run_id: RunId) {
         self.cancellations.lock().await.remove(&run_id);
         self.run_workspaces.lock().await.remove(&run_id);
+        self.run_available.notify_waiters();
     }
 
     pub(crate) async fn request_extension_action(

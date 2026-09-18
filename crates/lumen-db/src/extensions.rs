@@ -1021,16 +1021,16 @@ impl Database {
         .bind(occurred_at)
         .execute(&mut *transaction)
         .await?;
+        // Previously recorded faults remain causal even if the wall clock moves backward.
         let failures: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM plugin_failures
              WHERE workspace_id = ? AND plugin_id = ? AND plugin_version = ?
-               AND counted = 1 AND occurred_at >= ? AND occurred_at <= ?",
+               AND counted = 1 AND occurred_at >= ?",
         )
         .bind(workspace_id.to_string())
         .bind(plugin_id.as_str())
         .bind(version.as_str())
         .bind(window_start)
-        .bind(occurred_at)
         .fetch_one(&mut *transaction)
         .await?;
         if failures >= 3 {

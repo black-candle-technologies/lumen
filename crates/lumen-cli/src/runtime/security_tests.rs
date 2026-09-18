@@ -2562,6 +2562,56 @@ async fn schedule_job_creation_requires_approval_before_mutation() {
 }
 
 #[tokio::test]
+async fn approval_granted_before_run_is_parked_still_resumes_dispatch() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("admin done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(&harness, true, []).await;
+    let run_id = request_scheduled_job_admin_action(
+        &harness,
+        "schedule.job.create",
+        CapabilityName::ScheduleCreate,
+        scheduled_job_action_arguments("race proof", DataClass::Public, 2, 1, true, true),
+    )
+    .await;
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let stored = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(stored) = harness.service.runs.lock().await.remove(&run_id) {
+                return stored;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run parked before injected race");
+    approve_pending(&harness).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        harness.service.missing_run_observed.notified(),
+    )
+    .await
+    .expect("approval advance observed the missing parked run");
+    harness.service.runs.lock().await.insert(run_id, stored);
+    harness.service.run_available.notify_waiters();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_run_state(&harness, &run_id.to_string(), "completed"),
+    )
+    .await
+    .expect("granted run resumed after parking");
+    assert!(
+        harness
+            .database
+            .latest_scheduled_job_revision(scheduled_job_id())
+            .await
+            .expect("created job")
+            .is_some()
+    );
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn job_reviews_report_the_latest_occurrence_state() {
     let model = MockServer::start().await;
     let harness = Harness::new(&model, |_| {}).await;
@@ -3392,6 +3442,7 @@ async fn reviewed_skill_content_cannot_expand_runtime_capabilities() {
 
     let run_id = harness.create_run("follow the loaded procedure").await;
     wait_for_action_state(&harness, &run_id, "denied").await;
+    wait_for_run_state(&harness, &run_id, "failed").await;
     let run_state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
         .bind(&run_id)
         .fetch_one(harness.database.pool())
@@ -3992,7 +4043,7 @@ async fn rejected_or_expired_capture_publication_never_creates_a_skill() {
     );
     request_skill_publish(&harness, draft_id, expired_skill).await;
     let expired_approval = harness.pending_approval_id().await;
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    wait_for_approval_expiry(&harness, &expired_approval).await;
     let response = harness
         .request(
             "POST",
@@ -4325,6 +4376,13 @@ async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage
 
 async fn approve_pending(harness: &Harness) {
     let approval_id = harness.pending_approval_id().await;
+    let created_at: i64 =
+        sqlx::query_scalar("SELECT created_at FROM approval_requests WHERE id = ?")
+            .bind(&approval_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("approval creation time");
+    wait_for_wall_time(created_at).await;
     let response = harness
         .request(
             "POST",
@@ -4332,7 +4390,33 @@ async fn approve_pending(harness: &Harness) {
             r#"{"decision":"grant"}"#,
         )
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        panic!(
+            "approval {approval_id} grant returned {status}: {}",
+            response_json(response).await
+        );
+    }
+}
+
+async fn wait_for_approval_expiry(harness: &Harness, approval_id: &str) {
+    let expires_at: i64 =
+        sqlx::query_scalar("SELECT expires_at FROM approval_requests WHERE id = ?")
+            .bind(approval_id)
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("approval expiry");
+    wait_for_wall_time(expires_at).await;
+}
+
+async fn wait_for_wall_time(timestamp: i64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while i64::try_from(now().as_u64()).expect("clock within SQLite range") < timestamp {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("wall clock reached approval timestamp");
 }
 
 async fn wait_for_action_state(harness: &Harness, run_id: &str, expected: &str) {
@@ -5263,9 +5347,26 @@ subject = "operator"
         ))
         .await
         .expect("grant");
-    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+    if tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
-        .expect("executor entered");
+        .is_err()
+    {
+        let action: Option<String> =
+            sqlx::query_scalar("SELECT state FROM actions WHERE run_id = ?")
+                .bind(run_id.to_string())
+                .fetch_optional(database.pool())
+                .await
+                .expect("action state");
+        let approvals: Vec<String> = sqlx::query_scalar("SELECT state FROM approval_requests")
+            .fetch_all(database.pool())
+            .await
+            .expect("approval states");
+        let parked = service.runs.lock().await.contains_key(&run_id);
+        let active = service.cancellations.lock().await.contains_key(&run_id);
+        panic!(
+            "executor did not enter: action={action:?}, approvals={approvals:?}, parked={parked}, active={active}"
+        );
+    }
     let tasks = std::mem::take(&mut *service.tasks.lock().await);
     for task in tasks {
         task.abort();
@@ -6434,7 +6535,7 @@ async fn expired_approval_is_hidden_and_can_be_renewed_without_losing_history() 
             .await
             .expect("approval fingerprint");
 
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    wait_for_approval_expiry(&harness, &previous).await;
     let listed = harness.request("GET", "approvals", "").await;
     let listed: serde_json::Value = serde_json::from_slice(
         &listed

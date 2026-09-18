@@ -820,7 +820,7 @@ async fn rolling_failures_quarantine_one_workspace_and_survive_reopen() {
         )
         .await
         .expect("enable");
-    for timestamp in [2_000, 3_000, 4_000] {
+    for timestamp in [2_000, 3_000, 2_500] {
         database
             .record_plugin_failure(
                 workspace_id(),
