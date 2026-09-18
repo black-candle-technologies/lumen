@@ -38,7 +38,7 @@ impl EventBroker {
     }
 
     pub fn close(&self) {
-        let _ = self.inner.shutdown.send(true);
+        self.inner.shutdown.send_replace(true);
     }
 
     pub fn publish(
@@ -200,7 +200,25 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn close_ends_existing_and_future_subscriptions() {
+    async fn close_before_any_subscriber_ends_a_later_subscription() {
+        let broker = EventBroker::new(4);
+        let workspace_id = WorkspaceId::new();
+        let run_id = RunId::new();
+
+        broker.close();
+
+        let subscription = broker.subscribe(workspace_id, run_id, 0);
+        tokio::pin!(subscription);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), subscription.next())
+                .await
+                .expect("subscription closed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn close_ends_an_existing_subscription() {
         let broker = EventBroker::new(4);
         let workspace_id = WorkspaceId::new();
         let run_id = RunId::new();
@@ -215,12 +233,41 @@ mod tests {
                 .expect("existing subscription closed")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_close_is_idempotent_for_future_subscriptions() {
+        let broker = EventBroker::new(4);
+        let workspace_id = WorkspaceId::new();
+        let run_id = RunId::new();
+
+        broker.close();
+        broker.close();
+
         let future = broker.subscribe(workspace_id, run_id, 0);
         tokio::pin!(future);
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(1), future.next())
                 .await
                 .expect("future subscription closed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_racing_close_observes_closed_state() {
+        let broker = EventBroker::new(4);
+        let workspace_id = WorkspaceId::new();
+        let run_id = RunId::new();
+        let subscription = broker.subscribe(workspace_id, run_id, 0);
+        tokio::pin!(subscription);
+
+        broker.close();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), subscription.next())
+                .await
+                .expect("racing subscription closed")
                 .is_none()
         );
     }
