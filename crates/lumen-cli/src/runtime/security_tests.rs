@@ -6819,6 +6819,21 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("reconciliation JSON");
     assert_eq!(body["runs"][0]["run_id"], run_id.to_string());
     assert_eq!(body["runs"][0]["effect_certainty"], "unknown");
+    let status = harness
+        .request("GET", &format!("runs/{run_id}/status"), "")
+        .await;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status_bytes = status
+        .into_body()
+        .collect()
+        .await
+        .expect("status body")
+        .to_bytes();
+    let status: serde_json::Value = serde_json::from_slice(&status_bytes).expect("status JSON");
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["terminal_code"], "shutdown_forced");
+    assert_eq!(status["effect_certainty"], "unknown");
+    assert_eq!(status["reconciliation_required"], true);
 }
 
 #[tokio::test]

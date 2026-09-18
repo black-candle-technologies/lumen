@@ -58,9 +58,9 @@ use lumen_server::{
     PluginComponentReview, PluginDetailsQuery, PluginFailureReview, PluginReviewQuery,
     PluginSettingReview, PluginVersionDetails, PrincipalSummary, ProviderPolicyCommand,
     ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated, RunReconciliation,
-    RuntimeService, ServiceError, ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery,
-    ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
-    WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
+    RunStatus, RuntimeService, ServiceError, ServiceFuture, ServiceIdentityCommand,
+    ServiceIdentityQuery, ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery,
+    StagedPluginReview, WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2385,6 +2385,31 @@ impl RuntimeService for LocalRuntimeService {
                 .await
                 .map_err(sql_service_error)?
                 .ok_or(ServiceError::NotFound)
+        })
+    }
+
+    fn run_status_detail(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        run_id: RunId,
+    ) -> ServiceFuture<'_, RunStatus> {
+        let service = self.clone();
+        Box::pin(async move {
+            let state = service.run_status(workspace_id, run_id).await?;
+            let lifecycle = service
+                .database
+                .get_run_lifecycle(workspace_id, run_id)
+                .await
+                .map_err(repository_service_error)?;
+            Ok(match lifecycle {
+                Some(lifecycle) => RunStatus::new(
+                    state,
+                    lifecycle.terminal_code().map(str::to_owned),
+                    Some(lifecycle.effect_certainty().as_str().to_owned()),
+                    lifecycle.phase() == "reconciliation_required",
+                ),
+                None => RunStatus::new(state, None, None, false),
+            })
         })
     }
 

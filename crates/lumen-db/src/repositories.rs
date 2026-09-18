@@ -1080,6 +1080,15 @@ impl Database {
             return Err(RepositoryError::ApprovalNotAvailable);
         }
 
+        transition_action_lifecycle(
+            &mut transaction,
+            reservation.action_id,
+            "running",
+            "reserving_effect",
+            reserved_at,
+        )
+        .await?;
+
         sqlx::query(
             "INSERT INTO execution_attempts (
                 id, action_id, approval_id, state, reserved_at
@@ -1125,6 +1134,14 @@ impl Database {
         if result.rows_affected() != 1 {
             return Err(RepositoryError::ExecutionStateConflict);
         }
+        transition_action_lifecycle(
+            &mut transaction,
+            action_id,
+            "running",
+            "reserving_effect",
+            reserved_at,
+        )
+        .await?;
         sqlx::query("UPDATE actions SET state = 'running' WHERE id = ?")
             .bind(action_id.to_string())
             .execute(&mut *transaction)
@@ -1161,6 +1178,14 @@ impl Database {
         if result.rows_affected() != 1 {
             return Err(RepositoryError::ExecutionStateConflict);
         }
+        transition_action_lifecycle(
+            &mut transaction,
+            action_id,
+            "reserving_effect",
+            "running",
+            completed_at,
+        )
+        .await?;
         sqlx::query("UPDATE actions SET state = ? WHERE id = ?")
             .bind(state)
             .bind(action_id.to_string())
@@ -1186,6 +1211,46 @@ impl Database {
         }
         Ok(())
     }
+}
+
+async fn transition_action_lifecycle(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    action_id: ActionId,
+    expected: &str,
+    next: &str,
+    timestamp: i64,
+) -> Result<(), RepositoryError> {
+    let current: Option<String> = sqlx::query_scalar(
+        "SELECT lifecycle.phase FROM run_lifecycle lifecycle
+         JOIN actions action ON action.run_id = lifecycle.run_id
+         WHERE action.id = ?",
+    )
+    .bind(action_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(current) = current else {
+        // Older standalone action records have no owned run marker.
+        return Ok(());
+    };
+    if current != expected {
+        return Err(RepositoryError::ExecutionStateConflict);
+    }
+    let changed = sqlx::query(
+        "UPDATE run_lifecycle SET phase = ?, updated_at = ?
+         WHERE run_id = (SELECT run_id FROM actions WHERE id = ?)
+           AND phase = ?",
+    )
+    .bind(next)
+    .bind(timestamp)
+    .bind(action_id.to_string())
+    .bind(expected)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        return Err(RepositoryError::ExecutionStateConflict);
+    }
+    Ok(())
 }
 
 fn secret_reference_from_row(

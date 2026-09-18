@@ -71,6 +71,16 @@ pub trait RuntimeService: Send + Sync {
     fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>>;
     fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation>;
     fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String>;
+    fn run_status_detail(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> ServiceFuture<'_, RunStatus> {
+        Box::pin(async move {
+            let state = self.run_status(workspace_id, run_id).await?;
+            Ok(RunStatus::new(state, None, None, false))
+        })
+    }
     fn list_reconciliation_runs(
         &self,
         workspace_id: WorkspaceId,
@@ -1490,6 +1500,30 @@ impl CreateRunCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct RunCreated {
     run_id: RunId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RunStatus {
+    state: String,
+    terminal_code: Option<String>,
+    effect_certainty: Option<String>,
+    reconciliation_required: bool,
+}
+
+impl RunStatus {
+    pub fn new(
+        state: String,
+        terminal_code: Option<String>,
+        effect_certainty: Option<String>,
+        reconciliation_required: bool,
+    ) -> Self {
+        Self {
+            state,
+            terminal_code,
+            effect_certainty,
+            reconciliation_required,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

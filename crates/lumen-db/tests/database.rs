@@ -1039,6 +1039,15 @@ async fn owned_terminal_quarantines_an_in_flight_attempt_without_retry() {
         .reserve_execution_with_clock(reservation, || TimestampMillis::new(1_400))
         .await
         .expect("reserved");
+    assert_eq!(
+        database
+            .get_run_lifecycle(workspace_id(), run_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle")
+            .phase(),
+        "reserving_effect"
+    );
     let terminal = TerminalSpec::new(
         TerminalState::Failed,
         EffectCertainty::NoEffect,

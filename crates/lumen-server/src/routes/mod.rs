@@ -756,7 +756,8 @@ async fn run_events(
 #[derive(Serialize)]
 struct RunStatusResponse {
     run_id: RunId,
-    state: String,
+    #[serde(flatten)]
+    status: crate::RunStatus,
 }
 
 async fn run_status(
@@ -766,11 +767,11 @@ async fn run_status(
     let workspace_id = parse_workspace(&workspace)?;
     ensure_workspace(&state, workspace_id)?;
     let run_id = parse_run(&run)?;
-    let run_state = state.service.run_status(workspace_id, run_id).await?;
-    Ok(Json(RunStatusResponse {
-        run_id,
-        state: run_state,
-    }))
+    let status = state
+        .service
+        .run_status_detail(workspace_id, run_id)
+        .await?;
+    Ok(Json(RunStatusResponse { run_id, status }))
 }
 
 #[derive(Serialize)]
