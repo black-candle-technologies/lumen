@@ -5,6 +5,7 @@
   "disposition": "NOT ACCEPTED",
   "source_revisions": {
     "live": "bcceae4cabdb9af165f3df8e5744b4416347e1e2",
+    "checked_delay": "cb75f52d4eb738f0586f1229fe241e698ca4aaac",
     "automated": "f45c286733b3ebd6abe21aad20303792d310a36e"
   },
   "environments": {
@@ -19,7 +20,8 @@
   "evidence_roots": {
     "live": "lumen-m5-qa/evidence/3bb8e247-6102-4bbc-ae8b-c059e9a6fa55",
     "outage": "lumen-m5-qa/evidence/09f74d38-2fe2-4af1-adde-c98b15a97c50",
-    "delay": "lumen-m5-qa/evidence/c3c7b87c-5688-4c29-9029-97ff3501373d"
+    "delay": "lumen-m5-qa/evidence/c3c7b87c-5688-4c29-9029-97ff3501373d",
+    "checked_delay": "lumen-m5-qa/evidence/36e5afa4-d1fc-4721-9f80-0b0754d017aa"
   },
   "evidence": {
     "text": {"root": "live", "file": "live-exact-text.json", "sha256": "ab8f878677b73f26ef5e22651bc10426adb9d31daec48105e9a676f69a25c84f"},
@@ -33,6 +35,7 @@
     "cancel": {"root": "live", "file": "live-active-cancel.json", "sha256": "1d5bf6b6b161e7f508eaf484996f1c28a0740cdc630bebef26ac52250c11e271"},
     "outage": {"root": "outage", "file": "live-model-unavailable.json", "sha256": "ce83e6eadc6aca036f1dc9b9b289703c1e49aeadae3ffa1ee359309552a77d3c"},
     "delay": {"root": "delay", "file": "deterministic-delayed-provider.json", "sha256": "475d4ba50114c59fb0ea93683bc69e15cceafa5dbd7174008d7f937d790dfebf"},
+    "checked_delay": {"root": "checked_delay", "file": "checked-in-delayed-provider.json", "sha256": "808581eaae584a0a6fb672ea4b94030cf23c7c54f10430ec0b039353a6ca72c8"},
     "skill": {"root": "live", "file": "live-skill-capture-tamper.json", "sha256": "2380003771a29368764e86b9e4c59b037e798b3e762bba856382ae2d55381cff"},
     "audit": {"root": "live", "file": "live-audit-tamper-recovery.json", "sha256": "c92d79306d81200b4c4530e28924c5aad56f51e19f4bb0046113fd4f46da83d6"},
     "browser_state": {"root": "live", "file": "live-browser-automation-outage.json", "sha256": "9c9c6f775ecf76101ddabdc59c4809b33dadf368b2e31e0f4b06d14a6edf9a9a"},
@@ -61,7 +64,7 @@
     {"id": "unknown_outcome_reconciliation", "status": "NOT RUN", "source_ref": "live", "environment_ref": "live", "expected": "Unknown executor outcome remains explicitly uncertain", "observed": "No live unknown-outcome fault injection was performed; upstream review remains unresolved", "evidence_refs": []},
     {"id": "active_cancellation", "status": "PASS", "source_ref": "live", "environment_ref": "live", "expected": "Cancellation of a running model request becomes terminal without actions", "observed": "Run 7cb81520-cda3-419d-97b3-7f1645b41260 emitted run.cancelled, persisted cancelled, with zero actions", "evidence_refs": ["cancel"]},
     {"id": "provider_unavailable", "status": "PASS", "source_ref": "live", "environment_ref": "outage", "expected": "Closed provider endpoint produces a failed run and no side effect", "observed": "Run 9b42dc05-75ed-485a-8d07-400c1ffb5495 failed with request error, no actions, run_failed audit", "evidence_refs": ["outage"]},
-    {"id": "provider_delayed_response", "status": "PASS", "source_ref": "live", "environment_ref": "delay", "expected": "A bounded delayed SSE response remains visible and completes", "observed": "WSL-local stub delayed 2.5 s; run 8472c634-6e6a-4fad-8c4e-4e681044113d completed in 2.542 s with LUMEN_M5_DELAY_OK", "evidence_refs": ["delay"]},
+    {"id": "provider_delayed_response", "status": "PASS", "source_ref": "live", "additional_source_ref": "checked_delay", "environment_ref": "delay", "expected": "A bounded delayed SSE response remains visible and completes", "observed": "WSL-local stub delayed 2.5 s: parent run 8472c634-6e6a-4fad-8c4e-4e681044113d completed in 2.542 s; checked-in fixture run 86f8a49d-4126-470d-bf59-0f022140ffb1 completed in 2.584 s; both returned LUMEN_M5_DELAY_OK", "evidence_refs": ["delay", "checked_delay"]},
     {"id": "provider_timeout", "status": "NOT RUN", "source_ref": "live", "environment_ref": "delay", "expected": "Provider response beyond deadline fails with a consistent terminal state", "observed": "Only an in-budget 2.5-second delay was injected", "evidence_refs": []},
     {"id": "workflow_capture", "status": "PASS", "source_ref": "live", "environment_ref": "live", "expected": "Completed tool-bearing run yields a reviewable provenance-bound draft", "observed": "Capture of run d55a14b7-b6be-4fa2-8025-8b17914a4aa4 retained action kind, argument digest, audit sequence and review warning", "evidence_refs": ["skill"]},
     {"id": "skill_publish", "status": "PASS", "source_ref": "live", "environment_ref": "live", "expected": "Reviewed publication requires exact approval", "observed": "Approval eda99556-2805-4455-8d70-9ba13b53b53e consumed; skill 7ab9d210-133c-43db-b4b1-589d62afdbf9 version 1.0.0 published", "evidence_refs": ["skill"]},
