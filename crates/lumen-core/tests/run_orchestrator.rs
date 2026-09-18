@@ -326,6 +326,32 @@ async fn unresponsive_execution_is_bounded_and_never_reported_as_known_failure()
     assert!(audit.events().contains(&AuditEventKind::ExecutionUnknown));
 }
 
+#[tokio::test]
+async fn cancellation_precedes_a_required_skill_failure() {
+    let model = FakeModel::new([ModelOutput::FinalText("unused".into())]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let context =
+        run_context().with_skill_loads(vec![lumen_core::run::SkillLoadMetadata::excluded(
+            "required-skill",
+            "1",
+            "expected-digest",
+            "source_unavailable",
+            true,
+        )]);
+    let mut state = RunState::new(context, "cancelled", RunBudget::unlimited(3, 2));
+    state.cancel();
+    let outcome = orchestrator(&model, &executor, &approvals, &audit)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
+        .await
+        .expect("cancellation outcome");
+    assert_eq!(outcome, RunOutcome::Cancelled);
+    assert_eq!(model.call_count(), 0);
+    assert!(audit.events().contains(&AuditEventKind::RunCancelled));
+    assert!(!audit.events().contains(&AuditEventKind::RunFailed));
+}
+
 impl ExecutorPort for ClockedExecutor {
     fn execute<'a>(
         &'a self,

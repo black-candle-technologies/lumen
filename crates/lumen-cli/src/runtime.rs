@@ -79,6 +79,9 @@ use crate::{
     config::{Config, RemoteDataClass},
 };
 
+mod admission;
+use admission::AdmissionGate;
+
 const REVIEWED_SKILL_SOURCE_MAX_BYTES: usize = 65_536;
 
 async fn read_bounded_skill_source(
@@ -105,6 +108,7 @@ pub(crate) struct LocalRuntimeService {
     database: Database,
     owner_instance_id: uuid::Uuid,
     _owner_guard: Option<Arc<std::fs::File>>,
+    admission: AdmissionGate,
     data_root: Arc<Path>,
     events: EventBroker,
     policy: Policy,
@@ -119,9 +123,14 @@ pub(crate) struct LocalRuntimeService {
     run_available: Arc<Notify>,
     #[cfg(test)]
     missing_run_observed: Arc<Notify>,
+    #[cfg(test)]
+    pause_before_park_enabled: Arc<AtomicBool>,
+    #[cfg(test)]
+    pause_before_park_reached: Arc<Notify>,
+    #[cfg(test)]
+    pause_before_park_release: Arc<Notify>,
     cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
-    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     scheduler_cancellation: CancellationToken,
     shutting_down: Arc<AtomicBool>,
     redactor: Arc<SecretRedactor>,
@@ -138,6 +147,200 @@ struct PluginInvocationCommand {
 }
 
 impl LocalRuntimeService {
+    async fn settle_unprepared_owned_run(
+        &self,
+        run_id: RunId,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        code: &'static str,
+        error: &impl std::fmt::Display,
+    ) -> Result<(), ServiceError> {
+        let terminal = TerminalSpec::new(
+            TerminalState::Failed,
+            EffectCertainty::NoEffect,
+            code,
+            Some(self.bounded_diagnostic(error)),
+        )
+        .expect("static preparation terminal specification");
+        self.database
+            .terminalize_owned_run(
+                run_id,
+                workspace_id,
+                self.owner_instance_id,
+                &terminal,
+                AuditEventId::new(),
+                now(),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        self.admission.finish_owned(run_id);
+        self.database
+            .flush_terminal_audit(workspace_id, run_id)
+            .await
+            .map_err(repository_service_error)
+    }
+
+    async fn decide_approval_admitted(
+        &self,
+        command: ApprovalDecisionCommand,
+    ) -> Result<ApprovalResult, ServiceError> {
+        self.ensure_accepting_work()?;
+        let (run_id, result) = self.approvals.decide(&command).await?;
+        self.events
+            .publish(
+                command.workspace_id(),
+                run_id,
+                match command.decision() {
+                    ApprovalDecision::Grant => "approval.granted",
+                    ApprovalDecision::Reject => "approval.rejected",
+                },
+                CanonicalValue::object([(
+                    "approval_id",
+                    CanonicalValue::from(command.approval_id().to_string()),
+                )]),
+            )
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        self.spawn_advance(run_id).await;
+        Ok(result)
+    }
+
+    async fn renew_approval_admitted(
+        &self,
+        command: ApprovalRenewalCommand,
+    ) -> Result<ApprovalRenewal, ServiceError> {
+        self.ensure_accepting_work()?;
+        let previous = command.approval_id();
+        let mut runs = self.runs.lock().await;
+        let run_id = runs
+            .iter()
+            .find_map(|(run_id, stored)| {
+                stored
+                    .state
+                    .is_awaiting_approval(previous)
+                    .then_some(*run_id)
+            })
+            .ok_or(ServiceError::ApprovalConflict(ApprovalConflict::Stale))?;
+        let (_, approval_id) = self
+            .approvals
+            .renew(command.workspace_id(), previous, run_id)
+            .await?;
+        let updated = runs
+            .get_mut(&run_id)
+            .is_some_and(|stored| stored.state.renew_pending_approval(previous, approval_id));
+        if !updated {
+            return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+        }
+        drop(runs);
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                now(),
+                AuditEventKind::ApprovalCreated,
+                AuditOutcome::Pending,
+                Some(command.workspace_id()),
+                CanonicalValue::object([
+                    ("run_id", CanonicalValue::from(run_id.to_string())),
+                    (
+                        "previous_approval_id",
+                        CanonicalValue::from(previous.to_string()),
+                    ),
+                    ("approval_id", CanonicalValue::from(approval_id.to_string())),
+                    (
+                        "renewed_by",
+                        CanonicalValue::from(command.actor().subject()),
+                    ),
+                ]),
+            ))
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        self.events
+            .publish(
+                command.workspace_id(),
+                run_id,
+                "approval.renewed",
+                CanonicalValue::object([
+                    (
+                        "previous_approval_id",
+                        CanonicalValue::from(previous.to_string()),
+                    ),
+                    ("approval_id", CanonicalValue::from(approval_id.to_string())),
+                ]),
+            )
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        Ok(ApprovalRenewal::new(previous, approval_id, run_id))
+    }
+
+    async fn create_run_admitted(
+        &self,
+        command: CreateRunCommand,
+    ) -> Result<RunCreated, ServiceError> {
+        self.ensure_accepting_work()?;
+        let run_id = RunId::new();
+        self.database
+            .create_owned_run(
+                run_id,
+                command.workspace_id(),
+                command.actor(),
+                self.owner_instance_id,
+                now(),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        if self.admission.register_owned(run_id).is_err() {
+            self.settle_unprepared_owned_run(
+                run_id,
+                command.workspace_id(),
+                "admission_shutdown",
+                &"runtime sealed during admission",
+            )
+            .await?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
+        let reviewed_skills = match self
+            .prompt_with_reviewed_skills(command.workspace_id(), command.prompt())
+            .await
+        {
+            Ok(reviewed) => reviewed,
+            Err(error) => {
+                self.settle_unprepared_owned_run(
+                    run_id,
+                    command.workspace_id(),
+                    "run_preparation_failed",
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let state = RunState::new(
+            RunContext::new(run_id, command.workspace_id(), command.actor().clone())
+                .with_loaded_skills(reviewed_skills.loaded_skills)
+                .with_skill_loads(reviewed_skills.skill_loads),
+            reviewed_skills.prompt,
+            self.budget,
+        )
+        .with_data_class(command.data_class());
+        let stored = StoredRun {
+            workspace_id: command.workspace_id(),
+            state,
+            model_override: None,
+            capabilities_override: None,
+            scheduled_handoff: None,
+            start_disposition: StartDisposition::Created,
+        };
+        if let Err(error) = self.publish_run_created(run_id, command.workspace_id()) {
+            self.settle_unprepared_owned_run(
+                run_id,
+                command.workspace_id(),
+                "run_preparation_failed",
+                &error,
+            )
+            .await?;
+            return Err(error);
+        }
+        self.install_and_spawn_run(run_id, stored).await?;
+        Ok(RunCreated::new(run_id))
+    }
+
     pub(crate) async fn build_with_secret_store(
         config: &Config,
         database: Database,
@@ -330,6 +533,7 @@ impl LocalRuntimeService {
             database,
             owner_instance_id: uuid::Uuid::new_v4(),
             _owner_guard: owner_guard,
+            admission: AdmissionGate::default(),
             data_root: Arc::from(data_root),
             events,
             policy: Policy::default(),
@@ -352,9 +556,14 @@ impl LocalRuntimeService {
             run_available: Arc::new(Notify::new()),
             #[cfg(test)]
             missing_run_observed: Arc::new(Notify::new()),
+            #[cfg(test)]
+            pause_before_park_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            pause_before_park_reached: Arc::new(Notify::new()),
+            #[cfg(test)]
+            pause_before_park_release: Arc::new(Notify::new()),
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
-            tasks: Arc::new(Mutex::new(Vec::new())),
             scheduler_cancellation: CancellationToken::new(),
             shutting_down: Arc::new(AtomicBool::new(false)),
             redactor,
@@ -380,21 +589,20 @@ impl LocalRuntimeService {
     }
 
     async fn spawn_advance(&self, run_id: RunId) {
-        let mut tasks = self.tasks.lock().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        let handle = tokio::spawn(self.clone().advance(run_id));
-        tasks.push(handle);
+        let _ = self
+            .admission
+            .submit_owned(run_id, self.clone().advance(run_id));
     }
 
     async fn spawn_scheduler_loop(&self) {
-        let handle = tokio::spawn(self.clone().scheduled_job_loop());
-        self.tasks.lock().await.push(handle);
+        let _ = self.admission.submit(self.clone().scheduled_job_loop());
     }
 
     fn ensure_accepting_work(&self) -> Result<(), ServiceError> {
-        if self.shutting_down.load(Ordering::SeqCst) {
+        if self.shutting_down.load(Ordering::SeqCst) || self.admission.is_sealed() {
             return Err(ServiceError::Unavailable("runtime is shutting down".into()));
         }
         Ok(())
@@ -419,6 +627,20 @@ impl LocalRuntimeService {
     }
 
     pub(crate) async fn run_due_scheduled_jobs_once(
+        &self,
+        timestamp: TimestampMillis,
+    ) -> Result<Vec<RunId>, ServiceError> {
+        let service = self.clone();
+        let task = self
+            .admission
+            .submit(async move { service.run_due_scheduled_jobs_once_inner(timestamp).await })
+            .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+        task.await.map_err(|_| {
+            ServiceError::Internal("scheduled admission task exited before acknowledgement".into())
+        })?
+    }
+
+    async fn run_due_scheduled_jobs_once_inner(
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
@@ -778,6 +1000,31 @@ impl LocalRuntimeService {
         stored: StoredRun,
     ) -> Result<(), ServiceError> {
         let workspace_id = stored.workspace_id;
+        if self.admission.register_owned(run_id).is_err() {
+            let terminal = TerminalSpec::new(
+                TerminalState::Cancelled,
+                EffectCertainty::NoEffect,
+                "admission_shutdown",
+                Some("runtime shut down during admission".into()),
+            )
+            .expect("static terminal specification");
+            self.database
+                .terminalize_owned_run(
+                    run_id,
+                    workspace_id,
+                    self.owner_instance_id,
+                    &terminal,
+                    AuditEventId::new(),
+                    now(),
+                )
+                .await
+                .map_err(repository_service_error)?;
+            self.database
+                .flush_terminal_audit(workspace_id, run_id)
+                .await
+                .map_err(repository_service_error)?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
         for skill in stored
             .state
             .context()
@@ -1075,32 +1322,27 @@ impl LocalRuntimeService {
     }
 
     pub(crate) async fn drain_submitted_work(&self) {
+        let _ = self.admission.seal();
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
         self.scheduler_cancellation.cancel();
-        let mut tasks = std::mem::take(&mut *self.tasks.lock().await);
-        if tokio::time::timeout(Duration::from_secs(5), async {
-            for task in &mut tasks {
-                let _ = task.await;
-            }
-        })
-        .await
-        .is_err()
+        self.admission.close_tracker();
+        if tokio::time::timeout(Duration::from_secs(5), self.admission.wait())
+            .await
+            .is_err()
         {
-            for task in &tasks {
-                if !task.is_finished() {
-                    task.abort();
-                }
-            }
+            let _ = self.admission.abort_tracked();
         }
     }
 
     async fn shutdown_with_timeout(&self, drain_timeout: Duration) {
+        let _ = self.admission.seal();
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
         self.scheduler_cancellation.cancel();
+        self.admission.close_tracker();
         for cancellation in self.cancellations.lock().await.values() {
             cancellation.cancel();
         }
@@ -1113,25 +1355,25 @@ impl LocalRuntimeService {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut tasks = std::mem::take(&mut *self.tasks.lock().await);
-        tasks.extend(
-            waiting
-                .into_iter()
-                .map(|run_id| tokio::spawn(self.clone().advance(run_id))),
-        );
+        let mut waiting_tasks: Vec<_> = waiting
+            .into_iter()
+            .map(|run_id| tokio::spawn(self.clone().advance(run_id)))
+            .collect();
         let completed = tokio::time::timeout(drain_timeout, async {
-            for task in &mut tasks {
+            for task in &mut waiting_tasks {
                 let _ = task.await;
             }
+            self.admission.wait().await;
         })
         .await
         .is_ok();
         if !completed {
-            for task in &tasks {
+            for task in &waiting_tasks {
                 if !task.is_finished() {
                     task.abort();
                 }
             }
+            let _ = self.admission.abort_tracked();
         }
         let remaining = self.run_workspaces.lock().await.clone();
         if !remaining.is_empty() {
@@ -1337,6 +1579,26 @@ impl LocalRuntimeService {
                     return;
                 }
                 stored.start_disposition = StartDisposition::ResumeApproval;
+                #[cfg(test)]
+                if self.pause_before_park_enabled.load(Ordering::SeqCst) {
+                    self.pause_before_park_reached.notify_one();
+                    self.pause_before_park_release.notified().await;
+                }
+                if self.admission.is_sealed() {
+                    stored.state.cancel();
+                    self.terminalize_stored_run(
+                        run_id,
+                        &stored,
+                        "cancelled",
+                        "cancelled",
+                        "run.cancelled",
+                        CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+                        None,
+                        now(),
+                    )
+                    .await;
+                    return;
+                }
                 if let Err(error) = self.events.publish(
                     stored.workspace_id,
                     run_id,
@@ -1357,6 +1619,23 @@ impl LocalRuntimeService {
                 }
                 self.runs.lock().await.insert(run_id, stored);
                 self.run_available.notify_waiters();
+                if self.admission.is_sealed() {
+                    let removed = self.runs.lock().await.remove(&run_id);
+                    if let Some(mut stored) = removed {
+                        stored.state.cancel();
+                        self.terminalize_stored_run(
+                            run_id,
+                            &stored,
+                            "cancelled",
+                            "cancelled",
+                            "run.cancelled",
+                            CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+                            None,
+                            now(),
+                        )
+                        .await;
+                    }
+                }
             }
             Ok(outcome) => {
                 let (state, kind, mut payload) = terminal_event(&outcome);
@@ -1545,10 +1824,32 @@ impl LocalRuntimeService {
     async fn finish_run(&self, run_id: RunId) {
         self.cancellations.lock().await.remove(&run_id);
         self.run_workspaces.lock().await.remove(&run_id);
+        self.admission.finish_owned(run_id);
         self.run_available.notify_waiters();
     }
 
     pub(crate) async fn request_extension_action(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        actor: lumen_core::identity::PrincipalId,
+        proposal: ActionProposal,
+        capabilities: CapabilitySet,
+    ) -> Result<RunId, ServiceError> {
+        let service = self.clone();
+        let task = self
+            .admission
+            .submit(async move {
+                service
+                    .request_extension_action_inner(workspace_id, actor, proposal, capabilities)
+                    .await
+            })
+            .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+        task.await.map_err(|_| {
+            ServiceError::Internal("extension admission task exited before acknowledgement".into())
+        })?
+    }
+
+    async fn request_extension_action_inner(
         &self,
         workspace_id: lumen_core::identity::WorkspaceId,
         actor: lumen_core::identity::PrincipalId,
@@ -1561,6 +1862,16 @@ impl LocalRuntimeService {
             .create_owned_run(run_id, workspace_id, &actor, self.owner_instance_id, now())
             .await
             .map_err(repository_service_error)?;
+        if self.admission.register_owned(run_id).is_err() {
+            self.settle_unprepared_owned_run(
+                run_id,
+                workspace_id,
+                "admission_shutdown",
+                &"runtime sealed during admission",
+            )
+            .await?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
         let model: Arc<dyn ModelPort> = Arc::new(ActionRequestModel { proposal });
         let stored = StoredRun {
             workspace_id,
@@ -1574,14 +1885,21 @@ impl LocalRuntimeService {
             scheduled_handoff: None,
             start_disposition: StartDisposition::Created,
         };
-        self.events
-            .publish(
-                workspace_id,
+        if let Err(error) = self.events.publish(
+            workspace_id,
+            run_id,
+            "run.created",
+            CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        ) {
+            self.settle_unprepared_owned_run(
                 run_id,
-                "run.created",
-                CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+                workspace_id,
+                "run_preparation_failed",
+                &error,
             )
-            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            .await?;
+            return Err(ServiceError::Internal(error.to_string()));
+        }
         self.install_and_spawn_run(run_id, stored).await?;
         Ok(run_id)
     }
@@ -1745,42 +2063,17 @@ impl RuntimeService for LocalRuntimeService {
 
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated> {
         let service = self.clone();
+        let admitted = self
+            .admission
+            .submit(async move { service.create_run_admitted(command).await });
         Box::pin(async move {
-            service.ensure_accepting_work()?;
-            let run_id = RunId::new();
-            service
-                .database
-                .create_owned_run(
-                    run_id,
-                    command.workspace_id(),
-                    command.actor(),
-                    service.owner_instance_id,
-                    now(),
+            let task = admitted
+                .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+            task.await.map_err(|_| {
+                ServiceError::Internal(
+                    "runtime admission task exited before acknowledgement".into(),
                 )
-                .await
-                .map_err(repository_service_error)?;
-            let reviewed_skills = service
-                .prompt_with_reviewed_skills(command.workspace_id(), command.prompt())
-                .await?;
-            let state = RunState::new(
-                RunContext::new(run_id, command.workspace_id(), command.actor().clone())
-                    .with_loaded_skills(reviewed_skills.loaded_skills)
-                    .with_skill_loads(reviewed_skills.skill_loads),
-                reviewed_skills.prompt,
-                service.budget,
-            )
-            .with_data_class(command.data_class());
-            let stored = StoredRun {
-                workspace_id: command.workspace_id(),
-                state,
-                model_override: None,
-                capabilities_override: None,
-                scheduled_handoff: None,
-                start_disposition: StartDisposition::Created,
-            };
-            service.publish_run_created(run_id, command.workspace_id())?;
-            service.install_and_spawn_run(run_id, stored).await?;
-            Ok(RunCreated::new(run_id))
+            })?
         })
     }
 
@@ -1789,26 +2082,17 @@ impl RuntimeService for LocalRuntimeService {
         command: ApprovalDecisionCommand,
     ) -> ServiceFuture<'_, ApprovalResult> {
         let service = self.clone();
+        let admitted = self
+            .admission
+            .submit(async move { service.decide_approval_admitted(command).await });
         Box::pin(async move {
-            service.ensure_accepting_work()?;
-            let (run_id, result) = service.approvals.decide(&command).await?;
-            service
-                .events
-                .publish(
-                    command.workspace_id(),
-                    run_id,
-                    match command.decision() {
-                        ApprovalDecision::Grant => "approval.granted",
-                        ApprovalDecision::Reject => "approval.rejected",
-                    },
-                    CanonicalValue::object([(
-                        "approval_id",
-                        CanonicalValue::from(command.approval_id().to_string()),
-                    )]),
+            let task = admitted
+                .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+            task.await.map_err(|_| {
+                ServiceError::Internal(
+                    "approval decision task exited before acknowledgement".into(),
                 )
-                .map_err(|error| ServiceError::Internal(error.to_string()))?;
-            service.spawn_advance(run_id).await;
-            Ok(result)
+            })?
         })
     }
 
@@ -1817,69 +2101,15 @@ impl RuntimeService for LocalRuntimeService {
         command: ApprovalRenewalCommand,
     ) -> ServiceFuture<'_, ApprovalRenewal> {
         let service = self.clone();
+        let admitted = self
+            .admission
+            .submit(async move { service.renew_approval_admitted(command).await });
         Box::pin(async move {
-            service.ensure_accepting_work()?;
-            let previous = command.approval_id();
-            let mut runs = service.runs.lock().await;
-            let run_id = runs
-                .iter()
-                .find_map(|(run_id, stored)| {
-                    stored
-                        .state
-                        .is_awaiting_approval(previous)
-                        .then_some(*run_id)
-                })
-                .ok_or(ServiceError::ApprovalConflict(ApprovalConflict::Stale))?;
-            let (_, approval_id) = service
-                .approvals
-                .renew(command.workspace_id(), previous, run_id)
-                .await?;
-            let updated = runs
-                .get_mut(&run_id)
-                .is_some_and(|stored| stored.state.renew_pending_approval(previous, approval_id));
-            if !updated {
-                return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
-            }
-            drop(runs);
-            service
-                .audit
-                .record(AuditEvent::new(
-                    AuditEventId::new(),
-                    now(),
-                    AuditEventKind::ApprovalCreated,
-                    AuditOutcome::Pending,
-                    Some(command.workspace_id()),
-                    CanonicalValue::object([
-                        ("run_id", CanonicalValue::from(run_id.to_string())),
-                        (
-                            "previous_approval_id",
-                            CanonicalValue::from(previous.to_string()),
-                        ),
-                        ("approval_id", CanonicalValue::from(approval_id.to_string())),
-                        (
-                            "renewed_by",
-                            CanonicalValue::from(command.actor().subject()),
-                        ),
-                    ]),
-                ))
-                .await
-                .map_err(|error| ServiceError::Internal(error.to_string()))?;
-            service
-                .events
-                .publish(
-                    command.workspace_id(),
-                    run_id,
-                    "approval.renewed",
-                    CanonicalValue::object([
-                        (
-                            "previous_approval_id",
-                            CanonicalValue::from(previous.to_string()),
-                        ),
-                        ("approval_id", CanonicalValue::from(approval_id.to_string())),
-                    ]),
-                )
-                .map_err(|error| ServiceError::Internal(error.to_string()))?;
-            Ok(ApprovalRenewal::new(previous, approval_id, run_id))
+            let task = admitted
+                .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+            task.await.map_err(|_| {
+                ServiceError::Internal("approval renewal task exited before acknowledgement".into())
+            })?
         })
     }
 

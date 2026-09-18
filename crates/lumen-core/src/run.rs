@@ -464,6 +464,11 @@ impl<'a> RunOrchestrator<'a> {
             self.audit(state, AuditEventKind::RunCreated, AuditOutcome::Success)
                 .await?;
             state.started = true;
+            if state.cancelled || self.cancellation.is_cancelled() {
+                self.audit(state, AuditEventKind::RunCancelled, AuditOutcome::Failure)
+                    .await?;
+                return Ok(state.finish(RunOutcome::Cancelled));
+            }
             if let Some(skill) = state.context.required_skill_failure() {
                 let outcome = RunOutcome::RequiredSkillUnavailable {
                     skill_id: skill.skill_id().to_owned(),
@@ -477,7 +482,7 @@ impl<'a> RunOrchestrator<'a> {
         }
 
         loop {
-            if state.cancelled {
+            if state.cancelled || self.cancellation.is_cancelled() {
                 self.audit(state, AuditEventKind::RunCancelled, AuditOutcome::Failure)
                     .await?;
                 return Ok(state.finish(RunOutcome::Cancelled));

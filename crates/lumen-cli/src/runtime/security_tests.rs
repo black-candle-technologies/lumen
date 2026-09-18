@@ -5697,11 +5697,9 @@ subject = "operator"
             "executor did not enter: action={action:?}, approvals={approvals:?}, parked={parked}, active={active}"
         );
     }
-    let tasks = std::mem::take(&mut *service.tasks.lock().await);
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
-    }
+    service.admission.abort_tracked().expect("drivers aborted");
+    service.admission.close_tracker();
+    service.admission.wait().await;
 
     let recovered = database
         .recover_incomplete_executions(now())
@@ -6671,6 +6669,54 @@ async fn shutdown_terminalizes_a_run_waiting_for_approval() {
 }
 
 #[tokio::test]
+async fn approval_worker_cannot_park_after_admission_is_sealed() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "process.spawn",
+            serde_json::json!({
+                "program": test_program_string(), "args": ["waiting"], "environment": {}
+            }),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    harness
+        .service
+        .pause_before_park_enabled
+        .store(true, Ordering::SeqCst);
+    let reached = harness.service.pause_before_park_reached.notified();
+    let run_id = harness.create_run("pause at shutdown boundary").await;
+    tokio::time::timeout(Duration::from_secs(1), reached)
+        .await
+        .expect("worker reached post-pause boundary");
+    assert!(harness.service.admission.seal().expect("sealed"));
+    harness.service.pause_before_park_release.notify_one();
+    wait_for_run_state(&harness, &run_id, "cancelled").await;
+    assert!(
+        !harness
+            .service
+            .runs
+            .lock()
+            .await
+            .contains_key(&RunId::from_uuid(
+                uuid::Uuid::parse_str(&run_id).expect("run UUID")
+            ))
+    );
+    let approval: String = sqlx::query_scalar(
+        "SELECT state FROM approval_requests WHERE action_id IN
+         (SELECT id FROM actions WHERE run_id = ?)",
+    )
+    .bind(&run_id)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("approval state");
+    assert_eq!(approval, "invalidated");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn forced_shutdown_marks_an_unresponsive_run_failed() {
     let model = MockServer::start().await;
     let harness = Harness::new(&model, |_| {}).await;
@@ -6706,10 +6752,9 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
         .insert(run_id, harness.workspace_id);
     harness
         .service
-        .tasks
-        .lock()
-        .await
-        .push(tokio::spawn(std::future::pending()));
+        .admission
+        .submit(std::future::pending::<()>())
+        .expect("nonresponsive driver registered");
 
     tokio::time::timeout(
         Duration::from_secs(1),
@@ -6813,6 +6858,36 @@ async fn admission_that_crosses_shutdown_is_terminalized_without_a_stranded_run(
     harness.service.shutdown().await;
 }
 
+#[tokio::test]
+async fn dropped_run_submission_waiter_does_not_cancel_runtime_owned_admission() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("accepted work")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let pending = harness.service.create_run(CreateRunCommand::new(
+        harness.workspace_id,
+        PrincipalId::new("local", "operator").expect("actor"),
+        "work survives client disconnect".into(),
+    ));
+    drop(pending);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE state = 'completed'")
+                    .fetch_one(harness.database.pool())
+                    .await
+                    .expect("completed count");
+            if count == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime-owned admission completes");
+    assert_eq!(model.received_requests().await.expect("requests").len(), 1);
+    harness.service.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_deadline_includes_noncooperative_task_join() {
     let model = MockServer::start().await;
@@ -6821,13 +6896,12 @@ async fn shutdown_deadline_includes_noncooperative_task_join() {
     let entered_task = Arc::clone(&entered);
     harness
         .service
-        .tasks
-        .lock()
-        .await
-        .push(tokio::task::spawn_blocking(move || {
+        .admission
+        .submit(async move {
             entered_task.notify_one();
             std::thread::sleep(Duration::from_secs(2));
-        }));
+        })
+        .expect("noncooperative driver registered");
     entered.notified().await;
     tokio::time::timeout(
         Duration::from_secs(1),
