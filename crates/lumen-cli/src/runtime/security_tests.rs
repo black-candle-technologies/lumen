@@ -605,6 +605,70 @@ subject = "operator"
         harness
     }
 
+    async fn new_with_streaming(model: &MockServer) -> Self {
+        let (mut harness, _, _) =
+            Self::new_inner(model, |_| {}, None, None, None, None, (None, None)).await;
+        let config = Config::parse(&format!(
+            r#"
+[database]
+path = "ignored.sqlite3"
+
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = true
+
+[runtime]
+data_directory = {}
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = {}
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+            model.uri(),
+            path_toml(harness._directory.path().join("runtime")),
+            path_toml(harness._directory.path().join("workspace"))
+        ))
+        .expect("streaming config");
+        let events = EventBroker::new(128);
+        let service = Arc::new(
+            LocalRuntimeService::build_with_secret_store(
+                &config,
+                harness.database.clone(),
+                events.clone(),
+                Arc::new(harness.sandbox.clone()),
+                vec![TOKEN.to_owned()],
+                Arc::new(InMemorySecretStore::new()),
+            )
+            .await
+            .expect("streaming runtime"),
+        );
+        let state = ApiState::new(
+            service.clone(),
+            events.clone(),
+            TOKEN,
+            config.bootstrap_principal(),
+            BTreeSet::from([config.workspace_id()]),
+            SandboxCapabilityReport::new(
+                "test",
+                "kernel_enforced",
+                ["filesystem_isolation", "network_isolation"],
+                None,
+            ),
+        )
+        .expect("streaming API state");
+        harness.service.shutdown().await;
+        harness.app = router(state);
+        harness.events = events;
+        harness.service = service;
+        harness
+    }
+
     async fn new_inner(
         model: &MockServer,
         prepare_workspace: impl FnOnce(&std::path::Path),
@@ -2288,6 +2352,108 @@ async fn superseded_scheduled_revision_cannot_reserve_an_approved_write() {
             ._directory
             .path()
             .join("workspace/superseded-revision.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn complete_streamed_tool_call_creates_one_pending_action() {
+    let model = MockServer::start().await;
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_stream",
+                "type": "function",
+                "function": {
+                    "name": "filesystem_write",
+                    "arguments": "{\"path\":\"streamed.txt\",\"content\":\"safe\"}"
+                }
+            }]},
+            "finish_reason": "tool_calls"
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&model)
+        .await;
+    let harness = Harness::new_with_streaming(&model).await;
+    let run_id = harness.create_run("write from stream").await;
+    wait_for_run_state(&harness, &run_id, "awaiting_approval").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("action count");
+    let approvals: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("approval count");
+    assert_eq!((actions, approvals), (1, 1));
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/streamed.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn truncated_streamed_tool_call_creates_no_action_or_approval() {
+    let model = MockServer::start().await;
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_stream",
+                "type": "function",
+                "function": {
+                    "name": "filesystem_write",
+                    "arguments": "{\"path\":\"streamed.txt\",\"content\":\"unsafe\"}"
+                }
+            }]},
+            "finish_reason": "tool_calls"
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(format!("data: {chunk}\n\n"), "text/event-stream"),
+        )
+        .mount(&model)
+        .await;
+    let harness = Harness::new_with_streaming(&model).await;
+    let run_id = harness.create_run("do not trust truncated stream").await;
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("action count");
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approval count");
+    assert_eq!((actions, approvals), (0, 0));
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/streamed.txt")
             .exists()
     );
 }
@@ -5777,14 +5943,14 @@ async fn assert_approval_execution_audit_order(harness: &Harness, run_id: &str) 
 
 fn final_response(text: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "choices": [{"message": {"content": text, "tool_calls": []}}]
+        "choices": [{"finish_reason":"stop", "message": {"content": text, "tool_calls": []}}]
     }))
 }
 
 fn action_response(kind: &str, arguments: serde_json::Value) -> ResponseTemplate {
     let name = kind.replace('.', "_");
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "choices": [{"message": {
+        "choices": [{"finish_reason":"tool_calls", "message": {
             "content": null,
             "tool_calls": [{
                 "id": "call_test",

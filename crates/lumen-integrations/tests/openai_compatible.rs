@@ -79,7 +79,7 @@ fn loaded_model(size: u64, size_vram: u64) -> serde_json::Value {
 
 fn completion() -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
-        "choices": [{"message": {"content": "guarded answer"}}]
+        "choices": [{"finish_reason":"stop", "message": {"content": "guarded answer"}}]
     }))
 }
 
@@ -413,7 +413,7 @@ async fn sends_openai_request_and_parses_text_completion() {
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "model": "resolved-model",
-            "choices": [{"message": {"content": "hello back"}}]
+            "choices": [{"finish_reason":"stop", "message": {"content": "hello back"}}]
         })))
         .mount(&server)
         .await;
@@ -483,7 +483,7 @@ async fn sends_runtime_tool_schema_and_correlated_follow_up_messages() {
             }]
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "random-nonce"}}]
+            "choices": [{"finish_reason":"stop", "message": {"content": "random-nonce"}}]
         })))
         .mount(&server)
         .await;
@@ -501,6 +501,7 @@ async fn parses_structured_tool_call_as_untrusted_action_proposal() {
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
+                "finish_reason": "tool_calls",
                 "message": {
                     "content": null,
                     "tool_calls": [{
@@ -544,6 +545,7 @@ async fn rejects_malformed_tool_arguments() {
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
+                "finish_reason": "tool_calls",
                 "message": {
                     "tool_calls": [{
                         "id": "call-1",
@@ -573,7 +575,7 @@ async fn rejects_unknown_or_multiple_tool_calls() {
     let unknown_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"tool_calls": [{
+            "choices": [{"finish_reason":"tool_calls", "message": {"tool_calls": [{
                 "id": "call-1",
                 "type": "function",
                 "function": {"name": "unknown_tool", "arguments": "{}"}
@@ -591,7 +593,7 @@ async fn rejects_unknown_or_multiple_tool_calls() {
     let multiple_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"tool_calls": [
+            "choices": [{"finish_reason":"tool_calls", "message": {"tool_calls": [
                 {
                     "id": "call-1",
                     "type": "function",
@@ -620,6 +622,7 @@ async fn streams_one_tool_call_without_losing_its_identity() {
     let body = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"filesystem_\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"\\\"nonce.txt\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n"
     );
     Mock::given(method("POST"))
@@ -651,6 +654,7 @@ async fn consumes_sse_stream_and_aggregates_text() {
     let body = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n"
     );
     Mock::given(method("POST"))
@@ -672,6 +676,127 @@ async fn consumes_sse_stream_and_aggregates_text() {
     let output = client.generate(input()).await.expect("stream succeeds");
 
     assert_eq!(output, ModelOutput::FinalText("hello".into()));
+}
+
+#[tokio::test]
+async fn refuses_streamed_tool_call_without_transport_and_finish_finality() {
+    for (body, expected) in [
+        (
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"filesystem_read\",\"arguments\":\"{\\\"path\\\":\\\"nonce.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "before [DONE]",
+        ),
+        (
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"looks complete\"}}]}\n\ndata: [DONE]\n\n",
+            "terminal finish reason",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            OpenAiCompatibleClient::new(config(&server).with_streaming(true)).expect("client");
+        let error = client
+            .generate(tool_input())
+            .await
+            .expect_err("incomplete stream refused");
+        assert!(error.message().contains(expected), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn refuses_nonstream_length_and_finish_content_mismatch() {
+    for (finish, content, expected) in [
+        ("length", "partial", "length"),
+        ("tool_calls", "plain text", "tool_calls"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"finish_reason": finish, "message": {"content": content}}]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenAiCompatibleClient::new(config(&server)).expect("client");
+        let error = client
+            .generate(input())
+            .await
+            .expect_err("invalid finish refused");
+        assert!(error.message().contains(expected), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn refuses_stream_finish_failures_and_malformed_sse() {
+    for (body, expected) in [
+        (
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+            "length",
+        ),
+        (
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"filtered\"},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n",
+            "content_filter",
+        ),
+        ("data: not-json\n\n", "invalid model stream JSON"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            OpenAiCompatibleClient::new(config(&server).with_streaming(true)).expect("client");
+        let error = client
+            .generate(input())
+            .await
+            .expect_err("invalid stream refused");
+        assert!(error.message().contains(expected), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn refuses_conflicting_streamed_tool_id_and_multiple_indices() {
+    let first = json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+        "index":0,"id":"call-one","type":"function",
+        "function":{"name":"filesystem_read","arguments":"{\"path\":\"nonce.txt\"}"}
+    }]}}]});
+    for (second, expected) in [
+        (
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-two","function":{}}]},"finish_reason":"tool_calls"}]}),
+            "conflicting streamed tool call ID",
+        ),
+        (
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call-two","function":{}}]},"finish_reason":"tool_calls"}]}),
+            "multiple tool calls",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let body = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            OpenAiCompatibleClient::new(config(&server).with_streaming(true)).expect("client");
+        let error = client
+            .generate(tool_input())
+            .await
+            .expect_err("conflicting tool refused");
+        assert!(error.message().contains(expected), "{error}");
+    }
 }
 
 #[tokio::test]

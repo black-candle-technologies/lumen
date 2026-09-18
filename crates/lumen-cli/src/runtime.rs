@@ -5292,7 +5292,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "local result", "tool_calls": []}}]
+                "choices": [{"finish_reason":"stop", "message": {"content": "local result", "tool_calls": []}}]
             })))
             .mount(&model)
             .await;
