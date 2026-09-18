@@ -1,6 +1,6 @@
 # M5 cross-platform verification matrix — QA #27
 
-Evidence captured 2026-09-16–17 (America/Chicago). Verified implementation commit: `f45c286` on `qa-m5-27-platform-matrix`, based on `qa-m5-21-qa-launcher` at `c36d7f31dc3d212cabab2263d24f4a56e05a8894`. The final PR head adds this report only. Issue #27 remains open with `needs-validation`. A green local suite is not live M5 acceptance.
+Evidence captured 2026-09-16–17 (America/Chicago). Verified source commit: `f45c286` on `qa-m5-27-platform-matrix`, based on `qa-m5-21-qa-launcher` at `c36d7f31dc3d212cabab2263d24f4a56e05a8894`. The later PR head also pins CI Rust toolchains and adds this report; no tested source changed after `f45c286`. Issue #27 remains open with `needs-validation`. A green local suite is not live M5 acceptance.
 
 ## Historical claims versus retained evidence
 
@@ -19,7 +19,7 @@ The September 12 report and [issue #27](https://github.com/black-candle-technolo
 | GitHub Actions `m5-platform-matrix.yml` (Windows, Linux server/sandbox, Linux desktop-native, web) | Uploads named lists and raw logs per head SHA | Not yet observed at this report commit | NOT RUN; inspect PR checks/artifacts |
 | Live Ollama, GPU, manual desktop/browser acceptance for this issue | — | Not run as part of #27 | NOT RUN; #8 is the acceptance umbrella |
 
-No feature override was passed to either workspace command: Cargo defaults apply, with only `lumen-desktop` excluded from WSL. The new CI jobs record the checked-out PR head SHA, Rust/Node and OS versions, command lines, named inventories, raw run logs, and exit codes; artifacts upload even if a test step fails. The Linux server/sandbox job uses the existing privileged `rust:slim` Docker envelope needed for namespace tests, then runs the full non-desktop suite and sandbox gate. That container path was syntax-checked but could not be executed locally because Docker Desktop is unavailable. The Linux desktop job installs `pkg-config`, `libdbus-1-dev`, GTK 3, WebKitGTK 4.1, and the other native Tauri build prerequisites in CI only. No host packages were installed on this WSL machine.
+No feature override was passed to either workspace command: Cargo defaults apply, with only `lumen-desktop` excluded from WSL. The new CI jobs record the checked-out PR head SHA, Rust/Node and OS versions, command lines, named inventories, raw run logs, and exit codes; artifacts upload even if a test step fails. CI pins Rust `1.97.1` on Windows and `1.97.0` on Linux. The Linux server/sandbox job uses the existing privileged Docker envelope with `rust:1.97.0-slim` for namespace tests, then runs the full non-desktop suite and sandbox gate. That container path was syntax-checked but could not be executed locally because Docker Desktop is unavailable. The Linux desktop job installs `pkg-config`, `libdbus-1-dev`, GTK 3, WebKitGTK 4.1, and the other native Tauri build prerequisites in CI only. No host packages were installed on this WSL machine.
 
 The final named-inventory diff is 19 Unix/Linux-gated names present only in WSL and one desktop-target name present only in Windows. Specifically:
 
@@ -49,7 +49,7 @@ Windows only (desktop target excluded from WSL command):
 desktop_shell_has_one_local_least_privilege_authority_surface
 ```
 
-These are current-tree names, **not** reconstructed names for the historical 264/259 claims. Linux native desktop is a separate CI job, not inferred from the 356 server/CLI passes.
+These are current-tree names, **not** reconstructed names for the historical 264/259 claims. Linux native desktop is a separate CI job, not inferred from the 357 server/CLI passes.
 
 ## First failures, repairs, and remaining uncertainty
 
