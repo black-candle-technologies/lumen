@@ -2,7 +2,12 @@
   "name": "lumen",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": ">=24.18.0 <25",
+    "pnpm": "12.4.1 || 12.4.2"
+  },
   "scripts": {
+    "check:native": "node scripts/qa/check_native_deps.mjs",
     "dev:web": "pnpm --dir apps/web dev",
     "build:web": "pnpm --dir apps/web build",
     "check:web": "pnpm --dir apps/web check",

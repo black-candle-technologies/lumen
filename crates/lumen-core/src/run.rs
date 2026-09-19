@@ -464,6 +464,11 @@ impl<'a> RunOrchestrator<'a> {
             self.audit(state, AuditEventKind::RunCreated, AuditOutcome::Success)
                 .await?;
             state.started = true;
+            if state.cancelled || self.cancellation.is_cancelled() {
+                self.audit(state, AuditEventKind::RunCancelled, AuditOutcome::Failure)
+                    .await?;
+                return Ok(state.finish(RunOutcome::Cancelled));
+            }
             if let Some(skill) = state.context.required_skill_failure() {
                 let outcome = RunOutcome::RequiredSkillUnavailable {
                     skill_id: skill.skill_id().to_owned(),
@@ -477,7 +482,7 @@ impl<'a> RunOrchestrator<'a> {
         }
 
         loop {
-            if state.cancelled {
+            if state.cancelled || self.cancellation.is_cancelled() {
                 self.audit(state, AuditEventKind::RunCancelled, AuditOutcome::Failure)
                     .await?;
                 return Ok(state.finish(RunOutcome::Cancelled));
@@ -783,11 +788,19 @@ impl<'a> RunOrchestrator<'a> {
                     outcome = &mut execution => outcome?,
                     () = tokio::time::sleep(remaining) => {
                         cancellation.cancel();
-                        let _ = execution.await;
-                        return Ok(Some(
-                            self.exhaust_budget(state, BudgetKind::WallClock)
-                                .await?,
-                        ));
+                        match tokio::time::timeout(Duration::from_millis(250), &mut execution).await {
+                            Ok(Ok(ExecutionOutcome::Succeeded(_)
+                                | ExecutionOutcome::Proposed(_))) => {
+                                self.audit(state, AuditEventKind::ExecutionSucceeded,
+                                    AuditOutcome::Success).await?;
+                                return Ok(Some(self.exhaust_budget(state, BudgetKind::WallClock)
+                                    .await?));
+                            }
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(_)) | Err(_) => ExecutionOutcome::Unknown(
+                                "executor did not provide a definitive result after cancellation".into(),
+                            ),
+                        }
                     }
                 }
             }

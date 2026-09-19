@@ -94,7 +94,8 @@ fn limits() -> ExtensionInvocationLimits {
 }
 
 fn resource_limits() -> ResourceLimits {
-    ResourceLimits::new(1, 256 * 1024 * 1024, 64 * 1024, 32, 4).unwrap()
+    // RLIMIT_NPROC counts the host UID; these tests exercise sandbox isolation, not process quotas.
+    ResourceLimits::new(1, 256 * 1024 * 1024, 64 * 1024, 32, 512).unwrap()
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
