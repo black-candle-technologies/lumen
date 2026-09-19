@@ -1177,18 +1177,9 @@ impl ExtensionInvocationExecutor {
                 .await
                 .map_err(HostInvocationError::from),
         };
-        if invocation_token.is_cancelled() {
-            self.record_failure(
-                action.workspace_id(),
-                plugin,
-                version,
-                component,
-                arguments.request_id,
-                ExtensionFailureClass::Cancelled,
-            )
-            .await;
-            return Ok(ExecutionOutcome::Cancelled);
-        }
+        // Once the host has returned, preserve that observed outcome.  A
+        // concurrent configuration change may cancel future work, but must
+        // not rewrite a completed invocation as a health-affecting failure.
         match response {
             Ok(ExtensionResponse::Result { value }) => {
                 let json = serde_json::to_value(&value)
