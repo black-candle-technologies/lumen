@@ -315,10 +315,13 @@ export class ApiClient {
 	}
 
 	async listAudit(after = 0, limit = 100): Promise<AuditEvent[]> {
-		const response = await this.request<{ events: AuditEvent[] }>(
+		const response = await this.request<unknown>(
 			`audit?after=${after}&limit=${limit}`
 		);
-		return response.events;
+		if (!response || typeof response !== 'object' || !('events' in response) || !Array.isArray(response.events)) {
+			throw new ApiError(0, 'invalid_response', 'Audit response is missing an events array');
+		}
+		return response.events as AuditEvent[];
 	}
 
 	async listStagedPlugins(limit = 50, after = 0): Promise<StagedPluginReview[]> {
