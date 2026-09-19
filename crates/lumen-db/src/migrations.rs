@@ -7,6 +7,7 @@ use sqlx::{
 
 use crate::{Database, RepositoryError};
 
+// Keep this module dependent on the checked-in migration directory.
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 pub(crate) async fn connect(path: &Path) -> Result<Database, RepositoryError> {
