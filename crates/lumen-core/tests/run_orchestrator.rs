@@ -273,6 +273,85 @@ struct ClockedExecutor {
     completion_time: u64,
 }
 
+struct UnresponsiveExecutor {
+    calls: AtomicUsize,
+    cancellation: Mutex<Option<CancellationToken>>,
+}
+
+impl ExecutorPort for UnresponsiveExecutor {
+    fn execute(
+        &self,
+        _action: &AuthorizedAction,
+        cancellation: CancellationToken,
+    ) -> ExecutorFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.cancellation.lock().expect("cancellation lock") = Some(cancellation);
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn unresponsive_execution_is_bounded_and_never_reported_as_known_failure() {
+    let model = FakeModel::new([proposal("filesystem.read")]);
+    let executor = UnresponsiveExecutor {
+        calls: AtomicUsize::new(0),
+        cancellation: Mutex::new(None),
+    };
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(
+        run_context(),
+        "read",
+        RunBudget::limited(3, 2, Duration::from_millis(10), 1024),
+    );
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        orchestrator(&model, &executor, &approvals, &audit)
+            .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead)),
+    )
+    .await
+    .expect("bounded resolution")
+    .expect("run outcome");
+    assert!(matches!(outcome, RunOutcome::ExecutionUnknown { .. }));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        executor
+            .cancellation
+            .lock()
+            .expect("cancellation lock")
+            .as_ref()
+            .expect("token")
+            .is_cancelled()
+    );
+    assert!(audit.events().contains(&AuditEventKind::ExecutionUnknown));
+}
+
+#[tokio::test]
+async fn cancellation_precedes_a_required_skill_failure() {
+    let model = FakeModel::new([ModelOutput::FinalText("unused".into())]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let context =
+        run_context().with_skill_loads(vec![lumen_core::run::SkillLoadMetadata::excluded(
+            "required-skill",
+            "1",
+            "expected-digest",
+            "source_unavailable",
+            true,
+        )]);
+    let mut state = RunState::new(context, "cancelled", RunBudget::unlimited(3, 2));
+    state.cancel();
+    let outcome = orchestrator(&model, &executor, &approvals, &audit)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
+        .await
+        .expect("cancellation outcome");
+    assert_eq!(outcome, RunOutcome::Cancelled);
+    assert_eq!(model.call_count(), 0);
+    assert!(audit.events().contains(&AuditEventKind::RunCancelled));
+    assert!(!audit.events().contains(&AuditEventKind::RunFailed));
+}
+
 impl ExecutorPort for ClockedExecutor {
     fn execute<'a>(
         &'a self,
