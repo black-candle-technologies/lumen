@@ -12,15 +12,34 @@
 	import Timer from '@lucide/svelte/icons/timer';
 	import favicon from '$lib/assets/favicon.svg';
 	import ConnectionDialog from '$lib/components/ConnectionDialog.svelte';
-	import { connection, isConfigured, loadConnection, saveConnection } from '$lib/connection';
+	import {
+		connection,
+		connectionState,
+		disconnectConnection,
+		loadConnection,
+		saveConnection,
+		type ConnectionKind
+	} from '$lib/connection';
 
 	let { children } = $props();
 	let showSettings = $state(false);
 
 	onMount(() => {
-		loadConnection();
-		if (!isConfigured($connection)) showSettings = true;
+		void loadConnection().then((state) => {
+			if (state.kind !== 'connected') showSettings = true;
+		});
 	});
+
+	const connectionLabel: Record<ConnectionKind, string> = {
+		disconnected: 'Not connected',
+		configured: 'Configured',
+		connecting: 'Connecting',
+		connected: 'Local runtime',
+		authentication_failed: 'Authentication failed',
+		workspace_denied: 'Workspace denied',
+		invalid: 'Invalid settings',
+		unreachable: 'Runtime unreachable'
+	};
 
 	const navigation = [
 		{ href: '/', label: 'Chat', icon: Bot },
@@ -45,9 +64,9 @@
 			<img src={favicon} alt="" />
 			<strong>Lumen</strong>
 		</a>
-		<div class="connection-state" class:connected={isConfigured($connection)}>
-			<span></span>{isConfigured($connection) ? 'Local runtime' : 'Not connected'}
-		</div>
+		<button class="connection-state" class:connected={$connectionState.kind === 'connected'} class:connecting={$connectionState.kind === 'connecting'} title={$connectionState.message || 'Connection settings'} onclick={() => (showSettings = true)}>
+			<span></span>{connectionLabel[$connectionState.kind]}
+		</button>
 		<button class="icon-button" type="button" aria-label="Open connection settings" title="Connection settings" onclick={() => (showSettings = true)}>
 			<Settings size={18} />
 		</button>
@@ -64,7 +83,7 @@
 		</nav>
 	</aside>
 
-	<main>{@render children()}</main>
+	<main>{#key `${$connectionState.generation}:${$connectionState.kind}`}{@render children()}{/key}</main>
 
 	<nav class="mobile-nav" aria-label="Primary navigation">
 		{#each navigation as item}
@@ -79,8 +98,13 @@
 {#if showSettings}
 	<ConnectionDialog
 		settings={$connection}
-		onSave={(settings) => {
-			saveConnection(settings);
+		onSave={async (settings) => {
+			const state = await saveConnection(settings);
+			if (state.kind === 'connected') showSettings = false;
+			return state;
+		}}
+		onDisconnect={() => {
+			disconnectConnection();
 			showSettings = false;
 		}}
 		onClose={() => (showSettings = false)}

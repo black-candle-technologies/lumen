@@ -98,6 +98,7 @@ pub struct RunContext {
     actor: PrincipalId,
     job_origin: Option<JobOrigin>,
     loaded_skills: Vec<LoadedSkillMetadata>,
+    skill_loads: Vec<SkillLoadMetadata>,
 }
 
 impl RunContext {
@@ -108,6 +109,7 @@ impl RunContext {
             actor,
             job_origin: None,
             loaded_skills: Vec::new(),
+            skill_loads: Vec::new(),
         }
     }
 
@@ -118,6 +120,11 @@ impl RunContext {
 
     pub fn with_loaded_skills(mut self, loaded_skills: Vec<LoadedSkillMetadata>) -> Self {
         self.loaded_skills = loaded_skills;
+        self
+    }
+
+    pub fn with_skill_loads(mut self, skill_loads: Vec<SkillLoadMetadata>) -> Self {
+        self.skill_loads = skill_loads;
         self
     }
 
@@ -139,6 +146,16 @@ impl RunContext {
 
     pub fn loaded_skills(&self) -> &[LoadedSkillMetadata] {
         &self.loaded_skills
+    }
+
+    pub fn skill_loads(&self) -> &[SkillLoadMetadata] {
+        &self.skill_loads
+    }
+
+    fn required_skill_failure(&self) -> Option<&SkillLoadMetadata> {
+        self.skill_loads
+            .iter()
+            .find(|skill| skill.required && skill.status != "loaded")
     }
 }
 
@@ -172,6 +189,70 @@ impl LoadedSkillMetadata {
 
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillLoadMetadata {
+    skill_id: String,
+    version: String,
+    expected_digest: String,
+    status: &'static str,
+    reason: Option<&'static str>,
+    required: bool,
+}
+
+impl SkillLoadMetadata {
+    pub fn loaded(
+        skill_id: impl Into<String>,
+        version: impl Into<String>,
+        expected_digest: impl Into<String>,
+        required: bool,
+    ) -> Self {
+        Self {
+            skill_id: skill_id.into(),
+            version: version.into(),
+            expected_digest: expected_digest.into(),
+            status: "loaded",
+            reason: None,
+            required,
+        }
+    }
+
+    pub fn excluded(
+        skill_id: impl Into<String>,
+        version: impl Into<String>,
+        expected_digest: impl Into<String>,
+        reason: &'static str,
+        required: bool,
+    ) -> Self {
+        Self {
+            skill_id: skill_id.into(),
+            version: version.into(),
+            expected_digest: expected_digest.into(),
+            status: "excluded",
+            reason: Some(reason),
+            required,
+        }
+    }
+
+    pub fn skill_id(&self) -> &str {
+        &self.skill_id
+    }
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+    pub fn expected_digest(&self) -> &str {
+        &self.expected_digest
+    }
+    pub const fn status(&self) -> &'static str {
+        self.status
+    }
+    pub const fn reason(&self) -> Option<&'static str> {
+        self.reason
+    }
+    pub const fn required(&self) -> bool {
+        self.required
     }
 }
 
@@ -269,6 +350,32 @@ impl RunState {
         self.pending_action.is_some()
     }
 
+    pub fn is_awaiting_approval(&self, approval_id: ApprovalId) -> bool {
+        self.terminal_outcome.is_none()
+            && self
+                .pending_action
+                .as_ref()
+                .is_some_and(|pending| pending.approval_id == approval_id)
+    }
+
+    pub fn renew_pending_approval(
+        &mut self,
+        previous: ApprovalId,
+        replacement: ApprovalId,
+    ) -> bool {
+        if self.terminal_outcome.is_some() {
+            return false;
+        }
+        let Some(pending) = self.pending_action.as_mut() else {
+            return false;
+        };
+        if pending.approval_id != previous {
+            return false;
+        }
+        pending.approval_id = replacement;
+        true
+    }
+
     pub const fn context(&self) -> &RunContext {
         &self.context
     }
@@ -357,10 +464,25 @@ impl<'a> RunOrchestrator<'a> {
             self.audit(state, AuditEventKind::RunCreated, AuditOutcome::Success)
                 .await?;
             state.started = true;
+            if state.cancelled || self.cancellation.is_cancelled() {
+                self.audit(state, AuditEventKind::RunCancelled, AuditOutcome::Failure)
+                    .await?;
+                return Ok(state.finish(RunOutcome::Cancelled));
+            }
+            if let Some(skill) = state.context.required_skill_failure() {
+                let outcome = RunOutcome::RequiredSkillUnavailable {
+                    skill_id: skill.skill_id().to_owned(),
+                    version: skill.version().to_owned(),
+                    reason: skill.reason().unwrap_or("unavailable"),
+                };
+                self.audit(state, AuditEventKind::RunFailed, AuditOutcome::Failure)
+                    .await?;
+                return Ok(state.finish(outcome));
+            }
         }
 
         loop {
-            if state.cancelled {
+            if state.cancelled || self.cancellation.is_cancelled() {
                 self.audit(state, AuditEventKind::RunCancelled, AuditOutcome::Failure)
                     .await?;
                 return Ok(state.finish(RunOutcome::Cancelled));
@@ -666,11 +788,19 @@ impl<'a> RunOrchestrator<'a> {
                     outcome = &mut execution => outcome?,
                     () = tokio::time::sleep(remaining) => {
                         cancellation.cancel();
-                        let _ = execution.await;
-                        return Ok(Some(
-                            self.exhaust_budget(state, BudgetKind::WallClock)
-                                .await?,
-                        ));
+                        match tokio::time::timeout(Duration::from_millis(250), &mut execution).await {
+                            Ok(Ok(ExecutionOutcome::Succeeded(_)
+                                | ExecutionOutcome::Proposed(_))) => {
+                                self.audit(state, AuditEventKind::ExecutionSucceeded,
+                                    AuditOutcome::Success).await?;
+                                return Ok(Some(self.exhaust_budget(state, BudgetKind::WallClock)
+                                    .await?));
+                            }
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(_)) | Err(_) => ExecutionOutcome::Unknown(
+                                "executor did not provide a definitive result after cancellation".into(),
+                            ),
+                        }
                     }
                 }
             }
@@ -866,6 +996,36 @@ impl<'a> RunOrchestrator<'a> {
                 ),
             ));
         }
+        if !state.context.skill_loads().is_empty() {
+            payload.push((
+                "skill_loads",
+                CanonicalValue::Array(
+                    state
+                        .context
+                        .skill_loads()
+                        .iter()
+                        .map(|skill| {
+                            CanonicalValue::object([
+                                ("skill_id", CanonicalValue::from(skill.skill_id())),
+                                ("version", CanonicalValue::from(skill.version())),
+                                (
+                                    "expected_digest",
+                                    CanonicalValue::from(skill.expected_digest()),
+                                ),
+                                ("status", CanonicalValue::from(skill.status())),
+                                (
+                                    "reason",
+                                    skill
+                                        .reason()
+                                        .map_or(CanonicalValue::Null, CanonicalValue::from),
+                                ),
+                                ("required", CanonicalValue::from(skill.required())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ));
+        }
         self.audit
             .record(AuditEvent::new(
                 AuditEventId::new(),
@@ -887,15 +1047,32 @@ enum ActionProgress {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
-    Completed { text: String },
-    AwaitingApproval { approval_id: ApprovalId },
-    ApprovalRejected { approval_id: ApprovalId },
-    Denied { reason: DenialReason },
+    Completed {
+        text: String,
+    },
+    AwaitingApproval {
+        approval_id: ApprovalId,
+    },
+    ApprovalRejected {
+        approval_id: ApprovalId,
+    },
+    Denied {
+        reason: DenialReason,
+    },
     BudgetExhausted(BudgetKind),
     Cancelled,
-    ExecutionFailed { message: String },
+    ExecutionFailed {
+        message: String,
+    },
     ExecutionTimedOut,
-    ExecutionUnknown { message: String },
+    ExecutionUnknown {
+        message: String,
+    },
+    RequiredSkillUnavailable {
+        skill_id: String,
+        version: String,
+        reason: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
