@@ -21,6 +21,7 @@ use lumen_core::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::state::AuthenticationResult;
 use crate::{
     ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, ApprovalRenewalCommand,
     AuditQuery, CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand,
@@ -111,7 +112,7 @@ pub fn router(state: ApiState) -> Router {
             "/api/v1/workspaces/{workspace_id}/skills/capture-drafts/{draft_id}/publish",
             post(publish_capture_draft),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
 }
 
@@ -132,6 +133,7 @@ struct RuntimeCapabilityParameters {
 
 async fn runtime_capabilities(
     State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
     Path(workspace): Path<String>,
     Query(parameters): Query<RuntimeCapabilityParameters>,
 ) -> Result<Json<RuntimeCapabilitiesResponse>, ApiError> {
@@ -142,7 +144,7 @@ async fn runtime_capabilities(
         workspace: "ready",
         sandbox: state.sandbox().clone(),
         model: if parameters.probe_model {
-            state.service.model_readiness(workspace_id).await?
+            state.service.model_readiness(workspace_id, actor).await?
         } else {
             "not_checked".into()
         },
@@ -578,25 +580,32 @@ async fn authenticate(
     mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    let origin = headers.get(header::ORIGIN);
     if request.method() == Method::OPTIONS {
-        return with_local_cors(StatusCode::NO_CONTENT.into_response());
+        return with_local_cors(StatusCode::NO_CONTENT.into_response(), origin);
     }
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let Some(principal) = state.authenticate(authorization) else {
-        return with_local_cors(ApiError::Unauthorized.into_response());
+    let principal = match state.authenticate(authorization) {
+        AuthenticationResult::Authenticated(principal) => principal,
+        AuthenticationResult::Rejected => {
+            return with_local_cors(ApiError::Unauthorized.into_response(), origin);
+        }
+        AuthenticationResult::Throttled => {
+            return with_local_cors(ApiError::TooManyRequests.into_response(), origin);
+        }
     };
     request.extensions_mut().insert(principal);
-    with_local_cors(next.run(request).await)
+    with_local_cors(next.run(request).await, origin)
 }
 
-fn with_local_cors(mut response: Response) -> Response {
+fn with_local_cors(mut response: Response, origin: Option<&HeaderValue>) -> Response {
+    let Some(origin) = origin.filter(|origin| is_loopback_web_origin(origin)) else {
+        return response;
+    };
     let headers = response.headers_mut();
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("GET,POST,OPTIONS"),
@@ -607,6 +616,19 @@ fn with_local_cors(mut response: Response) -> Response {
     );
     headers.insert(header::VARY, HeaderValue::from_static("Origin"));
     response
+}
+
+fn is_loopback_web_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    (host == "127.0.0.1" || host == "localhost") && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 #[derive(Deserialize)]
@@ -729,6 +751,7 @@ async fn cancel_run(
 
 async fn run_events(
     State(state): State<ApiState>,
+    Extension(_actor): Extension<PrincipalId>,
     Path((workspace, run)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -746,6 +769,10 @@ async fn run_events(
         })
         .transpose()?
         .unwrap_or(0);
+    state
+        .events
+        .validate_resume_cursor(after)
+        .map_err(|_| ApiError::EventReplayUnavailable)?;
     Ok(Sse::new(state.events.subscribe(
         workspace_id,
         run_id,
@@ -762,6 +789,7 @@ struct RunStatusResponse {
 
 async fn run_status(
     State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
     Path((workspace, run)): Path<(String, String)>,
 ) -> Result<Json<RunStatusResponse>, ApiError> {
     let workspace_id = parse_workspace(&workspace)?;
@@ -769,7 +797,7 @@ async fn run_status(
     let run_id = parse_run(&run)?;
     let status = state
         .service
-        .run_status_detail(workspace_id, run_id)
+        .run_status_detail(workspace_id, run_id, actor)
         .await?;
     Ok(Json(RunStatusResponse { run_id, status }))
 }
@@ -781,11 +809,15 @@ struct ReconciliationRunsResponse {
 
 async fn list_reconciliation_runs(
     State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
     Path(workspace): Path<String>,
 ) -> Result<Json<ReconciliationRunsResponse>, ApiError> {
     let workspace_id = parse_workspace(&workspace)?;
     ensure_workspace(&state, workspace_id)?;
-    let runs = state.service.list_reconciliation_runs(workspace_id).await?;
+    let runs = state
+        .service
+        .list_reconciliation_runs(workspace_id, actor)
+        .await?;
     Ok(Json(ReconciliationRunsResponse { runs }))
 }
 
@@ -808,6 +840,7 @@ struct AuditResponse {
 
 async fn list_audit(
     State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
     Path(workspace): Path<String>,
     Query(parameters): Query<AuditParameters>,
 ) -> Result<Json<AuditResponse>, ApiError> {
@@ -820,6 +853,7 @@ async fn list_audit(
         .service
         .list_audit(AuditQuery::new(
             workspace_id,
+            actor,
             parameters.after,
             parameters.limit,
         ))
@@ -980,6 +1014,8 @@ enum ApiError {
     Unauthorized,
     Forbidden,
     BadRequest(String),
+    TooManyRequests,
+    EventReplayUnavailable,
     Service(ServiceError),
 }
 
@@ -1014,6 +1050,16 @@ impl IntoResponse for ApiError {
                 "workspace is not allowlisted".to_owned(),
             ),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
+            Self::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "authentication_throttled",
+                "too many failed authentication attempts".to_owned(),
+            ),
+            Self::EventReplayUnavailable => (
+                StatusCode::CONFLICT,
+                "event_replay_unavailable",
+                "event replay cursor is older than retained history".to_owned(),
+            ),
             Self::Service(ServiceError::NotFound) => (
                 StatusCode::NOT_FOUND,
                 "not_found",

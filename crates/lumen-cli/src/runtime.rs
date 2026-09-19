@@ -2366,6 +2366,7 @@ impl RuntimeService for LocalRuntimeService {
     fn model_readiness(
         &self,
         _workspace_id: lumen_core::identity::WorkspaceId,
+        _actor: lumen_core::identity::PrincipalId,
     ) -> ServiceFuture<'_, String> {
         Box::pin(async move {
             if self.model_probe.identity().endpoint_class()
@@ -2521,6 +2522,7 @@ impl RuntimeService for LocalRuntimeService {
         &self,
         workspace_id: lumen_core::identity::WorkspaceId,
         run_id: RunId,
+        _actor: lumen_core::identity::PrincipalId,
     ) -> ServiceFuture<'_, String> {
         let service = self.clone();
         Box::pin(async move {
@@ -2538,10 +2540,11 @@ impl RuntimeService for LocalRuntimeService {
         &self,
         workspace_id: lumen_core::identity::WorkspaceId,
         run_id: RunId,
+        actor: lumen_core::identity::PrincipalId,
     ) -> ServiceFuture<'_, RunStatus> {
         let service = self.clone();
         Box::pin(async move {
-            let state = service.run_status(workspace_id, run_id).await?;
+            let state = service.run_status(workspace_id, run_id, actor).await?;
             let lifecycle = service
                 .database
                 .get_run_lifecycle(workspace_id, run_id)
@@ -2562,6 +2565,7 @@ impl RuntimeService for LocalRuntimeService {
     fn list_reconciliation_runs(
         &self,
         workspace_id: lumen_core::identity::WorkspaceId,
+        _actor: lumen_core::identity::PrincipalId,
     ) -> ServiceFuture<'_, Vec<RunReconciliation>> {
         let service = self.clone();
         Box::pin(async move {

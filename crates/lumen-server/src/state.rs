@@ -1,8 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use lumen_core::{
@@ -60,7 +61,11 @@ impl ApprovalConflict {
 
 pub trait RuntimeService: Send + Sync {
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated>;
-    fn model_readiness(&self, workspace_id: WorkspaceId) -> ServiceFuture<'_, String>;
+    fn model_readiness(
+        &self,
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+    ) -> ServiceFuture<'_, String>;
     fn decide_approval(
         &self,
         command: ApprovalDecisionCommand,
@@ -70,20 +75,27 @@ pub trait RuntimeService: Send + Sync {
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>>;
     fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>>;
     fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation>;
-    fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String>;
+    fn run_status(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        actor: PrincipalId,
+    ) -> ServiceFuture<'_, String>;
     fn run_status_detail(
         &self,
         workspace_id: WorkspaceId,
         run_id: RunId,
+        actor: PrincipalId,
     ) -> ServiceFuture<'_, RunStatus> {
         Box::pin(async move {
-            let state = self.run_status(workspace_id, run_id).await?;
+            let state = self.run_status(workspace_id, run_id, actor).await?;
             Ok(RunStatus::new(state, None, None, false))
         })
     }
     fn list_reconciliation_runs(
         &self,
         workspace_id: WorkspaceId,
+        actor: PrincipalId,
     ) -> ServiceFuture<'_, Vec<RunReconciliation>>;
     fn list_staged_plugins(
         &self,
@@ -154,6 +166,12 @@ pub struct ApiState {
     sandbox: SandboxCapabilityReport,
 }
 
+pub(crate) enum AuthenticationResult {
+    Authenticated(PrincipalId),
+    Rejected,
+    Throttled,
+}
+
 impl ApiState {
     pub fn new(
         service: Arc<dyn RuntimeService>,
@@ -177,16 +195,33 @@ impl ApiState {
                 bearer_token_hash: Sha256::digest(bearer_token).into(),
                 principal,
                 allowed_workspaces,
+                failed_attempts: Mutex::new(VecDeque::new()),
             }),
             sandbox,
         })
     }
 
-    pub(crate) fn authenticate(&self, authorization: Option<&str>) -> Option<PrincipalId> {
-        let candidate = authorization?.strip_prefix("Bearer ")?;
+    pub(crate) fn authenticate(&self, authorization: Option<&str>) -> AuthenticationResult {
+        if self.authentication.is_throttled() {
+            return AuthenticationResult::Throttled;
+        }
+        let Some(candidate) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
+            self.authentication.record_failure();
+            return AuthenticationResult::Rejected;
+        };
+        if !(16..=4096).contains(&candidate.len()) {
+            self.authentication.record_failure();
+            return AuthenticationResult::Rejected;
+        }
         let candidate: [u8; 32] = Sha256::digest(candidate).into();
         let valid = bool::from(self.authentication.bearer_token_hash.ct_eq(&candidate));
-        valid.then(|| self.authentication.principal.clone())
+        if valid {
+            self.authentication.clear_failures();
+            AuthenticationResult::Authenticated(self.authentication.principal.clone())
+        } else {
+            self.authentication.record_failure();
+            AuthenticationResult::Rejected
+        }
     }
 
     pub(crate) fn allows_workspace(&self, workspace_id: WorkspaceId) -> bool {
@@ -1455,6 +1490,36 @@ struct LocalAuthentication {
     bearer_token_hash: [u8; 32],
     principal: PrincipalId,
     allowed_workspaces: BTreeSet<WorkspaceId>,
+    failed_attempts: Mutex<VecDeque<Instant>>,
+}
+
+impl LocalAuthentication {
+    const FAILURE_WINDOW: Duration = Duration::from_secs(30);
+    const FAILURE_LIMIT: usize = 8;
+
+    fn recent_failures(&self) -> std::sync::MutexGuard<'_, VecDeque<Instant>> {
+        let mut failures = self
+            .failed_attempts
+            .lock()
+            .expect("authentication throttle lock");
+        let cutoff = Instant::now() - Self::FAILURE_WINDOW;
+        while failures.front().is_some_and(|attempt| *attempt < cutoff) {
+            failures.pop_front();
+        }
+        failures
+    }
+
+    fn is_throttled(&self) -> bool {
+        self.recent_failures().len() >= Self::FAILURE_LIMIT
+    }
+
+    fn record_failure(&self) {
+        self.recent_failures().push_back(Instant::now());
+    }
+
+    fn clear_failures(&self) {
+        self.recent_failures().clear();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1815,17 +1880,24 @@ impl ApprovalResult {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditQuery {
     workspace_id: WorkspaceId,
+    actor: PrincipalId,
     after: i64,
     limit: u16,
 }
 
 impl AuditQuery {
-    pub(crate) const fn new(workspace_id: WorkspaceId, after: i64, limit: u16) -> Self {
+    pub(crate) const fn new(
+        workspace_id: WorkspaceId,
+        actor: PrincipalId,
+        after: i64,
+        limit: u16,
+    ) -> Self {
         Self {
             workspace_id,
+            actor,
             after,
             limit,
         }
@@ -1833,6 +1905,10 @@ impl AuditQuery {
 
     pub const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
     }
 
     pub const fn after(&self) -> i64 {

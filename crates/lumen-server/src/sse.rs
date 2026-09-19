@@ -41,6 +41,22 @@ impl EventBroker {
         self.inner.shutdown.send_replace(true);
     }
 
+    /// Reject cursors older than the retained broker history instead of
+    /// silently resuming with a gap.
+    pub fn validate_resume_cursor(&self, after: u64) -> Result<(), EventBrokerError> {
+        if after == 0 {
+            return Ok(());
+        }
+        let events = self.inner.events.read().expect("event replay lock");
+        if events
+            .front()
+            .is_some_and(|first| after < first.id.saturating_sub(1))
+        {
+            return Err(EventBrokerError::ReplayUnavailable);
+        }
+        Ok(())
+    }
+
     pub fn publish(
         &self,
         workspace_id: WorkspaceId,
@@ -191,6 +207,8 @@ impl RunEvent {
 pub enum EventBrokerError {
     #[error("event kind must be a bounded lowercase ASCII identifier")]
     InvalidEventKind,
+    #[error("event replay cursor is older than retained history")]
+    ReplayUnavailable,
 }
 
 #[cfg(test)]

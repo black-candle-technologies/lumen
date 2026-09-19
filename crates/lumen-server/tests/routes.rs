@@ -88,7 +88,11 @@ impl RuntimeService for FakeService {
         Box::pin(async { Ok(RunCreated::new(RunId::new())) })
     }
 
-    fn model_readiness(&self, workspace_id: WorkspaceId) -> ServiceFuture<'_, String> {
+    fn model_readiness(
+        &self,
+        workspace_id: WorkspaceId,
+        _actor: PrincipalId,
+    ) -> ServiceFuture<'_, String> {
         self.model_probe_queries
             .lock()
             .expect("probe queries")
@@ -97,7 +101,12 @@ impl RuntimeService for FakeService {
         Box::pin(async move { Ok(state) })
     }
 
-    fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String> {
+    fn run_status(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        _actor: PrincipalId,
+    ) -> ServiceFuture<'_, String> {
         self.run_status_queries
             .lock()
             .expect("queries")
@@ -109,6 +118,7 @@ impl RuntimeService for FakeService {
     fn list_reconciliation_runs(
         &self,
         workspace_id: WorkspaceId,
+        _actor: PrincipalId,
     ) -> ServiceFuture<'_, Vec<lumen_server::RunReconciliation>> {
         self.reconciliation_queries
             .lock()
@@ -1316,6 +1326,84 @@ async fn incorrect_local_bearer_token_is_rejected() {
 }
 
 #[tokio::test]
+async fn cors_echoes_only_local_web_origins() {
+    let workspace_id = WorkspaceId::new();
+    let (app, _, _) = test_app(workspace_id);
+    let path = format!("/api/v1/workspaces/{workspace_id}/runtime/capabilities");
+
+    let local = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::ORIGIN, "http://127.0.0.1:5173")
+                .body(Body::empty())
+                .expect("local request"),
+        )
+        .await
+        .expect("local response");
+    assert_eq!(
+        local.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&"http://127.0.0.1:5173".parse().expect("origin"))
+    );
+
+    let foreign = app
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::ORIGIN, "https://attacker.example")
+                .body(Body::empty())
+                .expect("foreign request"),
+        )
+        .await
+        .expect("foreign response");
+    assert_eq!(foreign.status(), StatusCode::OK);
+    assert!(
+        foreign
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn repeated_bad_bearers_are_throttled_before_runtime_dispatch() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    let path = format!("/api/v1/workspaces/{workspace_id}/runs");
+    for _ in 0..8 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::AUTHORIZATION, "Bearer wrong-local-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"prompt":"hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let throttled = app
+        .oneshot(request("POST", path, Body::from(r#"{"prompt":"hello"}"#)))
+        .await
+        .expect("response");
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        service
+            .run_commands
+            .lock()
+            .expect("run commands")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn unknown_workspace_is_rejected_before_service_dispatch() {
     let allowed_workspace = WorkspaceId::new();
     let requested_workspace = WorkspaceId::new();
@@ -1532,6 +1620,43 @@ async fn sse_replays_events_after_last_event_id() {
     assert!(text.contains("second"));
     assert!(!text.contains("first"));
     assert!(!text.contains("cross-workspace-secret"));
+}
+
+#[tokio::test]
+async fn stale_sse_cursor_returns_a_conflict_instead_of_a_gapped_stream() {
+    let workspace_id = WorkspaceId::new();
+    let run_id = RunId::new();
+    let (app, _, events) = test_app(workspace_id);
+    for index in 0..66 {
+        events
+            .publish(
+                workspace_id,
+                run_id,
+                "run.progress",
+                CanonicalValue::from(index.to_string()),
+            )
+            .expect("event");
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/workspaces/{workspace_id}/runs/{run_id}/events"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("last-event-id", "1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "event_replay_unavailable"
+    );
 }
 
 #[tokio::test]
