@@ -510,8 +510,14 @@ impl<'a> RunOrchestrator<'a> {
                     self.actions
                         .deny(&pending.action, &reason, self.clock.now())
                         .await?;
-                    self.audit(state, AuditEventKind::PolicyDenied, AuditOutcome::Denied)
-                        .await?;
+                    self.audit_action_with_denial(
+                        state,
+                        AuditEventKind::PolicyDenied,
+                        AuditOutcome::Denied,
+                        &pending.action,
+                        &reason,
+                    )
+                    .await?;
                     state.pending_action = None;
                     return Ok(state.finish(RunOutcome::Denied { reason }));
                 }
@@ -619,10 +625,11 @@ impl<'a> RunOrchestrator<'a> {
                     };
                     state.actions += 1;
                     self.actions.persist(&action, self.clock.now()).await?;
-                    self.audit(
+                    self.audit_action(
                         state,
                         AuditEventKind::ActionNormalized,
                         AuditOutcome::Success,
+                        &action,
                     )
                     .await?;
 
@@ -630,15 +637,26 @@ impl<'a> RunOrchestrator<'a> {
                     match &decision {
                         PolicyDecision::Deny(reason) => {
                             self.actions.deny(&action, reason, self.clock.now()).await?;
-                            self.audit(state, AuditEventKind::PolicyDenied, AuditOutcome::Denied)
-                                .await?;
+                            self.audit_action_with_denial(
+                                state,
+                                AuditEventKind::PolicyDenied,
+                                AuditOutcome::Denied,
+                                &action,
+                                reason,
+                            )
+                            .await?;
                             return Ok(state.finish(RunOutcome::Denied {
                                 reason: reason.clone(),
                             }));
                         }
                         PolicyDecision::Allow => {
-                            self.audit(state, AuditEventKind::PolicyAllowed, AuditOutcome::Success)
-                                .await?;
+                            self.audit_action(
+                                state,
+                                AuditEventKind::PolicyAllowed,
+                                AuditOutcome::Success,
+                                &action,
+                            )
+                            .await?;
                             let authorization = authorize_dispatch(
                                 &decision,
                                 &action,
@@ -664,10 +682,11 @@ impl<'a> RunOrchestrator<'a> {
                                 .await?
                             {
                                 ApprovalResolution::Pending(approval_id) => {
-                                    self.audit(
+                                    self.audit_action(
                                         state,
                                         AuditEventKind::ApprovalCreated,
                                         AuditOutcome::Pending,
+                                        &action,
                                     )
                                     .await?;
                                     state.pending_action = Some(PendingAction {
@@ -693,10 +712,11 @@ impl<'a> RunOrchestrator<'a> {
                                     }
                                 }
                                 ApprovalResolution::Rejected(approval_id) => {
-                                    self.audit(
+                                    self.audit_action(
                                         state,
                                         AuditEventKind::ApprovalRejected,
                                         AuditOutcome::Denied,
+                                        &action,
                                     )
                                     .await?;
                                     return Ok(
@@ -750,10 +770,11 @@ impl<'a> RunOrchestrator<'a> {
                 if approval_id != expected_id {
                     return Err(RunError::ApprovalIdentityMismatch);
                 }
-                self.audit(
+                self.audit_action(
                     state,
                     AuditEventKind::ApprovalRejected,
                     AuditOutcome::Denied,
+                    &action,
                 )
                 .await?;
                 Ok(ActionProgress::Terminal(RunOutcome::ApprovalRejected {
@@ -776,16 +797,18 @@ impl<'a> RunOrchestrator<'a> {
             Some(approval),
             self.clock.now(),
         )?;
-        self.audit(
+        self.audit_action(
             state,
             AuditEventKind::ApprovalGranted,
             AuditOutcome::Success,
+            action,
         )
         .await?;
-        self.audit(
+        self.audit_action(
             state,
             AuditEventKind::ApprovalConsumed,
             AuditOutcome::Success,
+            action,
         )
         .await?;
         Ok(authorization)
@@ -797,10 +820,11 @@ impl<'a> RunOrchestrator<'a> {
         action: AuthorizedAction,
         tool_call_id: Option<String>,
     ) -> Result<Option<RunOutcome>, RunError> {
-        self.audit(
+        self.audit_action(
             state,
             AuditEventKind::ExecutionStarted,
             AuditOutcome::Pending,
+            action.action(),
         )
         .await?;
         let cancellation = self.cancellation.clone();
@@ -817,8 +841,12 @@ impl<'a> RunOrchestrator<'a> {
                         match tokio::time::timeout(Duration::from_millis(250), &mut execution).await {
                             Ok(Ok(ExecutionOutcome::Succeeded(_)
                                 | ExecutionOutcome::Proposed(_))) => {
-                                self.audit(state, AuditEventKind::ExecutionSucceeded,
-                                    AuditOutcome::Success).await?;
+                                self.audit_action(
+                                    state,
+                                    AuditEventKind::ExecutionSucceeded,
+                                    AuditOutcome::Success,
+                                    action.action(),
+                                ).await?;
                                 return Ok(Some(self.exhaust_budget(state, BudgetKind::WallClock)
                                     .await?));
                             }
@@ -838,10 +866,11 @@ impl<'a> RunOrchestrator<'a> {
         };
         match outcome {
             ExecutionOutcome::Succeeded(result) => {
-                self.audit(
+                self.audit_action(
                     state,
                     AuditEventKind::ExecutionSucceeded,
                     AuditOutcome::Success,
+                    action.action(),
                 )
                 .await?;
                 let captured = serde_json::to_vec(&result)
@@ -866,10 +895,11 @@ impl<'a> RunOrchestrator<'a> {
                 Ok(None)
             }
             ExecutionOutcome::Proposed(proposal) => {
-                self.audit(
+                self.audit_action(
                     state,
                     AuditEventKind::ExecutionSucceeded,
                     AuditOutcome::Success,
+                    action.action(),
                 )
                 .await?;
                 let captured = serde_json::to_vec(&proposal)
@@ -891,37 +921,41 @@ impl<'a> RunOrchestrator<'a> {
                 Ok(None)
             }
             ExecutionOutcome::Failed(message) => {
-                self.audit(
+                self.audit_action(
                     state,
                     AuditEventKind::ExecutionFailed,
                     AuditOutcome::Failure,
+                    action.action(),
                 )
                 .await?;
                 Ok(Some(state.finish(RunOutcome::ExecutionFailed { message })))
             }
             ExecutionOutcome::Cancelled => {
-                self.audit(
+                self.audit_action(
                     state,
                     AuditEventKind::ExecutionCancelled,
                     AuditOutcome::Failure,
+                    action.action(),
                 )
                 .await?;
                 Ok(Some(state.finish(RunOutcome::Cancelled)))
             }
             ExecutionOutcome::TimedOut => {
-                self.audit(
+                self.audit_action(
                     state,
                     AuditEventKind::ExecutionTimedOut,
                     AuditOutcome::Failure,
+                    action.action(),
                 )
                 .await?;
                 Ok(Some(state.finish(RunOutcome::ExecutionTimedOut)))
             }
             ExecutionOutcome::Unknown(message) => {
-                self.audit(
+                self.audit_action(
                     state,
                     AuditEventKind::ExecutionUnknown,
                     AuditOutcome::Unknown,
+                    action.action(),
                 )
                 .await?;
                 Ok(Some(state.finish(RunOutcome::ExecutionUnknown { message })))
@@ -976,6 +1010,41 @@ impl<'a> RunOrchestrator<'a> {
         kind: AuditEventKind,
         outcome: AuditOutcome,
     ) -> Result<(), AuditPortError> {
+        self.audit_with_action(state, kind, outcome, None, None)
+            .await
+    }
+
+    async fn audit_action(
+        &self,
+        state: &RunState,
+        kind: AuditEventKind,
+        outcome: AuditOutcome,
+        action: &ActionEnvelope,
+    ) -> Result<(), AuditPortError> {
+        self.audit_with_action(state, kind, outcome, Some(action), None)
+            .await
+    }
+
+    async fn audit_action_with_denial(
+        &self,
+        state: &RunState,
+        kind: AuditEventKind,
+        outcome: AuditOutcome,
+        action: &ActionEnvelope,
+        reason: &DenialReason,
+    ) -> Result<(), AuditPortError> {
+        self.audit_with_action(state, kind, outcome, Some(action), Some(reason))
+            .await
+    }
+
+    async fn audit_with_action(
+        &self,
+        state: &RunState,
+        kind: AuditEventKind,
+        outcome: AuditOutcome,
+        action: Option<&ActionEnvelope>,
+        denial_reason: Option<&DenialReason>,
+    ) -> Result<(), AuditPortError> {
         let mut payload = vec![
             (
                 "run_id",
@@ -985,7 +1054,40 @@ impl<'a> RunOrchestrator<'a> {
                 "actor",
                 CanonicalValue::from(state.context.actor().subject()),
             ),
+            (
+                "actor_provider",
+                CanonicalValue::from(state.context.actor().provider()),
+            ),
         ];
+        if let Some(action) = action {
+            payload.extend([
+                ("action_id", CanonicalValue::from(action.id().to_string())),
+                ("action_kind", CanonicalValue::from(action.kind().as_str())),
+                (
+                    "required_capabilities",
+                    CanonicalValue::Array(
+                        action
+                            .required_capabilities()
+                            .iter()
+                            .map(|capability| {
+                                CanonicalValue::from(
+                                    serde_json::to_string(capability)
+                                        .expect("capability serialization cannot fail"),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]);
+        }
+        if let Some(reason) = denial_reason {
+            payload.push((
+                "denial_reason",
+                CanonicalValue::from(
+                    serde_json::to_string(reason).expect("denial reason serialization cannot fail"),
+                ),
+            ));
+        }
         if let Some(origin) = state.context.job_origin() {
             payload.extend([
                 ("job_id", CanonicalValue::from(origin.job_id().to_string())),

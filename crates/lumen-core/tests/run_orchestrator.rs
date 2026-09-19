@@ -1040,6 +1040,13 @@ async fn normalized_action_is_persisted_before_policy_denial() {
     assert!(matches!(outcome, RunOutcome::Denied { .. }));
     assert_eq!(actions.0.load(Ordering::SeqCst), 1);
     assert_eq!(executor.call_count(), 0);
+    let payload =
+        serde_json::to_string(&audit.payload(AuditEventKind::PolicyDenied)).expect("audit payload");
+    assert!(payload.contains(r#""actor_provider":"local""#));
+    assert!(payload.contains(r#""action_id":""#));
+    assert!(payload.contains(r#""action_kind":"filesystem.read""#));
+    assert!(payload.contains(r#""required_capabilities""#));
+    assert!(payload.contains(r#""denial_reason""#));
 }
 
 #[tokio::test]

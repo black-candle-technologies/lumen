@@ -43,7 +43,7 @@ pub enum PolicyDecision {
     RequireApproval,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum DenialReason {
     NoCapabilitiesDeclared,
     MissingCapability(Capability),
