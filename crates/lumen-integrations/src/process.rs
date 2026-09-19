@@ -603,6 +603,9 @@ struct ScheduledJobArguments {
     enabled: bool,
     next_due_at: Option<i64>,
     idempotent: bool,
+    previous_revision: Option<i64>,
+    previous_enabled: Option<bool>,
+    target_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -623,6 +626,8 @@ struct SkillPublishArguments {
     name: String,
     description: String,
     source_format: String,
+    source_digest: Option<String>,
+    source_run_id: Option<String>,
 }
 
 fn object_schema<const P: usize, const R: usize>(
@@ -730,6 +735,27 @@ fn normalize_scheduled_job_arguments(
         .transpose()?
         .map(CanonicalValue::from)
         .unwrap_or(CanonicalValue::Null);
+    let previous_revision = parsed
+        .previous_revision
+        .map(positive_revision)
+        .transpose()?
+        .map(CanonicalValue::from)
+        .unwrap_or(CanonicalValue::Null);
+    if previous_revision == CanonicalValue::Null && parsed.previous_enabled.is_some() {
+        return Err(NormalizationError::new(
+            "scheduled job previous state is invalid",
+        ));
+    }
+    let previous_enabled = parsed
+        .previous_enabled
+        .map(CanonicalValue::from)
+        .unwrap_or(CanonicalValue::Null);
+    let target_revision = parsed
+        .target_revision
+        .map(positive_revision)
+        .transpose()?
+        .map(CanonicalValue::from)
+        .unwrap_or(CanonicalValue::Null);
     Ok((
         job_id.clone(),
         CanonicalValue::object([
@@ -752,8 +778,17 @@ fn normalize_scheduled_job_arguments(
             ("enabled", CanonicalValue::from(parsed.enabled)),
             ("next_due_at", next_due_at),
             ("idempotent", CanonicalValue::from(parsed.idempotent)),
+            ("previous_revision", previous_revision),
+            ("previous_enabled", previous_enabled),
+            ("target_revision", target_revision),
         ]),
     ))
+}
+
+fn positive_revision(value: i64) -> Result<i64, NormalizationError> {
+    (value > 0)
+        .then_some(value)
+        .ok_or_else(|| NormalizationError::new("scheduled job revision is invalid"))
 }
 
 fn normalize_scheduled_job_schedule(
@@ -822,6 +857,29 @@ fn normalize_skill_publish_arguments(
     {
         return Err(NormalizationError::new("skill publish metadata is invalid"));
     }
+    let source_digest = parsed
+        .source_digest
+        .map(|digest| {
+            if digest.len() == 71
+                && digest.starts_with("sha256:")
+                && digest[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                Ok(digest)
+            } else {
+                Err(NormalizationError::new("skill source digest is invalid"))
+            }
+        })
+        .transpose()?;
+    let source_run_id = parsed
+        .source_run_id
+        .map(|run_id| {
+            uuid::Uuid::parse_str(&run_id)
+                .map(|parsed| parsed.to_string())
+                .map_err(|_| NormalizationError::new("source run ID must be a UUID"))
+        })
+        .transpose()?;
     Ok((
         skill_id.to_string(),
         CanonicalValue::object([
@@ -831,6 +889,14 @@ fn normalize_skill_publish_arguments(
             ("name", CanonicalValue::from(parsed.name)),
             ("description", CanonicalValue::from(parsed.description)),
             ("source_format", CanonicalValue::from(parsed.source_format)),
+            (
+                "source_digest",
+                source_digest.map_or(CanonicalValue::Null, CanonicalValue::from),
+            ),
+            (
+                "source_run_id",
+                source_run_id.map_or(CanonicalValue::Null, CanonicalValue::from),
+            ),
         ]),
     ))
 }

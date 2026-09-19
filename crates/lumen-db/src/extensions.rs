@@ -1002,7 +1002,6 @@ impl Database {
         occurred_at: TimestampMillis,
     ) -> Result<PluginWorkspaceState, RepositoryError> {
         let occurred_at = timestamp_to_i64(occurred_at)?;
-        let window_start = occurred_at.saturating_sub(10 * 60 * 1_000);
         let counted = i64::from(class.counts_toward_health());
         let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
@@ -1021,6 +1020,21 @@ impl Database {
         .bind(occurred_at)
         .execute(&mut *transaction)
         .await?;
+        // Let a bounded clock rollback reuse the latest nearby fault as the window end.
+        // A distant future timestamp must neither widen nor pin the health window.
+        let latest_failure: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(occurred_at) FROM plugin_failures
+             WHERE workspace_id = ? AND plugin_id = ? AND plugin_version = ?
+               AND counted = 1 AND occurred_at <= ?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(plugin_id.as_str())
+        .bind(version.as_str())
+        .bind(occurred_at.saturating_add(10 * 60 * 1_000))
+        .fetch_one(&mut *transaction)
+        .await?;
+        let window_end = latest_failure.unwrap_or(occurred_at);
+        let window_start = window_end.saturating_sub(10 * 60 * 1_000);
         let failures: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM plugin_failures
              WHERE workspace_id = ? AND plugin_id = ? AND plugin_version = ?
@@ -1030,7 +1044,7 @@ impl Database {
         .bind(plugin_id.as_str())
         .bind(version.as_str())
         .bind(window_start)
-        .bind(occurred_at)
+        .bind(window_end)
         .fetch_one(&mut *transaction)
         .await?;
         if failures >= 3 {

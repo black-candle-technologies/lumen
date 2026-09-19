@@ -1,15 +1,15 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
-    approval::{ApprovalId, ApprovalRequest, TimestampMillis},
+    approval::{ApprovalError, ApprovalId, ApprovalRequest, DispatchError, TimestampMillis},
     audit::{AuditEvent, AuditEventKind},
     capability::{
         Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope,
@@ -29,14 +29,42 @@ use lumen_core::{
     policy::{DenialReason, Policy, PolicyVersion},
     run::{
         ActionFuture, ActionNormalizer, ActionPort, ApprovalFuture, ApprovalPort,
-        ApprovalResolution, AuditFuture, AuditPort, AuditPortError, BudgetKind, NormalizationError,
-        RunBudget, RunContext, RunError, RunOrchestrator, RunOutcome, RunState,
+        ApprovalResolution, AuditFuture, AuditPort, AuditPortError, BudgetKind, Clock,
+        NormalizationError, RunBudget, RunContext, RunError, RunOrchestrator, RunOutcome, RunState,
     },
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const NOW: TimestampMillis = TimestampMillis::new(10_000);
+
+struct FixedClock;
+
+static CLOCK: FixedClock = FixedClock;
+
+impl Clock for FixedClock {
+    fn now(&self) -> TimestampMillis {
+        NOW
+    }
+}
+
+struct TestClock(AtomicU64);
+
+impl TestClock {
+    fn new(now: u64) -> Self {
+        Self(AtomicU64::new(now))
+    }
+
+    fn set(&self, now: u64) {
+        self.0.store(now, Ordering::SeqCst);
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> TimestampMillis {
+        TimestampMillis::new(self.0.load(Ordering::SeqCst))
+    }
+}
 
 fn workspace_id() -> WorkspaceId {
     WorkspaceId::from_uuid(
@@ -106,6 +134,43 @@ impl ModelPort for FakeModel {
                 .expect("model queue lock")
                 .pop_front()
                 .unwrap_or_else(|| Err(ModelError::new("no fake model output")))
+        })
+    }
+}
+
+struct ClockedModel {
+    inner: FakeModel,
+    clock: Arc<TestClock>,
+    completion_times: Mutex<VecDeque<u64>>,
+}
+
+impl ClockedModel {
+    fn new(
+        outputs: impl IntoIterator<Item = ModelOutput>,
+        clock: Arc<TestClock>,
+        completion_times: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        Self {
+            inner: FakeModel::new(outputs),
+            clock,
+            completion_times: Mutex::new(completion_times.into_iter().collect()),
+        }
+    }
+}
+
+impl ModelPort for ClockedModel {
+    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
+        let generation = self.inner.generate(input);
+        Box::pin(async move {
+            let output = generation.await;
+            let timestamp = self
+                .completion_times
+                .lock()
+                .expect("model completion times lock")
+                .pop_front()
+                .expect("model completion time");
+            self.clock.set(timestamp);
+            output
         })
     }
 }
@@ -202,6 +267,106 @@ impl ExecutorPort for FakeExecutor {
     }
 }
 
+struct ClockedExecutor {
+    inner: FakeExecutor,
+    clock: Arc<TestClock>,
+    completion_time: u64,
+}
+
+struct UnresponsiveExecutor {
+    calls: AtomicUsize,
+    cancellation: Mutex<Option<CancellationToken>>,
+}
+
+impl ExecutorPort for UnresponsiveExecutor {
+    fn execute(
+        &self,
+        _action: &AuthorizedAction,
+        cancellation: CancellationToken,
+    ) -> ExecutorFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.cancellation.lock().expect("cancellation lock") = Some(cancellation);
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn unresponsive_execution_is_bounded_and_never_reported_as_known_failure() {
+    let model = FakeModel::new([proposal("filesystem.read")]);
+    let executor = UnresponsiveExecutor {
+        calls: AtomicUsize::new(0),
+        cancellation: Mutex::new(None),
+    };
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(
+        run_context(),
+        "read",
+        RunBudget::limited(3, 2, Duration::from_millis(10), 1024),
+    );
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        orchestrator(&model, &executor, &approvals, &audit)
+            .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead)),
+    )
+    .await
+    .expect("bounded resolution")
+    .expect("run outcome");
+    assert!(matches!(outcome, RunOutcome::ExecutionUnknown { .. }));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        executor
+            .cancellation
+            .lock()
+            .expect("cancellation lock")
+            .as_ref()
+            .expect("token")
+            .is_cancelled()
+    );
+    assert!(audit.events().contains(&AuditEventKind::ExecutionUnknown));
+}
+
+#[tokio::test]
+async fn cancellation_precedes_a_required_skill_failure() {
+    let model = FakeModel::new([ModelOutput::FinalText("unused".into())]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let context =
+        run_context().with_skill_loads(vec![lumen_core::run::SkillLoadMetadata::excluded(
+            "required-skill",
+            "1",
+            "expected-digest",
+            "source_unavailable",
+            true,
+        )]);
+    let mut state = RunState::new(context, "cancelled", RunBudget::unlimited(3, 2));
+    state.cancel();
+    let outcome = orchestrator(&model, &executor, &approvals, &audit)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
+        .await
+        .expect("cancellation outcome");
+    assert_eq!(outcome, RunOutcome::Cancelled);
+    assert_eq!(model.call_count(), 0);
+    assert!(audit.events().contains(&AuditEventKind::RunCancelled));
+    assert!(!audit.events().contains(&AuditEventKind::RunFailed));
+}
+
+impl ExecutorPort for ClockedExecutor {
+    fn execute<'a>(
+        &'a self,
+        action: &'a AuthorizedAction,
+        cancellation: CancellationToken,
+    ) -> ExecutorFuture<'a> {
+        let execution = self.inner.execute(action, cancellation);
+        Box::pin(async move {
+            let outcome = execution.await;
+            self.clock.set(self.completion_time);
+            outcome
+        })
+    }
+}
+
 enum ApprovalBehavior {
     PendingThenGrant { id: ApprovalId, calls: AtomicUsize },
     AlwaysPending(ApprovalId),
@@ -257,6 +422,38 @@ impl ApprovalPort for FakeApprovals {
     }
 }
 
+struct ExpiringApprovals {
+    clock: Arc<TestClock>,
+}
+
+impl ApprovalPort for ExpiringApprovals {
+    fn resolve<'a>(
+        &'a self,
+        action: &'a ActionEnvelope,
+        version: &'a PolicyVersion,
+        now: TimestampMillis,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async move {
+            let mut request = ApprovalRequest::new(
+                ApprovalId::new(),
+                action.fingerprint(),
+                version.clone(),
+                TimestampMillis::new(9_000),
+                TimestampMillis::new(11_000),
+            )
+            .expect("valid approval");
+            request
+                .grant(
+                    PrincipalId::new("local", "admin").expect("valid approver"),
+                    now,
+                )
+                .expect("approval grants");
+            self.clock.set(11_000);
+            Ok(ApprovalResolution::Granted(request))
+        })
+    }
+}
+
 #[derive(Default)]
 struct FakeAudit {
     events: Mutex<Vec<AuditEvent>>,
@@ -289,6 +486,15 @@ impl FakeAudit {
             .expect("audit event")
             .payload()
             .clone()
+    }
+
+    fn recorded(&self) -> Vec<(AuditEventKind, TimestampMillis)> {
+        self.events
+            .lock()
+            .expect("audit events lock")
+            .iter()
+            .map(|event| (event.kind(), event.timestamp()))
+            .collect()
     }
 }
 
@@ -444,20 +650,21 @@ async fn extension_proposal_reenters_action_budget_policy_approval_and_audit() {
         &approvals,
         &audit,
         &actions,
+        &CLOCK,
         Policy::default(),
         policy_version(),
     );
 
     assert!(matches!(
         orchestrator
-            .run_until_blocked(&mut state, &capabilities, NOW)
+            .run_until_blocked(&mut state, &capabilities)
             .await
             .expect("first advance"),
         RunOutcome::AwaitingApproval { .. }
     ));
     assert_eq!(executor.call_count(), 1);
     let outcome = orchestrator
-        .run_until_blocked(&mut state, &capabilities, NOW)
+        .run_until_blocked(&mut state, &capabilities)
         .await
         .expect("second advance");
     assert_eq!(
@@ -539,12 +746,13 @@ async fn extension_child_broader_than_effective_grants_is_persisted_but_not_exec
         &approvals,
         &audit,
         &actions,
+        &CLOCK,
         Policy::default(),
         policy_version(),
     );
 
     let outcome = orchestrator
-        .run_until_blocked(&mut state, &capabilities, NOW)
+        .run_until_blocked(&mut state, &capabilities)
         .await
         .expect("run outcome");
     assert!(matches!(
@@ -573,6 +781,7 @@ fn orchestrator<'a>(
         approvals,
         audit,
         &ACTIONS,
+        &CLOCK,
         Policy::default(),
         policy_version(),
     )
@@ -587,7 +796,7 @@ async fn text_completion_finishes_without_executing_an_action() {
     let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("run succeeds");
 
@@ -606,6 +815,106 @@ async fn text_completion_finishes_without_executing_an_action() {
 }
 
 #[tokio::test]
+async fn audit_events_read_fresh_wall_time_after_async_boundaries() {
+    let clock = Arc::new(TestClock::new(1_000));
+    let model = ClockedModel::new(
+        [
+            proposal("filesystem.read"),
+            ModelOutput::FinalText("done".into()),
+        ],
+        clock.clone(),
+        [2_000, 4_000],
+    );
+    let executor = ClockedExecutor {
+        inner: FakeExecutor::succeeding(),
+        clock: clock.clone(),
+        completion_time: 3_000,
+    };
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
+    let orchestrator = RunOrchestrator::new(
+        &model,
+        &NORMALIZER,
+        &executor,
+        &approvals,
+        &audit,
+        &ACTIONS,
+        clock.as_ref(),
+        Policy::default(),
+        policy_version(),
+    );
+
+    assert_eq!(
+        orchestrator
+            .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead))
+            .await
+            .expect("run outcome"),
+        RunOutcome::Completed {
+            text: "done".into()
+        }
+    );
+    let recorded = audit.recorded();
+    assert_eq!(
+        recorded[0],
+        (AuditEventKind::RunCreated, TimestampMillis::new(1_000))
+    );
+    assert!(recorded.contains(&(AuditEventKind::ActionProposed, TimestampMillis::new(2_000))));
+    assert!(recorded.contains(&(
+        AuditEventKind::ExecutionSucceeded,
+        TimestampMillis::new(3_000)
+    )));
+    assert_eq!(
+        recorded.last(),
+        Some(&(AuditEventKind::RunCompleted, TimestampMillis::new(4_000)))
+    );
+}
+
+#[tokio::test]
+async fn backward_wall_clock_does_not_control_the_monotonic_budget() {
+    let clock = Arc::new(TestClock::new(10_000));
+    let model = ClockedModel::new(
+        [ModelOutput::FinalText("done".into())],
+        clock.clone(),
+        [9_000],
+    );
+    let executor = FakeExecutor::succeeding();
+    let approvals = FakeApprovals::always_pending();
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(
+        run_context(),
+        "hello",
+        RunBudget::limited(1, 0, Duration::from_secs(1), 1024),
+    );
+    let orchestrator = RunOrchestrator::new(
+        &model,
+        &NORMALIZER,
+        &executor,
+        &approvals,
+        &audit,
+        &ACTIONS,
+        clock.as_ref(),
+        Policy::default(),
+        policy_version(),
+    );
+
+    assert!(matches!(
+        orchestrator
+            .run_until_blocked(&mut state, &EffectiveCapabilities::default())
+            .await
+            .expect("run outcome"),
+        RunOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        audit.recorded(),
+        vec![
+            (AuditEventKind::RunCreated, TimestampMillis::new(10_000)),
+            (AuditEventKind::RunCompleted, TimestampMillis::new(9_000)),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn model_input_from_run_state_is_workspace_classified() {
     let model = FakeModel::new([ModelOutput::FinalText("done".to_owned())]);
     let executor = FakeExecutor::succeeding();
@@ -614,7 +923,7 @@ async fn model_input_from_run_state_is_workspace_classified() {
     let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("run succeeds");
 
@@ -639,7 +948,7 @@ async fn model_input_from_run_state_can_be_public_classified() {
         .with_data_class(DataClass::Public);
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("run succeeds");
 
@@ -664,11 +973,11 @@ async fn terminal_run_outcome_is_sticky_and_does_not_repeat_work() {
     let orchestrator = orchestrator(&model, &executor, &approvals, &audit);
 
     let first = orchestrator
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("first call completes");
     let second = orchestrator
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("terminal state can be inspected");
 
@@ -689,7 +998,7 @@ async fn denied_action_never_reaches_the_executor() {
     let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("denial is a run outcome");
 
@@ -718,12 +1027,13 @@ async fn normalized_action_is_persisted_before_policy_denial() {
         &approvals,
         &audit,
         &actions,
+        &CLOCK,
         Policy::default(),
         policy_version(),
     );
 
     let outcome = orchestrator
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("denial is recorded");
 
@@ -734,6 +1044,7 @@ async fn normalized_action_is_persisted_before_policy_denial() {
 
 #[tokio::test]
 async fn pending_approval_pauses_and_resume_does_not_repeat_the_model_call() {
+    let clock = TestClock::new(9_000);
     let model = FakeModel::new([
         proposal("filesystem.write"),
         ModelOutput::FinalText("saved".to_owned()),
@@ -742,10 +1053,20 @@ async fn pending_approval_pauses_and_resume_does_not_repeat_the_model_call() {
     let approvals = FakeApprovals::pending_then_grant();
     let audit = FakeAudit::default();
     let mut state = RunState::new(run_context(), "write", RunBudget::unlimited(3, 2));
-    let orchestrator = orchestrator(&model, &executor, &approvals, &audit);
+    let orchestrator = RunOrchestrator::new(
+        &model,
+        &NORMALIZER,
+        &executor,
+        &approvals,
+        &audit,
+        &ACTIONS,
+        &clock,
+        Policy::default(),
+        policy_version(),
+    );
 
     let first = orchestrator
-        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsWrite), NOW)
+        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsWrite))
         .await
         .expect("run pauses");
     assert!(matches!(first, RunOutcome::AwaitingApproval { .. }));
@@ -753,8 +1074,9 @@ async fn pending_approval_pauses_and_resume_does_not_repeat_the_model_call() {
     assert_eq!(model.call_count(), 1);
     assert_eq!(executor.call_count(), 0);
 
+    clock.set(10_000);
     let resumed = orchestrator
-        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsWrite), NOW)
+        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsWrite))
         .await
         .expect("run resumes");
     assert_eq!(
@@ -766,7 +1088,49 @@ async fn pending_approval_pauses_and_resume_does_not_repeat_the_model_call() {
     assert!(!state.has_pending_action());
     assert_eq!(model.call_count(), 2);
     assert_eq!(executor.call_count(), 1);
-    assert!(audit.events().contains(&AuditEventKind::ApprovalConsumed));
+    let recorded = audit.recorded();
+    assert!(recorded.contains(&(AuditEventKind::ApprovalCreated, TimestampMillis::new(9_000))));
+    assert!(recorded.contains(&(
+        AuditEventKind::ApprovalGranted,
+        TimestampMillis::new(10_000)
+    )));
+    assert!(recorded.contains(&(
+        AuditEventKind::ApprovalConsumed,
+        TimestampMillis::new(10_000)
+    )));
+}
+
+#[tokio::test]
+async fn approval_expiry_is_rechecked_with_fresh_time_before_dispatch() {
+    let clock = Arc::new(TestClock::new(10_000));
+    let model = FakeModel::new([proposal("filesystem.write")]);
+    let executor = FakeExecutor::succeeding();
+    let approvals = ExpiringApprovals {
+        clock: clock.clone(),
+    };
+    let audit = FakeAudit::default();
+    let mut state = RunState::new(run_context(), "write", RunBudget::unlimited(1, 1));
+    let orchestrator = RunOrchestrator::new(
+        &model,
+        &NORMALIZER,
+        &executor,
+        &approvals,
+        &audit,
+        &ACTIONS,
+        clock.as_ref(),
+        Policy::default(),
+        policy_version(),
+    );
+
+    assert_eq!(
+        orchestrator
+            .run_until_blocked(&mut state, &capabilities(CapabilityName::FsWrite))
+            .await,
+        Err(RunError::Dispatch(DispatchError::Approval(
+            ApprovalError::Expired
+        )))
+    );
+    assert_eq!(executor.call_count(), 0);
 }
 
 #[tokio::test]
@@ -791,13 +1155,13 @@ async fn tool_call_identity_and_result_are_preserved_after_approval() {
 
     assert!(matches!(
         orchestrator
-            .run_until_blocked(&mut state, &capabilities, NOW)
+            .run_until_blocked(&mut state, &capabilities)
             .await
             .expect("run pauses"),
         RunOutcome::AwaitingApproval { .. }
     ));
     let outcome = orchestrator
-        .run_until_blocked(&mut state, &capabilities, NOW)
+        .run_until_blocked(&mut state, &capabilities)
         .await
         .expect("run resumes");
 
@@ -835,7 +1199,7 @@ async fn exhausted_model_budget_stops_before_calling_the_model() {
     let mut state = RunState::new(run_context(), "hello", RunBudget::unlimited(0, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("budget exhaustion is a run outcome");
 
@@ -866,7 +1230,7 @@ async fn approval_waiting_counts_toward_the_wall_clock_budget() {
 
     assert!(matches!(
         orchestrator
-            .run_until_blocked(&mut state, &capabilities, NOW)
+            .run_until_blocked(&mut state, &capabilities)
             .await
             .expect("run pauses"),
         RunOutcome::AwaitingApproval { .. }
@@ -875,7 +1239,7 @@ async fn approval_waiting_counts_toward_the_wall_clock_budget() {
 
     assert_eq!(
         orchestrator
-            .run_until_blocked(&mut state, &capabilities, NOW)
+            .run_until_blocked(&mut state, &capabilities)
             .await
             .expect("budget exhaustion is a run outcome"),
         RunOutcome::BudgetExhausted(BudgetKind::WallClock)
@@ -893,7 +1257,7 @@ async fn cancelled_run_stops_before_model_or_executor_work() {
     state.cancel();
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("cancellation is a run outcome");
 
@@ -911,7 +1275,7 @@ async fn executor_failure_is_distinct_from_an_unknown_outcome() {
     let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
+        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead))
         .await
         .expect("known failure is a run outcome");
 
@@ -933,7 +1297,7 @@ async fn executor_unknown_outcome_is_preserved_for_reconciliation() {
     let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
+        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead))
         .await
         .expect("unknown execution is a run outcome");
 
@@ -955,7 +1319,7 @@ async fn audit_failure_before_dispatch_fails_closed() {
     let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
     let result = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
+        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead))
         .await;
 
     assert_eq!(
@@ -976,7 +1340,7 @@ async fn elapsed_wall_clock_budget_stops_before_model_or_executor_work() {
     tokio::time::sleep(Duration::from_millis(5)).await;
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &EffectiveCapabilities::default(), NOW)
+        .run_until_blocked(&mut state, &EffectiveCapabilities::default())
         .await
         .expect("wall-clock exhaustion is a run outcome");
 
@@ -1006,7 +1370,7 @@ async fn cumulative_captured_result_budget_stops_before_another_model_turn() {
     let mut state = RunState::new(run_context(), "read", budget);
 
     let outcome = orchestrator(&model, &executor, &approvals, &audit)
-        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
+        .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead))
         .await
         .expect("result-byte exhaustion is a run outcome");
 
@@ -1037,7 +1401,7 @@ async fn executor_cancellation_and_timeout_remain_distinct_run_outcomes() {
         let mut state = RunState::new(run_context(), "read", RunBudget::unlimited(3, 2));
 
         let outcome = orchestrator(&model, &executor, &approvals, &audit)
-            .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead), NOW)
+            .run_until_blocked(&mut state, &capabilities(CapabilityName::FsRead))
             .await
             .expect("execution terminal outcome");
 
