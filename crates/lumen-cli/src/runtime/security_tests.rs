@@ -435,6 +435,31 @@ struct Harness {
     workspace_id: lumen_core::identity::WorkspaceId,
 }
 
+#[derive(Debug)]
+struct RestartBaseline {
+    workspace_id: WorkspaceId,
+    service: PrincipalId,
+    job_id: JobId,
+    job_revision: JobRevision,
+    occurrence_key: OccurrenceKey,
+    run_id: RunId,
+    approval_id: ApprovalId,
+    approval_state: String,
+    approval_fingerprint: String,
+    approval_policy_version: String,
+    approval_created_at: i64,
+    approval_expires_at: i64,
+    replacement_approval_id: Option<String>,
+    skill_id: SkillId,
+    skill_version: SkillVersion,
+    skill_digest: String,
+    audit_ids: Vec<String>,
+    audit_kinds: Vec<String>,
+    audit_hashes: Vec<String>,
+    lifecycle_phase: String,
+    effect_certainty: String,
+}
+
 impl Harness {
     async fn new(model: &MockServer, prepare_workspace: impl FnOnce(&std::path::Path)) -> Self {
         Self::new_inner(
@@ -2010,6 +2035,483 @@ async fn scheduled_run_resumes_two_approval_required_actions() {
         .expect("attempt count");
     assert_eq!(attempts, 2);
     harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn same_database_restart_preserves_job_occurrence_approval_skill_audit_and_effect_identity() {
+    let model = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turns = Arc::clone(&turns);
+            move |_request: &MockRequest| {
+                if turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                    action_response(
+                        "filesystem.write",
+                        serde_json::json!({"path":"restart-effect.txt","content":"once"}),
+                    )
+                } else {
+                    final_response("scheduled effect settled")
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+
+    let root = tempfile::tempdir().expect("persistent runtime root");
+    let database_path = root.path().join("lumen.sqlite3");
+    let data_root = root.path().join("data");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&data_root).expect("data root");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = Config::parse(&format!(
+        r#"
+[database]
+path = {}
+
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = false
+
+[runtime]
+data_directory = {}
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = {}
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+        path_toml(&database_path),
+        model.uri(),
+        path_toml(&data_root),
+        path_toml(&workspace),
+    ))
+    .expect("persistent runtime config");
+    let workspace_id = config.workspace_id();
+    let operator = config.bootstrap_principal();
+    let database = Database::connect(&database_path)
+        .await
+        .expect("first database");
+    database
+        .bootstrap_workspace(workspace_id, &config.workspace.name, &operator, now())
+        .await
+        .expect("workspace bootstrap");
+    let events = EventBroker::new(128);
+    let service = Arc::new(
+        LocalRuntimeService::build_with_secret_store(
+            &config,
+            database.clone(),
+            events,
+            Arc::new(RecordingSandbox::new()),
+            vec![TOKEN.to_owned()],
+            Arc::new(InMemorySecretStore::new()),
+        )
+        .await
+        .expect("first runtime"),
+    );
+
+    let scheduled_service = scheduled_service_principal();
+    database
+        .upsert_service_identity(
+            &ServiceIdentity::new(
+                scheduled_service.clone(),
+                workspace_id,
+                operator.clone(),
+                "Restart continuity service",
+                true,
+                TimestampMillis::new(1_000),
+                TimestampMillis::new(1_000),
+            )
+            .expect("service identity"),
+            [Capability::new(
+                CapabilityName::FsWrite,
+                ResourceScope::workspace(workspace_id),
+            )],
+        )
+        .await
+        .expect("scheduled service");
+    let job_id = scheduled_job_id();
+    let job_revision = JobRevision::new(1).expect("job revision");
+    let scheduled_for = TimestampMillis::new(1_000);
+    database
+        .append_scheduled_job_revision(
+            &ScheduledJobRevision::new(
+                job_id,
+                job_revision,
+                workspace_id,
+                scheduled_service.clone(),
+                operator.clone(),
+                ScheduleSpec::once(scheduled_for),
+                "write one restart marker",
+                DataClass::Workspace,
+                2,
+                1,
+                true,
+                Some(scheduled_for),
+                false,
+                TimestampMillis::new(1_000),
+            )
+            .expect("scheduled job"),
+        )
+        .await
+        .expect("scheduled job stored");
+    let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+    let skill_version = SkillVersion::parse("1.0.0").expect("skill version");
+    let skill_source = b"# Restart-reviewed skill\n\nPersisted source bytes.\n";
+    let skill_digest = sha256_hex(skill_source);
+    let skill_path = data_root
+        .join("skills")
+        .join(skill_id.to_string())
+        .join(format!("{}.md", skill_version.as_str()));
+    std::fs::create_dir_all(skill_path.parent().expect("skill parent")).expect("skill parent");
+    std::fs::write(&skill_path, skill_source).expect("skill source bytes");
+    database
+        .publish_skill_version(
+            &SkillVersionRecord::new(
+                skill_id,
+                skill_version.clone(),
+                workspace_id,
+                "Restart-reviewed skill",
+                "Skill retained across a runtime restart",
+                "markdown",
+                skill_digest.clone(),
+                true,
+                operator.clone(),
+                Some(operator.clone()),
+                TimestampMillis::new(1_001),
+                Some(TimestampMillis::new(1_001)),
+            )
+            .expect("skill record"),
+            TimestampMillis::new(1_002),
+        )
+        .await
+        .expect("reviewed skill published");
+    let source_before = tokio::fs::read(&skill_path)
+        .await
+        .expect("source before restart");
+    assert_eq!(sha256_hex(&source_before), skill_digest);
+
+    let scheduled_runs = service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass");
+    assert_eq!(scheduled_runs.len(), 1, "one scheduled run");
+    let run_id = scheduled_runs[0];
+    wait_for_database_run_state(&database, run_id, "awaiting_approval").await;
+    let pending_approvals = database
+        .list_pending_approvals(workspace_id, now())
+        .await
+        .expect("pending approval");
+    assert_eq!(pending_approvals.len(), 1, "one pending approval");
+    let pending = &pending_approvals[0];
+    let approval_id = pending.approval_id();
+    service
+        .decide_approval(ApprovalDecisionCommand::new(
+            workspace_id,
+            approval_id,
+            operator.clone(),
+            ApprovalDecision::Grant,
+        ))
+        .await
+        .expect("approval granted");
+    wait_for_database_run_state(&database, run_id, "completed").await;
+    let occurrence_key = OccurrenceKey::new(job_id, job_revision, scheduled_for);
+    assert_eq!(
+        database
+            .scheduled_occurrence_run_id(&occurrence_key)
+            .await
+            .expect("occurrence run"),
+        Some(run_id)
+    );
+    assert_eq!(
+        std::fs::read(workspace.join("restart-effect.txt")).expect("effect before restart"),
+        b"once"
+    );
+    let attempts_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("attempt count before restart");
+    assert_eq!(attempts_before, 1);
+
+    let approval_before: (String, String, String, String, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT id, state, action_fingerprint, policy_version, created_at, expires_at, replacement_approval_id
+         FROM approval_requests WHERE id = ?",
+    )
+    .bind(approval_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("approval before restart");
+    let lifecycle_before = database
+        .get_run_lifecycle(workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("lifecycle before restart");
+    let audits_before = database
+        .list_audit_records(workspace_id, 0, 100)
+        .await
+        .expect("audit history before restart");
+    assert!(
+        audits_before
+            .iter()
+            .any(|record| record.event().kind() == AuditEventKind::RunCreated)
+    );
+    assert!(
+        audits_before
+            .iter()
+            .any(|record| record.event().kind() == AuditEventKind::ApprovalCreated)
+    );
+    assert!(
+        audits_before
+            .iter()
+            .any(|record| record.event().kind() == AuditEventKind::ExecutionSucceeded)
+    );
+    let baseline = RestartBaseline {
+        workspace_id,
+        service: scheduled_service,
+        job_id,
+        job_revision,
+        occurrence_key,
+        run_id,
+        approval_id,
+        approval_state: approval_before.1,
+        approval_fingerprint: approval_before.2,
+        approval_policy_version: approval_before.3,
+        approval_created_at: approval_before.4,
+        approval_expires_at: approval_before.5,
+        replacement_approval_id: approval_before.6,
+        skill_id,
+        skill_version: skill_version.clone(),
+        skill_digest: skill_digest.clone(),
+        audit_ids: audits_before
+            .iter()
+            .map(|record| record.event().id().to_string())
+            .collect(),
+        audit_kinds: audits_before
+            .iter()
+            .map(|record| record.event().kind().as_str().to_owned())
+            .collect(),
+        audit_hashes: audits_before
+            .iter()
+            .map(|record| record.hash().to_string())
+            .collect(),
+        lifecycle_phase: lifecycle_before.phase().to_owned(),
+        effect_certainty: lifecycle_before.effect_certainty().as_str().to_owned(),
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+        .await
+        .expect("first shutdown bounded");
+    drop(service);
+    drop(database);
+
+    let restarted_database = Database::connect(&database_path)
+        .await
+        .expect("reopened database");
+    let restarted_events = EventBroker::new(128);
+    let restarted_service = Arc::new(
+        LocalRuntimeService::build_with_secret_store(
+            &config,
+            restarted_database.clone(),
+            restarted_events.clone(),
+            Arc::new(RecordingSandbox::new()),
+            vec![TOKEN.to_owned()],
+            Arc::new(InMemorySecretStore::new()),
+        )
+        .await
+        .expect("second runtime against same paths"),
+    );
+
+    let job_after = restarted_database
+        .latest_scheduled_job_revision(baseline.job_id)
+        .await
+        .expect("job after restart")
+        .expect("same job after restart");
+    assert_eq!(job_after.job_id(), baseline.job_id);
+    assert_eq!(job_after.revision(), baseline.job_revision);
+    assert_eq!(job_after.service(), &baseline.service);
+    let occurrence_after = restarted_database
+        .scheduled_occurrence_record(&baseline.occurrence_key)
+        .await
+        .expect("occurrence after restart")
+        .expect("same occurrence after restart");
+    assert_eq!(occurrence_after.run_id(), Some(baseline.run_id));
+    assert_eq!(occurrence_after.state(), "succeeded");
+    let run_after: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(baseline.run_id.to_string())
+        .fetch_one(restarted_database.pool())
+        .await
+        .expect("run after restart");
+    assert_eq!(run_after, "completed");
+    let approval_after: (String, String, String, String, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT id, state, action_fingerprint, policy_version, created_at, expires_at, replacement_approval_id
+         FROM approval_requests WHERE id = ?",
+    )
+    .bind(baseline.approval_id.to_string())
+    .fetch_one(restarted_database.pool())
+    .await
+    .expect("same approval after restart");
+    assert_eq!(approval_after.0, baseline.approval_id.to_string());
+    assert_eq!(approval_after.1, baseline.approval_state);
+    assert_eq!(approval_after.2, baseline.approval_fingerprint);
+    assert_eq!(approval_after.3, baseline.approval_policy_version);
+    assert_eq!(approval_after.4, baseline.approval_created_at);
+    assert_eq!(approval_after.5, baseline.approval_expires_at);
+    assert_eq!(approval_after.6, baseline.replacement_approval_id);
+    let skill_after = restarted_database
+        .skill_version(
+            baseline.workspace_id,
+            baseline.skill_id,
+            &baseline.skill_version,
+        )
+        .await
+        .expect("skill after restart")
+        .expect("same skill after restart");
+    assert_eq!(skill_after.skill_id(), baseline.skill_id);
+    assert_eq!(skill_after.version(), &baseline.skill_version);
+    assert_eq!(skill_after.source_digest(), baseline.skill_digest);
+    let source_after = tokio::fs::read(&skill_path)
+        .await
+        .expect("source after restart");
+    assert_eq!(source_after, source_before);
+    assert_eq!(sha256_hex(&source_after), baseline.skill_digest);
+    let lifecycle_after = restarted_database
+        .get_run_lifecycle(baseline.workspace_id, baseline.run_id)
+        .await
+        .expect("lifecycle after restart")
+        .expect("same lifecycle after restart");
+    assert_eq!(lifecycle_after.phase(), baseline.lifecycle_phase);
+    assert_eq!(
+        lifecycle_after.effect_certainty().as_str(),
+        baseline.effect_certainty
+    );
+    let audits_after = restarted_database
+        .list_audit_records(baseline.workspace_id, 0, 100)
+        .await
+        .expect("audit history after restart");
+    assert_eq!(
+        audits_after
+            .iter()
+            .map(|record| record.event().id().to_string())
+            .collect::<Vec<_>>(),
+        baseline.audit_ids
+    );
+    assert_eq!(
+        audits_after
+            .iter()
+            .map(|record| record.event().kind().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        baseline.audit_kinds
+    );
+    assert_eq!(
+        audits_after
+            .iter()
+            .map(|record| record.hash().to_string())
+            .collect::<Vec<_>>(),
+        baseline.audit_hashes
+    );
+    restarted_database
+        .verify_audit_chain()
+        .await
+        .expect("audit chain after restart");
+    for (query, id) in [
+        (
+            "SELECT COUNT(*) FROM scheduled_job_revisions WHERE job_id = ?",
+            baseline.job_id.to_string(),
+        ),
+        (
+            "SELECT COUNT(*) FROM scheduled_job_runs WHERE occurrence_key = ?",
+            baseline.occurrence_key.as_str().to_owned(),
+        ),
+        (
+            "SELECT COUNT(*) FROM agent_runs WHERE id = ?",
+            baseline.run_id.to_string(),
+        ),
+        (
+            "SELECT COUNT(*) FROM approval_requests WHERE id = ?",
+            baseline.approval_id.to_string(),
+        ),
+        (
+            "SELECT COUNT(*) FROM skill_versions WHERE skill_id = ? AND version = '1.0.0'",
+            baseline.skill_id.to_string(),
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(id)
+            .fetch_one(restarted_database.pool())
+            .await
+            .expect("identity count after restart");
+        assert_eq!(count, 1, "duplicate persisted object for {query}");
+    }
+    let attempts_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)",
+    )
+    .bind(baseline.run_id.to_string())
+    .fetch_one(restarted_database.pool())
+    .await
+    .expect("attempt count after restart");
+    assert_eq!(attempts_after, 1);
+    assert_eq!(
+        std::fs::read(workspace.join("restart-effect.txt")).expect("effect after restart"),
+        b"once"
+    );
+    assert_eq!(
+        turns.load(Ordering::SeqCst),
+        2,
+        "restart must not call the model again"
+    );
+
+    let app = router(
+        ApiState::new(
+            restarted_service.clone(),
+            restarted_events,
+            TOKEN,
+            operator,
+            BTreeSet::from([baseline.workspace_id]),
+            SandboxCapabilityReport::new(
+                "test",
+                "kernel_enforced",
+                ["filesystem_isolation", "network_isolation"],
+                None,
+            ),
+        )
+        .expect("restarted API state"),
+    );
+    let status = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/workspaces/{}/runs/{}/status",
+                    baseline.workspace_id, baseline.run_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .expect("status request"),
+        )
+        .await
+        .expect("status response");
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: serde_json::Value = serde_json::from_slice(
+        &status
+            .into_body()
+            .collect()
+            .await
+            .expect("status body")
+            .to_bytes(),
+    )
+    .expect("status JSON");
+    assert_eq!(status["run_id"], baseline.run_id.to_string());
+    assert_eq!(status["state"], "completed");
+    restarted_service.shutdown().await;
 }
 
 #[tokio::test]
@@ -5810,6 +6312,25 @@ async fn wait_for_run_state(harness: &Harness, run_id: &str, expected: &str) {
         if tokio::time::Instant::now() >= deadline {
             panic!("run {run_id} did not reach state {expected}; actual {state:?}");
         }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_database_run_state(database: &Database, run_id: RunId, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_optional(database.pool())
+            .await
+            .expect("persisted run state");
+        if state.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "run {run_id} did not reach {expected}; actual {state:?}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
