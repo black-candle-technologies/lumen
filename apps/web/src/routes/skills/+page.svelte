@@ -11,7 +11,8 @@
 	let loadError = $state('');
 	let lastLoadedAt = $state('');
 	let loadedWorkspace = $state('');
-	let busyKey = $state('');
+	let busyKeys = $state(new Set<string>());
+	let publicationRuns = $state(new Map<string, string>());
 	let error = $state('');
 	let notice = $state('');
 
@@ -39,19 +40,35 @@
 	}
 
 	async function publishDraft(draft: WorkflowCaptureDraft) {
-		busyKey = draft.draft_id;
+		if (publicationRuns.has(draft.draft_id)) {
+			notice = `Publication approval already requested: ${publicationRuns.get(draft.draft_id)}`;
+			return;
+		}
+		setBusy(draft.draft_id, true);
 		try {
 			const result = await new ApiClient($connection).publishCaptureDraft(draft.draft_id, {
-				skill_id: crypto.randomUUID(),
+				skill_id: draft.draft_id,
 				version: '1.0.0',
 				name: draft.title,
 				description: `Captured from ${draft.created_by.provider}/${draft.created_by.subject}`
 			});
+			publicationRuns = new Map(publicationRuns).set(draft.draft_id, result.run_id);
 			notice = `Publication approval requested: ${result.run_id}`;
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Skill publish request failed.';
-		} finally { busyKey = ''; }
+		} finally { setBusy(draft.draft_id, false); }
+	}
+
+	function setBusy(key: string, active: boolean) {
+		const next = new Set(busyKeys);
+		if (active) next.add(key);
+		else next.delete(key);
+		busyKeys = next;
+	}
+
+	function isBusy(key: string): boolean {
+		return busyKeys.has(key);
 	}
 </script>
 
@@ -107,7 +124,7 @@
 						<article>
 							<header>
 								<div><h3>{draft.title}</h3><p>{draft.created_by.provider}/{draft.created_by.subject} · {draft.created_at}</p></div>
-								<button class="icon-button" type="button" aria-label={`Request publication approval for ${draft.title}`} title="Review and request approval" onclick={() => publishDraft(draft)} disabled={busyKey === draft.draft_id}><Upload size={17} /></button>
+								<button class="icon-button" type="button" aria-label={`Request publication approval for ${draft.title}`} title="Review and request approval" onclick={() => publishDraft(draft)} disabled={isBusy(draft.draft_id) || publicationRuns.has(draft.draft_id)}><Upload size={17} /></button>
 							</header>
 							<pre>{draft.body}</pre>
 						</article>

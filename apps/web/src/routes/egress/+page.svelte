@@ -20,7 +20,7 @@
 	let loadError = $state('');
 	let lastLoadedAt = $state('');
 	let loadedWorkspace = $state('');
-	let busyKey = $state('');
+	let busyKeys = $state(new Set<string>());
 	let error = $state('');
 	let notice = $state('');
 
@@ -53,7 +53,7 @@
 
 	async function setDestinationEnabled(policy: DestinationPolicy, enabled: boolean) {
 		const key = `destination:${policy.destination}`;
-		busyKey = key;
+		setBusy(key, true);
 		try {
 			const updated = await new ApiClient($connection).updateDestinationPolicy({
 				destination: policy.destination,
@@ -65,7 +65,7 @@
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Destination policy update failed.';
-		} finally { busyKey = ''; }
+		} finally { setBusy(key, false); }
 	}
 
 	async function setProviderEnabled(policy: ProviderPolicy, enabled: boolean) {
@@ -82,7 +82,7 @@
 
 	async function updateProvider(policy: ProviderPolicy, enabled: boolean, allowedClasses: DataClass[]) {
 		const key = `provider:${policy.provider_id}`;
-		busyKey = key;
+		setBusy(key, true);
 		try {
 			const updated = await new ApiClient($connection).updateProviderPolicy({
 				provider_id: policy.provider_id,
@@ -96,12 +96,12 @@
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Provider policy update failed.';
-		} finally { busyKey = ''; }
+		} finally { setBusy(key, false); }
 	}
 
 	async function setChannelAllowed(mapping: ChannelMapping, allowed: boolean) {
 		const key = mappingKey(mapping);
-		busyKey = key;
+		setBusy(key, true);
 		try {
 			const updated = await new ApiClient($connection).updateChannelMapping({
 				provider: mapping.provider,
@@ -117,7 +117,18 @@
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Channel allowlist update failed.';
-		} finally { busyKey = ''; }
+		} finally { setBusy(key, false); }
+	}
+
+	function setBusy(key: string, active: boolean) {
+		const next = new Set(busyKeys);
+		if (active) next.add(key);
+		else next.delete(key);
+		busyKeys = next;
+	}
+
+	function isBusy(key: string): boolean {
+		return busyKeys.has(key);
 	}
 
 	function mappingKey(mapping: ChannelMapping): string {
@@ -194,7 +205,7 @@
 											<input
 												type="checkbox"
 												checked={workspaceClasses(policy).includes(dataClass)}
-												disabled={busyKey === `provider:${policy.provider_id}`}
+												disabled={isBusy(`provider:${policy.provider_id}`)}
 												onchange={(event) => setProviderClass(policy, dataClass, event.currentTarget.checked)}
 											/>
 											<span>{dataClass}</span>
@@ -207,9 +218,9 @@
 							</div>
 							<div class="egress-actions">
 								{#if policy.enabled}
-									<button class="icon-button" type="button" aria-label={`Disable provider ${policy.provider_id}`} title="Disable provider" onclick={() => setProviderEnabled(policy, false)} disabled={busyKey === `provider:${policy.provider_id}`}><ShieldOff size={17} /></button>
+									<button class="icon-button" type="button" aria-label={`Disable provider ${policy.provider_id}`} title="Disable provider" onclick={() => setProviderEnabled(policy, false)} disabled={isBusy(`provider:${policy.provider_id}`)}><ShieldOff size={17} /></button>
 								{:else}
-									<button class="icon-button" type="button" aria-label={`Enable provider ${policy.provider_id}`} title="Enable provider" onclick={() => setProviderEnabled(policy, true)} disabled={busyKey === `provider:${policy.provider_id}`}><ShieldCheck size={17} /></button>
+									<button class="icon-button" type="button" aria-label={`Enable provider ${policy.provider_id}`} title="Enable provider" onclick={() => setProviderEnabled(policy, true)} disabled={isBusy(`provider:${policy.provider_id}`)}><ShieldCheck size={17} /></button>
 								{/if}
 							</div>
 						</div>
@@ -244,9 +255,9 @@
 							</div>
 							<div class="egress-actions">
 								{#if policy.enabled}
-									<button class="icon-button" type="button" aria-label={`Disable destination ${policy.destination}`} title="Disable destination" onclick={() => setDestinationEnabled(policy, false)} disabled={busyKey === `destination:${policy.destination}`}><ShieldOff size={17} /></button>
+									<button class="icon-button" type="button" aria-label={`Disable destination ${policy.destination}`} title="Disable destination" onclick={() => setDestinationEnabled(policy, false)} disabled={isBusy(`destination:${policy.destination}`)}><ShieldOff size={17} /></button>
 								{:else}
-									<button class="icon-button" type="button" aria-label={`Allow destination ${policy.destination}`} title="Allow destination" onclick={() => setDestinationEnabled(policy, true)} disabled={busyKey === `destination:${policy.destination}`}><ShieldCheck size={17} /></button>
+									<button class="icon-button" type="button" aria-label={`Allow destination ${policy.destination}`} title="Allow destination" onclick={() => setDestinationEnabled(policy, true)} disabled={isBusy(`destination:${policy.destination}`)}><ShieldCheck size={17} /></button>
 								{/if}
 							</div>
 						</div>
@@ -281,9 +292,9 @@
 							</div>
 							<div class="egress-actions">
 								{#if mapping.allowed}
-									<button class="icon-button" type="button" aria-label={`Disable ${mapping.provider} ${mapping.external_workspace_id} ${mapping.channel_id}`} title="Disable channel" onclick={() => setChannelAllowed(mapping, false)} disabled={busyKey === mappingKey(mapping)}><ShieldOff size={17} /></button>
+									<button class="icon-button" type="button" aria-label={`Disable ${mapping.provider} ${mapping.external_workspace_id} ${mapping.channel_id}`} title="Disable channel" onclick={() => setChannelAllowed(mapping, false)} disabled={isBusy(mappingKey(mapping))}><ShieldOff size={17} /></button>
 								{:else}
-									<button class="icon-button" type="button" aria-label={`Allow ${mapping.provider} ${mapping.external_workspace_id} ${mapping.channel_id}`} title="Allow channel" onclick={() => setChannelAllowed(mapping, true)} disabled={busyKey === mappingKey(mapping)}><ShieldCheck size={17} /></button>
+									<button class="icon-button" type="button" aria-label={`Allow ${mapping.provider} ${mapping.external_workspace_id} ${mapping.channel_id}`} title="Allow channel" onclick={() => setChannelAllowed(mapping, true)} disabled={isBusy(mappingKey(mapping))}><ShieldCheck size={17} /></button>
 								{/if}
 							</div>
 						</div>
