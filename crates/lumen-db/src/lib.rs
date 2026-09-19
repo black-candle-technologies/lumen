@@ -4,6 +4,7 @@ mod audit;
 mod automation;
 mod egress;
 mod extensions;
+mod lifecycle;
 mod migrations;
 mod repositories;
 
@@ -13,7 +14,8 @@ use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
 pub use automation::{
-    ScheduledJobRevision, ServiceIdentity, SkillVersionRecord, WorkflowCaptureDraft,
+    ScheduledJobRevision, ServiceIdentity, SkillPublicationIntent, SkillVersionRecord,
+    WorkflowCaptureDraft,
 };
 pub use egress::{
     ChannelIdentityMapping, DestinationRevision, ModelEndpointClass, ModelProviderRevision,
@@ -23,6 +25,7 @@ pub use extensions::{
     InstallResult, InstalledPluginVersion, PluginGrantRevision, PluginGrantScope,
     PluginSettingRevision, PluginSettingScope, PluginWorkspaceState, StagedPluginPackage,
 };
+pub use lifecycle::{EffectCertainty, RunLifecycleView, TerminalSpec, TerminalState};
 pub use repositories::{
     DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
     SecretReferenceError,

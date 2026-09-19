@@ -284,6 +284,30 @@ impl OpenAiCompatibleClient {
                     choices.len()
                 ))
             })?;
+            let finish = choice.finish_reason.as_deref().ok_or_else(|| {
+                ModelError::new("model response completed without terminal finish reason")
+            })?;
+            match finish {
+                "length" | "content_filter" => {
+                    return Err(ModelError::new(format!(
+                        "model response terminated without a complete usable result: {finish}"
+                    )));
+                }
+                "stop" if choice.message.tool_calls.is_empty() => {}
+                "tool_calls"
+                    if !choice.message.tool_calls.is_empty()
+                        && choice.message.content.as_deref().unwrap_or("").is_empty() => {}
+                "stop" | "tool_calls" => {
+                    return Err(ModelError::new(format!(
+                        "model response content conflicts with finish reason: {finish}"
+                    )));
+                }
+                other => {
+                    return Err(ModelError::new(format!(
+                        "unsupported model finish reason: {other}"
+                    )));
+                }
+            }
             output_from_parts(
                 choice.message.content.unwrap_or_default(),
                 choice.message.tool_calls,
@@ -461,11 +485,14 @@ async fn parse_stream(
     let mut events = limited.eventsource();
     let mut text = String::new();
     let mut tool_call = None::<AccumulatedToolCall>;
+    let mut saw_done = false;
+    let mut terminal_finish = None::<&'static str>;
 
     while let Some(event) = events.next().await {
         let event =
             event.map_err(|error| ModelError::new(format!("invalid model stream: {error}")))?;
         if event.data == "[DONE]" {
+            saw_done = true;
             break;
         }
         let chunk: StreamChunk = serde_json::from_str(&event.data)
@@ -475,6 +502,26 @@ async fn parse_stream(
                 return Err(ModelError::new(
                     "multiple model response choices are unsupported",
                 ));
+            }
+            if let Some(reason) = choice.finish_reason.as_deref() {
+                let finish = match reason {
+                    "stop" => "stop",
+                    "tool_calls" => "tool_calls",
+                    "length" | "content_filter" => {
+                        return Err(ModelError::new(format!(
+                            "model response terminated without a complete usable result: {reason}"
+                        )));
+                    }
+                    other => {
+                        return Err(ModelError::new(format!(
+                            "unsupported model finish reason: {other}"
+                        )));
+                    }
+                };
+                if terminal_finish.is_some_and(|previous| previous != finish) {
+                    return Err(ModelError::new("conflicting model finish reasons"));
+                }
+                terminal_finish = Some(finish);
             }
             if let Some(content) = choice.delta.content {
                 text.push_str(&content);
@@ -505,6 +552,19 @@ async fn parse_stream(
                 }
             }
         }
+    }
+
+    if !saw_done {
+        return Err(ModelError::new("model stream ended before [DONE]"));
+    }
+    let finish = terminal_finish
+        .ok_or_else(|| ModelError::new("model stream completed without terminal finish reason"))?;
+    if (tool_call.is_some() && (finish != "tool_calls" || !text.is_empty()))
+        || (tool_call.is_none() && finish != "stop")
+    {
+        return Err(ModelError::new(
+            "model stream content conflicts with finish reason",
+        ));
     }
 
     output_from_accumulated(text, tool_call, tools)
@@ -733,6 +793,7 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ResponseChoice {
     message: ResponseMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -765,6 +826,7 @@ struct StreamChunk {
 struct StreamChoice {
     index: usize,
     delta: StreamDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
