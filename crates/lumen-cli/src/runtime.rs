@@ -1,15 +1,18 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex as StdMutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use lumen_core::{
     action::{ActionEnvelope, CanonicalValue, RunId},
     approval::{
-        ApprovalId, ApprovalRequest, ApprovalState, DispatchAuthorization, ExecutionAttemptId,
-        TimestampMillis,
+        ApprovalError, ApprovalId, ApprovalRequest, ApprovalState, DispatchAuthorization,
+        ExecutionAttemptId, TimestampMillis, authorize_dispatch,
     },
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     automation::{
@@ -20,19 +23,20 @@ use lumen_core::{
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
     extension::{PluginComponentId, PluginId, PluginVersion},
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort, ModelTool},
-    policy::{Policy, PolicyVersion},
+    policy::{Policy, PolicyDecision, PolicyVersion},
     run::{
         ActionFuture, ActionNormalizer, ActionPort, ActionPortError, ApprovalFuture, ApprovalPort,
-        ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError,
+        ApprovalPortError, ApprovalResolution, AuditFuture, AuditPort, AuditPortError, Clock,
         LoadedSkillMetadata, NormalizationError, RunBudget, RunContext, RunOrchestrator,
-        RunOutcome, RunState,
+        RunOutcome, RunState, SkillLoadMetadata, SystemClock,
     },
     secret::SecretRefId,
 };
 use lumen_db::{
-    ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, ModelEndpointClass,
-    ModelProviderRevision, PluginGrantScope, PluginSettingScope, ScheduledJobRevision,
-    ServiceIdentity, SkillVersionRecord, WorkflowCaptureDraft, WorkspaceModelEgressRevision,
+    ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, EffectCertainty,
+    ModelEndpointClass, ModelProviderRevision, PluginGrantScope, PluginSettingScope,
+    ScheduledJobRevision, ServiceIdentity, SkillVersionRecord, TerminalSpec, TerminalState,
+    WorkflowCaptureDraft, WorkspaceModelEgressRevision,
 };
 use lumen_integrations::{
     filesystem::WorkspaceReader,
@@ -45,22 +49,24 @@ use lumen_integrations::{
     secrets::SecretStore,
 };
 use lumen_server::{
-    ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery, ApprovalResult,
-    ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested, CancelRunCommand,
-    CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview,
-    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview,
-    EventBroker, JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand,
-    PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
-    PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
-    ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated,
-    RuntimeService, ServiceError, ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery,
-    ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
-    WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
+    ApprovalConflict, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
+    ApprovalRenewal, ApprovalRenewalCommand, ApprovalResult, ApprovalSecretReference, AuditEntry,
+    AuditQuery, AutomationActionRequested, CancelRunCommand, CaptureWorkflowCommand,
+    ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview, CreateRunCommand,
+    DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview, EventBroker,
+    JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand, PluginActionRequested,
+    PluginComponentReview, PluginDetailsQuery, PluginFailureReview, PluginReviewQuery,
+    PluginSettingReview, PluginVersionDetails, PrincipalSummary, ProviderPolicyCommand,
+    ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated, RunReconciliation,
+    RunStatus, RuntimeService, ServiceError, ServiceFuture, ServiceIdentityCommand,
+    ServiceIdentityQuery, ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery,
+    StagedPluginReview, WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::extension_runtime::{
@@ -73,9 +79,26 @@ use crate::{
     config::{Config, RemoteDataClass},
 };
 
+mod admission;
+use admission::AdmissionGate;
+
+const REVIEWED_SKILL_SOURCE_MAX_BYTES: usize = 65_536;
+
+async fn read_bounded_skill_source(
+    reader: impl AsyncRead + Unpin,
+) -> Result<Option<Vec<u8>>, std::io::Error> {
+    let mut source = Vec::with_capacity(REVIEWED_SKILL_SOURCE_MAX_BYTES + 1);
+    reader
+        .take((REVIEWED_SKILL_SOURCE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut source)
+        .await?;
+    Ok((source.len() <= REVIEWED_SKILL_SOURCE_MAX_BYTES).then_some(source))
+}
+
 #[derive(Clone)]
 pub(crate) struct LocalRuntimeService {
     model: Arc<dyn ModelPort>,
+    model_probe: Arc<OpenAiCompatibleClient>,
     enforce_model_egress_policy: bool,
     normalizer: Arc<dyn ActionNormalizer>,
     executor: Arc<dyn ExecutorPort>,
@@ -83,6 +106,9 @@ pub(crate) struct LocalRuntimeService {
     audit: Arc<DatabaseAudit>,
     actions: Arc<DatabaseActions>,
     database: Database,
+    owner_instance_id: uuid::Uuid,
+    _owner_guard: Option<Arc<std::fs::File>>,
+    admission: AdmissionGate,
     data_root: Arc<Path>,
     events: EventBroker,
     policy: Policy,
@@ -90,13 +116,51 @@ pub(crate) struct LocalRuntimeService {
     ambient_capabilities: CapabilitySet,
     capabilities: EffectiveCapabilities,
     budget: RunBudget,
+    required_skills: BTreeSet<(SkillId, SkillVersion)>,
     scheduled_execution_lease_millis: u64,
     runs: Arc<Mutex<BTreeMap<RunId, StoredRun>>>,
+    // ponytail: one shared wakeup; use per-run signals only if contention becomes measurable.
+    run_available: Arc<Notify>,
+    #[cfg(test)]
+    missing_run_observed: Arc<Notify>,
+    #[cfg(test)]
+    pause_before_park_enabled: Arc<AtomicBool>,
+    #[cfg(test)]
+    pause_before_park_reached: Arc<Notify>,
+    #[cfg(test)]
+    pause_before_park_release: Arc<Notify>,
     cancellations: Arc<Mutex<BTreeMap<RunId, CancellationToken>>>,
     run_workspaces: Arc<Mutex<BTreeMap<RunId, lumen_core::identity::WorkspaceId>>>,
-    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     scheduler_cancellation: CancellationToken,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_deadline: Arc<StdMutex<Option<tokio::time::Instant>>>,
+    shutdown_report: Arc<watch::Sender<Option<Arc<ShutdownReport>>>>,
     redactor: Arc<SecretRedactor>,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownMode {
+    ServerCancel,
+    CliDrain,
+}
+
+const SHUTDOWN_SETTLEMENT_BUDGET: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Debug)]
+pub(crate) struct ShutdownReport {
+    forced: bool,
+    unresolved_runs: Vec<String>,
+    storage_errors: Vec<String>,
+    workers_still_running: usize,
+}
+
+impl ShutdownReport {
+    pub(crate) fn is_clean(&self) -> bool {
+        !self.forced
+            && self.unresolved_runs.is_empty()
+            && self.storage_errors.is_empty()
+            && self.workers_still_running == 0
+    }
 }
 
 struct PluginInvocationCommand {
@@ -110,6 +174,200 @@ struct PluginInvocationCommand {
 }
 
 impl LocalRuntimeService {
+    async fn settle_unprepared_owned_run(
+        &self,
+        run_id: RunId,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        code: &'static str,
+        error: &impl std::fmt::Display,
+    ) -> Result<(), ServiceError> {
+        let terminal = TerminalSpec::new(
+            TerminalState::Failed,
+            EffectCertainty::NoEffect,
+            code,
+            Some(self.bounded_diagnostic(error)),
+        )
+        .expect("static preparation terminal specification");
+        self.database
+            .terminalize_owned_run(
+                run_id,
+                workspace_id,
+                self.owner_instance_id,
+                &terminal,
+                AuditEventId::new(),
+                now(),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        self.admission.finish_owned(run_id);
+        self.database
+            .flush_terminal_audit(workspace_id, run_id)
+            .await
+            .map_err(repository_service_error)
+    }
+
+    async fn decide_approval_admitted(
+        &self,
+        command: ApprovalDecisionCommand,
+    ) -> Result<ApprovalResult, ServiceError> {
+        self.ensure_accepting_work()?;
+        let (run_id, result) = self.approvals.decide(&command).await?;
+        self.events
+            .publish(
+                command.workspace_id(),
+                run_id,
+                match command.decision() {
+                    ApprovalDecision::Grant => "approval.granted",
+                    ApprovalDecision::Reject => "approval.rejected",
+                },
+                CanonicalValue::object([(
+                    "approval_id",
+                    CanonicalValue::from(command.approval_id().to_string()),
+                )]),
+            )
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        self.spawn_advance(run_id).await;
+        Ok(result)
+    }
+
+    async fn renew_approval_admitted(
+        &self,
+        command: ApprovalRenewalCommand,
+    ) -> Result<ApprovalRenewal, ServiceError> {
+        self.ensure_accepting_work()?;
+        let previous = command.approval_id();
+        let mut runs = self.runs.lock().await;
+        let run_id = runs
+            .iter()
+            .find_map(|(run_id, stored)| {
+                stored
+                    .state
+                    .is_awaiting_approval(previous)
+                    .then_some(*run_id)
+            })
+            .ok_or(ServiceError::ApprovalConflict(ApprovalConflict::Stale))?;
+        let (_, approval_id) = self
+            .approvals
+            .renew(command.workspace_id(), previous, run_id)
+            .await?;
+        let updated = runs
+            .get_mut(&run_id)
+            .is_some_and(|stored| stored.state.renew_pending_approval(previous, approval_id));
+        if !updated {
+            return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+        }
+        drop(runs);
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                now(),
+                AuditEventKind::ApprovalCreated,
+                AuditOutcome::Pending,
+                Some(command.workspace_id()),
+                CanonicalValue::object([
+                    ("run_id", CanonicalValue::from(run_id.to_string())),
+                    (
+                        "previous_approval_id",
+                        CanonicalValue::from(previous.to_string()),
+                    ),
+                    ("approval_id", CanonicalValue::from(approval_id.to_string())),
+                    (
+                        "renewed_by",
+                        CanonicalValue::from(command.actor().subject()),
+                    ),
+                ]),
+            ))
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        self.events
+            .publish(
+                command.workspace_id(),
+                run_id,
+                "approval.renewed",
+                CanonicalValue::object([
+                    (
+                        "previous_approval_id",
+                        CanonicalValue::from(previous.to_string()),
+                    ),
+                    ("approval_id", CanonicalValue::from(approval_id.to_string())),
+                ]),
+            )
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        Ok(ApprovalRenewal::new(previous, approval_id, run_id))
+    }
+
+    async fn create_run_admitted(
+        &self,
+        command: CreateRunCommand,
+    ) -> Result<RunCreated, ServiceError> {
+        self.ensure_accepting_work()?;
+        let run_id = RunId::new();
+        self.database
+            .create_owned_run(
+                run_id,
+                command.workspace_id(),
+                command.actor(),
+                self.owner_instance_id,
+                now(),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        if self.admission.register_owned(run_id).is_err() {
+            self.settle_unprepared_owned_run(
+                run_id,
+                command.workspace_id(),
+                "admission_shutdown",
+                &"runtime sealed during admission",
+            )
+            .await?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
+        let reviewed_skills = match self
+            .prompt_with_reviewed_skills(command.workspace_id(), command.prompt())
+            .await
+        {
+            Ok(reviewed) => reviewed,
+            Err(error) => {
+                self.settle_unprepared_owned_run(
+                    run_id,
+                    command.workspace_id(),
+                    "run_preparation_failed",
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let state = RunState::new(
+            RunContext::new(run_id, command.workspace_id(), command.actor().clone())
+                .with_loaded_skills(reviewed_skills.loaded_skills)
+                .with_skill_loads(reviewed_skills.skill_loads),
+            reviewed_skills.prompt,
+            self.budget,
+        )
+        .with_data_class(command.data_class());
+        let stored = StoredRun {
+            workspace_id: command.workspace_id(),
+            state,
+            model_override: None,
+            capabilities_override: None,
+            scheduled_handoff: None,
+            start_disposition: StartDisposition::Created,
+        };
+        if let Err(error) = self.publish_run_created(run_id, command.workspace_id()) {
+            self.settle_unprepared_owned_run(
+                run_id,
+                command.workspace_id(),
+                "run_preparation_failed",
+                &error,
+            )
+            .await?;
+            return Err(error);
+        }
+        self.install_and_spawn_run(run_id, stored).await?;
+        Ok(RunCreated::new(run_id))
+    }
+
     pub(crate) async fn build_with_secret_store(
         config: &Config,
         database: Database,
@@ -117,6 +375,48 @@ impl LocalRuntimeService {
         sandbox: Arc<dyn SandboxBackend>,
         secrets: Vec<String>,
         secret_store: Arc<dyn SecretStore>,
+    ) -> Result<Self, CliError> {
+        Self::build_with_secret_store_inner(
+            config,
+            database,
+            events,
+            sandbox,
+            secrets,
+            secret_store,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn build_with_runtime_owner(
+        config: &Config,
+        database: Database,
+        events: EventBroker,
+        sandbox: Arc<dyn SandboxBackend>,
+        secrets: Vec<String>,
+        secret_store: Arc<dyn SecretStore>,
+        owner_guard: Arc<std::fs::File>,
+    ) -> Result<Self, CliError> {
+        Self::build_with_secret_store_inner(
+            config,
+            database,
+            events,
+            sandbox,
+            secrets,
+            secret_store,
+            Some(owner_guard),
+        )
+        .await
+    }
+
+    async fn build_with_secret_store_inner(
+        config: &Config,
+        database: Database,
+        events: EventBroker,
+        sandbox: Arc<dyn SandboxBackend>,
+        secrets: Vec<String>,
+        secret_store: Arc<dyn SecretStore>,
+        owner_guard: Option<Arc<std::fs::File>>,
     ) -> Result<Self, CliError> {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
         std::fs::create_dir_all(&config.runtime.data_directory)?;
@@ -135,9 +435,13 @@ impl LocalRuntimeService {
         .map_err(|error| CliError::Runtime(error.to_string()))?
         .with_streaming(config.model.streaming)
         .with_timeout(Duration::from_secs(config.model.timeout_seconds))
-        .with_max_response_bytes(config.model.max_response_bytes);
-        let model = OpenAiCompatibleClient::new(model_config)
-            .map_err(|error| CliError::Runtime(error.to_string()))?;
+        .with_max_response_bytes(config.model.max_response_bytes)
+        .with_ollama_gpu_policy(config.model.gpu_policy)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+        let model = Arc::new(
+            OpenAiCompatibleClient::new(model_config)
+                .map_err(|error| CliError::Runtime(error.to_string()))?,
+        );
         let allowed_programs: Vec<_> = config.process.allowed_programs.iter().cloned().collect();
         let secret_references = database
             .list_secret_references(config.workspace_id())
@@ -244,8 +548,10 @@ impl LocalRuntimeService {
         grants.extend(network_egress_capabilities);
         grants.extend(channel_send_capabilities);
         let ambient_capabilities = CapabilitySet::new(grants);
+        let (shutdown_report, _) = watch::channel(None);
         let service = Self {
-            model: Arc::new(model),
+            model: model.clone(),
+            model_probe: model,
             enforce_model_egress_policy: config.model.allow_remote,
             normalizer: Arc::new(normalizer),
             executor: Arc::new(executor),
@@ -253,6 +559,9 @@ impl LocalRuntimeService {
             audit: Arc::new(DatabaseAudit(database.clone())),
             actions: Arc::new(DatabaseActions(database.clone())),
             database,
+            owner_instance_id: uuid::Uuid::new_v4(),
+            _owner_guard: owner_guard,
+            admission: AdmissionGate::default(),
             data_root: Arc::from(data_root),
             events,
             policy: Policy::default(),
@@ -265,18 +574,45 @@ impl LocalRuntimeService {
                 Duration::from_secs(config.runtime.max_wall_time_seconds),
                 config.runtime.max_captured_result_bytes,
             ),
+            required_skills: config.required_skills(),
             scheduled_execution_lease_millis: config
                 .runtime
                 .max_wall_time_seconds
                 .saturating_mul(1_000)
                 .saturating_add(30_000),
             runs: Arc::new(Mutex::new(BTreeMap::new())),
+            run_available: Arc::new(Notify::new()),
+            #[cfg(test)]
+            missing_run_observed: Arc::new(Notify::new()),
+            #[cfg(test)]
+            pause_before_park_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            pause_before_park_reached: Arc::new(Notify::new()),
+            #[cfg(test)]
+            pause_before_park_release: Arc::new(Notify::new()),
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
-            tasks: Arc::new(Mutex::new(Vec::new())),
             scheduler_cancellation: CancellationToken::new(),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_deadline: Arc::new(StdMutex::new(None)),
+            shutdown_report: Arc::new(shutdown_report),
             redactor,
         };
+        if service._owner_guard.is_some() {
+            recover_skill_publications(&service.database, &service.data_root)
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            service
+                .database
+                .reconcile_abandoned_owned_runs(service.owner_instance_id, now())
+                .await?;
+        }
+        for (workspace_id, run_id) in service.database.list_pending_terminal_audits().await? {
+            service
+                .database
+                .flush_terminal_audit(workspace_id, run_id)
+                .await?;
+        }
         service
             .recover_scheduled_run_handoffs(now())
             .await
@@ -286,13 +622,23 @@ impl LocalRuntimeService {
     }
 
     async fn spawn_advance(&self, run_id: RunId) {
-        let handle = tokio::spawn(self.clone().advance(run_id));
-        self.tasks.lock().await.push(handle);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = self
+            .admission
+            .submit_owned(run_id, self.clone().advance(run_id));
     }
 
     async fn spawn_scheduler_loop(&self) {
-        let handle = tokio::spawn(self.clone().scheduled_job_loop());
-        self.tasks.lock().await.push(handle);
+        let _ = self.admission.submit(self.clone().scheduled_job_loop());
+    }
+
+    fn ensure_accepting_work(&self) -> Result<(), ServiceError> {
+        if self.shutting_down.load(Ordering::SeqCst) || self.admission.is_sealed() {
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
+        Ok(())
     }
 
     async fn scheduled_job_loop(self) {
@@ -304,7 +650,10 @@ impl LocalRuntimeService {
                     if self.scheduler_cancellation.is_cancelled() {
                         break;
                     }
-                    let _ = self.run_due_scheduled_jobs_once(now()).await;
+                    let timestamp = now();
+                    if let Err(error) = self.run_due_scheduled_jobs_once(timestamp).await {
+                        self.record_scheduler_poll_failure(&error, timestamp).await;
+                    }
                 }
             }
         }
@@ -314,6 +663,21 @@ impl LocalRuntimeService {
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
+        let service = self.clone();
+        let task = self
+            .admission
+            .submit(async move { service.run_due_scheduled_jobs_once_inner(timestamp).await })
+            .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+        task.await.map_err(|_| {
+            ServiceError::Internal("scheduled admission task exited before acknowledgement".into())
+        })?
+    }
+
+    async fn run_due_scheduled_jobs_once_inner(
+        &self,
+        timestamp: TimestampMillis,
+    ) -> Result<Vec<RunId>, ServiceError> {
+        self.ensure_accepting_work()?;
         let mut created = self.recover_scheduled_run_handoffs(timestamp).await?;
         let due = self
             .database
@@ -321,23 +685,115 @@ impl LocalRuntimeService {
             .await
             .map_err(|error| ServiceError::Internal(format!("load due scheduled jobs: {error}")))?;
         for job in due {
-            if let Some(run_id) = self.run_due_scheduled_job(job, timestamp).await? {
-                created.push(run_id);
+            match self.run_due_scheduled_job(job.clone(), timestamp).await {
+                Ok(Some(run_id)) => created.push(run_id),
+                Ok(None) => {}
+                Err(error) => {
+                    self.record_scheduler_job_failure(
+                        &job,
+                        job.next_due_at().unwrap_or(timestamp),
+                        &error,
+                        timestamp,
+                    )
+                    .await?;
+                }
             }
         }
         Ok(created)
+    }
+
+    async fn record_scheduler_job_failure(
+        &self,
+        job: &ScheduledJobRevision,
+        scheduled_for: TimestampMillis,
+        error: &ServiceError,
+        timestamp: TimestampMillis,
+    ) -> Result<(), ServiceError> {
+        let diagnostic = self.bounded_diagnostic(error);
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                timestamp,
+                AuditEventKind::SchedulerJobFailed,
+                AuditOutcome::Failure,
+                Some(job.workspace_id()),
+                CanonicalValue::object([
+                    ("job_id", CanonicalValue::from(job.job_id().to_string())),
+                    (
+                        "revision",
+                        CanonicalValue::from(
+                            i64::try_from(job.revision().as_u64()).unwrap_or(i64::MAX),
+                        ),
+                    ),
+                    (
+                        "scheduled_for",
+                        CanonicalValue::from(
+                            i64::try_from(scheduled_for.as_u64()).unwrap_or(i64::MAX),
+                        ),
+                    ),
+                    ("diagnostic", CanonicalValue::from(diagnostic)),
+                ]),
+            ))
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))
+    }
+
+    async fn record_scheduler_poll_failure(
+        &self,
+        error: &ServiceError,
+        timestamp: TimestampMillis,
+    ) {
+        let diagnostic = self.bounded_diagnostic(error);
+        eprintln!("event=scheduler_poll_failed diagnostic={diagnostic:?}");
+        if self
+            .audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                timestamp,
+                AuditEventKind::SchedulerPollFailed,
+                AuditOutcome::Failure,
+                None,
+                CanonicalValue::object([("diagnostic", CanonicalValue::from(diagnostic))]),
+            ))
+            .await
+            .is_err()
+        {
+            eprintln!("event=scheduler_poll_failed diagnostic_persistence=failed");
+        }
+    }
+
+    fn bounded_diagnostic(&self, error: &impl std::fmt::Display) -> String {
+        let mut diagnostic = error.to_string();
+        self.redactor.redact_string(&mut diagnostic);
+        diagnostic.chars().take(256).collect()
     }
 
     async fn recover_scheduled_run_handoffs(
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
-        self.database
+        let expired = self
+            .database
             .recover_expired_running_scheduled_runs(timestamp)
             .await
             .map_err(|error| {
                 ServiceError::Internal(format!("recover running scheduled runs: {error}"))
             })?;
+        if !expired.is_empty() {
+            for (workspace_id, run_id) in self
+                .database
+                .list_pending_terminal_audits()
+                .await
+                .map_err(repository_service_error)?
+            {
+                if expired.contains(&run_id) {
+                    self.database
+                        .flush_terminal_audit(workspace_id, run_id)
+                        .await
+                        .map_err(repository_service_error)?;
+                }
+            }
+        }
         let ready = self
             .database
             .ready_scheduled_run_handoffs()
@@ -347,46 +803,73 @@ impl LocalRuntimeService {
             })?;
         let mut recovered = Vec::new();
         for (occurrence, run_id, job) in ready {
-            let lease_id = uuid::Uuid::new_v4();
-            let claimed = self
-                .database
-                .claim_ready_scheduled_run(
-                    &occurrence,
-                    lease_id,
-                    timestamp,
-                    scheduled_lease_expiry(timestamp),
-                )
+            match self
+                .recover_ready_scheduled_run(&occurrence, run_id, &job, timestamp)
                 .await
-                .map_err(|error| {
-                    ServiceError::Internal(format!("claim ready scheduled run: {error}"))
-                })?;
-            if !claimed {
-                continue;
+            {
+                Ok(true) => recovered.push(run_id),
+                Ok(false) => {}
+                Err(error) => {
+                    self.record_scheduler_job_failure(
+                        &job,
+                        occurrence.scheduled_for(),
+                        &error,
+                        timestamp,
+                    )
+                    .await?;
+                }
             }
-            let stored = self
-                .prepare_stored_run(
-                    run_id,
-                    self.scheduled_run_request(&job, &occurrence, lease_id)
-                        .await?,
-                )
-                .await?;
-            self.publish_run_created(run_id, stored.workspace_id)?;
-            self.database
-                .start_scheduled_run(
-                    &occurrence,
-                    lease_id,
-                    run_id,
-                    timestamp,
-                    self.scheduled_execution_lease_expiry(timestamp),
-                )
-                .await
-                .map_err(|error| {
-                    ServiceError::Internal(format!("start recovered scheduled run: {error}"))
-                })?;
-            self.install_and_spawn_run(run_id, stored).await;
-            recovered.push(run_id);
         }
         Ok(recovered)
+    }
+
+    async fn recover_ready_scheduled_run(
+        &self,
+        occurrence: &OccurrenceKey,
+        run_id: RunId,
+        job: &ScheduledJobRevision,
+        timestamp: TimestampMillis,
+    ) -> Result<bool, ServiceError> {
+        let lease_id = uuid::Uuid::new_v4();
+        let claimed = self
+            .database
+            .claim_ready_scheduled_run(
+                occurrence,
+                lease_id,
+                timestamp,
+                scheduled_lease_expiry(timestamp),
+            )
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("claim ready scheduled run: {error}"))
+            })?;
+        if !claimed {
+            return Ok(false);
+        }
+        let mut stored = self
+            .prepare_stored_run(
+                run_id,
+                self.scheduled_run_request(job, occurrence, lease_id)
+                    .await?,
+            )
+            .await?;
+        self.publish_run_created(run_id, stored.workspace_id)?;
+        self.database
+            .start_owned_scheduled_run(
+                occurrence,
+                lease_id,
+                run_id,
+                self.owner_instance_id,
+                timestamp,
+                self.scheduled_execution_lease_expiry(timestamp),
+            )
+            .await
+            .map_err(|error| {
+                ServiceError::Internal(format!("start recovered scheduled run: {error}"))
+            })?;
+        stored.start_disposition = StartDisposition::ScheduledStartCommitted;
+        self.install_and_spawn_run(run_id, stored).await?;
+        Ok(true)
     }
 
     async fn run_due_scheduled_job(
@@ -442,13 +925,14 @@ impl LocalRuntimeService {
             .scheduled_run_request(&job, &occurrence, lease_id)
             .await?;
         let run_id = RunId::new();
-        let stored = self.prepare_stored_run(run_id, request).await?;
+        let mut stored = self.prepare_stored_run(run_id, request).await?;
         self.database
-            .persist_scheduled_run_handoff(
+            .persist_owned_scheduled_run_handoff(
                 &job,
                 &occurrence,
                 lease_id,
                 run_id,
+                self.owner_instance_id,
                 job.schedule().next_after(scheduled_for, job.enabled()),
                 timestamp,
             )
@@ -458,16 +942,18 @@ impl LocalRuntimeService {
             })?;
         self.publish_run_created(run_id, stored.workspace_id)?;
         self.database
-            .start_scheduled_run(
+            .start_owned_scheduled_run(
                 &occurrence,
                 lease_id,
                 run_id,
+                self.owner_instance_id,
                 timestamp,
                 self.scheduled_execution_lease_expiry(timestamp),
             )
             .await
             .map_err(|error| ServiceError::Internal(format!("start scheduled run: {error}")))?;
-        self.install_and_spawn_run(run_id, stored).await;
+        stored.start_disposition = StartDisposition::ScheduledStartCommitted;
+        self.install_and_spawn_run(run_id, stored).await?;
         Ok(Some(run_id))
     }
 
@@ -510,6 +996,7 @@ impl LocalRuntimeService {
         TimestampMillis::new(
             timestamp
                 .as_u64()
+                .max(now().as_u64())
                 .saturating_add(self.scheduled_execution_lease_millis),
         )
     }
@@ -526,7 +1013,9 @@ impl LocalRuntimeService {
         let reviewed_skills = self
             .prompt_with_reviewed_skills(request.workspace_id, &request.prompt)
             .await?;
-        context = context.with_loaded_skills(reviewed_skills.loaded_skills);
+        context = context
+            .with_loaded_skills(reviewed_skills.loaded_skills)
+            .with_skill_loads(reviewed_skills.skill_loads);
         let state = RunState::new(context, reviewed_skills.prompt, request.budget)
             .with_data_class(request.data_class);
         Ok(StoredRun {
@@ -535,6 +1024,7 @@ impl LocalRuntimeService {
             model_override: request.model_override,
             capabilities_override: request.capabilities_override,
             scheduled_handoff: request.scheduled_handoff,
+            start_disposition: StartDisposition::Created,
         })
     }
 
@@ -554,18 +1044,92 @@ impl LocalRuntimeService {
             .map_err(|error| ServiceError::Internal(error.to_string()))
     }
 
-    async fn install_and_spawn_run(&self, run_id: RunId, stored: StoredRun) {
+    async fn install_and_spawn_run(
+        &self,
+        run_id: RunId,
+        stored: StoredRun,
+    ) -> Result<(), ServiceError> {
         let workspace_id = stored.workspace_id;
+        if self.admission.register_owned(run_id).is_err() {
+            let terminal = TerminalSpec::new(
+                TerminalState::Cancelled,
+                EffectCertainty::NoEffect,
+                "admission_shutdown",
+                Some("runtime shut down during admission".into()),
+            )
+            .expect("static terminal specification");
+            self.database
+                .terminalize_owned_run(
+                    run_id,
+                    workspace_id,
+                    self.owner_instance_id,
+                    &terminal,
+                    AuditEventId::new(),
+                    now(),
+                )
+                .await
+                .map_err(repository_service_error)?;
+            self.database
+                .flush_terminal_audit(workspace_id, run_id)
+                .await
+                .map_err(repository_service_error)?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
+        for skill in stored
+            .state
+            .context()
+            .skill_loads()
+            .iter()
+            .filter(|skill| skill.status() == "excluded")
+        {
+            let _ = self.events.publish(
+                workspace_id,
+                run_id,
+                "skill.excluded",
+                skill_load_value(skill),
+            );
+        }
         self.runs.lock().await.insert(run_id, stored);
-        self.cancellations
-            .lock()
-            .await
-            .insert(run_id, CancellationToken::new());
+        let cancellation = CancellationToken::new();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            cancellation.cancel();
+        }
+        self.cancellations.lock().await.insert(run_id, cancellation);
         self.run_workspaces
             .lock()
             .await
             .insert(run_id, workspace_id);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            let timestamp = now();
+            let terminal = TerminalSpec::new(
+                TerminalState::Cancelled,
+                EffectCertainty::NoEffect,
+                "admission_shutdown",
+                Some("runtime shut down during admission".into()),
+            )
+            .expect("static shutdown terminal specification");
+            let result = self
+                .database
+                .terminalize_owned_run(
+                    run_id,
+                    workspace_id,
+                    self.owner_instance_id,
+                    &terminal,
+                    AuditEventId::new(),
+                    timestamp,
+                )
+                .await;
+            self.runs.lock().await.remove(&run_id);
+            self.finish_run(run_id).await;
+            result.map_err(repository_service_error)?;
+            self.database
+                .flush_terminal_audit(workspace_id, run_id)
+                .await
+                .map_err(repository_service_error)?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
         self.spawn_advance(run_id).await;
+        Ok(())
     }
 
     async fn prompt_with_reviewed_skills(
@@ -580,24 +1144,48 @@ impl LocalRuntimeService {
             .map_err(repository_service_error)?;
         let mut rendered = Vec::new();
         let mut loaded_skills = Vec::new();
+        let mut skill_loads = Vec::new();
+        let mut selected = BTreeSet::new();
         for skill in skills {
-            if let Some(context) = self
-                .load_reviewed_skill_context(workspace_id, &skill)
-                .await?
-            {
+            selected.insert((skill.skill_id(), skill.version().clone()));
+            let result = self.load_reviewed_skill_context(workspace_id, &skill).await;
+            skill_loads.push(result.metadata);
+            if let Some(context) = result.loaded {
                 loaded_skills.push(context.metadata);
                 rendered.push(context.rendered);
             }
+        }
+        for (skill_id, version) in self.required_skills.difference(&selected) {
+            let record = self
+                .database
+                .skill_version(workspace_id, *skill_id, version)
+                .await
+                .map_err(repository_service_error)?;
+            skill_loads.push(SkillLoadMetadata::excluded(
+                skill_id.to_string(),
+                version.as_str(),
+                record
+                    .as_ref()
+                    .map_or("", SkillVersionRecord::source_digest),
+                if record.is_some() {
+                    "disabled"
+                } else {
+                    "not_eligible"
+                },
+                true,
+            ));
         }
         if rendered.is_empty() {
             return Ok(ReviewedSkillPrompt {
                 prompt: prompt.to_owned(),
                 loaded_skills,
+                skill_loads,
             });
         }
         Ok(ReviewedSkillPrompt {
             prompt: format!("{}\n\nUser request:\n{}", rendered.join("\n\n"), prompt),
             loaded_skills,
+            skill_loads,
         })
     }
 
@@ -605,40 +1193,78 @@ impl LocalRuntimeService {
         &self,
         workspace_id: lumen_core::identity::WorkspaceId,
         skill: &SkillVersionRecord,
-    ) -> Result<Option<LoadedReviewedSkill>, ServiceError> {
-        if !skill.reviewed() || skill.workspace_id() != workspace_id {
-            return Ok(None);
+    ) -> SkillLoadResult {
+        let required = self
+            .required_skills
+            .contains(&(skill.skill_id(), skill.version().clone()));
+        let excluded = |reason| SkillLoadResult {
+            metadata: SkillLoadMetadata::excluded(
+                skill.skill_id().to_string(),
+                skill.version().as_str(),
+                skill.source_digest(),
+                reason,
+                required,
+            ),
+            loaded: None,
+        };
+        if skill.workspace_id() != workspace_id {
+            return excluded("not_eligible");
+        }
+        if !skill.reviewed() {
+            return excluded("unreviewed");
+        }
+        if skill.source_format() != "markdown" {
+            return excluded("unsupported_format");
         }
         let path = self
             .data_root
             .join("skills")
             .join(skill.skill_id().to_string())
             .join(format!("{}.md", skill.version().as_str()));
-        let source = match tokio::fs::read_to_string(&path).await {
-            Ok(source) => source,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(ServiceError::Internal(error.to_string())),
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return excluded("missing_source");
+            }
+            Err(_) => return excluded("read_failed"),
         };
-        if source.len() > 65_536 || sha256_hex(source.as_bytes()) != skill.source_digest() {
-            return Ok(None);
+        let source = match read_bounded_skill_source(file).await {
+            Ok(Some(source)) => source,
+            Ok(None) => return excluded("oversized"),
+            Err(_) => return excluded("read_failed"),
+        };
+        let source = match String::from_utf8(source) {
+            Ok(source) => source,
+            Err(_) => return excluded("unsupported_encoding"),
+        };
+        if sha256_hex(source.as_bytes()) != skill.source_digest() {
+            return excluded("digest_mismatch");
         }
-        Ok(Some(LoadedReviewedSkill {
-            metadata: LoadedSkillMetadata::new(
+        SkillLoadResult {
+            metadata: SkillLoadMetadata::loaded(
                 skill.skill_id().to_string(),
                 skill.version().as_str(),
                 skill.source_digest(),
+                required,
             ),
-            rendered: format!(
-                "Reviewed Lumen skill\nid: {}\nversion: {}\ndigest: {}\nformat: {}\nname: {}\ndescription: {}\n\n{}",
-                skill.skill_id(),
-                skill.version().as_str(),
-                skill.source_digest(),
-                skill.source_format(),
-                skill.name(),
-                skill.description(),
-                source
-            ),
-        }))
+            loaded: Some(LoadedReviewedSkill {
+                metadata: LoadedSkillMetadata::new(
+                    skill.skill_id().to_string(),
+                    skill.version().as_str(),
+                    skill.source_digest(),
+                ),
+                rendered: format!(
+                    "Reviewed Lumen skill\nid: {}\nversion: {}\ndigest: {}\nformat: {}\nname: {}\ndescription: {}\n\n{}",
+                    skill.skill_id(),
+                    skill.version().as_str(),
+                    skill.source_digest(),
+                    skill.source_format(),
+                    skill.name(),
+                    skill.description(),
+                    source
+                ),
+            }),
+        }
     }
 
     #[allow(dead_code)]
@@ -648,6 +1274,7 @@ impl LocalRuntimeService {
         run_id: RunId,
         actor: lumen_core::identity::PrincipalId,
     ) -> Result<uuid::Uuid, ServiceError> {
+        self.ensure_accepting_work()?;
         self.database.verify_audit_chain().await.map_err(|error| {
             ServiceError::Conflict(format!("audit chain does not verify: {error}"))
         })?;
@@ -673,21 +1300,37 @@ impl LocalRuntimeService {
         .await
         .map_err(sql_service_error)?;
         let mut action_lines = Vec::new();
-        for action in actions {
+        let mut procedure_lines = Vec::new();
+        for (index, action) in actions.into_iter().enumerate() {
             let arguments: String = action
                 .try_get("arguments_json")
                 .map_err(sql_service_error)?;
+            let kind = action
+                .try_get::<String, _>("kind")
+                .map_err(sql_service_error)?;
+            let state = action
+                .try_get::<String, _>("state")
+                .map_err(sql_service_error)?;
             action_lines.push(format!(
                 "- kind: {}; state: {}; arguments_sha256: {}",
-                action
-                    .try_get::<String, _>("kind")
-                    .map_err(sql_service_error)?,
-                action
-                    .try_get::<String, _>("state")
-                    .map_err(sql_service_error)?,
+                kind,
+                state,
                 sha256_hex(arguments.as_bytes())
             ));
+            procedure_lines.push(format!(
+                "{}. Review whether `{kind}` is still appropriate, supply fresh operator-approved inputs, and verify its live result.",
+                index + 1
+            ));
         }
+        let capture_kind = if action_lines.is_empty() {
+            procedure_lines.push(
+                "- No tool procedure was observed; this is provenance only and is not evidence of learned reusable behavior."
+                    .to_owned(),
+            );
+            "provenance-only zero-action draft"
+        } else {
+            "review-required tool procedure draft"
+        };
         if action_lines.is_empty() {
             action_lines.push("- none".to_owned());
         }
@@ -701,15 +1344,16 @@ impl LocalRuntimeService {
             .map(|record| record.event().kind().as_str())
             .collect::<Vec<_>>();
         let mut body = format!(
-            "# Captured Workflow\n\nsource_run_id: {run_id}\nsource_workspace_id: {workspace_id}\n\n## Actions\n{}\n\n## Audit Events\n{}\n\n## Required Variables\n- operator must review variables before publishing\n\n## Expected Outputs\n- source run completed successfully\n\n## Failure Notes\n- none captured",
+            "# Reviewable Workflow Capture Draft\n\nartifact_type: {capture_kind}\nsource_run_id: {run_id}\nsource_workspace_id: {workspace_id}\n\nThis draft preserves verified provenance, not replayable historical inputs or trusted automation.\n\n## Observed Actions\n{}\n\n## Candidate Procedure\n{}\n\n## Audit Events\n{}\n\n## Required Variables\n- Historical raw action inputs are deliberately unavailable; only their digests are retained.\n- Before publishing, the operator must define every fresh non-secret input required by each candidate step.\n\n## Expected Outputs\n- Verify each fresh action result during the new run; historical raw outputs are not reconstructed.\n- The source run completed successfully, which does not guarantee a changed-input run will succeed.\n\n## Operator Review Before Publishing\n1. Verify the source run, workspace, ordered actions, argument digests, and audit events.\n2. Confirm each action kind is still appropriate and document the current safe inputs outside this artifact.\n3. Reject the draft if a required variable, expected result, or failure condition is unclear.\n4. Publish only through the approval-bound skill publication path.\n\n## Capture Limitations\n- No historical raw inputs, tool outputs, or secret values are reconstructed.\n- Publication records review and integrity; it does not grant capabilities or bypass approval.\n\n## Failure Notes\n- No source-run failure was captured because only completed runs are eligible.",
             action_lines.join("\n"),
+            procedure_lines.join("\n"),
             event_kinds.join(", ")
         );
         self.redactor.redact_string(&mut body);
         let draft = WorkflowCaptureDraft::new(
             uuid::Uuid::new_v4(),
             workspace_id,
-            format!("Captured workflow {run_id}"),
+            format!("Reviewable workflow draft {run_id}"),
             body,
             actor,
             now(),
@@ -723,43 +1367,316 @@ impl LocalRuntimeService {
         Ok(draft_id)
     }
 
-    pub(crate) async fn shutdown(&self) {
-        self.scheduler_cancellation.cancel();
-        let mut tasks = std::mem::take(&mut *self.tasks.lock().await);
-        let completed = tokio::time::timeout(Duration::from_secs(5), async {
-            for task in &mut tasks {
-                let _ = task.await;
+    pub(crate) async fn shutdown(&self) -> Arc<ShutdownReport> {
+        let report = self.shutdown_with_timeout(Duration::from_secs(5)).await;
+        if report.forced || !report.unresolved_runs.is_empty() || !report.storage_errors.is_empty()
+        {
+            eprintln!(
+                "event=runtime_shutdown_incomplete unresolved_runs={} storage_errors={} workers_still_running={}",
+                report.unresolved_runs.len(),
+                report.storage_errors.len(),
+                report.workers_still_running
+            );
+        }
+        report
+    }
+
+    pub(crate) async fn drain_submitted_work(&self) -> Arc<ShutdownReport> {
+        let report = self
+            .wait_for_shutdown(ShutdownMode::CliDrain, Duration::from_secs(5))
+            .await;
+        if report.forced || !report.unresolved_runs.is_empty() {
+            eprintln!(
+                "event=cli_drain_incomplete unresolved_runs={} workers_still_running={}",
+                report.unresolved_runs.len(),
+                report.workers_still_running
+            );
+        }
+        report
+    }
+
+    async fn shutdown_with_timeout(&self, drain_timeout: Duration) -> Arc<ShutdownReport> {
+        self.wait_for_shutdown(ShutdownMode::ServerCancel, drain_timeout)
+            .await
+    }
+
+    async fn wait_for_shutdown(&self, mode: ShutdownMode, total: Duration) -> Arc<ShutdownReport> {
+        let (mut receiver, deadline) = {
+            let mut state = self.shutdown_deadline.lock().expect("shutdown state lock");
+            let deadline = match *state {
+                Some(deadline) => deadline,
+                None => {
+                    let deadline = tokio::time::Instant::now() + total + SHUTDOWN_SETTLEMENT_BUDGET;
+                    let _ = self.admission.seal();
+                    self.shutting_down.store(true, Ordering::SeqCst);
+                    *state = Some(deadline);
+                    let service = self.clone();
+                    tokio::spawn(async move {
+                        let report = match tokio::time::timeout_at(
+                            deadline,
+                            service.shutdown_supervisor(mode, deadline),
+                        )
+                        .await
+                        {
+                            Ok(report) => report,
+                            Err(_) => service.shutdown_deadline_report(),
+                        };
+                        service.shutdown_report.send_replace(Some(Arc::new(report)));
+                    });
+                    deadline
+                }
+            };
+            (self.shutdown_report.subscribe(), deadline)
+        };
+        loop {
+            if let Some(report) = receiver.borrow().clone() {
+                return report;
             }
-        })
-        .await
-        .is_ok();
-        if !completed {
-            for task in tasks {
-                task.abort();
-                let _ = task.await;
+            if tokio::time::timeout_at(deadline, receiver.changed())
+                .await
+                .is_err()
+            {
+                return Arc::new(self.shutdown_deadline_report());
             }
         }
     }
 
+    fn shutdown_deadline_report(&self) -> ShutdownReport {
+        let unresolved_runs = self
+            .run_workspaces
+            .try_lock()
+            .map(|runs| runs.keys().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        ShutdownReport {
+            forced: true,
+            unresolved_runs,
+            storage_errors: vec!["shutdown supervisor deadline exceeded".into()],
+            workers_still_running: self.admission.active_count(),
+        }
+    }
+
+    async fn request_shutdown_cancellation(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        for cancellation in self.cancellations.lock().await.values() {
+            cancellation.cancel();
+        }
+        let waiting = {
+            let mut runs = self.runs.lock().await;
+            runs.iter_mut()
+                .map(|(run_id, stored)| {
+                    stored.state.cancel();
+                    *run_id
+                })
+                .collect::<Vec<_>>()
+        };
+        waiting
+            .into_iter()
+            .map(|run_id| tokio::spawn(self.clone().advance(run_id)))
+            .collect()
+    }
+
+    async fn shutdown_supervisor(
+        &self,
+        mode: ShutdownMode,
+        deadline: tokio::time::Instant,
+    ) -> ShutdownReport {
+        self.scheduler_cancellation.cancel();
+        self.admission.close_tracker();
+        let cooperative = deadline - SHUTDOWN_SETTLEMENT_BUDGET;
+        let mut waiting_tasks = if matches!(mode, ShutdownMode::ServerCancel) {
+            self.request_shutdown_cancellation().await
+        } else {
+            Vec::new()
+        };
+        let mut forced = tokio::time::timeout_at(cooperative, async {
+            for task in &mut waiting_tasks {
+                let _ = task.await;
+            }
+            self.admission.wait().await;
+        })
+        .await
+        .is_err();
+        if matches!(mode, ShutdownMode::CliDrain) {
+            waiting_tasks.extend(self.request_shutdown_cancellation().await);
+            if tokio::time::timeout_at(deadline, async {
+                for task in &mut waiting_tasks {
+                    let _ = task.await;
+                }
+                self.admission.wait().await;
+            })
+            .await
+            .is_err()
+            {
+                forced = true;
+            }
+        }
+        if forced {
+            for task in &waiting_tasks {
+                if !task.is_finished() {
+                    task.abort();
+                }
+            }
+            let _ = self.admission.abort_tracked();
+        }
+        let workers_still_running = self.admission.active_count()
+            + waiting_tasks
+                .iter()
+                .filter(|task| !task.is_finished())
+                .count();
+        let remaining = self.run_workspaces.lock().await.clone();
+        if !remaining.is_empty() {
+            eprintln!(
+                "event=runtime_shutdown_forced remaining_runs={}",
+                remaining.len()
+            );
+        }
+        let mut unresolved_runs = Vec::new();
+        let mut storage_errors = Vec::new();
+        for (run_id, workspace_id) in remaining {
+            let timestamp = now();
+            let terminal = TerminalSpec::new(
+                TerminalState::Failed,
+                EffectCertainty::Unknown,
+                "shutdown_forced",
+                Some("graceful drain deadline exceeded".into()),
+            )
+            .expect("static shutdown terminal specification");
+            match tokio::time::timeout_at(
+                deadline,
+                self.database.terminalize_owned_run(
+                    run_id,
+                    workspace_id,
+                    self.owner_instance_id,
+                    &terminal,
+                    AuditEventId::new(),
+                    timestamp,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        self.database.flush_terminal_audit(workspace_id, run_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => storage_errors.push(self.bounded_diagnostic(&error)),
+                        Err(_) => storage_errors.push("terminal audit deadline exceeded".into()),
+                    }
+                    self.runs.lock().await.remove(&run_id);
+                    self.finish_run(run_id).await;
+                }
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "event=runtime_shutdown_forced run_id={run_id} diagnostic={:?}",
+                        self.bounded_diagnostic(&error)
+                    );
+                    unresolved_runs.push(run_id.to_string());
+                    storage_errors.push(self.bounded_diagnostic(&error));
+                }
+                Err(_) => {
+                    unresolved_runs.push(run_id.to_string());
+                    storage_errors.push("terminal persistence deadline exceeded".into());
+                }
+            }
+        }
+        ShutdownReport {
+            forced: forced || workers_still_running > 0,
+            unresolved_runs,
+            storage_errors,
+            workers_still_running,
+        }
+    }
+
     async fn advance(self, run_id: RunId) {
-        let Some(mut stored) = self.runs.lock().await.remove(&run_id) else {
-            return;
+        let mut stored = loop {
+            let available = self.run_available.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            if let Some(stored) = self.runs.lock().await.remove(&run_id) {
+                break stored;
+            }
+            #[cfg(test)]
+            self.missing_run_observed.notify_one();
+            if !self.cancellations.lock().await.contains_key(&run_id) {
+                return;
+            }
+            available.await;
         };
         if let Some((occurrence, lease_id)) = &stored.scheduled_handoff {
-            let current = self
+            let current = match self
                 .database
                 .scheduled_run_lease_is_current(occurrence, *lease_id, run_id)
                 .await
-                .unwrap_or(false);
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "dispatch_fence",
+                        &error,
+                        now(),
+                    )
+                    .await;
+                    self.finish_run(run_id).await;
+                    return;
+                }
+            };
             if !current {
-                self.finish_run(run_id).await;
+                self.terminalize_stored_run(
+                    run_id,
+                    &stored,
+                    "failed",
+                    "failed",
+                    "run.failed",
+                    CanonicalValue::from("scheduled lease is no longer current"),
+                    None,
+                    Some("scheduled lease is no longer current".into()),
+                    now(),
+                )
+                .await;
                 return;
             }
         }
-        let _ = self
-            .database
-            .update_run_state(run_id, "running", None)
+        let start = match stored.start_disposition {
+            StartDisposition::Created => {
+                self.database
+                    .start_owned_run(
+                        run_id,
+                        stored.workspace_id,
+                        self.owner_instance_id,
+                        false,
+                        now(),
+                    )
+                    .await
+            }
+            StartDisposition::ResumeApproval => {
+                self.database
+                    .start_owned_run(
+                        run_id,
+                        stored.workspace_id,
+                        self.owner_instance_id,
+                        true,
+                        now(),
+                    )
+                    .await
+            }
+            StartDisposition::ScheduledStartCommitted => Ok(()),
+        };
+        if let Err(error) = start {
+            self.record_run_reconciliation_required(
+                stored.workspace_id,
+                run_id,
+                "run_start",
+                &error,
+                now(),
+            )
             .await;
+            self.finish_run(run_id).await;
+            return;
+        }
         let cancellation = self
             .cancellations
             .lock()
@@ -789,6 +1706,7 @@ impl LocalRuntimeService {
             inner: model_inner,
             cancellation: cancellation.clone(),
         };
+        let clock = SystemClock;
         let orchestrator = RunOrchestrator::new(
             &model,
             self.normalizer.as_ref(),
@@ -796,6 +1714,7 @@ impl LocalRuntimeService {
             self.approvals.as_ref(),
             self.audit.as_ref(),
             self.actions.as_ref(),
+            &clock,
             self.policy.clone(),
             self.policy_version.clone(),
         )
@@ -807,16 +1726,54 @@ impl LocalRuntimeService {
                     .capabilities_override
                     .as_ref()
                     .unwrap_or(&self.capabilities),
-                now(),
             )
             .await
         {
             Ok(RunOutcome::AwaitingApproval { approval_id }) => {
-                let _ = self
+                if let Err(error) = self
                     .database
-                    .update_run_state(run_id, "awaiting_approval", None)
+                    .pause_owned_run_for_approval(
+                        run_id,
+                        stored.workspace_id,
+                        self.owner_instance_id,
+                        now(),
+                    )
+                    .await
+                {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "approval_pause",
+                        &error,
+                        now(),
+                    )
                     .await;
-                let _ = self.events.publish(
+                    self.finish_run(run_id).await;
+                    return;
+                }
+                stored.start_disposition = StartDisposition::ResumeApproval;
+                #[cfg(test)]
+                if self.pause_before_park_enabled.load(Ordering::SeqCst) {
+                    self.pause_before_park_reached.notify_one();
+                    self.pause_before_park_release.notified().await;
+                }
+                if self.admission.is_sealed() {
+                    stored.state.cancel();
+                    self.terminalize_stored_run(
+                        run_id,
+                        &stored,
+                        "cancelled",
+                        "cancelled",
+                        "run.cancelled",
+                        CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+                        None,
+                        None,
+                        now(),
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) = self.events.publish(
                     stored.workspace_id,
                     run_id,
                     "approval.required",
@@ -824,37 +1781,67 @@ impl LocalRuntimeService {
                         "approval_id",
                         CanonicalValue::from(approval_id.to_string()),
                     )]),
-                );
+                ) {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "approval_event",
+                        &error,
+                        now(),
+                    )
+                    .await;
+                }
                 self.runs.lock().await.insert(run_id, stored);
+                self.run_available.notify_waiters();
+                if self.admission.is_sealed() {
+                    let removed = self.runs.lock().await.remove(&run_id);
+                    if let Some(mut stored) = removed {
+                        stored.state.cancel();
+                        self.terminalize_stored_run(
+                            run_id,
+                            &stored,
+                            "cancelled",
+                            "cancelled",
+                            "run.cancelled",
+                            CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+                            None,
+                            None,
+                            now(),
+                        )
+                        .await;
+                    }
+                }
             }
             Ok(outcome) => {
                 let (state, kind, mut payload) = terminal_event(&outcome);
                 self.redactor.redact_value(&mut payload);
-                let timestamp = now();
-                let _ = self
-                    .database
-                    .update_run_state(run_id, state, Some(timestamp))
-                    .await;
-                if stored.state.context().job_origin().is_some() {
-                    let _ = self
-                        .database
-                        .complete_scheduled_occurrence_for_run(
-                            run_id,
-                            scheduled_occurrence_terminal_state(&outcome),
-                            timestamp,
-                        )
-                        .await;
-                }
-                let _ = self
-                    .events
-                    .publish(stored.workspace_id, run_id, kind, payload);
-                self.finish_run(run_id).await;
+                let diagnostic = match &outcome {
+                    RunOutcome::ExecutionFailed { message }
+                    | RunOutcome::ExecutionUnknown { message } => {
+                        Some(self.bounded_diagnostic(message))
+                    }
+                    RunOutcome::RequiredSkillUnavailable { reason, .. } => {
+                        Some(self.bounded_diagnostic(reason))
+                    }
+                    _ => None,
+                };
+                self.terminalize_stored_run(
+                    run_id,
+                    &stored,
+                    state,
+                    scheduled_occurrence_terminal_state(&outcome),
+                    kind,
+                    payload,
+                    None,
+                    diagnostic,
+                    now(),
+                )
+                .await;
             }
             Err(error) => {
                 let timestamp = now();
-                if cancellation.is_cancelled() {
-                    let _ = self
-                        .audit
+                let audit_failure = if cancellation.is_cancelled() {
+                    self.audit
                         .record(AuditEvent::new(
                             AuditEventId::new(),
                             timestamp,
@@ -866,40 +1853,185 @@ impl LocalRuntimeService {
                                 CanonicalValue::from(run_id.to_string()),
                             )]),
                         ))
-                        .await;
-                }
-                let _ = self
-                    .database
-                    .update_run_state(
-                        run_id,
-                        if cancellation.is_cancelled() {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        },
-                        Some(timestamp),
-                    )
-                    .await;
-                let mut message = error.to_string();
-                self.redactor.redact_string(&mut message);
-                let _ = self.events.publish(
-                    stored.workspace_id,
+                        .await
+                        .err()
+                        .map(|error| ("cancellation_audit", error.to_string()))
+                } else {
+                    None
+                };
+                let cancelled = cancellation.is_cancelled();
+                self.terminalize_stored_run(
                     run_id,
-                    if cancellation.is_cancelled() {
+                    &stored,
+                    if cancelled { "cancelled" } else { "failed" },
+                    if cancelled { "cancelled" } else { "failed" },
+                    if cancelled {
                         "run.cancelled"
                     } else {
                         "run.failed"
                     },
-                    CanonicalValue::from(message),
-                );
-                self.finish_run(run_id).await;
+                    CanonicalValue::from(self.bounded_diagnostic(&error)),
+                    audit_failure,
+                    Some(self.bounded_diagnostic(&error)),
+                    timestamp,
+                )
+                .await;
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn terminalize_stored_run(
+        &self,
+        run_id: RunId,
+        stored: &StoredRun,
+        state: &str,
+        scheduled_state: &str,
+        event_kind: &str,
+        payload: CanonicalValue,
+        prerequisite_failure: Option<(&'static str, String)>,
+        primary_diagnostic: Option<String>,
+        timestamp: TimestampMillis,
+    ) {
+        let terminal_state = match state {
+            "completed" if prerequisite_failure.is_none() => TerminalState::Completed,
+            "cancelled" => TerminalState::Cancelled,
+            _ => TerminalState::Failed,
+        };
+        let certainty = if scheduled_state == "unknown" || prerequisite_failure.is_some() {
+            EffectCertainty::Unknown
+        } else {
+            EffectCertainty::NoEffect
+        };
+        let code = prerequisite_failure.as_ref().map_or_else(
+            || match event_kind {
+                "run.completed" => "run_completed",
+                "run.cancelled" => "run_cancelled",
+                "run.timed_out" => "run_timed_out",
+                "run.failed" if scheduled_state == "unknown" => "execution_unknown",
+                _ => "run_failed",
+            },
+            |(stage, _)| stage,
+        );
+        let diagnostic = primary_diagnostic.or_else(|| {
+            prerequisite_failure
+                .as_ref()
+                .map(|(_, error)| self.bounded_diagnostic(error))
+        });
+        let terminal = TerminalSpec::new(terminal_state, certainty, code, diagnostic)
+            .expect("bounded terminal specification");
+        match self
+            .database
+            .terminalize_owned_run(
+                run_id,
+                stored.workspace_id,
+                self.owner_instance_id,
+                &terminal,
+                AuditEventId::new(),
+                timestamp,
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Err(error) = self
+                    .database
+                    .flush_terminal_audit(stored.workspace_id, run_id)
+                    .await
+                {
+                    let diagnostic = self.bounded_diagnostic(&error);
+                    if let Err(persist_error) = self
+                        .database
+                        .record_terminal_audit_failure(
+                            stored.workspace_id,
+                            run_id,
+                            diagnostic.clone(),
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "event=run_terminal_audit_failure_record_failed run_id={run_id} diagnostic={:?}",
+                            self.bounded_diagnostic(&persist_error)
+                        );
+                    }
+                    eprintln!(
+                        "event=run_terminal_audit_pending run_id={run_id} diagnostic={:?}",
+                        diagnostic
+                    );
+                } else if let Err(error) =
+                    self.events
+                        .publish(stored.workspace_id, run_id, event_kind, payload)
+                {
+                    self.record_run_reconciliation_required(
+                        stored.workspace_id,
+                        run_id,
+                        "terminal_event",
+                        &error,
+                        timestamp,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                self.record_run_reconciliation_required(
+                    stored.workspace_id,
+                    run_id,
+                    "terminal_persistence",
+                    &error,
+                    timestamp,
+                )
+                .await;
+            }
+        }
+        self.finish_run(run_id).await;
+    }
+
+    async fn record_run_reconciliation_required(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        run_id: RunId,
+        stage: &'static str,
+        error: &impl std::fmt::Display,
+        timestamp: TimestampMillis,
+    ) {
+        let diagnostic = self.bounded_diagnostic(error);
+        let payload = CanonicalValue::object([
+            ("run_id", CanonicalValue::from(run_id.to_string())),
+            ("stage", CanonicalValue::from(stage)),
+            ("diagnostic", CanonicalValue::from(diagnostic.clone())),
+        ]);
+        if self
+            .audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                timestamp,
+                AuditEventKind::RunReconciliationRequired,
+                AuditOutcome::Unknown,
+                Some(workspace_id),
+                payload.clone(),
+            ))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "event=run_reconciliation_required run_id={run_id} stage={stage} diagnostic={diagnostic:?} audit_persistence=failed"
+            );
+        }
+        if self
+            .events
+            .publish(workspace_id, run_id, "run.reconciliation_required", payload)
+            .is_err()
+        {
+            eprintln!(
+                "event=run_reconciliation_required run_id={run_id} stage={stage} diagnostic={diagnostic:?} event_publication=failed"
+            );
         }
     }
 
     async fn finish_run(&self, run_id: RunId) {
         self.cancellations.lock().await.remove(&run_id);
         self.run_workspaces.lock().await.remove(&run_id);
+        self.admission.finish_owned(run_id);
+        self.run_available.notify_waiters();
     }
 
     pub(crate) async fn request_extension_action(
@@ -909,43 +2041,72 @@ impl LocalRuntimeService {
         proposal: ActionProposal,
         capabilities: CapabilitySet,
     ) -> Result<RunId, ServiceError> {
+        let service = self.clone();
+        let task = self
+            .admission
+            .submit(async move {
+                service
+                    .request_extension_action_inner(workspace_id, actor, proposal, capabilities)
+                    .await
+            })
+            .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+        task.await.map_err(|_| {
+            ServiceError::Internal("extension admission task exited before acknowledgement".into())
+        })?
+    }
+
+    async fn request_extension_action_inner(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        actor: lumen_core::identity::PrincipalId,
+        proposal: ActionProposal,
+        capabilities: CapabilitySet,
+    ) -> Result<RunId, ServiceError> {
+        self.ensure_accepting_work()?;
         let run_id = RunId::new();
         self.database
-            .create_run(run_id, workspace_id, &actor, now())
+            .create_owned_run(run_id, workspace_id, &actor, self.owner_instance_id, now())
             .await
             .map_err(repository_service_error)?;
-        let model: Arc<dyn ModelPort> = Arc::new(ActionRequestModel { proposal });
-        self.runs.lock().await.insert(
-            run_id,
-            StoredRun {
-                workspace_id,
-                state: RunState::new(
-                    RunContext::new(run_id, workspace_id, actor),
-                    "authenticated extension administration request",
-                    self.budget,
-                ),
-                model_override: Some(model),
-                capabilities_override: Some(EffectiveCapabilities::new([capabilities])),
-                scheduled_handoff: None,
-            },
-        );
-        self.cancellations
-            .lock()
-            .await
-            .insert(run_id, CancellationToken::new());
-        self.run_workspaces
-            .lock()
-            .await
-            .insert(run_id, workspace_id);
-        self.events
-            .publish(
-                workspace_id,
+        if self.admission.register_owned(run_id).is_err() {
+            self.settle_unprepared_owned_run(
                 run_id,
-                "run.created",
-                CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+                workspace_id,
+                "admission_shutdown",
+                &"runtime sealed during admission",
             )
-            .map_err(|error| ServiceError::Internal(error.to_string()))?;
-        self.spawn_advance(run_id).await;
+            .await?;
+            return Err(ServiceError::Unavailable("runtime is shutting down".into()));
+        }
+        let model: Arc<dyn ModelPort> = Arc::new(ActionRequestModel { proposal });
+        let stored = StoredRun {
+            workspace_id,
+            state: RunState::new(
+                RunContext::new(run_id, workspace_id, actor),
+                "authenticated extension administration request",
+                self.budget,
+            ),
+            model_override: Some(model),
+            capabilities_override: Some(EffectiveCapabilities::new([capabilities])),
+            scheduled_handoff: None,
+            start_disposition: StartDisposition::Created,
+        };
+        if let Err(error) = self.events.publish(
+            workspace_id,
+            run_id,
+            "run.created",
+            CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        ) {
+            self.settle_unprepared_owned_run(
+                run_id,
+                workspace_id,
+                "run_preparation_failed",
+                &error,
+            )
+            .await?;
+            return Err(ServiceError::Internal(error.to_string()));
+        }
+        self.install_and_spawn_run(run_id, stored).await?;
         Ok(run_id)
     }
 
@@ -1087,56 +2248,38 @@ const fn remote_data_class(value: RemoteDataClass) -> DataClass {
 }
 
 impl RuntimeService for LocalRuntimeService {
+    fn model_readiness(
+        &self,
+        _workspace_id: lumen_core::identity::WorkspaceId,
+    ) -> ServiceFuture<'_, String> {
+        Box::pin(async move {
+            if self.model_probe.identity().endpoint_class()
+                == lumen_integrations::openai_compatible::EndpointClass::Remote
+            {
+                return Ok("remote_not_probed".into());
+            }
+            Ok(match self.model_probe.probe_local_model().await {
+                Ok(true) => "listed",
+                Ok(false) => "not_listed",
+                Err(_) => "unavailable",
+            }
+            .into())
+        })
+    }
+
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated> {
         let service = self.clone();
+        let admitted = self
+            .admission
+            .submit(async move { service.create_run_admitted(command).await });
         Box::pin(async move {
-            let run_id = RunId::new();
-            service
-                .database
-                .create_run(run_id, command.workspace_id(), command.actor(), now())
-                .await
-                .map_err(repository_service_error)?;
-            let reviewed_skills = service
-                .prompt_with_reviewed_skills(command.workspace_id(), command.prompt())
-                .await?;
-            let state = RunState::new(
-                RunContext::new(run_id, command.workspace_id(), command.actor().clone())
-                    .with_loaded_skills(reviewed_skills.loaded_skills),
-                reviewed_skills.prompt,
-                service.budget,
-            )
-            .with_data_class(command.data_class());
-            service.runs.lock().await.insert(
-                run_id,
-                StoredRun {
-                    workspace_id: command.workspace_id(),
-                    state,
-                    model_override: None,
-                    capabilities_override: None,
-                    scheduled_handoff: None,
-                },
-            );
-            service
-                .cancellations
-                .lock()
-                .await
-                .insert(run_id, CancellationToken::new());
-            service
-                .run_workspaces
-                .lock()
-                .await
-                .insert(run_id, command.workspace_id());
-            service
-                .events
-                .publish(
-                    command.workspace_id(),
-                    run_id,
-                    "run.created",
-                    CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+            let task = admitted
+                .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+            task.await.map_err(|_| {
+                ServiceError::Internal(
+                    "runtime admission task exited before acknowledgement".into(),
                 )
-                .map_err(|error| ServiceError::Internal(error.to_string()))?;
-            service.spawn_advance(run_id).await;
-            Ok(RunCreated::new(run_id))
+            })?
         })
     }
 
@@ -1145,25 +2288,34 @@ impl RuntimeService for LocalRuntimeService {
         command: ApprovalDecisionCommand,
     ) -> ServiceFuture<'_, ApprovalResult> {
         let service = self.clone();
+        let admitted = self
+            .admission
+            .submit(async move { service.decide_approval_admitted(command).await });
         Box::pin(async move {
-            let (run_id, result) = service.approvals.decide(&command, now()).await?;
-            service
-                .events
-                .publish(
-                    command.workspace_id(),
-                    run_id,
-                    match command.decision() {
-                        ApprovalDecision::Grant => "approval.granted",
-                        ApprovalDecision::Reject => "approval.rejected",
-                    },
-                    CanonicalValue::object([(
-                        "approval_id",
-                        CanonicalValue::from(command.approval_id().to_string()),
-                    )]),
+            let task = admitted
+                .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+            task.await.map_err(|_| {
+                ServiceError::Internal(
+                    "approval decision task exited before acknowledgement".into(),
                 )
-                .map_err(|error| ServiceError::Internal(error.to_string()))?;
-            service.spawn_advance(run_id).await;
-            Ok(result)
+            })?
+        })
+    }
+
+    fn renew_approval(
+        &self,
+        command: ApprovalRenewalCommand,
+    ) -> ServiceFuture<'_, ApprovalRenewal> {
+        let service = self.clone();
+        let admitted = self
+            .admission
+            .submit(async move { service.renew_approval_admitted(command).await });
+        Box::pin(async move {
+            let task = admitted
+                .map_err(|_| ServiceError::Unavailable("runtime is shutting down".into()))?;
+            task.await.map_err(|_| {
+                ServiceError::Internal("approval renewal task exited before acknowledgement".into())
+            })?
         })
     }
 
@@ -1199,7 +2351,7 @@ impl RuntimeService for LocalRuntimeService {
         Box::pin(async move {
             let approvals = self
                 .database
-                .list_pending_approvals(query.workspace_id())
+                .list_pending_approvals(query.workspace_id(), now())
                 .await
                 .map_err(repository_service_error)?;
             let references = self
@@ -1245,6 +2397,77 @@ impl RuntimeService for LocalRuntimeService {
                         approval.expires_at(),
                     )
                     .with_secret_references(metadata))
+                })
+                .collect()
+        })
+    }
+
+    fn run_status(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        run_id: RunId,
+    ) -> ServiceFuture<'_, String> {
+        let service = self.clone();
+        Box::pin(async move {
+            sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ? AND workspace_id = ?")
+                .bind(run_id.to_string())
+                .bind(workspace_id.to_string())
+                .fetch_optional(service.database.pool())
+                .await
+                .map_err(sql_service_error)?
+                .ok_or(ServiceError::NotFound)
+        })
+    }
+
+    fn run_status_detail(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        run_id: RunId,
+    ) -> ServiceFuture<'_, RunStatus> {
+        let service = self.clone();
+        Box::pin(async move {
+            let state = service.run_status(workspace_id, run_id).await?;
+            let lifecycle = service
+                .database
+                .get_run_lifecycle(workspace_id, run_id)
+                .await
+                .map_err(repository_service_error)?;
+            Ok(match lifecycle {
+                Some(lifecycle) => RunStatus::new(
+                    state,
+                    lifecycle.terminal_code().map(str::to_owned),
+                    Some(lifecycle.effect_certainty().as_str().to_owned()),
+                    lifecycle.phase() == "reconciliation_required",
+                ),
+                None => RunStatus::new(state, None, None, false),
+            })
+        })
+    }
+
+    fn list_reconciliation_runs(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+    ) -> ServiceFuture<'_, Vec<RunReconciliation>> {
+        let service = self.clone();
+        Box::pin(async move {
+            let runs = service
+                .database
+                .list_reconciliation_required_runs(workspace_id)
+                .await
+                .map_err(repository_service_error)?;
+            runs.into_iter()
+                .map(|(run_id, lifecycle)| {
+                    let code = lifecycle.terminal_code().ok_or_else(|| {
+                        ServiceError::Internal("reconciliation run missing terminal code".into())
+                    })?;
+                    Ok(RunReconciliation::new(
+                        run_id,
+                        lifecycle.effect_certainty().as_str(),
+                        code,
+                        lifecycle.primary_diagnostic().map(str::to_owned),
+                        lifecycle.secondary_diagnostic().map(str::to_owned),
+                        lifecycle.terminal_audit_pending(),
+                    ))
                 })
                 .collect()
         })
@@ -1762,7 +2985,12 @@ impl RuntimeService for LocalRuntimeService {
                         revision.schedule_kind, revision.schedule_start_at,
                         revision.interval_millis, revision.prompt, revision.data_class,
                         revision.max_model_turns, revision.max_actions, revision.enabled,
-                        revision.next_due_at, revision.idempotent, revision.created_at
+                        revision.next_due_at, revision.idempotent, revision.created_at,
+                        (SELECT run.state FROM scheduled_job_runs run
+                         WHERE run.job_id = job.job_id
+                           AND run.revision = revision.revision
+                         ORDER BY run.scheduled_for DESC, run.updated_at DESC
+                         LIMIT 1) AS last_run_state
                  FROM scheduled_jobs job
                  JOIN (
                     SELECT job_id, MAX(revision) AS revision
@@ -1788,13 +3016,12 @@ impl RuntimeService for LocalRuntimeService {
     ) -> ServiceFuture<'_, AutomationActionRequested> {
         let service = self.clone();
         Box::pin(async move {
-            let kind = if service
+            let current = service
                 .database
                 .latest_scheduled_job_revision(command.job_id())
                 .await
-                .map_err(repository_service_error)?
-                .is_some()
-            {
+                .map_err(repository_service_error)?;
+            let kind = if current.is_some() {
                 "schedule.job.update"
             } else {
                 "schedule.job.create"
@@ -1812,7 +3039,7 @@ impl RuntimeService for LocalRuntimeService {
                 .request_extension_action(
                     command.workspace_id(),
                     command.actor().clone(),
-                    scheduled_job_action_proposal(&command, kind),
+                    scheduled_job_action_proposal(&command, kind, current.as_ref()),
                     CapabilitySet::new([capability]),
                 )
                 .await?;
@@ -1821,6 +3048,7 @@ impl RuntimeService for LocalRuntimeService {
     }
 
     fn list_skills(&self, query: SkillReviewQuery) -> ServiceFuture<'_, Vec<SkillReview>> {
+        let service = self.clone();
         Box::pin(async move {
             let rows = sqlx::query(
                 "SELECT skill.skill_id, skill.workspace_id, skill.name, skill.description,
@@ -1842,7 +3070,35 @@ impl RuntimeService for LocalRuntimeService {
             .fetch_all(self.database.pool())
             .await
             .map_err(sql_service_error)?;
-            rows.into_iter().map(skill_review_from_row).collect()
+            let mut reviews = rows
+                .into_iter()
+                .map(skill_review_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let enabled = service
+                .database
+                .enabled_skill_versions(query.workspace_id())
+                .await
+                .map_err(repository_service_error)?;
+            for review in &mut reviews {
+                let required = service
+                    .required_skills
+                    .contains(&(review.skill_id(), review.version().clone()));
+                if !review.enabled() {
+                    review.set_load_status(required, "disabled", None);
+                    continue;
+                }
+                let Some(skill) = enabled.iter().find(|skill| {
+                    skill.skill_id() == review.skill_id() && skill.version() == review.version()
+                }) else {
+                    review.set_load_status(required, "excluded", Some("not_eligible"));
+                    continue;
+                };
+                let load = service
+                    .load_reviewed_skill_context(query.workspace_id(), skill)
+                    .await;
+                review.set_load_status(required, load.metadata.status(), load.metadata.reason());
+            }
+            Ok(reviews)
         })
     }
 
@@ -1863,6 +3119,20 @@ impl RuntimeService for LocalRuntimeService {
             let draft_id = command
                 .draft_id()
                 .ok_or_else(|| ServiceError::Conflict("skill publish requires a draft".into()))?;
+            let draft = service
+                .database
+                .get_workflow_capture_draft(draft_id)
+                .await
+                .map_err(repository_service_error)?
+                .ok_or(ServiceError::NotFound)?;
+            if draft.workspace_id() != command.workspace_id() {
+                return Err(ServiceError::NotFound);
+            }
+            let source_digest = sha256_hex(draft.body().as_bytes());
+            let source_run_id = draft
+                .body()
+                .lines()
+                .find_map(|line| line.strip_prefix("source_run_id: "));
             let run_id = service
                 .request_extension_action(
                     command.workspace_id(),
@@ -1879,6 +3149,11 @@ impl RuntimeService for LocalRuntimeService {
                             ("name", CanonicalValue::from(command.name())),
                             ("description", CanonicalValue::from(command.description())),
                             ("source_format", CanonicalValue::from("markdown")),
+                            ("source_digest", CanonicalValue::from(source_digest)),
+                            (
+                                "source_run_id",
+                                source_run_id.map_or(CanonicalValue::Null, CanonicalValue::from),
+                            ),
                         ]),
                     ),
                     CapabilitySet::new([capability]),
@@ -2016,7 +3291,11 @@ fn provider_policy_update_proposal(
     )
 }
 
-fn scheduled_job_action_proposal(command: &JobActionCommand, kind: &str) -> ActionProposal {
+fn scheduled_job_action_proposal(
+    command: &JobActionCommand,
+    kind: &str,
+    current: Option<&ScheduledJobRevision>,
+) -> ActionProposal {
     let (schedule_kind, run_at, start_at, interval_millis) = match command.schedule() {
         ScheduleSpec::Once { run_at } => (
             CanonicalValue::from("once"),
@@ -2090,6 +3369,26 @@ fn scheduled_job_action_proposal(command: &JobActionCommand, kind: &str) -> Acti
                 }),
             ),
             ("idempotent", CanonicalValue::from(command.idempotent())),
+            (
+                "previous_revision",
+                current.map_or(CanonicalValue::Null, |job| {
+                    canonical_u64(job.revision().as_u64())
+                }),
+            ),
+            (
+                "previous_enabled",
+                current.map_or(CanonicalValue::Null, |job| {
+                    CanonicalValue::from(job.enabled())
+                }),
+            ),
+            (
+                "target_revision",
+                canonical_u64(
+                    current
+                        .map(|job| job.revision().as_u64().saturating_add(1))
+                        .unwrap_or(1),
+                ),
+            ),
         ]),
     )
 }
@@ -2141,6 +3440,9 @@ struct ScheduledJobAdminAction {
     enabled: bool,
     next_due_at: Option<i64>,
     idempotent: bool,
+    previous_revision: Option<i64>,
+    previous_enabled: Option<bool>,
+    target_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2164,6 +3466,9 @@ struct ParsedScheduledJobAdminAction {
     enabled: bool,
     next_due_at: Option<TimestampMillis>,
     idempotent: bool,
+    previous_revision: Option<JobRevision>,
+    previous_enabled: Option<bool>,
+    target_revision: Option<JobRevision>,
 }
 
 async fn apply_scheduled_job_action(
@@ -2172,10 +3477,43 @@ async fn apply_scheduled_job_action(
     workspace_id: lumen_core::identity::WorkspaceId,
     parsed: ParsedScheduledJobAdminAction,
 ) -> Result<(), ServiceError> {
+    match kind {
+        "schedule.job.create"
+            if parsed.previous_revision.is_none()
+                && parsed.previous_enabled.is_none()
+                && parsed.target_revision == JobRevision::new(1).ok() => {}
+        "schedule.job.update" | "schedule.job.enable"
+            if parsed.previous_revision.is_some()
+                && parsed.previous_enabled.is_some()
+                && parsed.target_revision.is_some() => {}
+        _ => {
+            return Err(ServiceError::Conflict(
+                "scheduled action approval pins are missing or invalid".into(),
+            ));
+        }
+    }
     let latest = database
         .latest_scheduled_job_revision(parsed.job_id)
         .await
         .map_err(repository_service_error)?;
+    if let Some(expected_revision) = parsed.previous_revision {
+        let Some(current) = latest.as_ref() else {
+            return Err(ServiceError::Conflict(
+                "scheduled job changed since approval".into(),
+            ));
+        };
+        if current.revision() != expected_revision
+            || parsed.previous_enabled != Some(current.enabled())
+        {
+            return Err(ServiceError::Conflict(
+                "scheduled job changed since approval".into(),
+            ));
+        }
+    } else if parsed.previous_enabled.is_some() {
+        return Err(ServiceError::Conflict(
+            "scheduled job approval state is invalid".into(),
+        ));
+    }
     let revision = match (kind, latest.as_ref()) {
         ("schedule.job.create", None) => JobRevision::new(1),
         ("schedule.job.create", Some(_)) => {
@@ -2196,6 +3534,11 @@ async fn apply_scheduled_job_action(
         }
     }
     .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    if parsed.target_revision != Some(revision) {
+        return Err(ServiceError::Conflict(
+            "scheduled job changed since approval".into(),
+        ));
+    }
     let created_at = now();
     let revision = ScheduledJobRevision::new(
         parsed.job_id,
@@ -2255,6 +3598,14 @@ fn parse_scheduled_job_action(
         lumen_core::executor::ExecutorError::new("scheduled job action budget is invalid")
     })?;
     let next_due_at = parsed.next_due_at.map(timestamp_from_i64).transpose()?;
+    let previous_revision = parsed
+        .previous_revision
+        .map(job_revision_from_i64)
+        .transpose()?;
+    let target_revision = parsed
+        .target_revision
+        .map(job_revision_from_i64)
+        .transpose()?;
     Ok(ParsedScheduledJobAdminAction {
         job_id,
         service,
@@ -2267,7 +3618,17 @@ fn parse_scheduled_job_action(
         enabled: parsed.enabled,
         next_due_at,
         idempotent: parsed.idempotent,
+        previous_revision,
+        previous_enabled: parsed.previous_enabled,
+        target_revision,
     })
+}
+
+fn job_revision_from_i64(value: i64) -> Result<JobRevision, lumen_core::executor::ExecutorError> {
+    JobRevision::new(u64::try_from(value).map_err(|_| {
+        lumen_core::executor::ExecutorError::new("scheduled job revision is invalid")
+    })?)
+    .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))
 }
 
 fn parse_scheduled_job_schedule(
@@ -2320,6 +3681,8 @@ struct SkillPublishAction {
     name: String,
     description: String,
     source_format: String,
+    source_digest: String,
+    source_run_id: Option<String>,
 }
 
 struct ParsedSkillPublishAction {
@@ -2329,6 +3692,8 @@ struct ParsedSkillPublishAction {
     name: String,
     description: String,
     source_format: String,
+    source_digest: String,
+    source_run_id: Option<uuid::Uuid>,
 }
 
 async fn apply_skill_publish_action(
@@ -2346,21 +3711,35 @@ async fn apply_skill_publish_action(
     if draft.workspace_id() != workspace_id {
         return Err(ServiceError::NotFound);
     }
-    let source_path = data_root
-        .join("skills")
-        .join(parsed.skill_id.to_string())
-        .join(format!("{}.md", parsed.version.as_str()));
-    tokio::fs::create_dir_all(
-        source_path
-            .parent()
-            .ok_or_else(|| ServiceError::Internal("invalid skill source path".into()))?,
-    )
-    .await
-    .map_err(|error| ServiceError::Internal(error.to_string()))?;
-    tokio::fs::write(&source_path, draft.body())
+    let bytes = draft.body().as_bytes().to_vec();
+    if parsed.source_digest != sha256_hex(&bytes) {
+        return Err(ServiceError::Conflict(
+            "capture draft changed since approval".into(),
+        ));
+    }
+    let recorded_source_run = draft
+        .body()
+        .lines()
+        .find_map(|line| line.strip_prefix("source_run_id: "))
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ServiceError::Conflict("capture source run is invalid".into()))?;
+    if recorded_source_run != parsed.source_run_id {
+        return Err(ServiceError::Conflict(
+            "capture source run changed since approval".into(),
+        ));
+    }
+    if database
+        .skill_version(workspace_id, parsed.skill_id, &parsed.version)
         .await
-        .map_err(|error| ServiceError::Internal(error.to_string()))?;
-    let digest = sha256_hex(draft.body().as_bytes());
+        .map_err(repository_service_error)?
+        .is_some()
+    {
+        return Err(ServiceError::Conflict(
+            "skill version already published".into(),
+        ));
+    }
+    let digest = parsed.source_digest.clone();
     let created_at = now();
     let record = SkillVersionRecord::new(
         parsed.skill_id,
@@ -2377,21 +3756,272 @@ async fn apply_skill_publish_action(
         Some(created_at),
     )
     .map_err(|error| ServiceError::Conflict(error.to_string()))?;
+    let source_path = data_root
+        .join("skills")
+        .join(parsed.skill_id.to_string())
+        .join(format!("{}.md", parsed.version.as_str()));
+    let intent_id = uuid::Uuid::new_v4();
+    let stage_path = data_root
+        .join("skills")
+        .join(".staging")
+        .join(intent_id.to_string());
     database
-        .insert_skill_version(&record)
+        .prepare_skill_publication(intent_id, parsed.draft_id, &record)
         .await
         .map_err(repository_service_error)?;
+    if let Err(error) = write_skill_stage(&stage_path, &bytes).await {
+        let cleaned = match tokio::fs::remove_file(&stage_path).await {
+            Ok(()) => true,
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        database
+            .mark_skill_publication_state(
+                intent_id,
+                if cleaned {
+                    "abandoned"
+                } else {
+                    "reconciliation_required"
+                },
+                Some(&error.to_string()),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        return Err(error);
+    }
+    finalize_skill_publication(database, intent_id, &record, &stage_path, &source_path).await?;
+    Ok(parsed.skill_id)
+}
+
+async fn write_skill_stage(stage_path: &Path, bytes: &[u8]) -> Result<(), ServiceError> {
+    tokio::fs::create_dir_all(
+        stage_path
+            .parent()
+            .ok_or_else(|| ServiceError::Internal("invalid skill staging path".into()))?,
+    )
+    .await
+    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let mut stage_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(stage_path)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    stage_file
+        .write_all(bytes)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    stage_file
+        .flush()
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    stage_file
+        .sync_all()
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    Ok(())
+}
+
+async fn finalize_skill_publication(
+    database: &Database,
+    intent_id: uuid::Uuid,
+    record: &SkillVersionRecord,
+    stage_path: &Path,
+    source_path: &Path,
+) -> Result<(), ServiceError> {
+    let stage_file = tokio::fs::File::open(stage_path)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    let staged_bytes = read_bounded_skill_source(stage_file)
+        .await
+        .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    if staged_bytes.as_deref().map(sha256_hex).as_deref() != Some(record.source_digest()) {
+        let cleaned = !source_path.exists() && tokio::fs::remove_file(stage_path).await.is_ok();
+        database
+            .mark_skill_publication_state(
+                intent_id,
+                if cleaned {
+                    "abandoned"
+                } else {
+                    "reconciliation_required"
+                },
+                Some("staged source digest mismatch"),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        return Err(ServiceError::Conflict(
+            "staged source digest mismatch".into(),
+        ));
+    }
+    tokio::fs::create_dir_all(
+        source_path
+            .parent()
+            .ok_or_else(|| ServiceError::Internal("invalid skill source path".into()))?,
+    )
+    .await
+    .map_err(|error| ServiceError::Internal(error.to_string()))?;
+    match tokio::fs::hard_link(stage_path, source_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !same_file::is_same_file(stage_path, source_path).unwrap_or(false) {
+                database
+                    .mark_skill_publication_state(
+                        intent_id,
+                        "reconciliation_required",
+                        Some("foreign final source path"),
+                    )
+                    .await
+                    .map_err(repository_service_error)?;
+                return Err(ServiceError::Conflict(
+                    "skill version source already exists".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(ServiceError::Internal(error.to_string())),
+    }
     database
-        .set_skill_workspace_state(
-            workspace_id,
-            parsed.skill_id,
-            &parsed.version,
-            true,
-            created_at,
+        .mark_skill_publication_state(intent_id, "materialized", None)
+        .await
+        .map_err(repository_service_error)?;
+    if let Err(error) = database.commit_skill_publication(intent_id, record).await {
+        // A failed transaction has a known rollback only when the version lookup succeeds.
+        // Never remove a path that is not still linked to this intent's private stage.
+        let safe_to_clean = matches!(
+            database
+                .skill_version(record.workspace_id(), record.skill_id(), record.version())
+                .await,
+            Ok(None)
+        ) && same_file::is_same_file(stage_path, source_path).unwrap_or(false);
+        let cleaned = if safe_to_clean {
+            tokio::fs::remove_file(source_path).await.is_ok()
+                && tokio::fs::remove_file(stage_path).await.is_ok()
+        } else {
+            false
+        };
+        database
+            .mark_skill_publication_state(
+                intent_id,
+                if cleaned {
+                    "abandoned"
+                } else {
+                    "reconciliation_required"
+                },
+                Some(&error.to_string()),
+            )
+            .await
+            .map_err(repository_service_error)?;
+        return Err(repository_service_error(error));
+    }
+    let _ = tokio::fs::remove_file(stage_path).await;
+    Ok(())
+}
+
+async fn recover_skill_publications(
+    database: &Database,
+    data_root: &Path,
+) -> Result<(), ServiceError> {
+    for intent in database
+        .recoverable_skill_publications()
+        .await
+        .map_err(repository_service_error)?
+    {
+        let stage_path = data_root
+            .join("skills")
+            .join(".staging")
+            .join(intent.intent_id.to_string());
+        let source_path = data_root
+            .join("skills")
+            .join(intent.skill.skill_id().to_string())
+            .join(format!("{}.md", intent.skill.version().as_str()));
+        if intent.state == "committed" {
+            if !stage_path.exists() {
+                continue;
+            }
+            let staged = read_bounded_skill_source(
+                tokio::fs::File::open(&stage_path)
+                    .await
+                    .map_err(|error| ServiceError::Internal(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            if staged.as_deref().map(sha256_hex).as_deref() != Some(intent.skill.source_digest()) {
+                return Err(ServiceError::Conflict(
+                    "committed publication stage digest mismatch".into(),
+                ));
+            }
+            if !source_path.exists() {
+                tokio::fs::create_dir_all(
+                    source_path.parent().ok_or_else(|| {
+                        ServiceError::Internal("invalid skill source path".into())
+                    })?,
+                )
+                .await
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+                match tokio::fs::hard_link(&stage_path, &source_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(ServiceError::Internal(error.to_string())),
+                }
+            }
+            if !same_file::is_same_file(&stage_path, &source_path).unwrap_or(false) {
+                return Err(ServiceError::Conflict(
+                    "committed publication final path has foreign ownership".into(),
+                ));
+            }
+            tokio::fs::remove_file(&stage_path)
+                .await
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+            continue;
+        }
+        if !stage_path.exists() {
+            let (state, diagnostic) = if source_path.exists() {
+                (
+                    "reconciliation_required",
+                    "staged source missing with final source present",
+                )
+            } else {
+                (
+                    "abandoned",
+                    "staged source missing; fresh approval required",
+                )
+            };
+            database
+                .mark_skill_publication_state(intent.intent_id, state, Some(diagnostic))
+                .await
+                .map_err(repository_service_error)?;
+            continue;
+        }
+        if let Err(error) = finalize_skill_publication(
+            database,
+            intent.intent_id,
+            &intent.skill,
+            &stage_path,
+            &source_path,
         )
         .await
-        .map_err(repository_service_error)?;
-    Ok(parsed.skill_id)
+        {
+            let still_unsettled = database
+                .recoverable_skill_publications()
+                .await
+                .map_err(repository_service_error)?
+                .into_iter()
+                .any(|current| {
+                    current.intent_id == intent.intent_id
+                        && matches!(current.state.as_str(), "prepared" | "materialized")
+                });
+            if still_unsettled {
+                database
+                    .mark_skill_publication_state(
+                        intent.intent_id,
+                        "reconciliation_required",
+                        Some(&error.to_string()),
+                    )
+                    .await
+                    .map_err(repository_service_error)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_skill_publish_action(
@@ -2423,6 +4053,20 @@ fn parse_skill_publish_action(
             "skill publish metadata is invalid",
         ));
     }
+    if parsed.source_digest.len() != 71
+        || !parsed.source_digest.starts_with("sha256:")
+        || !parsed.source_digest[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parsed
+            .source_run_id
+            .as_ref()
+            .is_some_and(|run_id| uuid::Uuid::parse_str(run_id).is_err())
+    {
+        return Err(lumen_core::executor::ExecutorError::new(
+            "skill publish provenance is invalid",
+        ));
+    }
     Ok(ParsedSkillPublishAction {
         draft_id,
         skill_id,
@@ -2430,6 +4074,10 @@ fn parse_skill_publish_action(
         name: parsed.name,
         description: parsed.description,
         source_format: parsed.source_format,
+        source_digest: parsed.source_digest,
+        source_run_id: parsed
+            .source_run_id
+            .map(|run_id| uuid::Uuid::parse_str(&run_id).expect("validated source run ID")),
     })
 }
 
@@ -2579,6 +4227,8 @@ fn job_review_from_row(row: sqlx::sqlite::SqliteRow) -> Result<JobReview, Servic
         row.try_get::<i64, _>("idempotent")
             .map_err(sql_service_error)?
             == 1,
+        row.try_get::<Option<String>, _>("last_run_state")
+            .map_err(sql_service_error)?,
         timestamp_from_sql_row(&row, "created_at")?,
     ))
 }
@@ -2999,7 +4649,7 @@ impl ExecutorPort for RedactingExecutor {
         cancellation: CancellationToken,
     ) -> ExecutorFuture<'a> {
         Box::pin(async move {
-            let attempt_id = self.approvals.reserve(action, now()).await?;
+            let attempt_id = self.approvals.reserve(action).await?;
             let outcome = match self.inner.execute(action, cancellation).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -3128,16 +4778,49 @@ struct StoredRun {
     model_override: Option<Arc<dyn ModelPort>>,
     capabilities_override: Option<EffectiveCapabilities>,
     scheduled_handoff: Option<(OccurrenceKey, uuid::Uuid)>,
+    start_disposition: StartDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartDisposition {
+    Created,
+    ScheduledStartCommitted,
+    ResumeApproval,
 }
 
 struct ReviewedSkillPrompt {
     prompt: String,
     loaded_skills: Vec<LoadedSkillMetadata>,
+    skill_loads: Vec<SkillLoadMetadata>,
 }
 
 struct LoadedReviewedSkill {
     rendered: String,
     metadata: LoadedSkillMetadata,
+}
+
+struct SkillLoadResult {
+    metadata: SkillLoadMetadata,
+    loaded: Option<LoadedReviewedSkill>,
+}
+
+fn skill_load_value(skill: &SkillLoadMetadata) -> CanonicalValue {
+    CanonicalValue::object([
+        ("skill_id", CanonicalValue::from(skill.skill_id())),
+        ("version", CanonicalValue::from(skill.version())),
+        (
+            "expected_digest",
+            CanonicalValue::from(skill.expected_digest()),
+        ),
+        ("status", CanonicalValue::from(skill.status())),
+        (
+            "reason",
+            skill
+                .reason()
+                .map_or(CanonicalValue::Null, CanonicalValue::from),
+        ),
+        ("required", CanonicalValue::from(skill.required())),
+    ])
 }
 
 struct StoredRunRequest {
@@ -3260,11 +4943,13 @@ impl ActionNormalizer for RoutingNormalizer {
         context: &RunContext,
         proposal: ActionProposal,
     ) -> Result<ActionEnvelope, NormalizationError> {
-        if is_extension_action(proposal.kind()) {
+        let action = if is_extension_action(proposal.kind()) {
             self.extension.normalize(context, proposal)
         } else {
             self.builtin.normalize(context, proposal)
-        }
+        }?;
+        validate_immutable_action_pins(&action)?;
+        Ok(action)
     }
 
     fn model_tools(&self, context: &RunContext) -> Vec<ModelTool> {
@@ -3272,6 +4957,73 @@ impl ActionNormalizer for RoutingNormalizer {
         tools.extend(self.extension.model_tools(context));
         tools
     }
+}
+
+fn validate_immutable_action_pins(action: &ActionEnvelope) -> Result<(), NormalizationError> {
+    let kind = action.kind().as_str();
+    if kind == "skill.publish" {
+        let CanonicalValue::Object(arguments) = action.arguments() else {
+            return Err(NormalizationError::new(
+                "skill publication arguments must be an object",
+            ));
+        };
+        let valid_digest = matches!(arguments.get("source_digest"), Some(CanonicalValue::String(digest))
+            if digest.len() == 71
+                && digest.starts_with("sha256:")
+                && digest[7..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        let valid_source = matches!(arguments.get("source_run_id"), Some(CanonicalValue::Null))
+            || matches!(arguments.get("source_run_id"), Some(CanonicalValue::String(run_id))
+                if uuid::Uuid::parse_str(run_id).is_ok());
+        if !valid_digest || !valid_source {
+            return Err(NormalizationError::new(
+                "skill publication requires immutable source pins",
+            ));
+        }
+        return Ok(());
+    }
+    if !is_scheduled_job_admin_action(kind) {
+        return Ok(());
+    }
+    let CanonicalValue::Object(arguments) = action.arguments() else {
+        return Err(NormalizationError::new(
+            "scheduled action arguments must be an object",
+        ));
+    };
+    let target = match arguments.get("target_revision") {
+        Some(CanonicalValue::Integer(value)) if *value > 0 => *value,
+        _ => {
+            return Err(NormalizationError::new(
+                "scheduled action requires target revision pin",
+            ));
+        }
+    };
+    if kind == "schedule.job.create" {
+        if arguments.get("previous_revision") != Some(&CanonicalValue::Null)
+            || arguments.get("previous_enabled") != Some(&CanonicalValue::Null)
+            || target != 1
+        {
+            return Err(NormalizationError::new("scheduled create pins are invalid"));
+        }
+    } else {
+        let previous = match arguments.get("previous_revision") {
+            Some(CanonicalValue::Integer(value)) if *value > 0 => *value,
+            _ => {
+                return Err(NormalizationError::new(
+                    "scheduled action requires previous revision pin",
+                ));
+            }
+        };
+        if !matches!(
+            arguments.get("previous_enabled"),
+            Some(CanonicalValue::Bool(_))
+        ) || previous.checked_add(1) != Some(target)
+        {
+            return Err(NormalizationError::new(
+                "scheduled action approval pins are invalid",
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct RoutingExecutor {
@@ -3386,6 +5138,20 @@ fn terminal_event(outcome: &RunOutcome) -> (&'static str, &'static str, Canonica
             "run.timed_out",
             CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
         ),
+        RunOutcome::RequiredSkillUnavailable {
+            skill_id,
+            version,
+            reason,
+        } => (
+            "failed",
+            "run.failed",
+            CanonicalValue::object([
+                ("code", CanonicalValue::from("required_skill_unavailable")),
+                ("skill_id", CanonicalValue::from(skill_id.clone())),
+                ("version", CanonicalValue::from(version.clone())),
+                ("reason", CanonicalValue::from(*reason)),
+            ]),
+        ),
         other => (
             "failed",
             "run.failed",
@@ -3409,27 +5175,37 @@ struct ApprovalRecord {
     action: lumen_core::action::ActionEnvelope,
     request: ApprovalRequest,
     attempt_id: Option<ExecutionAttemptId>,
+    renewed: bool,
 }
 
 struct ApprovalRegistry {
     database: Database,
     ttl: Duration,
+    clock: Arc<dyn Clock>,
     records: Mutex<BTreeMap<ApprovalId, ApprovalRecord>>,
+    #[cfg(test)]
+    reservation_waiting: Arc<Notify>,
 }
 
 impl ApprovalRegistry {
     fn new(database: Database, ttl: Duration) -> Self {
+        Self::with_clock(database, ttl, Arc::new(SystemClock))
+    }
+
+    fn with_clock(database: Database, ttl: Duration, clock: Arc<dyn Clock>) -> Self {
         Self {
             database,
             ttl,
+            clock,
             records: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            reservation_waiting: Arc::new(Notify::new()),
         }
     }
 
     async fn decide(
         &self,
         command: &ApprovalDecisionCommand,
-        now: TimestampMillis,
     ) -> Result<(RunId, ApprovalResult), ServiceError> {
         let mut records = self.records.lock().await;
         let record = records
@@ -3438,16 +5214,61 @@ impl ApprovalRegistry {
         if record.workspace_id != command.workspace_id() {
             return Err(ServiceError::NotFound);
         }
+        if record.renewed {
+            return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+        }
+        let now = self.clock.now();
         let mut request = record.request.clone();
-        match command.decision() {
+        let decision = match command.decision() {
             ApprovalDecision::Grant => request.grant(command.actor().clone(), now),
             ApprovalDecision::Reject => request.reject(command.actor().clone(), now),
+        };
+        if let Err(error) = decision {
+            if request.state() == ApprovalState::Expired {
+                self.database
+                    .expire_pending_approvals(command.workspace_id(), now)
+                    .await
+                    .map_err(repository_service_error)?;
+                record.request = request;
+            }
+            return Err(ServiceError::ApprovalConflict(approval_conflict(error)));
         }
-        .map_err(|error| ServiceError::Conflict(error.to_string()))?;
-        self.database
-            .update_approval_decision(command.workspace_id(), &request)
-            .await
-            .map_err(repository_service_error)?;
+        let persisted = match command.decision() {
+            ApprovalDecision::Grant => self
+                .database
+                .update_approval_decision(command.workspace_id(), &request)
+                .await
+                .map(|_| ()),
+            ApprovalDecision::Reject => self
+                .database
+                .reject_approval_and_action(command.workspace_id(), &request)
+                .await
+                .and_then(|persisted_run_id| {
+                    if persisted_run_id == record.run_id {
+                        Ok(())
+                    } else {
+                        Err(lumen_db::RepositoryError::ApprovalDecisionConflict)
+                    }
+                }),
+        };
+        persisted.map_err(|error| match error {
+            lumen_db::RepositoryError::ApprovalStale => {
+                ServiceError::ApprovalConflict(ApprovalConflict::Stale)
+            }
+            lumen_db::RepositoryError::ApprovalActionChanged => {
+                ServiceError::ApprovalConflict(ApprovalConflict::ActionChanged)
+            }
+            lumen_db::RepositoryError::ApprovalExpired => {
+                ServiceError::ApprovalConflict(ApprovalConflict::Expired)
+            }
+            lumen_db::RepositoryError::ApprovalConsumed => {
+                ServiceError::ApprovalConflict(ApprovalConflict::Consumed)
+            }
+            lumen_db::RepositoryError::ApprovalDecisionConflict => {
+                ServiceError::ApprovalConflict(ApprovalConflict::AlreadyDecided)
+            }
+            error => repository_service_error(error),
+        })?;
         record.request = request;
         Ok((
             record.run_id,
@@ -3455,45 +5276,167 @@ impl ApprovalRegistry {
         ))
     }
 
+    async fn renew(
+        &self,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        approval_id: ApprovalId,
+        expected_run_id: RunId,
+    ) -> Result<(RunId, ApprovalId), ServiceError> {
+        let mut records = self.records.lock().await;
+        let now = self.clock.now();
+        let (run_id, action, policy_version) = {
+            let record = records
+                .get_mut(&approval_id)
+                .ok_or(ServiceError::NotFound)?;
+            if record.workspace_id != workspace_id {
+                return Err(ServiceError::NotFound);
+            }
+            if record.run_id != expected_run_id {
+                return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+            }
+            if record.renewed {
+                return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+            }
+            // The repository performs expiry and replacement together under
+            // one SQLite writer transaction below.
+            record.request.expire(now);
+            match record.request.state() {
+                ApprovalState::Expired => {}
+                ApprovalState::Pending => {
+                    return Err(ServiceError::ApprovalConflict(
+                        ApprovalConflict::NotRenewable,
+                    ));
+                }
+                ApprovalState::Granted | ApprovalState::Rejected => {
+                    return Err(ServiceError::ApprovalConflict(
+                        ApprovalConflict::AlreadyDecided,
+                    ));
+                }
+                ApprovalState::Consumed => {
+                    return Err(ServiceError::ApprovalConflict(ApprovalConflict::Consumed));
+                }
+                ApprovalState::Invalidated => {
+                    return Err(ServiceError::ApprovalConflict(ApprovalConflict::Stale));
+                }
+            }
+            (
+                record.run_id,
+                record.action.clone(),
+                record.request.policy_version().clone(),
+            )
+        };
+        let replacement = ApprovalId::new();
+        let ttl_millis = u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX);
+        let request = ApprovalRequest::new(
+            replacement,
+            action.fingerprint(),
+            policy_version,
+            now,
+            TimestampMillis::new(now.as_u64().saturating_add(ttl_millis)),
+        )
+        .map_err(|error| ServiceError::ApprovalConflict(approval_conflict(error)))?;
+        self.database
+            .renew_expired_approval(workspace_id, run_id, approval_id, &request, now)
+            .await
+            .map_err(|error| match error {
+                lumen_db::RepositoryError::ApprovalStale => {
+                    ServiceError::ApprovalConflict(ApprovalConflict::Stale)
+                }
+                error => repository_service_error(error),
+            })?;
+        records
+            .get_mut(&approval_id)
+            .expect("renewed approval remains registered")
+            .renewed = true;
+        records.insert(
+            replacement,
+            ApprovalRecord {
+                workspace_id,
+                run_id,
+                action,
+                request,
+                attempt_id: None,
+                renewed: false,
+            },
+        );
+        Ok((run_id, replacement))
+    }
+
     async fn reserve(
         &self,
         action: &AuthorizedAction,
-        now: TimestampMillis,
     ) -> Result<ExecutionAttemptId, lumen_core::executor::ExecutorError> {
-        let attempt_id = ExecutionAttemptId::new();
+        validate_immutable_action_pins(action.action())
+            .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
         match action.authorization() {
             DispatchAuthorization::PolicyAllowed => {
+                let attempt_id = ExecutionAttemptId::new();
                 self.database
-                    .reserve_allowed_execution(attempt_id, action.action().id(), now)
+                    .reserve_allowed_execution(attempt_id, action.action().id(), self.clock.now())
                     .await
                     .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+                Ok(attempt_id)
             }
             DispatchAuthorization::Approved { approval_id } => {
-                let mut records = self.records.lock().await;
-                let record = records.get_mut(&approval_id).ok_or_else(|| {
-                    lumen_core::executor::ExecutorError::new("approved action is not registered")
-                })?;
-                if record.action.fingerprint() != action.action().fingerprint()
-                    || record.attempt_id.is_some()
-                {
-                    return Err(lumen_core::executor::ExecutorError::new(
-                        "approved action cannot be reserved",
-                    ));
-                }
-                self.database
-                    .reserve_execution(DispatchReservation::new(
-                        attempt_id,
-                        action.action().id(),
-                        approval_id,
-                        action.action().fingerprint(),
-                        record.request.policy_version().clone(),
-                        now,
-                    ))
-                    .await
-                    .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
-                record.attempt_id = Some(attempt_id);
+                self.reserve_approved(action.action(), approval_id).await
             }
         }
+    }
+
+    async fn reserve_approved(
+        &self,
+        action: &ActionEnvelope,
+        approval_id: ApprovalId,
+    ) -> Result<ExecutionAttemptId, lumen_core::executor::ExecutorError> {
+        let attempt_id = ExecutionAttemptId::new();
+        #[cfg(test)]
+        self.reservation_waiting.notify_waiters();
+        let mut records = self.records.lock().await;
+        let record = records.get_mut(&approval_id).ok_or_else(|| {
+            lumen_core::executor::ExecutorError::new("approved action is not registered")
+        })?;
+        if record.action.fingerprint() != action.fingerprint() || record.attempt_id.is_some() {
+            return Err(lumen_core::executor::ExecutorError::new(
+                "approved action cannot be reserved",
+            ));
+        }
+        let mut validated_request = record.request.clone();
+        let policy_version = validated_request.policy_version().clone();
+        authorize_dispatch(
+            &PolicyDecision::RequireApproval,
+            action,
+            &policy_version,
+            Some(&mut validated_request),
+            self.clock.now(),
+        )
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+        let clock = Arc::clone(&self.clock);
+        let reserved_at = self
+            .database
+            .reserve_execution_with_clock(
+                DispatchReservation::new(
+                    attempt_id,
+                    action.id(),
+                    approval_id,
+                    action.fingerprint(),
+                    record.request.policy_version().clone(),
+                    self.clock.now(),
+                ),
+                move || clock.now(),
+            )
+            .await
+            .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+        let mut consumed_request = record.request.clone();
+        authorize_dispatch(
+            &PolicyDecision::RequireApproval,
+            action,
+            &policy_version,
+            Some(&mut consumed_request),
+            reserved_at,
+        )
+        .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
+        record.request = consumed_request;
+        record.attempt_id = Some(attempt_id);
         Ok(attempt_id)
     }
 }
@@ -3507,10 +5450,9 @@ impl ApprovalPort for ApprovalRegistry {
     ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             let mut records = self.records.lock().await;
-            if let Some((approval_id, record)) = records
-                .iter_mut()
-                .find(|(_, record)| record.action.fingerprint() == action.fingerprint())
-            {
+            if let Some((approval_id, record)) = records.iter_mut().find(|(_, record)| {
+                !record.renewed && record.action.fingerprint() == action.fingerprint()
+            }) {
                 return match record.request.state() {
                     ApprovalState::Pending => Ok(ApprovalResolution::Pending(*approval_id)),
                     ApprovalState::Rejected => Ok(ApprovalResolution::Rejected(*approval_id)),
@@ -3546,6 +5488,7 @@ impl ApprovalPort for ApprovalRegistry {
                     action: action.clone(),
                     request,
                     attempt_id: None,
+                    renewed: false,
                 },
             );
             Ok(ApprovalResolution::Pending(approval_id))
@@ -3598,12 +5541,22 @@ fn repository_service_error(error: lumen_db::RepositoryError) -> ServiceError {
     ServiceError::Internal(error.to_string())
 }
 
+fn approval_conflict(error: ApprovalError) -> ApprovalConflict {
+    match error {
+        ApprovalError::Expired => ApprovalConflict::Expired,
+        ApprovalError::AlreadyGranted | ApprovalError::Rejected => ApprovalConflict::AlreadyDecided,
+        ApprovalError::AlreadyConsumed => ApprovalConflict::Consumed,
+        ApprovalError::ActionFingerprintMismatch => ApprovalConflict::ActionChanged,
+        ApprovalError::PolicyVersionMismatch
+        | ApprovalError::Invalidated
+        | ApprovalError::InvalidDecisionTime
+        | ApprovalError::InvalidTimeRange
+        | ApprovalError::NotGranted => ApprovalConflict::Stale,
+    }
+}
+
 pub(crate) fn now() -> TimestampMillis {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    TimestampMillis::new(u64::try_from(millis).unwrap_or(u64::MAX))
+    SystemClock.now()
 }
 
 fn scheduled_lease_expiry(timestamp: TimestampMillis) -> TimestampMillis {
@@ -3658,7 +5611,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "local result", "tool_calls": []}}]
+                "choices": [{"finish_reason":"stop", "message": {"content": "local result", "tool_calls": []}}]
             })))
             .mount(&model)
             .await;

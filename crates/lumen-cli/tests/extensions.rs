@@ -255,16 +255,22 @@ async fn install_command_creates_approval_bound_action_without_installing_direct
     let database = Database::connect(root.path().join("lumen.sqlite3"))
         .await
         .expect("database");
-    let action: (String, String) =
-        sqlx::query_as("SELECT kind, state FROM actions ORDER BY created_at DESC LIMIT 1")
-            .fetch_one(database.pool())
-            .await
-            .expect("stored action");
+    let action: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT kind, state, terminal_reason FROM actions ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored action");
     let approvals: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
             .fetch_one(database.pool())
             .await
             .expect("approval count");
+    let invalidated: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'invalidated'")
+            .fetch_one(database.pool())
+            .await
+            .expect("invalidated approval count");
     let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
         .fetch_one(database.pool())
         .await
@@ -275,7 +281,11 @@ async fn install_command_creates_approval_bound_action_without_installing_direct
         .expect("installed count");
     assert_eq!(
         action,
-        ("plugin.install".to_owned(), "normalized".to_owned())
+        (
+            "plugin.install".to_owned(),
+            "cancelled".to_owned(),
+            Some("run_cancelled".to_owned())
+        )
     );
-    assert_eq!((approvals, attempts, installed), (1, 0, 0));
+    assert_eq!((approvals, invalidated, attempts, installed), (0, 1, 0, 0));
 }
