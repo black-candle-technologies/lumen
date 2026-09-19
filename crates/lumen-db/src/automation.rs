@@ -14,6 +14,16 @@ use crate::{Database, RepositoryError, timestamp_to_i64};
 
 type ExpiredRunRow = (String, String, String, Option<String>, Option<String>);
 
+/// The result of a scheduled-run recovery sweep.  A live occurrence whose
+/// lease has expired is not evidence that it is safe to recover: another
+/// runtime may still own it.  Keep those occurrences visible without letting
+/// one of them roll back recovery of unrelated occurrences.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct ScheduledRunRecoveryReport {
+    pub recovered: Vec<lumen_core::action::RunId>,
+    pub skipped_active: Vec<lumen_core::action::RunId>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceIdentity {
     principal: PrincipalId,
@@ -895,7 +905,7 @@ impl Database {
     pub async fn recover_expired_running_scheduled_runs(
         &self,
         now: TimestampMillis,
-    ) -> Result<Vec<lumen_core::action::RunId>, RepositoryError> {
+    ) -> Result<ScheduledRunRecoveryReport, RepositoryError> {
         let now_i64 = timestamp_to_i64(now)?;
         let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<ExpiredRunRow> = sqlx::query_as(
@@ -912,12 +922,19 @@ impl Database {
         .bind(now_i64)
         .fetch_all(&mut *transaction)
         .await?;
+        let mut report = ScheduledRunRecoveryReport::default();
         for (run_id, run_state, workspace_id, phase, certainty) in &rows {
+            let parsed_run_id = lumen_core::action::RunId::from_uuid(
+                run_id
+                    .parse()
+                    .map_err(|_| RepositoryError::InvalidAutomationState)?,
+            );
             if phase
                 .as_deref()
                 .is_some_and(|phase| !matches!(phase, "terminal" | "reconciliation_required"))
             {
-                return Err(RepositoryError::ExecutionStateConflict);
+                report.skipped_active.push(parsed_run_id);
+                continue;
             }
             let (mut occurrence_state, fail_run) = match run_state.as_str() {
                 "completed" => ("succeeded", false),
@@ -928,7 +945,8 @@ impl Database {
             };
             if phase.is_some() {
                 if fail_run {
-                    return Err(RepositoryError::ExecutionStateConflict);
+                    report.skipped_active.push(parsed_run_id);
+                    continue;
                 }
                 if certainty.as_deref() == Some("unknown") {
                     occurrence_state = "unknown";
@@ -1019,17 +1037,67 @@ impl Database {
                 .execute(&mut *transaction)
                 .await?;
             }
+            report.recovered.push(parsed_run_id);
         }
         transaction.commit().await?;
-        rows.into_iter()
-            .map(|(run_id, _, _, _, _)| {
-                Ok(lumen_core::action::RunId::from_uuid(
-                    run_id
-                        .parse()
-                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
-                ))
-            })
-            .collect()
+        Ok(report)
+    }
+
+    /// Renew a currently owned running scheduled occurrence.  The time is
+    /// deliberately sampled after the SQLite writer boundary: a contender
+    /// waiting on that boundary must never revive an already-expired lease.
+    pub async fn renew_owned_scheduled_run_lease_with_clock<F>(
+        &self,
+        key: &OccurrenceKey,
+        run_id: lumen_core::action::RunId,
+        lease_id: Uuid,
+        owner_instance_id: Uuid,
+        lease_duration: Duration,
+        clock: F,
+    ) -> Result<bool, RepositoryError>
+    where
+        F: FnOnce() -> TimestampMillis,
+    {
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let now = clock();
+        let now_i64 = timestamp_to_i64(now)?;
+        let duration = u64::try_from(lease_duration.as_millis())
+            .map_err(|_| RepositoryError::TimestampOutOfRange)?;
+        let expires_at = TimestampMillis::new(
+            now.as_u64()
+                .checked_add(duration)
+                .ok_or(RepositoryError::TimestampOutOfRange)?,
+        );
+        let changed = sqlx::query(
+            "UPDATE scheduled_job_leases
+             SET leased_at = ?, expires_at = ?
+             WHERE occurrence_key = ?
+               AND lease_id = ?
+               AND expires_at > ?
+               AND EXISTS (
+                   SELECT 1
+                   FROM scheduled_job_runs occurrence
+                   JOIN run_lifecycle lifecycle ON lifecycle.run_id = occurrence.run_id
+                   WHERE occurrence.occurrence_key = scheduled_job_leases.occurrence_key
+                     AND occurrence.run_id = ?
+                     AND occurrence.state = 'running'
+                     AND occurrence.start_lease_id = scheduled_job_leases.lease_id
+                     AND lifecycle.owner_instance_id = ?
+                     AND lifecycle.phase IN ('running', 'awaiting_approval', 'reserving_effect')
+               )",
+        )
+        .bind(now_i64)
+        .bind(timestamp_to_i64(expires_at)?)
+        .bind(key.as_str())
+        .bind(lease_id.to_string())
+        .bind(now_i64)
+        .bind(run_id.to_string())
+        .bind(owner_instance_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        Ok(changed == 1)
     }
 
     pub async fn persist_scheduled_run_handoff(
@@ -1503,7 +1571,8 @@ impl Database {
                  ON CONFLICT(workspace_id, skill_id) DO UPDATE SET
                     version = excluded.version,
                     enabled = excluded.enabled,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > skill_workspace_state.updated_at",
             )
             .bind(skill.workspace_id.to_string())
             .bind(skill.skill_id.to_string())

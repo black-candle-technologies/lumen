@@ -199,7 +199,9 @@ impl ApprovalRequest {
     }
 
     pub fn expire(&mut self, now: TimestampMillis) -> bool {
-        if self.state == ApprovalState::Pending && now >= self.expires_at {
+        if matches!(self.state, ApprovalState::Pending | ApprovalState::Granted)
+            && now >= self.expires_at
+        {
             self.state = ApprovalState::Expired;
             return true;
         }

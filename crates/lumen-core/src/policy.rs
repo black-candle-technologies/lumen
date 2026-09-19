@@ -70,7 +70,7 @@ impl Policy {
             }
         }
 
-        if action.kind().as_str() == "plugin.disable" {
+        if is_fail_safe_plugin_disable(action) {
             return PolicyDecision::Allow;
         }
 
@@ -84,6 +84,21 @@ impl Policy {
             PolicyDecision::Allow
         }
     }
+}
+
+fn is_fail_safe_plugin_disable(action: &ActionEnvelope) -> bool {
+    if action.kind().as_str() != "plugin.disable" {
+        return false;
+    }
+    let required = action.required_capabilities();
+    if required.len() != 1 || required[0].name() != CapabilityName::PluginEnable {
+        return false;
+    }
+    matches!(
+        required[0].scope(),
+        crate::capability::ResourceScope::Exact { resource_type, value }
+            if resource_type == "plugin" && value.contains('@')
+    )
 }
 
 impl Default for Policy {

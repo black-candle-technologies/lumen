@@ -735,13 +735,15 @@ async fn expired_started_handoff_recovers_as_unknown_without_redispatch() {
             .recover_expired_running_scheduled_runs(TimestampMillis::new(3_999))
             .await
             .expect("active recovery")
+            .recovered
             .is_empty()
     );
     assert_eq!(
         database
             .recover_expired_running_scheduled_runs(TimestampMillis::new(4_000))
             .await
-            .expect("expired recovery"),
+            .expect("expired recovery")
+            .recovered,
         vec![run_id]
     );
     let states: (String, String) = sqlx::query_as(
@@ -788,6 +790,7 @@ async fn expired_started_handoff_recovers_as_unknown_without_redispatch() {
             .recover_expired_running_scheduled_runs(TimestampMillis::new(4_000))
             .await
             .expect("repeat recovery")
+            .recovered
             .is_empty()
     );
 }

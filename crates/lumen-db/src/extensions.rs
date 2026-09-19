@@ -210,6 +210,12 @@ pub enum PluginSettingScope {
     Agent(String),
 }
 
+#[derive(Clone, Copy)]
+enum PluginApprovalInvalidationScope {
+    Global,
+    Workspace(WorkspaceId),
+}
+
 impl PluginSettingScope {
     fn parts(&self) -> Result<(&'static str, String), RepositoryError> {
         match self {
@@ -912,6 +918,12 @@ impl Database {
             version.as_str(),
             "grant_set_digest",
             grant_set_digest.as_str(),
+            match scope {
+                PluginGrantScope::Global => PluginApprovalInvalidationScope::Global,
+                PluginGrantScope::Workspace(workspace) => {
+                    PluginApprovalInvalidationScope::Workspace(workspace)
+                }
+            },
         )
         .await?;
         transaction.commit().await?;
@@ -979,6 +991,14 @@ impl Database {
             version.as_str(),
             "settings_digest",
             settings_digest.as_str(),
+            match scope {
+                PluginSettingScope::Workspace(workspace) => {
+                    PluginApprovalInvalidationScope::Workspace(workspace)
+                }
+                PluginSettingScope::Global
+                | PluginSettingScope::User(_)
+                | PluginSettingScope::Agent(_) => PluginApprovalInvalidationScope::Global,
+            },
         )
         .await?;
         transaction.commit().await?;
@@ -1123,6 +1143,7 @@ async fn invalidate_plugin_approvals(
     version: &str,
     digest_field: &str,
     current_digest: &str,
+    scope: PluginApprovalInvalidationScope,
 ) -> Result<(), RepositoryError> {
     let digest_path = match digest_field {
         "grant_set_digest" => "$.grant_set_digest",
@@ -1137,12 +1158,21 @@ async fn invalidate_plugin_approvals(
                AND json_extract(actions.extension_provenance_json, '$.plugin_id') = ?
                AND json_extract(actions.extension_provenance_json, '$.plugin_version') = ?
                AND json_extract(actions.extension_provenance_json, ?) != ?
+               AND (? IS NULL OR actions.workspace_id = ?)
          )",
     )
     .bind(plugin_id)
     .bind(version)
     .bind(digest_path)
     .bind(current_digest)
+    .bind(match scope {
+        PluginApprovalInvalidationScope::Global => None,
+        PluginApprovalInvalidationScope::Workspace(workspace) => Some(workspace.to_string()),
+    })
+    .bind(match scope {
+        PluginApprovalInvalidationScope::Global => None,
+        PluginApprovalInvalidationScope::Workspace(workspace) => Some(workspace.to_string()),
+    })
     .execute(&mut **transaction)
     .await?;
     Ok(())

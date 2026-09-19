@@ -303,6 +303,51 @@ impl Database {
         .await
     }
 
+    /// Durably records that an owned active run can no longer be advanced
+    /// safely.  This is intentionally separate from audit/SSE publication so
+    /// an observational failure cannot make a run disappear from recovery.
+    pub async fn mark_owned_run_reconciliation_required(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        owner_instance_id: Uuid,
+        redacted_diagnostic: String,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let now = timestamp_to_i64(now)?;
+        let changed = sqlx::query(
+            "UPDATE run_lifecycle
+             SET phase = 'reconciliation_required',
+                 effect_certainty = CASE
+                     WHEN effect_certainty = 'no_effect' AND EXISTS (
+                         SELECT 1 FROM actions
+                         JOIN execution_attempts ON execution_attempts.action_id = actions.id
+                         WHERE actions.run_id = run_lifecycle.run_id
+                           AND execution_attempts.state IN ('reserved', 'running', 'unknown')
+                     ) THEN 'unknown'
+                     ELSE effect_certainty
+                 END,
+                 secondary_diagnostic = COALESCE(secondary_diagnostic, ?),
+                 updated_at = ?
+             WHERE run_id = ? AND workspace_id = ? AND owner_instance_id = ?
+               AND phase IN ('admitted', 'preparing', 'running', 'awaiting_approval', 'reserving_effect')",
+        )
+        .bind(truncate_utf8(redacted_diagnostic, 1024))
+        .bind(now)
+        .bind(run_id.to_string())
+        .bind(workspace_id.to_string())
+        .bind(owner_instance_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn transition_owned_active_run(
         &self,

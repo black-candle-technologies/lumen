@@ -29,6 +29,12 @@ pub type ApprovalFuture<'a> =
 pub type AuditFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AuditPortError>> + Send + 'a>>;
 pub type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ActionPortError>> + Send + 'a>>;
 
+fn executor_error_unknown(error: ExecutorError) -> ExecutionOutcome {
+    ExecutionOutcome::Unknown(format!(
+        "executor did not provide a definitive result: {error}"
+    ))
+}
+
 /// Supplies wall-clock timestamps for persisted lifecycle facts. Elapsed run
 /// budgets remain based on `Instant` and are unaffected by clock adjustments.
 pub trait Clock: Send + Sync {
@@ -386,7 +392,7 @@ impl RunState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PendingAction {
     action: ActionEnvelope,
     approval_id: ApprovalId,
@@ -495,17 +501,31 @@ impl<'a> RunOrchestrator<'a> {
                 return self.exhaust_budget(state, BudgetKind::WallClock).await;
             }
 
-            if let Some(pending) = state.pending_action.take() {
+            if let Some(pending) = state.pending_action.clone() {
+                // Approval is not a permanent authorization grant. A parked
+                // action must still fit the current capability ceiling.
+                if let PolicyDecision::Deny(reason) =
+                    self.policy.evaluate(&pending.action, capabilities)
+                {
+                    self.actions
+                        .deny(&pending.action, &reason, self.clock.now())
+                        .await?;
+                    self.audit(state, AuditEventKind::PolicyDenied, AuditOutcome::Denied)
+                        .await?;
+                    state.pending_action = None;
+                    return Ok(state.finish(RunOutcome::Denied { reason }));
+                }
                 match self
                     .resolve_approval(
                         state,
-                        pending.action,
+                        pending.action.clone(),
                         pending.approval_id,
-                        pending.tool_call_id,
+                        pending.tool_call_id.clone(),
                     )
                     .await?
                 {
                     ActionProgress::Ready(action, tool_call_id) => {
+                        state.pending_action = None;
                         if let Some(outcome) = self.execute(state, action, tool_call_id).await? {
                             return Ok(outcome);
                         }
@@ -515,7 +535,10 @@ impl<'a> RunOrchestrator<'a> {
                         state.pending_action = Some(pending);
                         return Ok(outcome);
                     }
-                    ActionProgress::Terminal(outcome) => return Ok(state.finish(outcome)),
+                    ActionProgress::Terminal(outcome) => {
+                        state.pending_action = None;
+                        return Ok(state.finish(outcome));
+                    }
                 }
             }
 
@@ -746,12 +769,6 @@ impl<'a> RunOrchestrator<'a> {
         action: &ActionEnvelope,
         approval: &mut ApprovalRequest,
     ) -> Result<crate::approval::DispatchAuthorization, RunError> {
-        self.audit(
-            state,
-            AuditEventKind::ApprovalGranted,
-            AuditOutcome::Success,
-        )
-        .await?;
         let authorization = authorize_dispatch(
             &PolicyDecision::RequireApproval,
             action,
@@ -759,6 +776,12 @@ impl<'a> RunOrchestrator<'a> {
             Some(approval),
             self.clock.now(),
         )?;
+        self.audit(
+            state,
+            AuditEventKind::ApprovalGranted,
+            AuditOutcome::Success,
+        )
+        .await?;
         self.audit(
             state,
             AuditEventKind::ApprovalConsumed,
@@ -785,7 +808,10 @@ impl<'a> RunOrchestrator<'a> {
         let outcome = match self.wall_time_remaining(state) {
             Some(remaining) => {
                 tokio::select! {
-                    outcome = &mut execution => outcome?,
+                    outcome = &mut execution => match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => executor_error_unknown(error),
+                    },
                     () = tokio::time::sleep(remaining) => {
                         cancellation.cancel();
                         match tokio::time::timeout(Duration::from_millis(250), &mut execution).await {
@@ -797,14 +823,18 @@ impl<'a> RunOrchestrator<'a> {
                                     .await?));
                             }
                             Ok(Ok(outcome)) => outcome,
-                            Ok(Err(_)) | Err(_) => ExecutionOutcome::Unknown(
+                            Ok(Err(error)) => executor_error_unknown(error),
+                            Err(_) => ExecutionOutcome::Unknown(
                                 "executor did not provide a definitive result after cancellation".into(),
                             ),
                         }
                     }
                 }
             }
-            None => execution.await?,
+            None => match execution.await {
+                Ok(outcome) => outcome,
+                Err(error) => executor_error_unknown(error),
+            },
         };
         match outcome {
             ExecutionOutcome::Succeeded(result) => {

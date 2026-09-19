@@ -983,13 +983,28 @@ impl Database {
         workspace_id: WorkspaceId,
         approval: &ApprovalRequest,
     ) -> Result<(), RepositoryError> {
-        let approver = approval
-            .decided_by()
-            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
         let decided_at = approval
             .decided_at()
             .ok_or(RepositoryError::ApprovalDecisionConflict)?;
+        self.update_approval_decision_with_clock(workspace_id, approval, move || decided_at)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn update_approval_decision_with_clock<F>(
+        &self,
+        workspace_id: WorkspaceId,
+        approval: &ApprovalRequest,
+        clock: F,
+    ) -> Result<TimestampMillis, RepositoryError>
+    where
+        F: FnOnce() -> TimestampMillis,
+    {
+        let approver = approval
+            .decided_by()
+            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let decided_at = clock();
         sqlx::query(
             "INSERT OR IGNORE INTO identities (provider, subject, created_at) VALUES (?, ?, ?)",
         )
@@ -1002,6 +1017,7 @@ impl Database {
             "UPDATE approval_requests
              SET state = ?, decided_by_provider = ?, decided_by_subject = ?, decided_at = ?
              WHERE id = ? AND state = 'pending'
+               AND expires_at > ?
                AND action_fingerprint = ?
                AND policy_version = ?
                AND EXISTS (
@@ -1016,6 +1032,7 @@ impl Database {
         .bind(approver.subject())
         .bind(timestamp_to_i64(decided_at)?)
         .bind(approval.id().to_string())
+        .bind(timestamp_to_i64(decided_at)?)
         .bind(approval.action_fingerprint().as_str())
         .bind(approval.policy_version().as_str())
         .bind(workspace_id.to_string())
@@ -1060,7 +1077,7 @@ impl Database {
             return Err(RepositoryError::ApprovalDecisionConflict);
         }
         transaction.commit().await?;
-        Ok(())
+        Ok(decided_at)
     }
 
     pub async fn list_pending_approvals(
@@ -1115,7 +1132,7 @@ impl Database {
     ) -> Result<u64, RepositoryError> {
         sqlx::query(
             "UPDATE approval_requests SET state = 'expired'
-             WHERE state = 'pending' AND expires_at <= ?
+             WHERE state IN ('pending', 'granted') AND expires_at <= ?
                AND action_id IN (SELECT id FROM actions WHERE workspace_id = ?)",
         )
         .bind(timestamp_to_i64(now)?)
@@ -1207,8 +1224,26 @@ impl Database {
         action_id: ActionId,
         reserved_at: TimestampMillis,
     ) -> Result<(), RepositoryError> {
-        let reserved_at = timestamp_to_i64(reserved_at)?;
+        self.reserve_allowed_execution_with_clock(attempt_id, action_id, move || reserved_at)
+            .await
+            .map(|_| ())
+    }
+
+    /// Reserves an approval-free effect using time sampled after acquiring the
+    /// SQLite writer boundary.  This mirrors approved reservations and avoids
+    /// authorizing a reservation with a stale pre-lock timestamp.
+    pub async fn reserve_allowed_execution_with_clock<F>(
+        &self,
+        attempt_id: ExecutionAttemptId,
+        action_id: ActionId,
+        clock: F,
+    ) -> Result<TimestampMillis, RepositoryError>
+    where
+        F: FnOnce() -> TimestampMillis,
+    {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let reserved_at = clock();
+        let reserved_at_i64 = timestamp_to_i64(reserved_at)?;
         let result = sqlx::query(
             "INSERT INTO execution_attempts (
                 id, action_id, approval_id, state, reserved_at
@@ -1216,7 +1251,7 @@ impl Database {
                WHERE id = ? AND state = 'normalized'",
         )
         .bind(attempt_id.to_string())
-        .bind(reserved_at)
+        .bind(reserved_at_i64)
         .bind(action_id.to_string())
         .execute(&mut *transaction)
         .await?;
@@ -1228,7 +1263,7 @@ impl Database {
             action_id,
             "running",
             "reserving_effect",
-            reserved_at,
+            reserved_at_i64,
         )
         .await?;
         sqlx::query("UPDATE actions SET state = 'running' WHERE id = ?")
@@ -1236,7 +1271,7 @@ impl Database {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(reserved_at)
     }
 
     pub async fn complete_execution(

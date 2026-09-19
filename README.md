@@ -77,9 +77,9 @@ The reason is practical: runtime state needs to be queryable, auditable, mutable
 
 ## Repository Status
 
-Milestones 1, 2, and 3 are implemented. The repository includes strict local configuration, SQLite state and audit chaining, a loopback OpenAI-compatible model client, capability and one-shot approval enforcement, bounded workspace file reads and writes, supervised process execution, OS-keychain secret references, cancellation and resource quotas, authenticated HTTP/SSE APIs, exact chat/approval/plugin/audit control surfaces, and a verified local extension runtime.
+Milestones 1 through 5 are implemented. The repository includes strict local configuration, SQLite state and audit chaining, capability and approval lifecycles, durable automation with scheduled-job revisions and service identities, reviewed skill capture and publication, extension runtime controls, bounded egress, and durable run reconciliation.
 
-Linux process actions require the complete bubblewrap profile. macOS uses a narrower reported `sandbox-exec` profile. The Tauri application is a command-free packaging shell with no filesystem, shell, process, or opener permissions. Local plugin packages can be staged, reviewed, approved for install, granted narrowly, enabled per workspace, and invoked through WASM components or supervised subprocesses with exact provenance and quarantine behavior. Remote providers, external channels, scheduled jobs, browser automation, public plugin marketplaces, automatic plugin updates, and learned skills remain intentionally unavailable until their roadmap milestones are implemented.
+Linux process actions require the complete bubblewrap profile. macOS uses a narrower reported `sandbox-exec` profile. The Tauri application is a command-free packaging shell with no filesystem, shell, process, or opener permissions. Local plugin packages can be staged, reviewed, approved for install, granted narrowly, enabled per workspace, and invoked through WASM components or supervised subprocesses with exact provenance and quarantine behavior. Future work includes multi-model orchestration, mixed-trust projections, a primary operator authority system, browser automation, and a public plugin marketplace.
 
 ## License
 

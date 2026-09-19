@@ -421,6 +421,13 @@ impl LocalRuntimeService {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
         std::fs::create_dir_all(&config.runtime.data_directory)?;
         let data_root = std::fs::canonicalize(&config.runtime.data_directory)?;
+        #[cfg(test)]
+        let owner_guard = owner_guard.or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| std::fs::File::open(path).ok())
+                .map(Arc::new)
+        });
         bootstrap_configured_remote_model_provider(config, &database).await?;
         let endpoint_policy = if config.model.allow_remote {
             EndpointPolicy::AllowRemote
@@ -606,6 +613,11 @@ impl LocalRuntimeService {
                 .database
                 .reconcile_abandoned_owned_runs(service.owner_instance_id, now())
                 .await?;
+            service
+                .recover_scheduled_run_handoffs(now())
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            service.spawn_scheduler_loop().await;
         }
         for (workspace_id, run_id) in service.database.list_pending_terminal_audits().await? {
             service
@@ -613,11 +625,6 @@ impl LocalRuntimeService {
                 .flush_terminal_audit(workspace_id, run_id)
                 .await?;
         }
-        service
-            .recover_scheduled_run_handoffs(now())
-            .await
-            .map_err(|error| CliError::Runtime(error.to_string()))?;
-        service.spawn_scheduler_loop().await;
         Ok(service)
     }
 
@@ -663,6 +670,12 @@ impl LocalRuntimeService {
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
+        // Short-lived command runtimes intentionally have no scheduler
+        // authority.  Treat an explicit poll as a no-op rather than allowing
+        // it to claim durable work owned by the long-lived service.
+        if self._owner_guard.is_none() {
+            return Ok(Vec::new());
+        }
         let service = self.clone();
         let task = self
             .admission
@@ -772,27 +785,30 @@ impl LocalRuntimeService {
         &self,
         timestamp: TimestampMillis,
     ) -> Result<Vec<RunId>, ServiceError> {
-        let expired = self
+        let report = self
             .database
             .recover_expired_running_scheduled_runs(timestamp)
             .await
             .map_err(|error| {
                 ServiceError::Internal(format!("recover running scheduled runs: {error}"))
             })?;
-        if !expired.is_empty() {
+        if !report.recovered.is_empty() {
             for (workspace_id, run_id) in self
                 .database
                 .list_pending_terminal_audits()
                 .await
                 .map_err(repository_service_error)?
             {
-                if expired.contains(&run_id) {
+                if report.recovered.contains(&run_id) {
                     self.database
                         .flush_terminal_audit(workspace_id, run_id)
                         .await
                         .map_err(repository_service_error)?;
                 }
             }
+        }
+        for run_id in report.skipped_active {
+            eprintln!("event=scheduled_recovery_skipped_active run_id={run_id}");
         }
         let ready = self
             .database
@@ -1094,11 +1110,29 @@ impl LocalRuntimeService {
         if self.shutting_down.load(Ordering::SeqCst) {
             cancellation.cancel();
         }
-        self.cancellations.lock().await.insert(run_id, cancellation);
+        self.cancellations
+            .lock()
+            .await
+            .insert(run_id, cancellation.clone());
         self.run_workspaces
             .lock()
             .await
             .insert(run_id, workspace_id);
+        if let Some((occurrence, lease_id)) = self
+            .runs
+            .lock()
+            .await
+            .get(&run_id)
+            .and_then(|stored| stored.scheduled_handoff.clone())
+        {
+            self.spawn_scheduled_lease_heartbeat(
+                run_id,
+                workspace_id,
+                occurrence,
+                lease_id,
+                cancellation.clone(),
+            );
+        }
         if self.shutting_down.load(Ordering::SeqCst) {
             let timestamp = now();
             let terminal = TerminalSpec::new(
@@ -1994,6 +2028,23 @@ impl LocalRuntimeService {
         timestamp: TimestampMillis,
     ) {
         let diagnostic = self.bounded_diagnostic(error);
+        if let Err(persistence_error) = self
+            .database
+            .mark_owned_run_reconciliation_required(
+                workspace_id,
+                run_id,
+                self.owner_instance_id,
+                diagnostic.clone(),
+                timestamp,
+            )
+            .await
+        {
+            eprintln!(
+                "event=run_reconciliation_required run_id={run_id} stage={stage} diagnostic={diagnostic:?} durable_persistence=failed error={:?}",
+                self.bounded_diagnostic(&persistence_error)
+            );
+            return;
+        }
         let payload = CanonicalValue::object([
             ("run_id", CanonicalValue::from(run_id.to_string())),
             ("stage", CanonicalValue::from(stage)),
@@ -2028,10 +2079,74 @@ impl LocalRuntimeService {
     }
 
     async fn finish_run(&self, run_id: RunId) {
-        self.cancellations.lock().await.remove(&run_id);
+        if let Some(cancellation) = self.cancellations.lock().await.remove(&run_id) {
+            cancellation.cancel();
+        }
         self.run_workspaces.lock().await.remove(&run_id);
         self.admission.finish_owned(run_id);
         self.run_available.notify_waiters();
+    }
+
+    fn spawn_scheduled_lease_heartbeat(
+        &self,
+        run_id: RunId,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        occurrence: OccurrenceKey,
+        lease_id: uuid::Uuid,
+        cancellation: CancellationToken,
+    ) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            service
+                .scheduled_lease_heartbeat(run_id, workspace_id, occurrence, lease_id, cancellation)
+                .await;
+        });
+    }
+
+    async fn scheduled_lease_heartbeat(
+        self,
+        run_id: RunId,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        occurrence: OccurrenceKey,
+        lease_id: uuid::Uuid,
+        cancellation: CancellationToken,
+    ) {
+        let lease_window = Duration::from_millis(self.scheduled_execution_lease_millis);
+        let interval =
+            std::cmp::min(Duration::from_secs(30), lease_window / 3).max(Duration::from_millis(1));
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(interval) => {
+                    match self.database.renew_owned_scheduled_run_lease_with_clock(
+                        &occurrence,
+                        run_id,
+                        lease_id,
+                        self.owner_instance_id,
+                        lease_window,
+                        now,
+                    ).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            cancellation.cancel();
+                            self.record_run_reconciliation_required(
+                                workspace_id, run_id, "scheduled_lease_lost",
+                                &"scheduled lease could not be renewed", now(),
+                            ).await;
+                            return;
+                        }
+                        Err(error) => {
+                            cancellation.cancel();
+                            self.record_run_reconciliation_required(
+                                workspace_id, run_id, "scheduled_lease_renewal", &error, now(),
+                            ).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) async fn request_extension_action(
@@ -5236,7 +5351,9 @@ impl ApprovalRegistry {
         let persisted = match command.decision() {
             ApprovalDecision::Grant => self
                 .database
-                .update_approval_decision(command.workspace_id(), &request)
+                .update_approval_decision_with_clock(command.workspace_id(), &request, || {
+                    self.clock.now()
+                })
                 .await
                 .map(|_| ()),
             ApprovalDecision::Reject => self
@@ -5372,7 +5489,9 @@ impl ApprovalRegistry {
             DispatchAuthorization::PolicyAllowed => {
                 let attempt_id = ExecutionAttemptId::new();
                 self.database
-                    .reserve_allowed_execution(attempt_id, action.action().id(), self.clock.now())
+                    .reserve_allowed_execution_with_clock(attempt_id, action.action().id(), || {
+                        self.clock.now()
+                    })
                     .await
                     .map_err(|error| lumen_core::executor::ExecutorError::new(error.to_string()))?;
                 Ok(attempt_id)

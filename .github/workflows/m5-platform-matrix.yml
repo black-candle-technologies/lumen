@@ -63,12 +63,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p evidence
-          { git rev-parse HEAD; uname -a; printf '%s\n' 'runner=ubuntu-24.04; container=rust:1.97.0-slim --privileged; features=workspace defaults; excluded=lumen-desktop; CARGO_INCREMENTAL=0'; } > evidence/context.txt
-          printf '%s\n' 'docker run --rm --privileged rust:1.97.0-slim' 'cargo test --workspace --exclude lumen-desktop --locked -- --list' 'cargo test --workspace --exclude lumen-desktop --locked' 'bash scripts/verify-linux-plugin-sandbox.sh' > evidence/commands.txt
+          { git rev-parse HEAD; uname -a; printf '%s\n' 'runner=ubuntu-24.04; container=rust:1.97.1-slim --privileged; features=workspace defaults; excluded=lumen-desktop; CARGO_INCREMENTAL=0'; } > evidence/context.txt
+          printf '%s\n' 'docker run --rm --privileged rust:1.97.1-slim' 'cargo test --workspace --exclude lumen-desktop --locked -- --list' 'cargo test --workspace --exclude lumen-desktop --locked' 'bash scripts/verify-linux-plugin-sandbox.sh' > evidence/commands.txt
           if docker run --rm --privileged \
             --volume "$PWD:/workspace" --workdir /workspace \
             --env CARGO_INCREMENTAL=0 --env CARGO_TARGET_DIR=/tmp/lumen-target \
-            rust:1.97.0-slim bash -lc '
+            rust:1.97.1-slim bash -lc '
               set -u
               apt-get update > evidence/setup.txt 2>&1 || exit $?
               apt-get install -y --no-install-recommends bubblewrap ca-certificates pkg-config >> evidence/setup.txt 2>&1 || exit $?
@@ -105,8 +105,8 @@ jobs:
           ref: ${{ env.M5_HEAD_SHA }}
       - name: Select verified Linux Rust toolchain
         run: |
-          rustup toolchain install 1.97.0 --profile minimal
-          rustup default 1.97.0
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
       - name: Install Tauri 2 native desktop prerequisites
         run: |
           sudo apt-get update

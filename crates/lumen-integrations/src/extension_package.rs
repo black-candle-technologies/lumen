@@ -117,8 +117,16 @@ impl PackageStager {
         let manifest_digest = sha256(&canonical_manifest);
         let package_digest = package_digest(&snapshots);
         let destination = quarantine_root.join(package_digest.as_str());
-        if !destination.exists() {
-            write_snapshot(&quarantine_root, &destination, &snapshots)?;
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    return Err(PackageStageError::QuarantineConflict);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_snapshot(&quarantine_root, &destination, &snapshots)?;
+            }
+            Err(error) => return Err(error.into()),
         }
         verify_existing(&destination, &snapshots, self.limits)?;
         let files = snapshots
@@ -183,9 +191,18 @@ impl PackageStager {
             return Err(PackageStageError::InvalidInstalledRoot);
         }
         let destination = installed_root.join(approved.package_digest.as_str());
-        if !destination.exists() {
-            write_snapshot(&installed_root, &destination, &snapshots)?;
-            seal_directories(&destination)?;
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    return Err(PackageStageError::InstalledContentConflict);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_snapshot(&installed_root, &destination, &snapshots)?;
+                seal_directories(&destination)?;
+                sync_directory(&destination)?;
+            }
+            Err(error) => return Err(error.into()),
         }
         verify_existing(&destination, &snapshots, self.limits)
             .map_err(|_| PackageStageError::InstalledContentConflict)?;
@@ -556,18 +573,42 @@ fn write_snapshot(
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&target, &file.bytes)?;
+            write_file_durable(&target, &file.bytes)?;
             let mut permissions = fs::metadata(&target)?.permissions();
             permissions.set_readonly(true);
             fs::set_permissions(&target, permissions)?;
         }
+        sync_directory(&temporary)?;
         fs::rename(&temporary, destination)?;
+        sync_directory(root)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&temporary);
     }
     result
+}
+
+fn write_file_durable(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 fn seal_directories(root: &Path) -> Result<(), PackageStageError> {

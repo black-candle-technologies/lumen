@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "model-client")]
+use futures_util::StreamExt;
 use lumen_core::{
     action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue},
     automation::{SkillId, SkillVersion},
@@ -476,19 +478,27 @@ impl BuiltinExecutor {
             ));
         }
         let status = response.status().as_u16();
-        let body = tokio::select! {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(next) = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(ExecutionOutcome::Cancelled),
-            result = response.bytes() => result,
-        };
-        let body = match body {
-            Ok(body) => body,
-            Err(error) => return Ok(ExecutionOutcome::Failed(error.to_string())),
-        };
-        if body.len() > NETWORK_RESPONSE_LIMIT_BYTES {
-            return Ok(ExecutionOutcome::Failed(
-                "network response byte limit exceeded".to_owned(),
-            ));
+            next = stream.next() => next,
+        } {
+            let chunk = match next {
+                Ok(chunk) => chunk,
+                Err(error) => return Ok(ExecutionOutcome::Failed(error.to_string())),
+            };
+            let length = match body.len().checked_add(chunk.len()) {
+                Some(length) => length,
+                None => return Err(ExecutorError::new("network response size overflow")),
+            };
+            if length > NETWORK_RESPONSE_LIMIT_BYTES {
+                return Ok(ExecutionOutcome::Failed(
+                    "network response byte limit exceeded".to_owned(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
         }
         let bytes = i64::try_from(body.len()).unwrap_or(i64::MAX);
         let body = String::from_utf8_lossy(&body).into_owned();
@@ -957,7 +967,7 @@ fn parse_secret_environment(
     values
         .into_iter()
         .map(|(name, value)| {
-            if !valid_environment_name(&name) {
+            if !valid_environment_name(&name) || environment_name_is_forbidden(&name) {
                 return Err(NormalizationError::new(format!(
                     "secret environment name is invalid: {name}"
                 )));
@@ -967,6 +977,21 @@ fn parse_secret_environment(
             Ok((name, reference))
         })
         .collect()
+}
+
+fn environment_name_is_forbidden(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "DYLD_FRAMEWORK_PATH"
+            | "DYLD_FALLBACK_LIBRARY_PATH"
+            | "PYTHONPATH"
+            | "RUBYOPT"
+            | "NODE_OPTIONS"
+    )
 }
 
 fn valid_environment_name(value: &str) -> bool {
@@ -1060,7 +1085,7 @@ impl ProcessExecutor {
     async fn execute_with_resolved_secrets(
         &self,
         request: ProcessRequest,
-        resolved_secret_names: &BTreeSet<String>,
+        _resolved_secret_names: &BTreeSet<String>,
         cancellation: CancellationToken,
     ) -> Result<ExecutionOutcome, ProcessError> {
         let program = std::fs::canonicalize(&request.program)
@@ -1069,7 +1094,7 @@ impl ProcessExecutor {
             return Err(ProcessError::ProgramNotAllowed(request.program));
         }
         if let Some(name) = request.environment.keys().find(|name| {
-            !self.allowed_environment.contains(*name) && !resolved_secret_names.contains(*name)
+            environment_name_is_forbidden(name) || !self.allowed_environment.contains(*name)
         }) {
             return Err(ProcessError::EnvironmentNotAllowed(name.clone()));
         }

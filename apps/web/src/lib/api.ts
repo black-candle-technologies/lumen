@@ -450,21 +450,30 @@ export class ApiClient {
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
-		while (true) {
-			const { done, value } = await reader.read();
-			buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n');
-			let boundary = buffer.indexOf('\n\n');
-			while (boundary !== -1) {
-				const frame = buffer.slice(0, boundary);
-				buffer = buffer.slice(boundary + 2);
-				const event = parseFrame(frame);
-				if (event) {
-					onEvent(event);
-					if (isTerminalRunEvent(event.event)) return;
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n');
+				let boundary = buffer.indexOf('\n\n');
+				while (boundary !== -1) {
+					const frame = buffer.slice(0, boundary);
+					buffer = buffer.slice(boundary + 2);
+					const event = parseFrame(frame);
+					if (event) {
+						onEvent(event);
+						if (isTerminalRunEvent(event.event)) return;
+					}
+					boundary = buffer.indexOf('\n\n');
 				}
-				boundary = buffer.indexOf('\n\n');
+				if (done) return;
 			}
-			if (done) break;
+		} finally {
+			try {
+				await reader.cancel();
+			} catch {
+				// Already closed or aborted.
+			}
+			reader.releaseLock();
 		}
 	}
 

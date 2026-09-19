@@ -12,7 +12,9 @@
 	let loadError = $state('');
 	let lastLoadedAt = $state('');
 	let loadedWorkspace = $state('');
-	let busy = $state(false);
+	let busyKeys = $state<string[]>([]);
+	let detailGeneration = 0;
+	let detailAbort: AbortController | null = null;
 	let error = $state('');
 	let notice = $state('');
 
@@ -44,17 +46,32 @@
 	async function select(plugin: StagedPluginReview) {
 		selected = plugin;
 		detail = null;
+		detailGeneration += 1;
+		const generation = detailGeneration;
+		detailAbort?.abort();
+		detailAbort = new AbortController();
+		const expectedKey = `${plugin.plugin_id}@${plugin.version}`;
+		const connectionSnapshot = { ...$connection };
 		try {
-			detail = await new ApiClient($connection).getPluginVersion(plugin.plugin_id, plugin.version);
+			const loaded = await new ApiClient(connectionSnapshot, fetch, detailAbort.signal)
+				.getPluginVersion(plugin.plugin_id, plugin.version);
+			if (generation !== detailGeneration || !selected || `${selected.plugin_id}@${selected.version}` !== expectedKey) return;
+			if (loaded.plugin_id !== plugin.plugin_id || loaded.version !== plugin.version) {
+				throw new Error('Plugin detail identity mismatch');
+			}
+			detail = loaded;
 			error = '';
 		} catch (cause) {
+			if (generation !== detailGeneration || detailAbort.signal.aborted) return;
 			error = cause instanceof ApiError ? cause.message : 'Plugin details could not be loaded.';
 		}
 	}
 
 	async function requestAction(kind: string, digest: string) {
-		if (!selected || busy) return;
-		busy = true;
+		if (!selected || !detail || detail.plugin_id !== selected.plugin_id || detail.version !== selected.version || detail.package_digest !== selected.package_digest) return;
+		const key = `${selected.plugin_id}@${selected.version}:${kind}`;
+		if (busyKeys.includes(key)) return;
+		busyKeys = [...busyKeys, key];
 		try {
 			const result = await new ApiClient($connection).requestPluginAction({
 				kind,
@@ -66,7 +83,7 @@
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Plugin action request failed.';
-		} finally { busy = false; }
+		} finally { busyKeys = busyKeys.filter((current) => current !== key); }
 	}
 </script>
 
@@ -100,7 +117,7 @@
 					</button>
 				{/each}
 			</div>
-			<PluginReview staged={selected} {detail} {busy} onAction={requestAction} />
+			<PluginReview staged={selected} {detail} busy={busyKeys.length > 0} onAction={requestAction} />
 		</div>
 	{/if}
 </section>

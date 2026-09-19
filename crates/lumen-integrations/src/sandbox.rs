@@ -864,18 +864,25 @@ impl ProcessMonitor {
             Arc::clone(&notify),
         ));
 
+        let deadline = tokio::time::Instant::now() + timeout;
         let wait_result = tokio::select! {
             result = child.wait() => WaitResult::Exited(result),
             () = cancellation.cancelled() => WaitResult::Cancelled,
-            () = tokio::time::sleep(timeout) => WaitResult::TimedOut,
+            () = tokio::time::sleep_until(deadline) => WaitResult::TimedOut,
             () = notify.notified() => WaitResult::OutputLimit,
         };
 
         let (termination, status) = match wait_result {
-            WaitResult::Exited(result) => (
-                Termination::Exited,
-                Some(result.map_err(|error| SandboxError::Wait(error.to_string()))?),
-            ),
+            WaitResult::Exited(result) => {
+                // A direct child can exit while a descendant keeps an output
+                // pipe open.  It is still part of this supervised process
+                // group and must not make output draining unbounded.
+                terminate_process_tree(&mut child, process_id).await;
+                (
+                    Termination::Exited,
+                    Some(result.map_err(|error| SandboxError::Wait(error.to_string()))?),
+                )
+            }
             WaitResult::Cancelled | WaitResult::TimedOut | WaitResult::OutputLimit => {
                 terminate_process_tree(&mut child, process_id).await;
                 let termination = match wait_result {
@@ -888,12 +895,21 @@ impl ProcessMonitor {
             }
         };
 
-        let stdout = stdout_task
-            .await
-            .map_err(|error| SandboxError::Read(error.to_string()))??;
-        let stderr = stderr_task
-            .await
-            .map_err(|error| SandboxError::Read(error.to_string()))??;
+        let stdout = match tokio::time::timeout_at(deadline, stdout_task).await {
+            Ok(joined) => joined.map_err(|error| SandboxError::Read(error.to_string()))??,
+            Err(_) => {
+                terminate_process_tree(&mut child, process_id).await;
+                stderr_task.abort();
+                return Err(SandboxError::TimedOut);
+            }
+        };
+        let stderr = match tokio::time::timeout_at(deadline, stderr_task).await {
+            Ok(joined) => joined.map_err(|error| SandboxError::Read(error.to_string()))??,
+            Err(_) => {
+                terminate_process_tree(&mut child, process_id).await;
+                return Err(SandboxError::TimedOut);
+            }
+        };
         if let Some(task) = stdin_task {
             let _ = task.await;
         }

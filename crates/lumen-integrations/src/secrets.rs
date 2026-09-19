@@ -78,10 +78,21 @@ impl SecretStore for OsKeyringSecretStore {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct InMemorySecretStore {
     values: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     unavailable: Option<String>,
+}
+
+impl std::fmt::Debug for InMemorySecretStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entries = self.values.try_lock().ok().map(|values| values.len());
+        formatter
+            .debug_struct("InMemorySecretStore")
+            .field("entries", &entries)
+            .field("unavailable", &self.unavailable.is_some())
+            .finish()
+    }
 }
 
 impl InMemorySecretStore {
