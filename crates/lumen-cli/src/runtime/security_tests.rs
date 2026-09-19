@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -15,14 +15,18 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use lumen_core::audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome};
 use lumen_core::{
-    action::{CanonicalValue, RunId},
+    action::{ActionEnvelope, ActionId, ActionKind, CanonicalValue, RunId},
     approval::{ApprovalId, TimestampMillis},
     automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion},
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
     egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
-    identity::{ChannelDestination, ExternalChannelIdentity, PrincipalId, WorkspaceId},
+    identity::{
+        ChannelDestination, ComponentId, ExternalChannelIdentity, PrincipalId, WorkspaceId,
+    },
     model::{ActionProposal, ModelFuture, ModelInput, ModelOutput, ModelPort},
+    policy::PolicyVersion,
+    run::{ApprovalPort, Clock},
     secret::SecretRefId,
 };
 use lumen_db::{
@@ -44,6 +48,7 @@ use lumen_server::{
     RuntimeService, SandboxCapabilityReport, router,
 };
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wiremock::{
@@ -52,8 +57,9 @@ use wiremock::{
 };
 
 use super::{
-    EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand,
+    ApprovalRegistry, EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand,
     REVIEWED_SKILL_SOURCE_MAX_BYTES, RedactingExecutor, now, read_bounded_skill_source,
+    recover_skill_publications, write_skill_stage,
 };
 use crate::{
     config::{Config, toml_string},
@@ -64,6 +70,20 @@ use crate::{
 };
 
 const TOKEN: &str = "security-test-token";
+
+struct TestWallClock(AtomicU64);
+
+impl TestWallClock {
+    fn new(now: u64) -> Self {
+        Self(AtomicU64::new(now))
+    }
+}
+
+impl Clock for TestWallClock {
+    fn now(&self) -> TimestampMillis {
+        TimestampMillis::new(self.0.load(Ordering::SeqCst))
+    }
+}
 
 fn test_program() -> std::path::PathBuf {
     #[cfg(windows)]
@@ -97,6 +117,144 @@ fn path_toml(path: impl AsRef<std::path::Path>) -> String {
 fn stored_relative_path(path: &std::path::Path, root: &std::path::Path) -> String {
     crate::relative_storage_path(path.strip_prefix(root).expect("relative path"))
         .expect("portable relative path")
+}
+
+#[tokio::test]
+async fn approval_registry_uses_its_injected_clock_for_decisions() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let workspace_id = WorkspaceId::new();
+    let actor = PrincipalId::new("local", "operator").expect("valid principal");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let action = ActionEnvelope::new(
+        ActionId::new(),
+        RunId::new(),
+        workspace_id,
+        actor.clone(),
+        ComponentId::new("builtin.filesystem").expect("component"),
+        ActionKind::new("filesystem.write").expect("action kind"),
+        CanonicalValue::object([("path", CanonicalValue::from("probe.txt"))]),
+        vec![Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::path(
+                workspace_id,
+                lumen_core::capability::WorkspacePath::parse("probe.txt").expect("path"),
+            ),
+        )],
+    );
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let clock = Arc::new(TestWallClock::new(1_500));
+    let registry = ApprovalRegistry::with_clock(
+        database,
+        Duration::from_secs(1),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    );
+    let policy_version = PolicyVersion::new("policy-v1").expect("policy version");
+    let approval_id = match registry
+        .resolve(&action, &policy_version, TimestampMillis::new(1_000))
+        .await
+        .expect("approval is created")
+    {
+        lumen_core::run::ApprovalResolution::Pending(approval_id) => approval_id,
+        other => panic!("expected pending approval, got {other:?}"),
+    };
+
+    registry
+        .decide(&ApprovalDecisionCommand::new(
+            workspace_id,
+            approval_id,
+            actor,
+            ApprovalDecision::Grant,
+        ))
+        .await
+        .expect("clock-valid approval grants");
+}
+
+#[tokio::test]
+async fn approval_reservation_expires_after_waiting_for_the_registry_lock() {
+    let database = Database::connect_in_memory().await.expect("database opens");
+    let workspace_id = WorkspaceId::new();
+    let actor = PrincipalId::new("local", "operator").expect("valid principal");
+    database
+        .insert_workspace(workspace_id, "Default", TimestampMillis::new(1_000))
+        .await
+        .expect("workspace stored");
+    let action = ActionEnvelope::new(
+        ActionId::new(),
+        RunId::new(),
+        workspace_id,
+        actor.clone(),
+        ComponentId::new("builtin.filesystem").expect("component"),
+        ActionKind::new("filesystem.write").expect("action kind"),
+        CanonicalValue::object([("path", CanonicalValue::from("probe.txt"))]),
+        vec![Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::path(
+                workspace_id,
+                lumen_core::capability::WorkspacePath::parse("probe.txt").expect("path"),
+            ),
+        )],
+    );
+    database
+        .insert_action(&action, TimestampMillis::new(1_000))
+        .await
+        .expect("action stored");
+    let clock = Arc::new(TestWallClock::new(1_500));
+    let registry = Arc::new(ApprovalRegistry::with_clock(
+        database.clone(),
+        Duration::from_secs(1),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ));
+    let policy_version = PolicyVersion::new("policy-v1").expect("policy version");
+    let approval_id = match registry
+        .resolve(&action, &policy_version, TimestampMillis::new(1_000))
+        .await
+        .expect("approval is created")
+    {
+        lumen_core::run::ApprovalResolution::Pending(approval_id) => approval_id,
+        other => panic!("expected pending approval, got {other:?}"),
+    };
+    registry
+        .decide(&ApprovalDecisionCommand::new(
+            workspace_id,
+            approval_id,
+            actor,
+            ApprovalDecision::Grant,
+        ))
+        .await
+        .expect("approval granted while valid");
+
+    let records = registry.records.lock().await;
+    let reservation_registry = Arc::clone(&registry);
+    let reservation_action = action.clone();
+    let reservation_waiting = registry.reservation_waiting.notified();
+    let reservation = tokio::spawn(async move {
+        reservation_registry
+            .reserve_approved(&reservation_action, approval_id)
+            .await
+    });
+    reservation_waiting.await;
+    clock.0.store(2_000, Ordering::SeqCst);
+    drop(records);
+
+    assert!(reservation.await.expect("reservation task joins").is_err());
+    let row = sqlx::query(
+        "SELECT
+            (SELECT state FROM approval_requests WHERE id = ?) AS approval_state,
+            (SELECT COUNT(*) FROM execution_attempts WHERE approval_id = ?) AS attempt_count",
+    )
+    .bind(approval_id.to_string())
+    .bind(approval_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("reservation state loads");
+    assert_eq!(row.get::<String, _>("approval_state"), "granted");
+    assert_eq!(row.get::<i64, _>("attempt_count"), 0);
 }
 
 #[cfg(not(unix))]
@@ -277,6 +435,31 @@ struct Harness {
     workspace_id: lumen_core::identity::WorkspaceId,
 }
 
+#[derive(Debug)]
+struct RestartBaseline {
+    workspace_id: WorkspaceId,
+    service: PrincipalId,
+    job_id: JobId,
+    job_revision: JobRevision,
+    occurrence_key: OccurrenceKey,
+    run_id: RunId,
+    approval_id: ApprovalId,
+    approval_state: String,
+    approval_fingerprint: String,
+    approval_policy_version: String,
+    approval_created_at: i64,
+    approval_expires_at: i64,
+    replacement_approval_id: Option<String>,
+    skill_id: SkillId,
+    skill_version: SkillVersion,
+    skill_digest: String,
+    audit_ids: Vec<String>,
+    audit_kinds: Vec<String>,
+    audit_hashes: Vec<String>,
+    lifecycle_phase: String,
+    effect_certainty: String,
+}
+
 impl Harness {
     async fn new(model: &MockServer, prepare_workspace: impl FnOnce(&std::path::Path)) -> Self {
         Self::new_inner(
@@ -445,6 +628,70 @@ subject = "operator"
         harness.events = events;
         harness.service = service;
         harness.sandbox = sandbox;
+        harness
+    }
+
+    async fn new_with_streaming(model: &MockServer) -> Self {
+        let (mut harness, _, _) =
+            Self::new_inner(model, |_| {}, None, None, None, None, (None, None)).await;
+        let config = Config::parse(&format!(
+            r#"
+[database]
+path = "ignored.sqlite3"
+
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = true
+
+[runtime]
+data_directory = {}
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = {}
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+            model.uri(),
+            path_toml(harness._directory.path().join("runtime")),
+            path_toml(harness._directory.path().join("workspace"))
+        ))
+        .expect("streaming config");
+        let events = EventBroker::new(128);
+        let service = Arc::new(
+            LocalRuntimeService::build_with_secret_store(
+                &config,
+                harness.database.clone(),
+                events.clone(),
+                Arc::new(harness.sandbox.clone()),
+                vec![TOKEN.to_owned()],
+                Arc::new(InMemorySecretStore::new()),
+            )
+            .await
+            .expect("streaming runtime"),
+        );
+        let state = ApiState::new(
+            service.clone(),
+            events.clone(),
+            TOKEN,
+            config.bootstrap_principal(),
+            BTreeSet::from([config.workspace_id()]),
+            SandboxCapabilityReport::new(
+                "test",
+                "kernel_enforced",
+                ["filesystem_isolation", "network_isolation"],
+                None,
+            ),
+        )
+        .expect("streaming API state");
+        harness.service.shutdown().await;
+        harness.app = router(state);
+        harness.events = events;
+        harness.service = service;
         harness
     }
 
@@ -1671,7 +1918,1196 @@ async fn scheduled_due_once_job_creates_one_service_attributed_run() {
         canonical_object_get(run_created.payload(), "occurrence_key"),
         Some(&CanonicalValue::from(occurrence.as_str()))
     );
+    assert_eq!(
+        model
+            .received_requests()
+            .await
+            .expect("provider requests")
+            .len(),
+        1,
+        "the committed scheduled start reaches exactly one model call"
+    );
+    assert!(
+        !records.iter().any(|record| {
+            canonical_object_get(record.event().payload(), "stage")
+                == Some(&CanonicalValue::from("run_start"))
+        }),
+        "scheduled start must not report the old generic-start conflict"
+    );
     harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_run_resumes_two_approval_required_actions() {
+    let model = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turns = Arc::clone(&turns);
+            move |_request: &MockRequest| match turns.fetch_add(1, Ordering::SeqCst) {
+                0 => action_response(
+                    "filesystem.write",
+                    serde_json::json!({"path":"scheduled-a.txt","content":"A"}),
+                ),
+                1 => action_response(
+                    "filesystem.write",
+                    serde_json::json!({"path":"scheduled-b.txt","content":"B"}),
+                ),
+                _ => final_response("scheduled two-step done"),
+            }
+        })
+        .mount(&model)
+        .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        3,
+        2,
+    )
+    .await;
+
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let first_approval = harness.pending_approval_id().await;
+    let root = harness._directory.path().join("workspace");
+    assert!(!root.join("scheduled-a.txt").exists());
+    assert!(!root.join("scheduled-b.txt").exists());
+
+    approve_pending(&harness).await;
+    let second_approval = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let approval = harness.pending_approval_id().await;
+            if approval != first_approval {
+                return approval;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second approval is parked");
+    assert_ne!(first_approval, second_approval);
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("scheduled-a.txt")).expect("first effect"),
+        "A"
+    );
+    assert!(!root.join("scheduled-b.txt").exists());
+    assert_eq!(turns.load(Ordering::SeqCst), 2);
+
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &run_id.to_string(), "completed").await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("scheduled-b.txt")).expect("second effect"),
+        "B"
+    );
+    assert_eq!(turns.load(Ordering::SeqCst), 3);
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("terminal states");
+    assert_eq!(states, ("completed".into(), "succeeded".into()));
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 2);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn same_database_restart_preserves_job_occurrence_approval_skill_audit_and_effect_identity() {
+    let model = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let turns = Arc::clone(&turns);
+            move |_request: &MockRequest| {
+                if turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                    action_response(
+                        "filesystem.write",
+                        serde_json::json!({"path":"restart-effect.txt","content":"once"}),
+                    )
+                } else {
+                    final_response("scheduled effect settled")
+                }
+            }
+        })
+        .mount(&model)
+        .await;
+
+    let root = tempfile::tempdir().expect("persistent runtime root");
+    let database_path = root.path().join("lumen.sqlite3");
+    let data_root = root.path().join("data");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&data_root).expect("data root");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let config = Config::parse(&format!(
+        r#"
+[database]
+path = {}
+
+[model]
+endpoint = "{}/v1/"
+model = "local-model"
+streaming = false
+
+[runtime]
+data_directory = {}
+
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = {}
+
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+        path_toml(&database_path),
+        model.uri(),
+        path_toml(&data_root),
+        path_toml(&workspace),
+    ))
+    .expect("persistent runtime config");
+    let workspace_id = config.workspace_id();
+    let operator = config.bootstrap_principal();
+    let database = Database::connect(&database_path)
+        .await
+        .expect("first database");
+    database
+        .bootstrap_workspace(workspace_id, &config.workspace.name, &operator, now())
+        .await
+        .expect("workspace bootstrap");
+    let events = EventBroker::new(128);
+    let service = Arc::new(
+        LocalRuntimeService::build_with_secret_store(
+            &config,
+            database.clone(),
+            events,
+            Arc::new(RecordingSandbox::new()),
+            vec![TOKEN.to_owned()],
+            Arc::new(InMemorySecretStore::new()),
+        )
+        .await
+        .expect("first runtime"),
+    );
+
+    let scheduled_service = scheduled_service_principal();
+    database
+        .upsert_service_identity(
+            &ServiceIdentity::new(
+                scheduled_service.clone(),
+                workspace_id,
+                operator.clone(),
+                "Restart continuity service",
+                true,
+                TimestampMillis::new(1_000),
+                TimestampMillis::new(1_000),
+            )
+            .expect("service identity"),
+            [Capability::new(
+                CapabilityName::FsWrite,
+                ResourceScope::workspace(workspace_id),
+            )],
+        )
+        .await
+        .expect("scheduled service");
+    let job_id = scheduled_job_id();
+    let job_revision = JobRevision::new(1).expect("job revision");
+    let scheduled_for = TimestampMillis::new(1_000);
+    database
+        .append_scheduled_job_revision(
+            &ScheduledJobRevision::new(
+                job_id,
+                job_revision,
+                workspace_id,
+                scheduled_service.clone(),
+                operator.clone(),
+                ScheduleSpec::once(scheduled_for),
+                "write one restart marker",
+                DataClass::Workspace,
+                2,
+                1,
+                true,
+                Some(scheduled_for),
+                false,
+                TimestampMillis::new(1_000),
+            )
+            .expect("scheduled job"),
+        )
+        .await
+        .expect("scheduled job stored");
+    let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+    let skill_version = SkillVersion::parse("1.0.0").expect("skill version");
+    let skill_source = b"# Restart-reviewed skill\n\nPersisted source bytes.\n";
+    let skill_digest = sha256_hex(skill_source);
+    let skill_path = data_root
+        .join("skills")
+        .join(skill_id.to_string())
+        .join(format!("{}.md", skill_version.as_str()));
+    std::fs::create_dir_all(skill_path.parent().expect("skill parent")).expect("skill parent");
+    std::fs::write(&skill_path, skill_source).expect("skill source bytes");
+    database
+        .publish_skill_version(
+            &SkillVersionRecord::new(
+                skill_id,
+                skill_version.clone(),
+                workspace_id,
+                "Restart-reviewed skill",
+                "Skill retained across a runtime restart",
+                "markdown",
+                skill_digest.clone(),
+                true,
+                operator.clone(),
+                Some(operator.clone()),
+                TimestampMillis::new(1_001),
+                Some(TimestampMillis::new(1_001)),
+            )
+            .expect("skill record"),
+            TimestampMillis::new(1_002),
+        )
+        .await
+        .expect("reviewed skill published");
+    let source_before = tokio::fs::read(&skill_path)
+        .await
+        .expect("source before restart");
+    assert_eq!(sha256_hex(&source_before), skill_digest);
+
+    let scheduled_runs = service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass");
+    assert_eq!(scheduled_runs.len(), 1, "one scheduled run");
+    let run_id = scheduled_runs[0];
+    wait_for_database_run_state(&database, run_id, "awaiting_approval").await;
+    let pending_approvals = database
+        .list_pending_approvals(workspace_id, now())
+        .await
+        .expect("pending approval");
+    assert_eq!(pending_approvals.len(), 1, "one pending approval");
+    let pending = &pending_approvals[0];
+    let approval_id = pending.approval_id();
+    service
+        .decide_approval(ApprovalDecisionCommand::new(
+            workspace_id,
+            approval_id,
+            operator.clone(),
+            ApprovalDecision::Grant,
+        ))
+        .await
+        .expect("approval granted");
+    wait_for_database_run_state(&database, run_id, "completed").await;
+    let occurrence_key = OccurrenceKey::new(job_id, job_revision, scheduled_for);
+    assert_eq!(
+        database
+            .scheduled_occurrence_run_id(&occurrence_key)
+            .await
+            .expect("occurrence run"),
+        Some(run_id)
+    );
+    assert_eq!(
+        std::fs::read(workspace.join("restart-effect.txt")).expect("effect before restart"),
+        b"once"
+    );
+    let attempts_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("attempt count before restart");
+    assert_eq!(attempts_before, 1);
+
+    let approval_before: (String, String, String, String, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT id, state, action_fingerprint, policy_version, created_at, expires_at, replacement_approval_id
+         FROM approval_requests WHERE id = ?",
+    )
+    .bind(approval_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("approval before restart");
+    let lifecycle_before = database
+        .get_run_lifecycle(workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("lifecycle before restart");
+    let audits_before = database
+        .list_audit_records(workspace_id, 0, 100)
+        .await
+        .expect("audit history before restart");
+    assert!(
+        audits_before
+            .iter()
+            .any(|record| record.event().kind() == AuditEventKind::RunCreated)
+    );
+    assert!(
+        audits_before
+            .iter()
+            .any(|record| record.event().kind() == AuditEventKind::ApprovalCreated)
+    );
+    assert!(
+        audits_before
+            .iter()
+            .any(|record| record.event().kind() == AuditEventKind::ExecutionSucceeded)
+    );
+    let baseline = RestartBaseline {
+        workspace_id,
+        service: scheduled_service,
+        job_id,
+        job_revision,
+        occurrence_key,
+        run_id,
+        approval_id,
+        approval_state: approval_before.1,
+        approval_fingerprint: approval_before.2,
+        approval_policy_version: approval_before.3,
+        approval_created_at: approval_before.4,
+        approval_expires_at: approval_before.5,
+        replacement_approval_id: approval_before.6,
+        skill_id,
+        skill_version: skill_version.clone(),
+        skill_digest: skill_digest.clone(),
+        audit_ids: audits_before
+            .iter()
+            .map(|record| record.event().id().to_string())
+            .collect(),
+        audit_kinds: audits_before
+            .iter()
+            .map(|record| record.event().kind().as_str().to_owned())
+            .collect(),
+        audit_hashes: audits_before
+            .iter()
+            .map(|record| record.hash().to_string())
+            .collect(),
+        lifecycle_phase: lifecycle_before.phase().to_owned(),
+        effect_certainty: lifecycle_before.effect_certainty().as_str().to_owned(),
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+        .await
+        .expect("first shutdown bounded");
+    drop(service);
+    drop(database);
+
+    let restarted_database = Database::connect(&database_path)
+        .await
+        .expect("reopened database");
+    let restarted_events = EventBroker::new(128);
+    let restarted_service = Arc::new(
+        LocalRuntimeService::build_with_secret_store(
+            &config,
+            restarted_database.clone(),
+            restarted_events.clone(),
+            Arc::new(RecordingSandbox::new()),
+            vec![TOKEN.to_owned()],
+            Arc::new(InMemorySecretStore::new()),
+        )
+        .await
+        .expect("second runtime against same paths"),
+    );
+
+    let job_after = restarted_database
+        .latest_scheduled_job_revision(baseline.job_id)
+        .await
+        .expect("job after restart")
+        .expect("same job after restart");
+    assert_eq!(job_after.job_id(), baseline.job_id);
+    assert_eq!(job_after.revision(), baseline.job_revision);
+    assert_eq!(job_after.service(), &baseline.service);
+    let occurrence_after = restarted_database
+        .scheduled_occurrence_record(&baseline.occurrence_key)
+        .await
+        .expect("occurrence after restart")
+        .expect("same occurrence after restart");
+    assert_eq!(occurrence_after.run_id(), Some(baseline.run_id));
+    assert_eq!(occurrence_after.state(), "succeeded");
+    let run_after: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(baseline.run_id.to_string())
+        .fetch_one(restarted_database.pool())
+        .await
+        .expect("run after restart");
+    assert_eq!(run_after, "completed");
+    let approval_after: (String, String, String, String, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT id, state, action_fingerprint, policy_version, created_at, expires_at, replacement_approval_id
+         FROM approval_requests WHERE id = ?",
+    )
+    .bind(baseline.approval_id.to_string())
+    .fetch_one(restarted_database.pool())
+    .await
+    .expect("same approval after restart");
+    assert_eq!(approval_after.0, baseline.approval_id.to_string());
+    assert_eq!(approval_after.1, baseline.approval_state);
+    assert_eq!(approval_after.2, baseline.approval_fingerprint);
+    assert_eq!(approval_after.3, baseline.approval_policy_version);
+    assert_eq!(approval_after.4, baseline.approval_created_at);
+    assert_eq!(approval_after.5, baseline.approval_expires_at);
+    assert_eq!(approval_after.6, baseline.replacement_approval_id);
+    let skill_after = restarted_database
+        .skill_version(
+            baseline.workspace_id,
+            baseline.skill_id,
+            &baseline.skill_version,
+        )
+        .await
+        .expect("skill after restart")
+        .expect("same skill after restart");
+    assert_eq!(skill_after.skill_id(), baseline.skill_id);
+    assert_eq!(skill_after.version(), &baseline.skill_version);
+    assert_eq!(skill_after.source_digest(), baseline.skill_digest);
+    let source_after = tokio::fs::read(&skill_path)
+        .await
+        .expect("source after restart");
+    assert_eq!(source_after, source_before);
+    assert_eq!(sha256_hex(&source_after), baseline.skill_digest);
+    let lifecycle_after = restarted_database
+        .get_run_lifecycle(baseline.workspace_id, baseline.run_id)
+        .await
+        .expect("lifecycle after restart")
+        .expect("same lifecycle after restart");
+    assert_eq!(lifecycle_after.phase(), baseline.lifecycle_phase);
+    assert_eq!(
+        lifecycle_after.effect_certainty().as_str(),
+        baseline.effect_certainty
+    );
+    let audits_after = restarted_database
+        .list_audit_records(baseline.workspace_id, 0, 100)
+        .await
+        .expect("audit history after restart");
+    assert_eq!(
+        audits_after
+            .iter()
+            .map(|record| record.event().id().to_string())
+            .collect::<Vec<_>>(),
+        baseline.audit_ids
+    );
+    assert_eq!(
+        audits_after
+            .iter()
+            .map(|record| record.event().kind().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        baseline.audit_kinds
+    );
+    assert_eq!(
+        audits_after
+            .iter()
+            .map(|record| record.hash().to_string())
+            .collect::<Vec<_>>(),
+        baseline.audit_hashes
+    );
+    restarted_database
+        .verify_audit_chain()
+        .await
+        .expect("audit chain after restart");
+    for (query, id) in [
+        (
+            "SELECT COUNT(*) FROM scheduled_job_revisions WHERE job_id = ?",
+            baseline.job_id.to_string(),
+        ),
+        (
+            "SELECT COUNT(*) FROM scheduled_job_runs WHERE occurrence_key = ?",
+            baseline.occurrence_key.as_str().to_owned(),
+        ),
+        (
+            "SELECT COUNT(*) FROM agent_runs WHERE id = ?",
+            baseline.run_id.to_string(),
+        ),
+        (
+            "SELECT COUNT(*) FROM approval_requests WHERE id = ?",
+            baseline.approval_id.to_string(),
+        ),
+        (
+            "SELECT COUNT(*) FROM skill_versions WHERE skill_id = ? AND version = '1.0.0'",
+            baseline.skill_id.to_string(),
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(id)
+            .fetch_one(restarted_database.pool())
+            .await
+            .expect("identity count after restart");
+        assert_eq!(count, 1, "duplicate persisted object for {query}");
+    }
+    let attempts_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)",
+    )
+    .bind(baseline.run_id.to_string())
+    .fetch_one(restarted_database.pool())
+    .await
+    .expect("attempt count after restart");
+    assert_eq!(attempts_after, 1);
+    assert_eq!(
+        std::fs::read(workspace.join("restart-effect.txt")).expect("effect after restart"),
+        b"once"
+    );
+    assert_eq!(
+        turns.load(Ordering::SeqCst),
+        2,
+        "restart must not call the model again"
+    );
+
+    let app = router(
+        ApiState::new(
+            restarted_service.clone(),
+            restarted_events,
+            TOKEN,
+            operator,
+            BTreeSet::from([baseline.workspace_id]),
+            SandboxCapabilityReport::new(
+                "test",
+                "kernel_enforced",
+                ["filesystem_isolation", "network_isolation"],
+                None,
+            ),
+        )
+        .expect("restarted API state"),
+    );
+    let status = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/workspaces/{}/runs/{}/status",
+                    baseline.workspace_id, baseline.run_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .expect("status request"),
+        )
+        .await
+        .expect("status response");
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: serde_json::Value = serde_json::from_slice(
+        &status
+            .into_body()
+            .collect()
+            .await
+            .expect("status body")
+            .to_bytes(),
+    )
+    .expect("status JSON");
+    assert_eq!(status["run_id"], baseline.run_id.to_string());
+    assert_eq!(status["state"], "completed");
+    restarted_service.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled_scheduled_service_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"revoked-service.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("UPDATE service_identities SET enabled = 0 WHERE workspace_id = ?")
+        .bind(harness.workspace_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("disable service");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/revoked-service.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn revoked_scheduled_grant_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"revoked-grant.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("DELETE FROM service_identity_grants WHERE workspace_id = ?")
+        .bind(harness.workspace_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("revoke grant");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/revoked-grant.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn replaced_scheduled_lease_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"replaced-lease.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("UPDATE scheduled_job_leases SET lease_id = ? WHERE occurrence_key IN (SELECT occurrence_key FROM scheduled_job_runs WHERE run_id = ?)")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(run_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("replace lease");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/replaced-lease.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn expired_scheduled_lease_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"expired-lease.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query("UPDATE scheduled_job_leases SET expires_at = 3000 WHERE occurrence_key IN (SELECT occurrence_key FROM scheduled_job_runs WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .expect("expire lease");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/expired-lease.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn superseded_scheduled_revision_cannot_reserve_an_approved_write() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"superseded-revision.txt","content":"blocked"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    insert_scheduled_service(
+        &harness,
+        true,
+        [Capability::new(
+            CapabilityName::FsWrite,
+            ResourceScope::workspace(harness.workspace_id),
+        )],
+    )
+    .await;
+    insert_scheduled_job(
+        &harness,
+        ScheduleSpec::once(TimestampMillis::new(1_000)),
+        true,
+        Some(TimestampMillis::new(1_000)),
+        DataClass::Workspace,
+        2,
+        1,
+    )
+    .await;
+    let run_id = harness
+        .service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
+        .await
+        .expect("scheduler pass")[0];
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    let approval = harness.pending_approval_id().await;
+    sqlx::query(
+        "INSERT INTO scheduled_job_revisions (
+            job_id, revision, schedule_kind, schedule_start_at, interval_millis,
+            prompt, data_class, max_model_turns, max_actions, enabled,
+            next_due_at, idempotent, created_at
+         ) SELECT job_id, 2, schedule_kind, schedule_start_at, interval_millis,
+                  prompt, data_class, max_model_turns, max_actions, enabled,
+                  next_due_at, idempotent, created_at
+           FROM scheduled_job_revisions WHERE job_id = ? AND revision = 1",
+    )
+    .bind(scheduled_job_id().to_string())
+    .execute(harness.database.pool())
+    .await
+    .expect("new revision");
+    let decision = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval}/decision"),
+            r#"{"decision":"grant"}"#,
+        )
+        .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("attempt count");
+    assert_eq!(attempts, 0);
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/superseded-revision.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn unpinned_scheduled_creation_is_rejected_before_approval() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+            ActionProposal::new(
+                "schedule.job.create",
+                scheduled_job_action_arguments("unpinned", DataClass::Public, 2, 1, true, true),
+            ),
+            CapabilitySet::new([Capability::new(
+                CapabilityName::ScheduleCreate,
+                ResourceScope::exact("scheduled_job", scheduled_job_id().to_string())
+                    .expect("job scope"),
+            )]),
+        )
+        .await
+        .expect("accepted run");
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("action count");
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approval count");
+    assert_eq!((actions, approvals), (0, 0));
+}
+
+#[tokio::test]
+async fn incomplete_scheduled_update_pins_are_rejected_before_approval() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    for case in [
+        "missing_previous",
+        "missing_enabled",
+        "missing_target",
+        "wrong_target",
+    ] {
+        let CanonicalValue::Object(mut arguments) =
+            scheduled_job_action_arguments("pinned", DataClass::Public, 2, 1, true, true)
+        else {
+            unreachable!()
+        };
+        if case != "missing_previous" {
+            arguments.insert("previous_revision".into(), CanonicalValue::from(1_i64));
+        }
+        if case != "missing_enabled" {
+            arguments.insert("previous_enabled".into(), CanonicalValue::from(true));
+        }
+        if case != "missing_target" {
+            arguments.insert(
+                "target_revision".into(),
+                CanonicalValue::from(if case == "wrong_target" { 1_i64 } else { 2_i64 }),
+            );
+        }
+        let run_id = harness
+            .service
+            .request_extension_action(
+                harness.workspace_id,
+                PrincipalId::new("local", "operator").expect("operator"),
+                ActionProposal::new("schedule.job.update", CanonicalValue::Object(arguments)),
+                CapabilitySet::new([Capability::new(
+                    CapabilityName::ScheduleModify,
+                    ResourceScope::exact("scheduled_job", scheduled_job_id().to_string())
+                        .expect("scope"),
+                )]),
+            )
+            .await
+            .expect("accepted run");
+        wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+        let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("actions");
+        assert_eq!(actions, 0, "action persisted for {case}");
+    }
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approvals");
+    assert_eq!(approvals, 0);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn skill_publication_without_source_digest_is_rejected_before_approval() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Captured workflow",
+        format!("# Draft\nsource_run_id: {}", RunId::new()),
+        PrincipalId::new("local", "operator").expect("operator"),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = skill_id();
+    let run_id = harness
+        .service
+        .request_extension_action(
+            harness.workspace_id,
+            PrincipalId::new("local", "operator").expect("operator"),
+            ActionProposal::new(
+                "skill.publish",
+                CanonicalValue::object([
+                    ("draft_id", CanonicalValue::from(draft.id().to_string())),
+                    ("skill_id", CanonicalValue::from(skill_id.to_string())),
+                    ("version", CanonicalValue::from("1.0.0")),
+                    ("name", CanonicalValue::from("Captured workflow skill")),
+                    ("description", CanonicalValue::from("Reviewed capture")),
+                    ("source_format", CanonicalValue::from("markdown")),
+                ]),
+            ),
+            CapabilitySet::new([Capability::new(
+                CapabilityName::SkillPublish,
+                ResourceScope::exact("skill", skill_id.to_string()).expect("skill scope"),
+            )]),
+        )
+        .await
+        .expect("accepted run");
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("actions");
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approvals");
+    assert_eq!((actions, approvals), (0, 0));
+}
+
+#[tokio::test]
+async fn complete_streamed_tool_call_creates_one_pending_action() {
+    let model = MockServer::start().await;
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_stream",
+                "type": "function",
+                "function": {
+                    "name": "filesystem_write",
+                    "arguments": "{\"path\":\"streamed.txt\",\"content\":\"safe\"}"
+                }
+            }]},
+            "finish_reason": "tool_calls"
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&model)
+        .await;
+    let harness = Harness::new_with_streaming(&model).await;
+    let run_id = harness.create_run("write from stream").await;
+    wait_for_run_state(&harness, &run_id, "awaiting_approval").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("action count");
+    let approvals: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("approval count");
+    assert_eq!((actions, approvals), (1, 1));
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/streamed.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn truncated_streamed_tool_call_creates_no_action_or_approval() {
+    let model = MockServer::start().await;
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_stream",
+                "type": "function",
+                "function": {
+                    "name": "filesystem_write",
+                    "arguments": "{\"path\":\"streamed.txt\",\"content\":\"unsafe\"}"
+                }
+            }]},
+            "finish_reason": "tool_calls"
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(format!("data: {chunk}\n\n"), "text/event-stream"),
+        )
+        .mount(&model)
+        .await;
+    let harness = Harness::new_with_streaming(&model).await;
+    let run_id = harness.create_run("do not trust truncated stream").await;
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("action count");
+    let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests")
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("approval count");
+    assert_eq!((actions, approvals), (0, 0));
+    assert!(
+        !harness
+            ._directory
+            .path()
+            .join("workspace/streamed.txt")
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -1708,6 +3144,18 @@ async fn scheduled_provider_failure_terminalizes_both_records() {
     .expect("terminal states");
     assert_eq!(states, ("failed".into(), "failed".into()));
     harness.wait_for_audit(AuditEventKind::RunFailed).await;
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle readback")
+        .expect("owned lifecycle");
+    assert!(
+        lifecycle
+            .primary_diagnostic()
+            .is_some_and(|diagnostic| diagnostic.contains("model")),
+        "provider cause must survive after transient runtime state is gone"
+    );
     harness.service.shutdown().await;
 }
 
@@ -1803,9 +3251,7 @@ async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
         .run_due_scheduled_jobs_once(TimestampMillis::new(2_000))
         .await
         .expect("scheduler pass")[0];
-    harness
-        .wait_for_audit(AuditEventKind::RunReconciliationRequired)
-        .await;
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
     let states: (String, String) = sqlx::query_as(
         "SELECT run.state, occurrence.state
          FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
@@ -1816,6 +3262,24 @@ async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
     .await
     .expect("terminal states");
     assert_eq!(states, ("failed".into(), "failed".into()));
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("lifecycle");
+    assert_eq!(lifecycle.phase(), "terminal");
+    assert!(lifecycle.terminal_audit_pending());
+    assert!(
+        lifecycle
+            .primary_diagnostic()
+            .is_some_and(|value| value.contains("model"))
+    );
+    assert!(
+        lifecycle
+            .secondary_diagnostic()
+            .is_some_and(|value| value.contains("injected audit failure"))
+    );
     let records = harness
         .database
         .list_audit_records_for_run(harness.workspace_id, run_id)
@@ -1826,12 +3290,41 @@ async fn scheduled_terminal_audit_failure_surfaces_reconciliation() {
             .iter()
             .any(|record| record.event().kind() == AuditEventKind::RunFailed)
     );
-    assert!(records.iter().any(|record| {
-        let event = record.event();
-        event.kind() == AuditEventKind::RunReconciliationRequired
-            && canonical_object_get(event.payload(), "stage")
-                == Some(&CanonicalValue::from("terminal_audit"))
-    }));
+    sqlx::query("DROP TRIGGER fail_run_failed_audit")
+        .execute(harness.database.pool())
+        .await
+        .expect("fault removed");
+    harness
+        .database
+        .flush_terminal_audit(harness.workspace_id, run_id)
+        .await
+        .expect("frozen audit repaired");
+    harness
+        .database
+        .flush_terminal_audit(harness.workspace_id, run_id)
+        .await
+        .expect("repair replay is idempotent");
+    let repaired = harness
+        .database
+        .list_audit_records_for_run(harness.workspace_id, run_id)
+        .await
+        .expect("repaired records");
+    assert_eq!(
+        repaired
+            .iter()
+            .filter(|record| record.event().kind() == AuditEventKind::RunFailed)
+            .count(),
+        1
+    );
+    assert!(
+        !harness
+            .database
+            .get_run_lifecycle(harness.workspace_id, run_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle")
+            .terminal_audit_pending()
+    );
     harness.service.shutdown().await;
 }
 
@@ -2270,6 +3763,13 @@ async fn committed_unstarted_scheduled_handoff_recovers_the_same_run() {
         vec![run_id]
     );
     wait_for_run_state(&harness, &run_id.to_string(), "completed").await;
+    let recovered = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("recovered lifecycle");
+    assert_eq!(recovered.phase(), "terminal");
     let occurrence_state: String =
         sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE occurrence_key = ?")
             .bind(occurrence.as_str())
@@ -3845,6 +5345,14 @@ async fn invalid_skill_metadata_leaves_no_unreviewed_source() {
                     ("name", CanonicalValue::from("Bad\nName")),
                     ("description", CanonicalValue::from("Reviewed capture")),
                     ("source_format", CanonicalValue::from("markdown")),
+                    (
+                        "source_digest",
+                        CanonicalValue::from(super::sha256_hex(draft.body().as_bytes())),
+                    ),
+                    (
+                        "source_run_id",
+                        CanonicalValue::from("00000000-0000-4000-8000-000000000003"),
+                    ),
                 ]),
             ),
             CapabilitySet::new([Capability::new(
@@ -3907,6 +5415,297 @@ async fn failed_skill_enablement_rolls_back_version_and_source() {
             .is_none()
     );
     assert!(!skill_source_path(&harness, published_skill, &version).exists());
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn skill_publication_never_adopts_equal_bytes_at_a_foreign_final_path() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("publish done")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        format!("# Capture\nsource_run_id: {}", RunId::new()),
+        PrincipalId::new("local", "operator").expect("operator"),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = skill_id();
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    let final_path = skill_source_path(&harness, skill_id, &version);
+    std::fs::create_dir_all(final_path.parent().expect("parent")).expect("skill directory");
+    std::fs::write(&final_path, draft.body()).expect("foreign equal-byte file");
+
+    let run_id = request_skill_publish(&harness, draft.id(), skill_id).await;
+    wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
+    approve_pending(&harness).await;
+    wait_for_run_state(&harness, &run_id.to_string(), "failed").await;
+    assert_eq!(
+        std::fs::read_to_string(&final_path).expect("foreign file"),
+        draft.body()
+    );
+    assert!(
+        harness
+            .database
+            .skill_version(harness.workspace_id, skill_id, &version)
+            .await
+            .expect("version lookup")
+            .is_none()
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM skill_publication_intents WHERE workspace_id = ? AND skill_id = ? AND version = ?",
+    )
+    .bind(harness.workspace_id.to_string())
+    .bind(skill_id.to_string())
+    .bind(version.as_str())
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("reconciliation intent");
+    assert_eq!(state, "reconciliation_required");
+}
+
+#[tokio::test]
+async fn publication_recovery_finishes_only_owned_synced_sources() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture",
+        actor.clone(),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let data_root = harness._directory.path().join("runtime");
+    for already_linked in [false, true] {
+        let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+        let version = SkillVersion::parse("1.0.0").expect("version");
+        let record = SkillVersionRecord::new(
+            skill_id,
+            version.clone(),
+            harness.workspace_id,
+            "Captured",
+            "Captured description",
+            "markdown",
+            sha256_hex(draft.body().as_bytes()),
+            true,
+            actor.clone(),
+            Some(actor.clone()),
+            TimestampMillis::new(1_000),
+            Some(TimestampMillis::new(1_000)),
+        )
+        .expect("skill record");
+        let intent_id = uuid::Uuid::new_v4();
+        harness
+            .database
+            .prepare_skill_publication(intent_id, draft.id(), &record)
+            .await
+            .expect("prepared intent");
+        let stage = data_root
+            .join("skills")
+            .join(".staging")
+            .join(intent_id.to_string());
+        write_skill_stage(&stage, draft.body().as_bytes())
+            .await
+            .expect("synced stage");
+        let final_path = skill_source_path(&harness, skill_id, &version);
+        if already_linked {
+            std::fs::create_dir_all(final_path.parent().expect("parent")).expect("final directory");
+            std::fs::hard_link(&stage, &final_path).expect("owned final link");
+        }
+        recover_skill_publications(&harness.database, &data_root)
+            .await
+            .expect("recovered intent");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("published source"),
+            draft.body()
+        );
+        assert!(!stage.exists());
+        assert!(
+            harness
+                .database
+                .skill_version(harness.workspace_id, skill_id, &version)
+                .await
+                .expect("version lookup")
+                .is_some()
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM skill_publication_intents WHERE intent_id = ?")
+                .bind(intent_id.to_string())
+                .fetch_one(harness.database.pool())
+                .await
+                .expect("intent state");
+        assert_eq!(state, "committed");
+        std::fs::hard_link(&final_path, &stage).expect("simulate crash before stage cleanup");
+        recover_skill_publications(&harness.database, &data_root)
+            .await
+            .expect("post-commit cleanup recovery");
+        assert!(!stage.exists());
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("retained published source"),
+            draft.body()
+        );
+        std::fs::hard_link(&final_path, &stage).expect("simulate retained stage");
+        std::fs::remove_file(&final_path).expect("simulate lost final directory entry");
+        recover_skill_publications(&harness.database, &data_root)
+            .await
+            .expect("committed source recovery");
+        assert!(!stage.exists());
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("restored committed source"),
+            draft.body()
+        );
+    }
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn publication_recovery_releases_missing_owned_stage_for_fresh_retry() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture",
+        actor.clone(),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    let record = SkillVersionRecord::new(
+        skill_id,
+        version.clone(),
+        harness.workspace_id,
+        "Captured",
+        "Captured description",
+        "markdown",
+        sha256_hex(draft.body().as_bytes()),
+        true,
+        actor.clone(),
+        Some(actor),
+        TimestampMillis::new(1_000),
+        Some(TimestampMillis::new(1_000)),
+    )
+    .expect("skill record");
+    let abandoned_id = uuid::Uuid::new_v4();
+    harness
+        .database
+        .prepare_skill_publication(abandoned_id, draft.id(), &record)
+        .await
+        .expect("prepared intent");
+    recover_skill_publications(
+        &harness.database,
+        &harness._directory.path().join("runtime"),
+    )
+    .await
+    .expect("recovery");
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM skill_publication_intents WHERE intent_id = ?")
+            .bind(abandoned_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("intent state");
+    assert_eq!(state, "abandoned");
+    assert!(!skill_source_path(&harness, skill_id, &version).exists());
+    harness
+        .database
+        .prepare_skill_publication(uuid::Uuid::new_v4(), draft.id(), &record)
+        .await
+        .expect("fresh retry intent");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn publication_recovery_cleans_partial_owned_stage_without_touching_final() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("unused")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let actor = PrincipalId::new("local", "operator").expect("operator");
+    let draft = WorkflowCaptureDraft::new(
+        uuid::Uuid::new_v4(),
+        harness.workspace_id,
+        "Capture",
+        "# Capture",
+        actor.clone(),
+        TimestampMillis::new(1_000),
+    )
+    .expect("draft");
+    harness
+        .database
+        .insert_workflow_capture_draft(&draft)
+        .await
+        .expect("stored draft");
+    let skill_id = SkillId::from_uuid(uuid::Uuid::new_v4());
+    let version = SkillVersion::parse("1.0.0").expect("version");
+    let record = SkillVersionRecord::new(
+        skill_id,
+        version.clone(),
+        harness.workspace_id,
+        "Captured",
+        "Captured description",
+        "markdown",
+        sha256_hex(draft.body().as_bytes()),
+        true,
+        actor.clone(),
+        Some(actor),
+        TimestampMillis::new(1_000),
+        Some(TimestampMillis::new(1_000)),
+    )
+    .expect("skill record");
+    let abandoned_id = uuid::Uuid::new_v4();
+    harness
+        .database
+        .prepare_skill_publication(abandoned_id, draft.id(), &record)
+        .await
+        .expect("prepared intent");
+    let data_root = harness._directory.path().join("runtime");
+    let stage = data_root
+        .join("skills")
+        .join(".staging")
+        .join(abandoned_id.to_string());
+    std::fs::create_dir_all(stage.parent().expect("stage parent")).expect("staging directory");
+    std::fs::write(&stage, b"partial").expect("partial stage");
+    recover_skill_publications(&harness.database, &data_root)
+        .await
+        .expect("recovery");
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM skill_publication_intents WHERE intent_id = ?")
+            .bind(abandoned_id.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("intent state");
+    assert_eq!(state, "abandoned");
+    assert!(!stage.exists());
+    assert!(!skill_source_path(&harness, skill_id, &version).exists());
+    harness
+        .database
+        .prepare_skill_publication(uuid::Uuid::new_v4(), draft.id(), &record)
+        .await
+        .expect("fresh retry intent");
     harness.service.shutdown().await;
 }
 
@@ -4037,6 +5836,21 @@ async fn rejected_or_expired_capture_publication_never_creates_a_skill() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     wait_for_run_state(&harness, &rejected_run.to_string(), "failed").await;
+    let rejected_action: (String, Option<String>) =
+        sqlx::query_as("SELECT state, terminal_reason FROM actions WHERE run_id = ?")
+            .bind(rejected_run.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("rejected action state");
+    let rejected_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)")
+            .bind(rejected_run.to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .expect("rejected execution attempts");
+    assert_eq!(rejected_action.0, "denied");
+    assert_eq!(rejected_action.1.as_deref(), Some("approval_rejected"));
+    assert_eq!(rejected_attempts, 0);
 
     let expired_skill = SkillId::from_uuid(
         uuid::Uuid::parse_str("bb29fc40-ca47-4067-b31d-00dd010662da").expect("expired skill ID"),
@@ -4502,12 +6316,57 @@ async fn wait_for_run_state(harness: &Harness, run_id: &str, expected: &str) {
     }
 }
 
+async fn wait_for_database_run_state(database: &Database, run_id: RunId, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_optional(database.pool())
+            .await
+            .expect("persisted run state");
+        if state.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "run {run_id} did not reach {expected}; actual {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn request_scheduled_job_admin_action(
     harness: &Harness,
     kind: &str,
     capability: CapabilityName,
-    arguments: CanonicalValue,
+    mut arguments: CanonicalValue,
 ) -> lumen_core::action::RunId {
+    let current = harness
+        .database
+        .latest_scheduled_job_revision(scheduled_job_id())
+        .await
+        .expect("latest scheduled revision");
+    let CanonicalValue::Object(object) = &mut arguments else {
+        panic!("scheduled arguments are an object");
+    };
+    object.insert(
+        "previous_revision".into(),
+        current.as_ref().map_or(CanonicalValue::Null, |job| {
+            CanonicalValue::from(i64::try_from(job.revision().as_u64()).expect("revision"))
+        }),
+    );
+    object.insert(
+        "previous_enabled".into(),
+        current.as_ref().map_or(CanonicalValue::Null, |job| {
+            CanonicalValue::from(job.enabled())
+        }),
+    );
+    object.insert(
+        "target_revision".into(),
+        CanonicalValue::from(
+            i64::try_from(current.map_or(1, |job| job.revision().as_u64() + 1)).expect("revision"),
+        ),
+    );
     harness
         .service
         .request_extension_action(
@@ -4529,6 +6388,17 @@ async fn request_skill_publish(
     draft_id: uuid::Uuid,
     skill_id: SkillId,
 ) -> lumen_core::action::RunId {
+    let draft = harness
+        .database
+        .get_workflow_capture_draft(draft_id)
+        .await
+        .expect("draft lookup")
+        .expect("draft exists");
+    let source_digest = super::sha256_hex(draft.body().as_bytes());
+    let source_run = draft
+        .body()
+        .lines()
+        .find_map(|line| line.strip_prefix("source_run_id: "));
     harness
         .service
         .request_extension_action(
@@ -4546,6 +6416,11 @@ async fn request_skill_publish(
                         CanonicalValue::from("A reviewed skill published from a captured workflow"),
                     ),
                     ("source_format", CanonicalValue::from("markdown")),
+                    ("source_digest", CanonicalValue::from(source_digest)),
+                    (
+                        "source_run_id",
+                        source_run.map_or(CanonicalValue::Null, CanonicalValue::from),
+                    ),
                 ]),
             ),
             CapabilitySet::new([Capability::new(
@@ -5080,14 +6955,14 @@ async fn assert_approval_execution_audit_order(harness: &Harness, run_id: &str) 
 
 fn final_response(text: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "choices": [{"message": {"content": text, "tool_calls": []}}]
+        "choices": [{"finish_reason":"stop", "message": {"content": text, "tool_calls": []}}]
     }))
 }
 
 fn action_response(kind: &str, arguments: serde_json::Value) -> ResponseTemplate {
     let name = kind.replace('.', "_");
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "choices": [{"message": {
+        "choices": [{"finish_reason":"tool_calls", "message": {
             "content": null,
             "tool_calls": [{
                 "id": "call_test",
@@ -5367,11 +7242,9 @@ subject = "operator"
             "executor did not enter: action={action:?}, approvals={approvals:?}, parked={parked}, active={active}"
         );
     }
-    let tasks = std::mem::take(&mut *service.tasks.lock().await);
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
-    }
+    service.admission.abort_tracked().expect("drivers aborted");
+    service.admission.close_tracker();
+    service.admission.wait().await;
 
     let recovered = database
         .recover_incomplete_executions(now())
@@ -6241,10 +8114,15 @@ async fn delayed_model_run_records_distinct_lifecycle_times_and_valid_audit_hash
     .fetch_all(harness.database.pool())
     .await
     .expect("lifecycle audit events");
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(events[0].0, "run_created");
     assert_eq!(events[1].0, "run_completed");
+    assert_eq!(events[2].0, "run_completed");
     assert!(events[1].1 > events[0].1, "lifecycle time must advance");
+    assert!(
+        events[2].1 >= events[1].1,
+        "durable terminal time cannot precede completion"
+    );
     harness
         .database
         .verify_audit_chain()
@@ -6336,6 +8214,54 @@ async fn shutdown_terminalizes_a_run_waiting_for_approval() {
 }
 
 #[tokio::test]
+async fn approval_worker_cannot_park_after_admission_is_sealed() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "process.spawn",
+            serde_json::json!({
+                "program": test_program_string(), "args": ["waiting"], "environment": {}
+            }),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    harness
+        .service
+        .pause_before_park_enabled
+        .store(true, Ordering::SeqCst);
+    let reached = harness.service.pause_before_park_reached.notified();
+    let run_id = harness.create_run("pause at shutdown boundary").await;
+    tokio::time::timeout(Duration::from_secs(1), reached)
+        .await
+        .expect("worker reached post-pause boundary");
+    assert!(harness.service.admission.seal().expect("sealed"));
+    harness.service.pause_before_park_release.notify_one();
+    wait_for_run_state(&harness, &run_id, "cancelled").await;
+    assert!(
+        !harness
+            .service
+            .runs
+            .lock()
+            .await
+            .contains_key(&RunId::from_uuid(
+                uuid::Uuid::parse_str(&run_id).expect("run UUID")
+            ))
+    );
+    let approval: String = sqlx::query_scalar(
+        "SELECT state FROM approval_requests WHERE action_id IN
+         (SELECT id FROM actions WHERE run_id = ?)",
+    )
+    .bind(&run_id)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("approval state");
+    assert_eq!(approval, "invalidated");
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn forced_shutdown_marks_an_unresponsive_run_failed() {
     let model = MockServer::start().await;
     let harness = Harness::new(&model, |_| {}).await;
@@ -6343,7 +8269,13 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
     let actor = PrincipalId::new("local", "operator").expect("operator");
     harness
         .database
-        .create_run(run_id, harness.workspace_id, &actor, now())
+        .create_owned_run(
+            run_id,
+            harness.workspace_id,
+            &actor,
+            harness.service.owner_instance_id,
+            now(),
+        )
         .await
         .expect("run");
     harness
@@ -6365,10 +8297,9 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
         .insert(run_id, harness.workspace_id);
     harness
         .service
-        .tasks
-        .lock()
-        .await
-        .push(tokio::spawn(std::future::pending()));
+        .admission
+        .submit(std::future::pending::<()>())
+        .expect("nonresponsive driver registered");
 
     tokio::time::timeout(
         Duration::from_secs(1),
@@ -6385,9 +8316,267 @@ async fn forced_shutdown_marks_an_unresponsive_run_failed() {
         .await
         .expect("run state");
     assert_eq!(state, "failed");
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("owned lifecycle");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert_eq!(
+        lifecycle.effect_certainty(),
+        lumen_db::EffectCertainty::Unknown
+    );
+    assert!(!lifecycle.terminal_audit_pending());
     harness
         .wait_for_audit(AuditEventKind::RunReconciliationRequired)
         .await;
+    let response = harness.request("GET", "runs/reconciliation", "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("reconciliation JSON");
+    assert_eq!(body["runs"][0]["run_id"], run_id.to_string());
+    assert_eq!(body["runs"][0]["effect_certainty"], "unknown");
+    let status = harness
+        .request("GET", &format!("runs/{run_id}/status"), "")
+        .await;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status_bytes = status
+        .into_body()
+        .collect()
+        .await
+        .expect("status body")
+        .to_bytes();
+    let status: serde_json::Value = serde_json::from_slice(&status_bytes).expect("status JSON");
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["terminal_code"], "shutdown_forced");
+    assert_eq!(status["effect_certainty"], "unknown");
+    assert_eq!(status["reconciliation_required"], true);
+}
+
+#[tokio::test]
+async fn admission_that_crosses_shutdown_is_terminalized_without_a_stranded_run() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = RunId::new();
+    let actor = PrincipalId::new("local", "operator").expect("actor");
+    harness
+        .database
+        .create_owned_run(
+            run_id,
+            harness.workspace_id,
+            &actor,
+            harness.service.owner_instance_id,
+            now(),
+        )
+        .await
+        .expect("accepted row");
+    harness.service.shutting_down.store(true, Ordering::SeqCst);
+    let admission = harness
+        .service
+        .install_and_spawn_run(
+            run_id,
+            super::StoredRun {
+                workspace_id: harness.workspace_id,
+                state: lumen_core::run::RunState::new(
+                    lumen_core::run::RunContext::new(run_id, harness.workspace_id, actor),
+                    "shutdown race",
+                    harness.service.budget,
+                ),
+                model_override: None,
+                capabilities_override: None,
+                scheduled_handoff: None,
+                start_disposition: super::StartDisposition::Created,
+            },
+        )
+        .await;
+    assert!(matches!(
+        admission,
+        Err(lumen_server::ServiceError::Unavailable(_))
+    ));
+    let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("state");
+    assert_eq!(state, "cancelled");
+    assert!(!harness.service.runs.lock().await.contains_key(&run_id));
+    assert!(
+        !harness
+            .service
+            .run_workspaces
+            .lock()
+            .await
+            .contains_key(&run_id)
+    );
+    harness.service.shutting_down.store(false, Ordering::SeqCst);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropped_run_submission_waiter_does_not_cancel_runtime_owned_admission() {
+    let model = MockServer::start().await;
+    mount_response(&model, final_response("accepted work")).await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let pending = harness.service.create_run(CreateRunCommand::new(
+        harness.workspace_id,
+        PrincipalId::new("local", "operator").expect("actor"),
+        "work survives client disconnect".into(),
+    ));
+    drop(pending);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE state = 'completed'")
+                    .fetch_one(harness.database.pool())
+                    .await
+                    .expect("completed count");
+            if count == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime-owned admission completes");
+    assert_eq!(model.received_requests().await.expect("requests").len(), 1);
+    harness.service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_deadline_includes_noncooperative_task_join() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_task = Arc::clone(&entered);
+    harness
+        .service
+        .admission
+        .submit(async move {
+            entered_task.notify_one();
+            std::thread::sleep(Duration::from_secs(2));
+        })
+        .expect("noncooperative driver registered");
+    entered.notified().await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .service
+            .shutdown_with_timeout(Duration::from_millis(20)),
+    )
+    .await
+    .expect("shutdown has a total deadline");
+}
+
+#[tokio::test]
+async fn cancelled_first_shutdown_waiter_does_not_abandon_settlement() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = RunId::new();
+    let actor = PrincipalId::new("local", "operator").expect("actor");
+    harness
+        .database
+        .create_owned_run(
+            run_id,
+            harness.workspace_id,
+            &actor,
+            harness.service.owner_instance_id,
+            now(),
+        )
+        .await
+        .expect("run");
+    harness
+        .database
+        .start_owned_run(
+            run_id,
+            harness.workspace_id,
+            harness.service.owner_instance_id,
+            false,
+            now(),
+        )
+        .await
+        .expect("start");
+    harness
+        .service
+        .admission
+        .register_owned(run_id)
+        .expect("owned");
+    harness
+        .service
+        .run_workspaces
+        .lock()
+        .await
+        .insert(run_id, harness.workspace_id);
+    harness
+        .service
+        .cancellations
+        .lock()
+        .await
+        .insert(run_id, tokio_util::sync::CancellationToken::new());
+    harness
+        .service
+        .admission
+        .submit(std::future::pending::<()>())
+        .expect("stalled driver");
+    let first_service = harness.service.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .shutdown_with_timeout(Duration::from_millis(100))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !harness.service.shutting_down.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown started");
+    first.abort();
+    let _ = first.await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .service
+            .shutdown_with_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .expect("second caller observes same settlement");
+    let lifecycle = harness
+        .database
+        .get_run_lifecycle(harness.workspace_id, run_id)
+        .await
+        .expect("lookup")
+        .expect("lifecycle");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert!(!lifecycle.terminal_audit_pending());
+}
+
+#[tokio::test]
+async fn two_shutdown_callers_receive_the_same_retained_report() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let first_service = harness.service.clone();
+    let second_service = harness.service.clone();
+    let (first, second) = tokio::join!(
+        async move {
+            first_service
+                .shutdown_with_timeout(Duration::from_millis(20))
+                .await
+        },
+        async move {
+            second_service
+                .shutdown_with_timeout(Duration::from_secs(5))
+                .await
+        },
+    );
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(!first.forced);
+    assert!(first.unresolved_runs.is_empty());
 }
 
 #[tokio::test]
@@ -6880,6 +9069,94 @@ async fn approved_file_write_uses_the_one_shot_runtime_dispatch_path() {
 }
 
 #[tokio::test]
+async fn rejected_file_write_route_leaves_no_effect_and_refuses_replay_or_foreign_scope() {
+    let model = MockServer::start().await;
+    mount_response(
+        &model,
+        action_response(
+            "filesystem.write",
+            serde_json::json!({"path":"rejected.txt","content":"must not exist"}),
+        ),
+    )
+    .await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let run_id = harness.create_run("write a file for rejection").await;
+    wait_for_run_state(&harness, &run_id, "awaiting_approval").await;
+    let approval_id = harness.pending_approval_id().await;
+    let target = harness._directory.path().join("workspace/rejected.txt");
+    assert!(!target.exists());
+
+    let foreign = WorkspaceId::new();
+    let foreign_response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/workspaces/{foreign}/approvals/{approval_id}/decision"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"decision":"reject"}"#))
+                .expect("foreign decision request"),
+        )
+        .await
+        .expect("foreign decision response");
+    assert_ne!(foreign_response.status(), StatusCode::OK);
+    let pending: String = sqlx::query_scalar("SELECT state FROM approval_requests WHERE id = ?")
+        .bind(&approval_id)
+        .fetch_one(harness.database.pool())
+        .await
+        .expect("pending state");
+    assert_eq!(pending, "pending");
+
+    let response = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"reject"}"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_run_state(&harness, &run_id, "failed").await;
+    let row: (String, String, Option<String>, String, i64) = sqlx::query_as(
+        "SELECT approval.state, action.state, action.terminal_reason, run.state,
+                (SELECT COUNT(*) FROM execution_attempts WHERE action_id = action.id)
+         FROM approval_requests approval
+         JOIN actions action ON action.id = approval.action_id
+         JOIN agent_runs run ON run.id = action.run_id
+         WHERE approval.id = ?",
+    )
+    .bind(&approval_id)
+    .fetch_one(harness.database.pool())
+    .await
+    .expect("rejection facts");
+    assert_eq!(
+        row,
+        (
+            "rejected".into(),
+            "denied".into(),
+            Some("approval_rejected".into()),
+            "failed".into(),
+            0
+        )
+    );
+    assert!(!target.exists());
+
+    let replay = harness
+        .request(
+            "POST",
+            &format!("approvals/{approval_id}/decision"),
+            r#"{"decision":"reject"}"#,
+        )
+        .await;
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert!(!target.exists());
+    harness.service.shutdown().await;
+}
+
+#[tokio::test]
 async fn file_write_decision_mutation_and_concurrent_change_fail_closed_end_to_end() {
     let model = MockServer::start().await;
     let turn = Arc::new(AtomicUsize::new(0));
@@ -7366,4 +9643,21 @@ async fn shutdown_reaches_an_executing_process_and_persists_cancelled() {
         .expect("run state");
     assert_eq!(attempt_state, "cancelled");
     assert_eq!(run_state, "cancelled");
+}
+
+#[tokio::test]
+async fn shutdown_deadline_covers_contended_run_registry() {
+    let model = MockServer::start().await;
+    let harness = Harness::new(&model, |_| {}).await;
+    let held = harness.service.run_workspaces.lock().await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .service
+            .shutdown_with_timeout(Duration::from_millis(20)),
+    )
+    .await
+    .expect("shutdown must not wait indefinitely for the run registry");
+    assert!(!report.is_clean());
+    drop(held);
 }
