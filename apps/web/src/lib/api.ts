@@ -24,6 +24,24 @@ export type Approval = {
 	secret_references?: Array<{ id: string; label: string; environment: string }>;
 };
 
+let defaultRequestSignal: AbortSignal | undefined;
+
+export function setDefaultRequestSignal(signal: AbortSignal): void {
+	defaultRequestSignal = signal;
+}
+
+export type ApprovalList = {
+	approvals: Approval[];
+	server_time: number;
+};
+
+export type ApprovalRenewal = {
+	previous_approval_id: string;
+	approval_id: string;
+	run_id: string;
+	state: 'pending';
+};
+
 export type AuditEvent = {
 	sequence: number;
 	event_id: string;
@@ -198,6 +216,7 @@ export type JobReview = {
 	enabled: boolean;
 	next_due_at?: number | null;
 	idempotent: boolean;
+	last_run_state?: 'claimed' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown' | null;
 	created_at: number;
 };
 
@@ -226,6 +245,9 @@ export type SkillReview = {
 	reviewed_by?: PrincipalSummary | null;
 	created_at: number;
 	reviewed_at?: number | null;
+	required: boolean;
+	load_status: 'loaded' | 'excluded' | 'disabled';
+	exclusion_reason?: string | null;
 };
 
 export type WorkflowCaptureDraft = {
@@ -259,7 +281,8 @@ export class ApiClient {
 
 	constructor(
 		private readonly settings: ConnectionSettings,
-		private readonly fetcher: typeof fetch = fetch
+		private readonly fetcher: typeof fetch = fetch,
+		private readonly signal: AbortSignal | undefined = defaultRequestSignal
 	) {
 		this.baseUrl = settings.baseUrl.replace(/\/+$/, '');
 	}
@@ -272,9 +295,12 @@ export class ApiClient {
 		return this.request(`runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
 	}
 
-	async listApprovals(): Promise<Approval[]> {
-		const response = await this.request<{ approvals: Approval[] }>('approvals');
-		return response.approvals;
+	async listApprovals(): Promise<ApprovalList> {
+		return this.request('approvals');
+	}
+
+	async verifyConnection(): Promise<void> {
+		await this.request('runtime/capabilities');
 	}
 
 	async decideApproval(approvalId: string, decision: 'grant' | 'reject'): Promise<void> {
@@ -284,11 +310,18 @@ export class ApiClient {
 		});
 	}
 
+	async renewApproval(approvalId: string): Promise<ApprovalRenewal> {
+		return this.request(`approvals/${encodeURIComponent(approvalId)}/renew`, { method: 'POST' });
+	}
+
 	async listAudit(after = 0, limit = 100): Promise<AuditEvent[]> {
-		const response = await this.request<{ events: AuditEvent[] }>(
+		const response = await this.request<unknown>(
 			`audit?after=${after}&limit=${limit}`
 		);
-		return response.events;
+		if (!response || typeof response !== 'object' || !('events' in response) || !Array.isArray(response.events)) {
+			throw new ApiError(0, 'invalid_response', 'Audit response is missing an events array');
+		}
+		return response.events as AuditEvent[];
 	}
 
 	async listStagedPlugins(limit = 50, after = 0): Promise<StagedPluginReview[]> {
@@ -397,6 +430,10 @@ export class ApiClient {
 		});
 	}
 
+	async getRunStatus(runId: string): Promise<{ run_id: string; state: string }> {
+		return this.request(`runs/${encodeURIComponent(runId)}/status`);
+	}
+
 	async streamRunEvents(
 		runId: string,
 		after: number,
@@ -405,7 +442,7 @@ export class ApiClient {
 	): Promise<void> {
 		const response = await this.fetcher(this.url(`runs/${encodeURIComponent(runId)}/events`), {
 			headers: this.headers({ 'Last-Event-ID': String(after) }),
-			signal
+			signal: signal ?? this.signal
 		});
 		if (!response.ok) await this.throwResponse(response);
 		if (!response.body) throw new ApiError(0, 'stream_unavailable', 'Run event stream is unavailable');
@@ -434,7 +471,8 @@ export class ApiClient {
 	private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
 		const response = await this.fetcher(this.url(path), {
 			...init,
-			headers: this.headers(init.headers)
+			headers: this.headers(init.headers),
+			signal: init.signal ?? this.signal
 		});
 		if (!response.ok) await this.throwResponse(response);
 		if (response.status === 204) return undefined as T;

@@ -24,15 +24,67 @@ use crate::EventBroker;
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalConflict {
+    Expired,
+    Stale,
+    AlreadyDecided,
+    Consumed,
+    ActionChanged,
+    NotRenewable,
+}
+
+impl ApprovalConflict {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Expired => "approval_expired",
+            Self::Stale => "approval_stale",
+            Self::AlreadyDecided => "approval_already_decided",
+            Self::Consumed => "approval_consumed",
+            Self::ActionChanged => "approval_action_changed",
+            Self::NotRenewable => "approval_not_renewable",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Expired => "approval expired",
+            Self::Stale => "approval is stale",
+            Self::AlreadyDecided => "approval was already decided",
+            Self::Consumed => "approval was already consumed",
+            Self::ActionChanged => "action changed after approval review",
+            Self::NotRenewable => "approval is not eligible for renewal",
+        }
+    }
+}
+
 pub trait RuntimeService: Send + Sync {
     fn create_run(&self, command: CreateRunCommand) -> ServiceFuture<'_, RunCreated>;
+    fn model_readiness(&self, workspace_id: WorkspaceId) -> ServiceFuture<'_, String>;
     fn decide_approval(
         &self,
         command: ApprovalDecisionCommand,
     ) -> ServiceFuture<'_, ApprovalResult>;
+    fn renew_approval(&self, command: ApprovalRenewalCommand)
+    -> ServiceFuture<'_, ApprovalRenewal>;
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>>;
     fn list_approvals(&self, query: ApprovalQuery) -> ServiceFuture<'_, Vec<ApprovalPreview>>;
     fn cancel_run(&self, command: CancelRunCommand) -> ServiceFuture<'_, RunCancellation>;
+    fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String>;
+    fn run_status_detail(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+    ) -> ServiceFuture<'_, RunStatus> {
+        Box::pin(async move {
+            let state = self.run_status(workspace_id, run_id).await?;
+            Ok(RunStatus::new(state, None, None, false))
+        })
+    }
+    fn list_reconciliation_runs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> ServiceFuture<'_, Vec<RunReconciliation>>;
     fn list_staged_plugins(
         &self,
         query: PluginReviewQuery,
@@ -1111,6 +1163,7 @@ pub struct JobReview {
     enabled: bool,
     next_due_at: Option<TimestampMillis>,
     idempotent: bool,
+    last_run_state: Option<String>,
     created_at: TimestampMillis,
 }
 
@@ -1130,6 +1183,7 @@ impl JobReview {
         enabled: bool,
         next_due_at: Option<TimestampMillis>,
         idempotent: bool,
+        last_run_state: Option<String>,
         created_at: TimestampMillis,
     ) -> Self {
         Self {
@@ -1146,6 +1200,7 @@ impl JobReview {
             enabled,
             next_due_at,
             idempotent,
+            last_run_state,
             created_at,
         }
     }
@@ -1256,6 +1311,9 @@ pub struct SkillReview {
     reviewed_by: Option<PrincipalSummary>,
     created_at: TimestampMillis,
     reviewed_at: Option<TimestampMillis>,
+    required: bool,
+    load_status: &'static str,
+    exclusion_reason: Option<&'static str>,
 }
 
 impl SkillReview {
@@ -1289,7 +1347,33 @@ impl SkillReview {
             reviewed_by,
             created_at,
             reviewed_at,
+            required: false,
+            load_status: "disabled",
+            exclusion_reason: None,
         }
+    }
+
+    pub const fn skill_id(&self) -> SkillId {
+        self.skill_id
+    }
+
+    pub const fn version(&self) -> &SkillVersion {
+        &self.version
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn set_load_status(
+        &mut self,
+        required: bool,
+        status: &'static str,
+        reason: Option<&'static str>,
+    ) {
+        self.required = required;
+        self.load_status = status;
+        self.exclusion_reason = reason;
     }
 }
 
@@ -1418,6 +1502,60 @@ pub struct RunCreated {
     run_id: RunId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RunStatus {
+    state: String,
+    terminal_code: Option<String>,
+    effect_certainty: Option<String>,
+    reconciliation_required: bool,
+}
+
+impl RunStatus {
+    pub fn new(
+        state: String,
+        terminal_code: Option<String>,
+        effect_certainty: Option<String>,
+        reconciliation_required: bool,
+    ) -> Self {
+        Self {
+            state,
+            terminal_code,
+            effect_certainty,
+            reconciliation_required,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RunReconciliation {
+    run_id: RunId,
+    effect_certainty: String,
+    terminal_code: String,
+    primary_diagnostic: Option<String>,
+    secondary_diagnostic: Option<String>,
+    terminal_audit_pending: bool,
+}
+
+impl RunReconciliation {
+    pub fn new(
+        run_id: RunId,
+        effect_certainty: &str,
+        terminal_code: &str,
+        primary_diagnostic: Option<String>,
+        secondary_diagnostic: Option<String>,
+        terminal_audit_pending: bool,
+    ) -> Self {
+        Self {
+            run_id,
+            effect_certainty: effect_certainty.to_owned(),
+            terminal_code: terminal_code.to_owned(),
+            primary_diagnostic,
+            secondary_diagnostic,
+            terminal_audit_pending,
+        }
+    }
+}
+
 impl RunCreated {
     pub const fn new(run_id: RunId) -> Self {
         Self { run_id }
@@ -1479,6 +1617,62 @@ impl ApprovalDecisionCommand {
 pub struct ApprovalResult {
     approval_id: ApprovalId,
     decision: ApprovalDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalRenewalCommand {
+    workspace_id: WorkspaceId,
+    approval_id: ApprovalId,
+    actor: PrincipalId,
+}
+
+impl ApprovalRenewalCommand {
+    pub const fn new(
+        workspace_id: WorkspaceId,
+        approval_id: ApprovalId,
+        actor: PrincipalId,
+    ) -> Self {
+        Self {
+            workspace_id,
+            approval_id,
+            actor,
+        }
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn approval_id(&self) -> ApprovalId {
+        self.approval_id
+    }
+
+    pub const fn actor(&self) -> &PrincipalId {
+        &self.actor
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ApprovalRenewal {
+    previous_approval_id: ApprovalId,
+    approval_id: ApprovalId,
+    run_id: RunId,
+    state: &'static str,
+}
+
+impl ApprovalRenewal {
+    pub const fn new(
+        previous_approval_id: ApprovalId,
+        approval_id: ApprovalId,
+        run_id: RunId,
+    ) -> Self {
+        Self {
+            previous_approval_id,
+            approval_id,
+            run_id,
+            state: "pending",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1690,6 +1884,8 @@ pub enum ServiceError {
     NotFound,
     #[error("request conflicts with current runtime state: {0}")]
     Conflict(String),
+    #[error("approval request conflicts with current runtime state: {}", .0.message())]
+    ApprovalConflict(ApprovalConflict),
     #[error("runtime prerequisite is unavailable: {0}")]
     Unavailable(String),
     #[error("runtime service failed: {0}")]

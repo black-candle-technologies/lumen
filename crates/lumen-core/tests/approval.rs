@@ -121,6 +121,24 @@ fn expired_approval_is_marked_expired_and_cannot_dispatch() {
 }
 
 #[test]
+fn pending_approval_cannot_be_granted_or_rejected_at_expiry() {
+    let action = action("notes/today.md");
+    let mut grant = pending_approval(&action);
+    let mut reject = pending_approval(&action);
+
+    assert_eq!(
+        grant.grant(approver(), EXPIRES_AT),
+        Err(ApprovalError::Expired)
+    );
+    assert_eq!(
+        reject.reject(approver(), EXPIRES_AT),
+        Err(ApprovalError::Expired)
+    );
+    assert_eq!(grant.state(), ApprovalState::Expired);
+    assert_eq!(reject.state(), ApprovalState::Expired);
+}
+
+#[test]
 fn dispatch_cannot_be_recorded_before_the_grant_decision() {
     let action = action("notes/today.md");
     let mut approval = pending_approval(&action);
