@@ -15,9 +15,10 @@ pre, code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .topbar { grid-column: 1 / -1; display: grid; grid-template-columns: 208px 1fr auto; align-items: center; height: 56px; padding: 0 18px; border-bottom: 1px solid #dfe2dc; background: #fff; z-index: 20; }
 .brand { display: inline-flex; align-items: center; gap: 10px; width: max-content; text-decoration: none; font-size: 15px; }
 .brand img { width: 25px; height: 25px; }
-.connection-state { justify-self: end; display: inline-flex; align-items: center; gap: 7px; margin-right: 12px; color: #777d75; font-size: 12px; }
+.connection-state { justify-self: end; display: inline-flex; align-items: center; gap: 7px; margin-right: 12px; border: 0; padding: 0; background: transparent; color: #777d75; font-size: 12px; cursor: pointer; }
 .connection-state span { width: 7px; height: 7px; border-radius: 50%; background: #b3b7b1; }
 .connection-state.connected span { background: #27845a; }
+.connection-state.connecting span { background: #c18a34; }
 .sidebar { border-right: 1px solid #dfe2dc; background: #fafbf8; padding: 14px 10px; }
 .sidebar nav { display: grid; gap: 3px; }
 .sidebar a, .mobile-nav a { display: flex; align-items: center; gap: 10px; text-decoration: none; color: #5d625b; font-size: 14px; font-weight: 550; border-radius: 6px; }

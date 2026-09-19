@@ -121,7 +121,7 @@ async fn migration_adds_the_complete_extension_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 6);
+    assert_eq!(migrations, 13);
 }
 
 #[tokio::test]
@@ -820,7 +820,7 @@ async fn rolling_failures_quarantine_one_workspace_and_survive_reopen() {
         )
         .await
         .expect("enable");
-    for timestamp in [2_000, 3_000, 4_000] {
+    for timestamp in [2_000, 3_000, 2_500] {
         database
             .record_plugin_failure(
                 workspace_id(),
@@ -844,4 +844,67 @@ async fn rolling_failures_quarantine_one_workspace_and_survive_reopen() {
             .expect("state"),
         Some(PluginWorkspaceState::HealthQuarantine)
     );
+}
+
+#[tokio::test]
+async fn future_dated_failure_does_not_extend_health_window() {
+    let database = Database::connect_in_memory().await.expect("database");
+    database
+        .insert_workspace(workspace_id(), "Default", TimestampMillis::new(500))
+        .await
+        .expect("workspace");
+    let staged = staged("1.2.3", '1', '2');
+    database
+        .insert_staged_plugin_package(&staged)
+        .await
+        .expect("stage");
+    database
+        .install_staged_plugin(
+            staged.id(),
+            "plugins/git/1.2.3/artifact",
+            TimestampMillis::new(1_100),
+        )
+        .await
+        .expect("install");
+    let plugin = PluginId::parse("dev.example.git-tools").expect("ID");
+    let version = PluginVersion::parse("1.2.3").expect("version");
+    let component = PluginComponentId::parse("status").expect("component");
+    database
+        .enable_plugin_version(
+            workspace_id(),
+            plugin.clone(),
+            version.clone(),
+            TimestampMillis::new(1_200),
+        )
+        .await
+        .expect("enable");
+
+    for timestamp in [1_000_000, 2_000, 3_000] {
+        let state = database
+            .record_plugin_failure(
+                workspace_id(),
+                plugin.clone(),
+                version.clone(),
+                component.clone(),
+                Uuid::new_v4(),
+                ExtensionFailureClass::PluginFault,
+                TimestampMillis::new(timestamp),
+            )
+            .await
+            .expect("failure");
+        assert_eq!(state, PluginWorkspaceState::Enabled);
+    }
+    let state = database
+        .record_plugin_failure(
+            workspace_id(),
+            plugin,
+            version,
+            component,
+            Uuid::new_v4(),
+            ExtensionFailureClass::PluginFault,
+            TimestampMillis::new(4_000),
+        )
+        .await
+        .expect("third ordinary fault");
+    assert_eq!(state, PluginWorkspaceState::HealthQuarantine);
 }

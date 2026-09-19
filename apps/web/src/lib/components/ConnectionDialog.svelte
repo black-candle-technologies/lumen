@@ -1,20 +1,25 @@
 <script lang="ts">
 	import X from '@lucide/svelte/icons/x';
 	import type { ConnectionSettings } from '$lib/api';
+	import type { ConnectionState } from '$lib/connection';
 
 	let {
 		settings,
 		onSave,
+		onDisconnect,
 		onClose
 	}: {
 		settings: ConnectionSettings;
-		onSave: (settings: ConnectionSettings) => void;
+		onSave: (settings: ConnectionSettings) => Promise<ConnectionState>;
+		onDisconnect: () => void;
 		onClose: () => void;
 	} = $props();
 
 	let baseUrl = $state('');
 	let workspaceId = $state('');
 	let token = $state('');
+	let busy = $state(false);
+	let error = $state('');
 
 	$effect(() => {
 		baseUrl = settings.baseUrl;
@@ -22,9 +27,13 @@
 		token = settings.token;
 	});
 
-	function submit(event: SubmitEvent) {
+	async function submit(event: SubmitEvent) {
 		event.preventDefault();
-		onSave({ baseUrl: baseUrl.trim(), workspaceId: workspaceId.trim(), token: token.trim() });
+		busy = true;
+		error = '';
+		const state = await onSave({ baseUrl: baseUrl.trim(), workspaceId: workspaceId.trim(), token: token.trim() });
+		busy = false;
+		if (state.kind !== 'connected') error = state.message;
 	}
 </script>
 
@@ -37,6 +46,7 @@
 			</button>
 		</header>
 		<form onsubmit={submit}>
+			{#if error}<div class="notice error">{error}</div>{/if}
 			<label>
 				<span>Runtime URL</span>
 				<input bind:value={baseUrl} type="url" required />
@@ -50,7 +60,8 @@
 				<input bind:value={token} type="password" required autocomplete="off" />
 			</label>
 			<footer>
-				<button class="primary" type="submit">Connect</button>
+				<button type="button" onclick={onDisconnect} disabled={busy}>Disconnect</button>
+				<button class="primary" type="submit" disabled={busy}>{busy ? 'Connecting…' : 'Connect'}</button>
 			</footer>
 		</form>
 	</div>

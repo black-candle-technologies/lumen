@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep this script LF-only so it remains directly executable from WSL checkouts.
+
 usage() {
   cat <<'EOF'
 Usage: scripts/verify-linux-plugin-sandbox.sh [--dry-run]
