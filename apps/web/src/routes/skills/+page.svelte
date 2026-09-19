@@ -3,11 +3,14 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Upload from '@lucide/svelte/icons/upload';
 	import { ApiClient, ApiError, type SkillReview, type WorkflowCaptureDraft } from '$lib/api';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	let skills = $state<SkillReview[]>([]);
 	let drafts = $state<WorkflowCaptureDraft[]>([]);
-	let loading = $state(true);
+	let loadState = $state<'loading' | 'success' | 'error'>('loading');
+	let loadError = $state('');
+	let lastLoadedAt = $state('');
+	let loadedWorkspace = $state('');
 	let busyKey = $state('');
 	let error = $state('');
 	let notice = $state('');
@@ -15,15 +18,24 @@
 	onMount(load);
 
 	async function load() {
-		if (!isConfigured($connection)) { loading = false; return; }
-		loading = true;
+		if ($connectionState.kind !== 'connected') {
+			loadState = 'error';
+			loadError = 'Runtime connection is not verified. Open connection settings.';
+			return;
+		}
+		loadState = 'loading';
 		try {
 			const client = new ApiClient($connection);
 			[skills, drafts] = await Promise.all([client.listSkills(), client.listCaptureDrafts()]);
+			loadError = '';
 			error = '';
+			lastLoadedAt = new Date().toLocaleString();
+			loadedWorkspace = $connection.workspaceId;
+			loadState = 'success';
 		} catch (cause) {
-			error = cause instanceof ApiError ? cause.message : 'Skill controls could not be loaded.';
-		} finally { loading = false; }
+			loadError = cause instanceof ApiError ? cause.message : 'Skill controls could not be loaded.';
+			loadState = 'error';
+		}
 	}
 
 	async function publishDraft(draft: WorkflowCaptureDraft) {
@@ -35,7 +47,7 @@
 				name: draft.title,
 				description: `Captured from ${draft.created_by.provider}/${draft.created_by.subject}`
 			});
-			notice = `Approval requested: ${result.run_id}`;
+			notice = `Publication approval requested: ${result.run_id}`;
 			error = '';
 		} catch (cause) {
 			error = cause instanceof ApiError ? cause.message : 'Skill publish request failed.';
@@ -45,28 +57,39 @@
 
 <section class="page skills-page">
 	<header class="page-heading">
-		<div><h1>Skills</h1><p>{skills.length} versions, {drafts.length} capture drafts</p></div>
-		<button class="icon-button" type="button" aria-label="Refresh skills" title="Refresh" onclick={load} disabled={loading}><RefreshCw size={17} /></button>
+		<div><h1>Skills</h1><p>{lastLoadedAt ? `${skills.length} versions, ${drafts.length} capture drafts${loadState === 'error' ? ' (stale)' : ''}` : 'Counts unavailable'}</p></div>
+		<button class="icon-button" type="button" aria-label="Refresh skills" title="Refresh" onclick={load} disabled={loadState === 'loading'}><RefreshCw size={17} /></button>
 	</header>
+	{#if loadError}
+		<div class="notice error" role="alert">{loadError} <button type="button" onclick={load}>Retry</button></div>
+	{/if}
+	{#if loadState === 'error' && lastLoadedAt}
+		<div class="notice" role="status">Showing stale data for workspace {loadedWorkspace} from {lastLoadedAt}.</div>
+	{/if}
 	{#if error}<div class="notice error">{error}</div>{/if}
 	{#if notice}<div class="notice">{notice}</div>{/if}
 
-	{#if loading}
+	{#if loadState === 'loading' && !lastLoadedAt}
 		<div class="empty">Loading skills...</div>
+	{:else if loadState === 'error' && !lastLoadedAt}
+		<div class="empty">Skill data is unavailable.</div>
 	{:else}
 		<section class="skills-section">
-			<h2>Reviewed Versions</h2>
+			<h2>Skill Versions</h2>
 			{#if skills.length === 0}
-				<div class="subtle-empty">No reviewed skill versions.</div>
+				<div class="subtle-empty">{loadState === 'error' ? 'The previously loaded skill list was empty.' : 'No skill versions.'}</div>
 			{:else}
-				<div class="skills-table" role="table" aria-label="Reviewed skills">
+				<div class="skills-table" role="table" aria-label="Skills">
 					<div class="skills-header skill-row" role="row"><span>Skill</span><span>Digest</span><span>Review</span><span>Status</span></div>
 					{#each skills as skill (`${skill.skill_id}:${skill.version}`)}
 						<div class="skills-record skill-row" role="row">
 							<div><span class="field-label">Skill</span><strong>{skill.name}</strong><code>{skill.skill_id} · {skill.version}</code><span class="micro">{skill.description}</span></div>
 							<div><span class="field-label">Digest</span><code>{skill.source_digest}</code><span class="micro">{skill.source_format}</span></div>
 							<div><span class="field-label">Review</span><code>{skill.reviewed_by ? `${skill.reviewed_by.provider}/${skill.reviewed_by.subject}` : 'unreviewed'}</code><span class="micro">{skill.reviewed_at ?? skill.created_at}</span></div>
-							<div><span class:allowed={skill.enabled} class="skills-status">{skill.enabled ? 'enabled' : 'disabled'}</span></div>
+							<div>
+								<span class:allowed={skill.load_status === 'loaded'} class:warning={skill.load_status === 'excluded'} class="skills-status">{skill.load_status}</span>
+								<span class="micro">{skill.required ? 'required' : 'optional'}{skill.exclusion_reason ? ` · ${skill.exclusion_reason}` : ''}</span>
+							</div>
 						</div>
 					{/each}
 				</div>
@@ -74,16 +97,17 @@
 		</section>
 
 		<section class="skills-section">
-			<h2>Capture Drafts</h2>
+			<h2>Reviewable Capture Drafts</h2>
+			<p class="micro">Drafts preserve provenance, not historical raw inputs or outputs. Review every required variable and candidate step before requesting publication.</p>
 			{#if drafts.length === 0}
-				<div class="subtle-empty">No capture drafts.</div>
+				<div class="subtle-empty">{loadState === 'error' ? 'The previously loaded capture draft list was empty.' : 'No capture drafts.'}</div>
 			{:else}
 				<div class="draft-list" aria-label="Workflow capture drafts">
 					{#each drafts as draft (draft.draft_id)}
 						<article>
 							<header>
 								<div><h3>{draft.title}</h3><p>{draft.created_by.provider}/{draft.created_by.subject} · {draft.created_at}</p></div>
-								<button class="icon-button" type="button" aria-label={`Publish capture draft ${draft.title}`} title="Publish draft" onclick={() => publishDraft(draft)} disabled={busyKey === draft.draft_id}><Upload size={17} /></button>
+								<button class="icon-button" type="button" aria-label={`Request publication approval for ${draft.title}`} title="Review and request approval" onclick={() => publishDraft(draft)} disabled={busyKey === draft.draft_id}><Upload size={17} /></button>
 							</header>
 							<pre>{draft.body}</pre>
 						</article>
@@ -107,6 +131,7 @@
 	.micro { display: block; color: #73786f; font-size: 11px; }
 	.skills-status { width: max-content; border-radius: 4px; padding: 3px 6px; background: #f1e6d5; color: #865a1c; font-size: 11px; font-weight: 700; }
 	.skills-status.allowed { background: #e0eee5; color: #276344; }
+	.skills-status.warning { background: #fff0db; color: #8a560d; }
 	.draft-list { display: grid; gap: 10px; }
 	.draft-list article { border: 1px solid #dfe3dc; border-radius: 6px; background: #fff; overflow: hidden; }
 	.draft-list header { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #edf0ea; }

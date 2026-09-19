@@ -83,6 +83,40 @@ fn filesystem_proposals_are_normalized_to_path_scoped_capabilities() {
 }
 
 #[test]
+fn model_tool_catalog_uses_provider_safe_names() {
+    let context = run_context();
+    let normalizer =
+        BuiltinActionNormalizer::new(ComponentId::new("builtin.tools").expect("component ID"));
+    let tools = normalizer.model_tools(&context);
+
+    assert_eq!(
+        tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+        [
+            "filesystem_read",
+            "filesystem_write",
+            "process_spawn",
+            "network_egress"
+        ]
+    );
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.action_kind())
+            .collect::<Vec<_>>(),
+        [
+            "filesystem.read",
+            "filesystem.write",
+            "process.spawn",
+            "network.egress"
+        ]
+    );
+    assert!(tools.iter().all(|tool| matches!(
+        tool.input_schema(),
+        lumen_core::action::CanonicalValue::Object(_)
+    )));
+}
+
+#[test]
 fn network_egress_proposals_are_normalized_to_destination_scoped_capabilities() {
     let context = run_context();
     let normalizer =

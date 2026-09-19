@@ -3,6 +3,7 @@ use std::path::Path;
 use lumen_core::{
     action::{ActionEnvelope, ActionFingerprint, ActionId, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
+    capability::{Capability, CapabilityName, CapabilitySet, ResourceScope, WorkspacePath},
     identity::PrincipalId,
     identity::WorkspaceId,
     policy::PolicyVersion,
@@ -360,6 +361,42 @@ impl Database {
             .bind(recovered_at)
             .execute(&mut *transaction)
             .await?;
+            for execution in &recovered {
+                let payload = serde_json::json!({
+                    "run_id": execution.run_id().to_string(),
+                    "terminal_code": "execution_interrupted",
+                    "effect_certainty": "unknown",
+                    "primary_diagnostic": "execution outcome lost during restart",
+                })
+                .to_string();
+                sqlx::query(
+                    "UPDATE run_lifecycle SET phase = 'reconciliation_required',
+                        effect_certainty = 'unknown', terminal_code = 'execution_interrupted',
+                        primary_diagnostic = 'execution outcome lost during restart',
+                        terminal_audit_id = ?, terminal_audit_pending = 1,
+                        terminal_audit_occurred_at = ?, terminal_audit_payload_json = ?,
+                        updated_at = ?
+                     WHERE run_id = ? AND workspace_id = ?
+                       AND phase IN ('admitted', 'preparing', 'running',
+                                     'awaiting_approval', 'reserving_effect')",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(recovered_at)
+                .bind(payload)
+                .bind(recovered_at)
+                .bind(execution.run_id().to_string())
+                .bind(execution.workspace_id().to_string())
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE scheduled_job_runs SET state = 'unknown', updated_at = ?
+                     WHERE run_id = ? AND state = 'running'",
+                )
+                .bind(recovered_at)
+                .bind(execution.run_id().to_string())
+                .execute(&mut *transaction)
+                .await?;
+            }
         }
         transaction.commit().await?;
         Ok(recovered)
@@ -415,6 +452,36 @@ impl Database {
         actor: &PrincipalId,
         created_at: TimestampMillis,
     ) -> Result<(), RepositoryError> {
+        self.create_run_with_owner(run_id, workspace_id, actor, None, created_at)
+            .await
+    }
+
+    pub async fn create_owned_run(
+        &self,
+        run_id: RunId,
+        workspace_id: WorkspaceId,
+        actor: &PrincipalId,
+        owner_instance_id: uuid::Uuid,
+        created_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.create_run_with_owner(
+            run_id,
+            workspace_id,
+            actor,
+            Some(owner_instance_id),
+            created_at,
+        )
+        .await
+    }
+
+    async fn create_run_with_owner(
+        &self,
+        run_id: RunId,
+        workspace_id: WorkspaceId,
+        actor: &PrincipalId,
+        owner_instance_id: Option<uuid::Uuid>,
+        created_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
         let created_at = timestamp_to_i64(created_at)?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
@@ -437,6 +504,21 @@ impl Database {
         .bind(created_at)
         .execute(&mut *transaction)
         .await?;
+        if let Some(owner_instance_id) = owner_instance_id {
+            sqlx::query(
+                "INSERT INTO run_lifecycle (
+                    run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, 'admitted', 'no_effect', ?, ?)",
+            )
+            .bind(run_id.to_string())
+            .bind(workspace_id.to_string())
+            .bind(owner_instance_id.to_string())
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -447,19 +529,244 @@ impl Database {
         state: &str,
         completed_at: Option<TimestampMillis>,
     ) -> Result<(), RepositoryError> {
+        let expected_states = match state {
+            "running" => &["created", "awaiting_approval"][..],
+            "awaiting_approval" => &["running"][..],
+            "completed" | "failed" | "cancelled" => {
+                &["created", "running", "awaiting_approval"][..]
+            }
+            _ => return Err(RepositoryError::InvalidRunState(state.to_owned())),
+        };
+        self.transition_run_state(run_id, expected_states, state, completed_at)
+            .await
+    }
+
+    pub async fn transition_run_state(
+        &self,
+        run_id: lumen_core::action::RunId,
+        expected_states: &[&str],
+        state: &str,
+        completed_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
         if !matches!(
             state,
             "running" | "awaiting_approval" | "completed" | "failed" | "cancelled"
-        ) {
+        ) || expected_states.is_empty()
+            || expected_states.iter().any(|expected| {
+                !matches!(
+                    *expected,
+                    "created"
+                        | "running"
+                        | "awaiting_approval"
+                        | "completed"
+                        | "failed"
+                        | "cancelled"
+                )
+            })
+        {
             return Err(RepositoryError::InvalidRunState(state.to_owned()));
         }
-        sqlx::query("UPDATE agent_runs SET state = ?, completed_at = ? WHERE id = ?")
-            .bind(state)
-            .bind(completed_at.map(timestamp_to_i64).transpose()?)
-            .bind(run_id.to_string())
-            .execute(&self.pool)
-            .await?;
+        let mut query = sqlx::QueryBuilder::new("UPDATE agent_runs SET state = ");
+        query.push_bind(state);
+        query.push(", completed_at = ");
+        query.push_bind(completed_at.map(timestamp_to_i64).transpose()?);
+        query.push(" WHERE id = ");
+        query.push_bind(run_id.to_string());
+        query.push(" AND state IN (");
+        let mut separated = query.separated(", ");
+        for expected_state in expected_states {
+            separated.push_bind(*expected_state);
+        }
+        separated.push_unseparated(")");
+        let updated = query.build().execute(&self.pool).await?.rows_affected();
+        if updated != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
         Ok(())
+    }
+
+    pub async fn reject_approval_and_action(
+        &self,
+        workspace_id: WorkspaceId,
+        approval: &ApprovalRequest,
+    ) -> Result<RunId, RepositoryError> {
+        if approval.state() != lumen_core::approval::ApprovalState::Rejected {
+            return Err(RepositoryError::ApprovalDecisionConflict);
+        }
+        let approver = approval
+            .decided_by()
+            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
+        let decided_at = approval
+            .decided_at()
+            .ok_or(RepositoryError::ApprovalDecisionConflict)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO identities (provider, subject, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(approver.provider())
+        .bind(approver.subject())
+        .bind(timestamp_to_i64(decided_at)?)
+        .execute(&mut *transaction)
+        .await?;
+
+        let run_id: Option<String> = sqlx::query_scalar(
+            "SELECT actions.run_id
+             FROM approval_requests
+             JOIN actions ON actions.id = approval_requests.action_id
+             WHERE approval_requests.id = ?
+               AND approval_requests.state = 'pending'
+               AND approval_requests.action_fingerprint = ?
+               AND approval_requests.policy_version = ?
+               AND actions.workspace_id = ?
+               AND actions.fingerprint = approval_requests.action_fingerprint
+               AND actions.state = 'normalized'",
+        )
+        .bind(approval.id().to_string())
+        .bind(approval.action_fingerprint().as_str())
+        .bind(approval.policy_version().as_str())
+        .bind(workspace_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let run_id = run_id.ok_or(RepositoryError::ApprovalDecisionConflict)?;
+
+        let approval_updated = sqlx::query(
+            "UPDATE approval_requests
+             SET state = 'rejected', decided_by_provider = ?, decided_by_subject = ?, decided_at = ?
+             WHERE id = ? AND state = 'pending' AND action_fingerprint = ? AND policy_version = ?",
+        )
+        .bind(approver.provider())
+        .bind(approver.subject())
+        .bind(timestamp_to_i64(decided_at)?)
+        .bind(approval.id().to_string())
+        .bind(approval.action_fingerprint().as_str())
+        .bind(approval.policy_version().as_str())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if approval_updated != 1 {
+            return Err(RepositoryError::ApprovalDecisionConflict);
+        }
+        let action_updated = sqlx::query(
+            "UPDATE actions
+             SET state = 'denied', terminal_reason = 'approval_rejected'
+             WHERE id = (
+                 SELECT action_id FROM approval_requests WHERE id = ?
+             ) AND workspace_id = ? AND state = 'normalized'",
+        )
+        .bind(approval.id().to_string())
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if action_updated != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        transaction.commit().await?;
+        parse_uuid(run_id, RunId::from_uuid)
+    }
+
+    pub async fn terminalize_run(
+        &self,
+        run_id: lumen_core::action::RunId,
+        state: &str,
+        scheduled_state: Option<&str>,
+        completed_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(state, "completed" | "failed" | "cancelled")
+            || scheduled_state.is_some_and(|state| {
+                !matches!(state, "succeeded" | "failed" | "cancelled" | "unknown")
+            })
+        {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        let completed_at = timestamp_to_i64(completed_at)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let updated = sqlx::query(
+            "UPDATE agent_runs SET state = ?, completed_at = ?
+             WHERE id = ? AND state IN ('created', 'running', 'awaiting_approval')",
+        )
+        .bind(state)
+        .bind(completed_at)
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+                    .bind(run_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            if current.as_deref() != Some(state) {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+        }
+        if let Some(scheduled_state) = scheduled_state {
+            let updated = sqlx::query(
+                "UPDATE scheduled_job_runs SET state = ?, updated_at = ?
+                 WHERE run_id = ? AND state = 'running'",
+            )
+            .bind(scheduled_state)
+            .bind(completed_at)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if updated == 0 {
+                let current: Option<String> =
+                    sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE run_id = ?")
+                        .bind(run_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if current.as_deref() != Some(scheduled_state) {
+                    return Err(RepositoryError::ExecutionStateConflict);
+                }
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn force_fail_run_on_shutdown(
+        &self,
+        run_id: lumen_core::action::RunId,
+        completed_at: TimestampMillis,
+    ) -> Result<bool, RepositoryError> {
+        let completed_at = timestamp_to_i64(completed_at)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(state) = state else {
+            return Err(RepositoryError::ExecutionStateConflict);
+        };
+        let active = matches!(state.as_str(), "created" | "running" | "awaiting_approval");
+        if active {
+            let updated = sqlx::query(
+                "UPDATE agent_runs SET state = 'failed', completed_at = ?
+                 WHERE id = ? AND state IN ('created', 'running', 'awaiting_approval')",
+            )
+            .bind(completed_at)
+            .bind(run_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if updated != 1 {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+        }
+        let occurrence = sqlx::query(
+            "UPDATE scheduled_job_runs SET state = 'unknown', updated_at = ?
+             WHERE run_id = ? AND state = 'running'",
+        )
+        .bind(completed_at)
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        Ok(active || occurrence == 1)
     }
 
     pub async fn insert_workspace(
@@ -583,6 +890,94 @@ impl Database {
         Ok(())
     }
 
+    pub async fn renew_expired_approval(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        old_id: ApprovalId,
+        replacement: &ApprovalRequest,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        if replacement.state() != lumen_core::approval::ApprovalState::Pending
+            || replacement.created_at() != now
+            || replacement.expires_at() <= now
+        {
+            return Err(RepositoryError::ApprovalStale);
+        }
+        let now_i64 = timestamp_to_i64(now)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE approval_requests SET state = 'expired'
+             WHERE id = ? AND state = 'pending' AND expires_at <= ?
+               AND action_id IN (
+                   SELECT id FROM actions WHERE workspace_id = ? AND run_id = ?
+               )",
+        )
+        .bind(old_id.to_string())
+        .bind(now_i64)
+        .bind(workspace_id.to_string())
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let action_id: Option<String> = sqlx::query_scalar(
+            "SELECT action.id FROM approval_requests old
+             JOIN actions action ON action.id = old.action_id
+             JOIN agent_runs run ON run.id = action.run_id
+             JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id
+             WHERE old.id = ? AND old.state = 'expired'
+               AND old.expires_at <= ? AND old.replacement_approval_id IS NULL
+               AND old.action_fingerprint = ? AND old.policy_version = ?
+               AND action.fingerprint = old.action_fingerprint
+               AND action.state = 'normalized' AND action.workspace_id = ?
+               AND run.id = ? AND run.workspace_id = ?
+               AND run.state = 'awaiting_approval'
+               AND lifecycle.phase = 'awaiting_approval'
+               AND NOT EXISTS (
+                   SELECT 1 FROM approval_requests other
+                   WHERE other.action_id = action.id AND other.id <> old.id
+                     AND other.state IN ('pending', 'granted')
+               )",
+        )
+        .bind(old_id.to_string())
+        .bind(now_i64)
+        .bind(replacement.action_fingerprint().as_str())
+        .bind(replacement.policy_version().as_str())
+        .bind(workspace_id.to_string())
+        .bind(run_id.to_string())
+        .bind(workspace_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let action_id = action_id.ok_or(RepositoryError::ApprovalStale)?;
+        sqlx::query(
+            "INSERT INTO approval_requests (
+                id, action_id, action_fingerprint, policy_version, state,
+                created_at, expires_at
+             ) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(replacement.id().to_string())
+        .bind(action_id)
+        .bind(replacement.action_fingerprint().as_str())
+        .bind(replacement.policy_version().as_str())
+        .bind(now_i64)
+        .bind(timestamp_to_i64(replacement.expires_at())?)
+        .execute(&mut *transaction)
+        .await?;
+        let changed = sqlx::query(
+            "UPDATE approval_requests SET replacement_approval_id = ?
+             WHERE id = ? AND state = 'expired' AND replacement_approval_id IS NULL",
+        )
+        .bind(replacement.id().to_string())
+        .bind(old_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(RepositoryError::ApprovalStale);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_approval_decision(
         &self,
         workspace_id: WorkspaceId,
@@ -607,10 +1002,13 @@ impl Database {
             "UPDATE approval_requests
              SET state = ?, decided_by_provider = ?, decided_by_subject = ?, decided_at = ?
              WHERE id = ? AND state = 'pending'
+               AND action_fingerprint = ?
+               AND policy_version = ?
                AND EXISTS (
                    SELECT 1 FROM actions
                    WHERE actions.id = approval_requests.action_id
                      AND actions.workspace_id = ?
+                     AND actions.fingerprint = approval_requests.action_fingerprint
                )",
         )
         .bind(approval.state().as_str())
@@ -618,10 +1016,47 @@ impl Database {
         .bind(approver.subject())
         .bind(timestamp_to_i64(decided_at)?)
         .bind(approval.id().to_string())
+        .bind(approval.action_fingerprint().as_str())
+        .bind(approval.policy_version().as_str())
         .bind(workspace_id.to_string())
         .execute(&mut *transaction)
         .await?;
         if result.rows_affected() != 1 {
+            let current = sqlx::query(
+                "SELECT approval_requests.state,
+                        approval_requests.action_fingerprint AS approval_fingerprint,
+                        approval_requests.policy_version,
+                        actions.fingerprint AS action_fingerprint
+                 FROM approval_requests
+                 JOIN actions ON actions.id = approval_requests.action_id
+                 WHERE approval_requests.id = ? AND actions.workspace_id = ?",
+            )
+            .bind(approval.id().to_string())
+            .bind(workspace_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(current) = current {
+                match current.try_get::<String, _>("state")?.as_str() {
+                    "expired" => return Err(RepositoryError::ApprovalExpired),
+                    "consumed" => return Err(RepositoryError::ApprovalConsumed),
+                    "invalidated" => return Err(RepositoryError::ApprovalStale),
+                    "pending" => {
+                        if current.try_get::<String, _>("action_fingerprint")?
+                            != approval.action_fingerprint().as_str()
+                        {
+                            return Err(RepositoryError::ApprovalActionChanged);
+                        }
+                        if current.try_get::<String, _>("approval_fingerprint")?
+                            != approval.action_fingerprint().as_str()
+                            || current.try_get::<String, _>("policy_version")?
+                                != approval.policy_version().as_str()
+                        {
+                            return Err(RepositoryError::ApprovalStale);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             return Err(RepositoryError::ApprovalDecisionConflict);
         }
         transaction.commit().await?;
@@ -631,7 +1066,9 @@ impl Database {
     pub async fn list_pending_approvals(
         &self,
         workspace_id: WorkspaceId,
+        now: TimestampMillis,
     ) -> Result<Vec<PendingApprovalView>, RepositoryError> {
+        self.expire_pending_approvals(workspace_id, now).await?;
         let rows = sqlx::query(
             "SELECT approvals.id AS approval_id, actions.run_id, actions.kind,
                     actions.arguments_json, actions.capabilities_json,
@@ -671,12 +1108,44 @@ impl Database {
             .collect()
     }
 
+    pub async fn expire_pending_approvals(
+        &self,
+        workspace_id: WorkspaceId,
+        now: TimestampMillis,
+    ) -> Result<u64, RepositoryError> {
+        sqlx::query(
+            "UPDATE approval_requests SET state = 'expired'
+             WHERE state = 'pending' AND expires_at <= ?
+               AND action_id IN (SELECT id FROM actions WHERE workspace_id = ?)",
+        )
+        .bind(timestamp_to_i64(now)?)
+        .bind(workspace_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(Into::into)
+    }
+
     pub async fn reserve_execution(
         &self,
         reservation: DispatchReservation,
     ) -> Result<(), RepositoryError> {
-        let reserved_at = timestamp_to_i64(reservation.reserved_at)?;
+        let reserved_at = reservation.reserved_at;
+        self.reserve_execution_with_clock(reservation, move || reserved_at)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn reserve_execution_with_clock<F>(
+        &self,
+        reservation: DispatchReservation,
+        clock: F,
+    ) -> Result<TimestampMillis, RepositoryError>
+    where
+        F: FnOnce() -> TimestampMillis,
+    {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let reserved_at = timestamp_to_i64(clock())?;
         let updated = sqlx::query(
             "UPDATE approval_requests
              SET state = 'consumed', consumed_at = ?
@@ -700,6 +1169,15 @@ impl Database {
             return Err(RepositoryError::ApprovalNotAvailable);
         }
 
+        transition_action_lifecycle(
+            &mut transaction,
+            reservation.action_id,
+            "running",
+            "reserving_effect",
+            reserved_at,
+        )
+        .await?;
+
         sqlx::query(
             "INSERT INTO execution_attempts (
                 id, action_id, approval_id, state, reserved_at
@@ -718,7 +1196,9 @@ impl Database {
             .await?;
 
         transaction.commit().await?;
-        Ok(())
+        Ok(TimestampMillis::new(
+            u64::try_from(reserved_at).map_err(|_| RepositoryError::TimestampOutOfRange)?,
+        ))
     }
 
     pub async fn reserve_allowed_execution(
@@ -743,6 +1223,14 @@ impl Database {
         if result.rows_affected() != 1 {
             return Err(RepositoryError::ExecutionStateConflict);
         }
+        transition_action_lifecycle(
+            &mut transaction,
+            action_id,
+            "running",
+            "reserving_effect",
+            reserved_at,
+        )
+        .await?;
         sqlx::query("UPDATE actions SET state = 'running' WHERE id = ?")
             .bind(action_id.to_string())
             .execute(&mut *transaction)
@@ -779,6 +1267,14 @@ impl Database {
         if result.rows_affected() != 1 {
             return Err(RepositoryError::ExecutionStateConflict);
         }
+        transition_action_lifecycle(
+            &mut transaction,
+            action_id,
+            "reserving_effect",
+            "running",
+            completed_at,
+        )
+        .await?;
         sqlx::query("UPDATE actions SET state = ? WHERE id = ?")
             .bind(state)
             .bind(action_id.to_string())
@@ -804,6 +1300,194 @@ impl Database {
         }
         Ok(())
     }
+}
+
+async fn transition_action_lifecycle(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    action_id: ActionId,
+    expected: &str,
+    next: &str,
+    timestamp: i64,
+) -> Result<(), RepositoryError> {
+    let scheduled: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM scheduled_job_runs occurrence
+             JOIN actions action ON action.run_id = occurrence.run_id
+             WHERE action.id = ?
+         )",
+    )
+    .bind(action_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if expected == "running" && scheduled == 1 {
+        let authorized: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM actions action
+                 JOIN scheduled_job_runs occurrence ON occurrence.run_id = action.run_id
+                 JOIN scheduled_job_leases lease
+                   ON lease.occurrence_key = occurrence.occurrence_key
+                 JOIN scheduled_jobs job ON job.job_id = occurrence.job_id
+                 JOIN scheduled_job_revisions revision
+                   ON revision.job_id = job.job_id AND revision.revision = occurrence.revision
+                 JOIN service_identities service
+                   ON service.provider = job.service_provider
+                  AND service.subject = job.service_subject
+                  AND service.workspace_id = job.workspace_id
+                 WHERE action.id = ? AND occurrence.state = 'running'
+                   AND occurrence.start_lease_id = lease.lease_id
+                   AND lease.expires_at > ?
+                   AND job.workspace_id = action.workspace_id
+                   AND action.actor_provider = service.provider
+                   AND action.actor_subject = service.subject
+                   AND service.enabled = 1 AND revision.enabled = 1
+                   AND revision.revision = (
+                       SELECT MAX(latest.revision) FROM scheduled_job_revisions latest
+                       WHERE latest.job_id = job.job_id
+                   )
+             )",
+        )
+        .bind(action_id.to_string())
+        .bind(timestamp)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if authorized != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        let (required_json, provider, subject, workspace): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT action.capabilities_json, job.service_provider,
+                        job.service_subject, job.workspace_id
+                 FROM actions action
+                 JOIN scheduled_job_runs occurrence ON occurrence.run_id = action.run_id
+                 JOIN scheduled_jobs job ON job.job_id = occurrence.job_id
+                 WHERE action.id = ?",
+            )
+            .bind(action_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT capability_name, scope_kind, scope_workspace_id, scope_path,
+                    scope_resource_type, scope_resource_value
+             FROM service_identity_grants
+             WHERE provider = ? AND subject = ? AND workspace_id = ?",
+        )
+        .bind(provider)
+        .bind(subject)
+        .bind(workspace)
+        .fetch_all(&mut **transaction)
+        .await?;
+        let grants = CapabilitySet::new(
+            rows.into_iter()
+                .map(|row| {
+                    let name = CapabilityName::parse(&row.try_get::<String, _>("capability_name")?)
+                        .ok_or(RepositoryError::InvalidAutomationState)?;
+                    Ok(Capability::new(
+                        name,
+                        crate::automation::scope_from_row(&row)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, RepositoryError>>()?,
+        );
+        if !required_capabilities_from_json(&required_json)?
+            .iter()
+            .all(|capability| grants.allows(capability))
+        {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+    }
+    let current: Option<String> = sqlx::query_scalar(
+        "SELECT lifecycle.phase FROM run_lifecycle lifecycle
+         JOIN actions action ON action.run_id = lifecycle.run_id
+         WHERE action.id = ?",
+    )
+    .bind(action_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(current) = current else {
+        // Older standalone action records have no owned run marker.
+        return Ok(());
+    };
+    if current != expected {
+        return Err(RepositoryError::ExecutionStateConflict);
+    }
+    let changed = sqlx::query(
+        "UPDATE run_lifecycle SET phase = ?, updated_at = ?
+         WHERE run_id = (SELECT run_id FROM actions WHERE id = ?)
+           AND phase = ?",
+    )
+    .bind(next)
+    .bind(timestamp)
+    .bind(action_id.to_string())
+    .bind(expected)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        return Err(RepositoryError::ExecutionStateConflict);
+    }
+    Ok(())
+}
+
+fn required_capabilities_from_json(value: &str) -> Result<Vec<Capability>, RepositoryError> {
+    let parsed: serde_json::Value = serde_json::from_str(value)?;
+    let items = parsed
+        .as_array()
+        .ok_or(RepositoryError::InvalidAutomationState)?;
+    items
+        .iter()
+        .map(|item| {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .and_then(CapabilityName::parse)
+                .ok_or(RepositoryError::InvalidAutomationState)?;
+            let scope = item
+                .get("scope")
+                .ok_or(RepositoryError::InvalidAutomationState)?;
+            let kind = scope
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(RepositoryError::InvalidAutomationState)?;
+            let resource = match kind {
+                "workspace" | "path" => {
+                    let workspace = scope
+                        .get("workspace_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(RepositoryError::InvalidAutomationState)?;
+                    let workspace = WorkspaceId::from_uuid(
+                        Uuid::parse_str(workspace)
+                            .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    );
+                    if kind == "workspace" {
+                        ResourceScope::workspace(workspace)
+                    } else {
+                        let path = scope
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or(RepositoryError::InvalidAutomationState)?;
+                        ResourceScope::path(
+                            workspace,
+                            WorkspacePath::parse(path)
+                                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                        )
+                    }
+                }
+                "exact" => ResourceScope::exact(
+                    scope
+                        .get("resource_type")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(RepositoryError::InvalidAutomationState)?,
+                    scope
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(RepositoryError::InvalidAutomationState)?,
+                )
+                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                _ => return Err(RepositoryError::InvalidAutomationState),
+            };
+            Ok(Capability::new(name, resource))
+        })
+        .collect()
 }
 
 fn secret_reference_from_row(

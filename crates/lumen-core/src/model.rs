@@ -16,6 +16,7 @@ pub trait ModelPort: Send + Sync {
 pub struct ModelInput {
     messages: Vec<ModelMessage>,
     data_class: DataClass,
+    tools: Vec<ModelTool>,
 }
 
 impl ModelInput {
@@ -23,6 +24,7 @@ impl ModelInput {
         Self {
             messages,
             data_class: DataClass::Workspace,
+            tools: Vec::new(),
         }
     }
 
@@ -38,17 +40,91 @@ impl ModelInput {
     pub const fn data_class(&self) -> DataClass {
         self.data_class
     }
+
+    pub fn with_tools(mut self, tools: Vec<ModelTool>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn tools(&self) -> &[ModelTool] {
+        &self.tools
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelTool {
+    name: String,
+    description: String,
+    action_kind: String,
+    input_schema: CanonicalValue,
+}
+
+impl ModelTool {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        action_kind: impl Into<String>,
+        input_schema: CanonicalValue,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            action_kind: action_kind.into(),
+            input_schema,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn action_kind(&self) -> &str {
+        &self.action_kind
+    }
+
+    pub const fn input_schema(&self) -> &CanonicalValue {
+        &self.input_schema
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelMessage {
     role: ModelRole,
     content: CanonicalValue,
+    tool_call: Option<ModelToolCall>,
+    tool_call_id: Option<String>,
 }
 
 impl ModelMessage {
     pub const fn new(role: ModelRole, content: CanonicalValue) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            tool_call: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_tool_call(call: ModelToolCall) -> Self {
+        Self {
+            role: ModelRole::Assistant,
+            content: CanonicalValue::Null,
+            tool_call: Some(call),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(call_id: impl Into<String>, content: CanonicalValue) -> Self {
+        Self {
+            role: ModelRole::Tool,
+            content,
+            tool_call: None,
+            tool_call_id: Some(call_id.into()),
+        }
     }
 
     pub const fn role(&self) -> ModelRole {
@@ -57,6 +133,43 @@ impl ModelMessage {
 
     pub const fn content(&self) -> &CanonicalValue {
         &self.content
+    }
+
+    pub const fn tool_call(&self) -> Option<&ModelToolCall> {
+        self.tool_call.as_ref()
+    }
+
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelToolCall {
+    id: String,
+    name: String,
+    arguments: CanonicalValue,
+}
+
+impl ModelToolCall {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: CanonicalValue) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn arguments(&self) -> &CanonicalValue {
+        &self.arguments
     }
 }
 
@@ -77,6 +190,8 @@ pub enum ModelOutput {
 pub struct ActionProposal {
     kind: String,
     arguments: CanonicalValue,
+    #[serde(skip_serializing)]
+    tool_call: Option<ModelToolCall>,
 }
 
 impl ActionProposal {
@@ -84,11 +199,21 @@ impl ActionProposal {
         Self {
             kind: kind.into(),
             arguments,
+            tool_call: None,
         }
+    }
+
+    pub fn with_tool_call(mut self, tool_call: ModelToolCall) -> Self {
+        self.tool_call = Some(tool_call);
+        self
     }
 
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    pub const fn tool_call(&self) -> Option<&ModelToolCall> {
+        self.tool_call.as_ref()
     }
 
     pub fn into_arguments(self) -> CanonicalValue {

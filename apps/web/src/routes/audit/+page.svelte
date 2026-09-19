@@ -4,30 +4,48 @@
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import { ApiClient, ApiError, type AuditEvent } from '$lib/api';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	let events = $state<AuditEvent[]>([]);
 	let expanded = $state<number | null>(null);
-	let loading = $state(true);
-	let error = $state('');
+	let loadState = $state<'loading' | 'success' | 'error'>('loading');
+	let loadError = $state('');
+	let lastLoadedAt = $state('');
+	let loadedWorkspace = $state('');
 
 	onMount(load);
 
 	async function load() {
-		if (!isConfigured($connection)) { loading = false; return; }
-		loading = true;
-		try { events = await new ApiClient($connection).listAudit(); error = ''; }
-		catch (cause) { error = cause instanceof ApiError ? cause.message : 'Audit events could not be loaded.'; }
-		finally { loading = false; }
+		if ($connectionState.kind !== 'connected') {
+			loadState = 'error';
+			loadError = 'Runtime connection is not verified. Open connection settings.';
+			return;
+		}
+		loadState = 'loading';
+		try {
+			events = await new ApiClient($connection).listAudit();
+			loadError = '';
+			lastLoadedAt = new Date().toLocaleString();
+			loadedWorkspace = $connection.workspaceId;
+			loadState = 'success';
+		} catch (cause) {
+			loadError = cause instanceof ApiError ? cause.message : 'Audit events could not be loaded.';
+			loadState = 'error';
+		}
 	}
 </script>
 
 <section class="page audit-page">
 	<header class="page-heading">
-		<div><h1>Audit</h1><p>Ordered runtime events</p></div>
-		<button class="icon-button" type="button" aria-label="Refresh audit events" title="Refresh" onclick={load} disabled={loading}><RefreshCw size={17} /></button>
+		<div><h1>Audit</h1><p>First 100 ordered runtime events; use the QA inspector for complete run provenance.</p></div>
+		<button class="icon-button" type="button" aria-label="Refresh audit events" title="Refresh" onclick={load} disabled={loadState === 'loading'}><RefreshCw size={17} /></button>
 	</header>
-	{#if error}<div class="notice error">{error}</div>{/if}
+	{#if loadError}
+		<div class="notice error" role="alert">{loadError} <button type="button" onclick={load}>Retry</button></div>
+	{/if}
+	{#if loadState === 'error' && lastLoadedAt}
+		<div class="notice" role="status">Showing stale data for workspace {loadedWorkspace} from {lastLoadedAt}.</div>
+	{/if}
 	<div class="audit-table" role="table" aria-label="Audit events">
 		<div class="audit-header" role="row"><span>Seq</span><span>Event</span><span>Outcome</span><span>Time</span><span></span></div>
 		{#each events as event (event.sequence)}
@@ -44,7 +62,13 @@
 				<div class="audit-detail"><pre>{JSON.stringify(event.payload, null, 2)}</pre><code>{event.event_id}</code></div>
 			{/if}
 		{/each}
-		{#if !loading && events.length === 0}<div class="empty">No audit events.</div>{/if}
+		{#if loadState === 'loading' && !lastLoadedAt}
+			<div class="empty">Loading audit events...</div>
+		{:else if loadState === 'error' && !lastLoadedAt}
+			<div class="empty">Audit data is unavailable.</div>
+		{:else if events.length === 0}
+			<div class="empty">{loadState === 'error' ? 'The previously loaded audit event list was empty.' : 'No audit events.'}</div>
+		{/if}
 	</div>
 </section>
 

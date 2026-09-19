@@ -103,7 +103,9 @@ Skill context does not grant capabilities, approve actions, change policy, or by
 
 ## Workflow Capture
 
-Workflow capture creates draft skill material only from completed source runs whose audit chain verifies. Draft bodies are generated from persisted run, action, and audit records, include source run IDs, action kinds, action argument digests, required-variable notes, expected outputs, and failure notes, and avoid copying raw action arguments or known secret values.
+Workflow capture creates a reviewable, provenance-backed draft only from completed source runs whose audit chain verifies. A tool-bearing draft records the source run and workspace, ordered action kinds and states, action-argument digests, ordered audit events, and candidate steps that require fresh operator-approved inputs. A zero-action capture is labeled provenance-only and is not evidence of learned reusable behavior.
+
+Capture is not replay reconstruction. Historical raw action inputs and tool outputs are unavailable, and Lumen never adds raw secret values to make a draft replayable. Before publishing, the operator must verify the provenance, decide whether each action remains appropriate, define every fresh non-secret variable, confirm expected results and failure conditions, and reject incomplete drafts. Publishing records that review and source integrity; it does not prove that changed inputs will succeed.
 
 Publishing a capture draft as a reviewed skill is a `skill.publish` action. It requires the `skill.publish` capability, goes through approval, dispatch reservation, execution, and audit, writes immutable local skill source, stores the reviewed skill version digest in SQL, and enables the version for the workspace only after approval is consumed.
 
