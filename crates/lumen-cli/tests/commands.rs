@@ -142,6 +142,47 @@ async fn audit_verify_rejects_a_tampered_persisted_event() {
 }
 
 #[tokio::test]
+async fn sandbox_report_does_not_require_config_or_create_runtime_state() {
+    let directory = tempdir().expect("temporary directory");
+    let config = directory.path().join("missing.toml");
+    let cli = || Cli {
+        config: config.clone(),
+        command: Command::Sandbox {
+            command: SandboxCommand::Report,
+        },
+    };
+
+    let public = execute(cli()).await.expect("public sandbox report");
+    let injected = execute_with_secret_store(cli(), Arc::new(InMemorySecretStore::new()), None)
+        .await
+        .expect("injected sandbox report");
+    assert!(matches!(public, CommandOutput::SandboxReport(_)));
+    assert!(matches!(injected, CommandOutput::SandboxReport(_)));
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("fixture root")
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn runtime_commands_still_reject_invalid_config() {
+    let directory = tempdir().expect("temporary directory");
+    let config = directory.path().join("invalid.toml");
+    std::fs::write(&config, "not = [valid").expect("invalid fixture");
+
+    let error = execute(Cli {
+        config,
+        command: Command::Migrate,
+    })
+    .await
+    .expect_err("migration requires valid config");
+    assert!(matches!(error, CliError::Config(_)));
+    assert!(!directory.path().join("lumen.sqlite3").exists());
+}
+
+#[tokio::test]
 async fn sandbox_report_describes_the_detected_platform_without_starting_runtime() {
     let directory = tempdir().expect("temporary directory");
     let config = write_config(directory.path());

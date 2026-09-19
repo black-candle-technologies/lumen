@@ -364,6 +364,9 @@ test.beforeEach(async ({ page }) => {
 		});
 		await route.fulfill({ status: 202, json: { run_id: 'run-job', state: 'approval_requested' } });
 	});
+	await page.route('**/api/v1/workspaces/*/runs/run-job/status', async (route) => {
+		await route.fulfill({ json: { run_id: 'run-job', state: 'awaiting_approval' } });
+	});
 	await page.route('**/api/v1/workspaces/*/skills/capture-drafts/*/publish', async (route) => {
 		expect(route.request().postDataJSON()).toMatchObject({
 			version: '1.0.0',
@@ -669,6 +672,118 @@ test('shows exact approval details and handles a changed action conflict', async
 	await page.screenshot({ path: testInfo.outputPath('approval-controls.png') });
 });
 
+test('shows validated job and skill publication previews with authoritative state changes', async ({ page }) => {
+	const jobId = '05e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	const runAt = 1767225600000;
+	const jobArguments = (id: string, enabled: boolean, previousRevision: number | null, previousEnabled: boolean | null) => ({
+		job_id: id,
+		service_provider: 'service',
+		service_subject: 'nightly',
+		owner_provider: 'local',
+		owner_subject: 'operator',
+		schedule: { kind: 'interval', start_at: runAt, interval_millis: 3600000 },
+		prompt: `Review ${'the long authorization queue '.repeat(20)}`,
+		data_class: 'workspace',
+		max_model_turns: 4,
+		max_actions: 8,
+		enabled,
+		next_due_at: enabled ? runAt : null,
+		idempotent: true,
+		previous_revision: previousRevision,
+		previous_enabled: previousEnabled,
+		target_revision: previousRevision === null ? 1 : previousRevision + 1
+	});
+	const approval = (approvalId: string, kind: string, arguments_: Record<string, unknown>, expiresAt = 9999999999999) => ({
+		approval_id: approvalId,
+		run_id: `run-${approvalId}`,
+		kind,
+		arguments: arguments_,
+		capabilities: [],
+		fingerprint: 'e'.repeat(64),
+		created_at: 10,
+		expires_at: expiresAt
+	});
+	await page.unroute('**/api/v1/workspaces/*/approvals');
+	await page.route('**/api/v1/workspaces/*/approvals', async (route) => {
+		await route.fulfill({
+			json: {
+				server_time: 1000,
+				approvals: [
+					approval('job-create', 'schedule.job.create', jobArguments(jobId, true, null, null)),
+					approval('job-pause', 'schedule.job.update', jobArguments('35e0bb38-b491-4532-b9b6-0ac57ec4f357', false, 2, true)),
+					approval('job-resume', 'schedule.job.enable', jobArguments('45e0bb38-b491-4532-b9b6-0ac57ec4f357', true, 3, false)),
+					approval('job-stale', 'schedule.job.update', jobArguments('15e0bb38-b491-4532-b9b6-0ac57ec4f357', false, 4, true)),
+					approval('job-expired', 'schedule.job.update', jobArguments('25e0bb38-b491-4532-b9b6-0ac57ec4f357', false, 5, true), 500),
+					approval('skill-publish', 'skill.publish', {
+						draft_id: '00000000-0000-4000-8000-000000000000',
+						skill_id: '7f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763',
+						version: '1.2.3',
+						name: 'Captured triage workflow',
+						description: 'Review and route the verified queue.',
+						source_format: 'markdown',
+						source_digest: `sha256:${'a'.repeat(64)}`,
+						source_run_id: '9f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763'
+					}),
+					approval('malformed', 'schedule.job.update', { job_id: 'not-a-uuid' }),
+					approval('invalid-date', 'schedule.job.create', {
+						...jobArguments('55e0bb38-b491-4532-b9b6-0ac57ec4f357', true, null, null),
+						schedule: { kind: 'once', run_at: Number.MAX_SAFE_INTEGER }
+					}),
+					approval('unknown', 'unknown.action', {})
+				]
+			}
+		});
+	});
+	let rejected = false;
+	await page.route('**/approvals/job-create/decision', async (route) => {
+		rejected = route.request().postDataJSON().decision === 'reject';
+		await route.fulfill({ status: 204 });
+	});
+	await page.route('**/approvals/job-stale/decision', async (route) => {
+		await route.fulfill({ status: 409, json: { error: { code: 'approval_stale', message: 'stale' } } });
+	});
+
+	await page.goto('/approvals');
+	const create = page.locator('article').filter({ hasText: jobId });
+	const pause = page.locator('article').filter({ hasText: '35e0bb38-b491-4532-b9b6-0ac57ec4f357' });
+	const resume = page.locator('article').filter({ hasText: '45e0bb38-b491-4532-b9b6-0ac57ec4f357' });
+	const stale = page.locator('article').filter({ hasText: '15e0bb38-b491-4532-b9b6-0ac57ec4f357' });
+	const expired = page.locator('article').filter({ hasText: '25e0bb38-b491-4532-b9b6-0ac57ec4f357' });
+	const skill = page.locator('article').filter({ hasText: '7f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763@1.2.3' });
+	const localSchedule = await page.evaluate((timestamp) => new Date(timestamp).toLocaleString(undefined, { timeZoneName: 'short' }), runAt);
+
+	await expect(skill).toContainText('Run declared in draft');
+	await expect(create).toContainText(localSchedule);
+	await expect(create).toContainText('Every 1 hour from');
+	await expect(create).toContainText('service/nightly');
+	await expect(create).toContainText('workspace');
+	await expect(create).toContainText('4 model turns · 8 actions');
+	await expect(create).toContainText('Not created');
+	await expect(create).toContainText('Enabled · revision 1');
+	await expect(pause).toContainText('Enabled · revision 2');
+	await expect(pause).toContainText('Paused · revision 3');
+	await expect(resume).toContainText('Paused · revision 3');
+	await expect(resume).toContainText('Enabled · revision 4');
+	await expect(expired.getByRole('button', { name: 'Grant approval' })).toBeDisabled();
+	await expect(expired.getByRole('button', { name: 'Renew approval' })).toBeVisible();
+
+	await expect(skill).toContainText('Captured triage workflow');
+	await expect(skill).toContainText('7f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763@1.2.3');
+	await expect(skill).toContainText(`sha256:${'a'.repeat(64)}`);
+	await expect(skill).toContainText('00000000-0000-4000-8000-000000000000');
+	await expect(skill).toContainText('9f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763');
+	await expect(skill).toContainText('does not grant capabilities or expose the protected draft body');
+	await expect(page.getByText('No action-specific preview is available')).toHaveCount(3);
+
+	await stale.getByRole('button', { name: 'Grant approval' }).click();
+	await expect(page.getByText('This approval is stale. Refresh and review the current request.')).toBeVisible();
+	await create.getByRole('button', { name: 'Reject approval' }).focus();
+	await page.keyboard.press('Enter');
+	expect(rejected).toBe(true);
+	await expect(create).toHaveCount(0);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
 test('expires an in-flight approval and renews it with disabled stale controls', async ({ page }) => {
 	let renewed = false;
 	await page.unroute('**/api/v1/workspaces/*/approvals');
@@ -792,14 +907,251 @@ test('shows automation controls and pauses scheduled jobs through approval reque
 	await expect(page.getByRole('heading', { name: 'Automation' })).toBeVisible();
 	await expect(page.getByText('Nightly reviewer')).toBeVisible();
 	await expect(page.getByText('service/nightly').first()).toBeVisible();
-	await expect(page.getByText('every 60000 ms from 1000')).toBeVisible();
+	const job = page.locator('.automation-record').filter({ hasText: '05e0bb38-b491-4532-b9b6-0ac57ec4f357' });
+	const next = await page.evaluate(() => new Date(2000).toLocaleString(undefined, { timeZoneName: 'short' }));
+	await expect(job).toContainText('Every 1m from');
+	await expect(job).toContainText('start_at=1000 interval_millis=60000');
+	await expect(job).toContainText(`Next ${next}`);
+	await expect(job).toContainText('revision 2');
+	if (testInfo.project.name === 'mobile') await expect(job.locator('.field-label').first()).toBeVisible();
+	else {
+		await expect(job.locator('.field-label').first()).toBeHidden();
+		await expect(page.getByRole('columnheader', { name: 'Schedule' })).toBeVisible();
+	}
+	await expect(job.getByRole('cell').filter({ hasText: 'start_at=1000' })).toContainText('start_at=1000');
 	await expect(page.getByText('model.prompt')).toHaveCount(0);
 	await expect(page.getByText('browser-secret-must-not-render')).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-	await page.getByRole('button', { name: /Pause job/ }).click();
+	const pause = page.getByRole('button', { name: /Pause job/ });
+	await pause.click();
 	await expect(page.getByText('Approval requested: run-job')).toBeVisible();
-	await expect(page.getByRole('button', { name: /Pause job/ })).toBeVisible();
+	await expect(job).toContainText('Change pending approval; persisted state: enabled');
+	await expect(job.locator('.automation-status')).toHaveText('enabled');
+	await expect(pause).toBeDisabled();
 	await page.screenshot({ path: testInfo.outputPath('automation.png') });
+});
+
+test('keeps each job disabled during concurrent approval requests', async ({ page }) => {
+	const firstId = '05e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	const secondId = '15e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	let started!: () => void;
+	let release!: () => void;
+	const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+	const firstReleased = new Promise<void>((resolve) => { release = resolve; });
+	await page.unroute('**/api/v1/workspaces/*/automation/jobs');
+	await page.route('**/api/v1/workspaces/*/automation/jobs', async (route) => {
+		const job = (id: string) => ({
+			job_id: id, revision: 2, workspace_id: workspaceId,
+			service: { provider: 'service', subject: 'nightly' },
+			owner: { provider: 'local', subject: 'operator' },
+			schedule: { kind: 'once', run_at: 1000 }, prompt: id,
+			data_class: 'workspace', max_model_turns: 4, max_actions: 8,
+			enabled: true, next_due_at: 2000, idempotent: true, created_at: 10
+		});
+		await route.fulfill({ json: { jobs: [job(firstId), job(secondId)] } });
+	});
+	await page.unroute('**/api/v1/workspaces/*/automation/jobs/*');
+	await page.route('**/api/v1/workspaces/*/automation/jobs/*', async (route) => {
+		if (route.request().url().endsWith(firstId)) { started(); await firstReleased; }
+		await route.fulfill({ status: 202, json: { run_id: 'run-job', state: 'approval_requested' } });
+	});
+	await page.goto('/automation');
+	const first = page.getByRole('button', { name: `Pause job ${firstId}` });
+	const second = page.getByRole('button', { name: `Pause job ${secondId}` });
+	await first.click();
+	await firstStarted;
+	try {
+		await second.click();
+		await expect(second).toBeDisabled();
+		await expect(first).toBeDisabled();
+	} finally { release(); }
+});
+
+test('keeps a job request guarded until its run is terminal', async ({ page }) => {
+	const jobId = '05e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	let approvalPending = true;
+	let releaseTerminal!: () => void;
+	const terminalReady = new Promise<void>((resolve) => { releaseTerminal = resolve; });
+	await page.route('**/api/v1/workspaces/*/runs/run-job/events', async (route) => {
+		await terminalReady;
+		await route.fulfill({ contentType: 'text/event-stream', body: 'id: 1\nevent: run.failed\ndata: {}\n\n' });
+	});
+	await page.unroute('**/api/v1/workspaces/*/approvals');
+	await page.route('**/api/v1/workspaces/*/approvals', async (route) => {
+		await route.fulfill({ json: {
+			server_time: 1000,
+			approvals: approvalPending ? [{
+				approval_id: 'approval-job', run_id: 'run-job', kind: 'schedule.job.update',
+				arguments: { job_id: jobId }, capabilities: [], fingerprint: 'a'.repeat(64),
+				created_at: 10, expires_at: 9999999999999
+			}] : []
+		} });
+	});
+	await page.goto('/automation');
+	const pause = page.getByRole('button', { name: `Pause job ${jobId}` });
+	await pause.click();
+	await expect(pause).toBeDisabled();
+	await page.getByRole('button', { name: 'Refresh automation controls' }).click();
+	await expect(pause).toBeDisabled();
+	approvalPending = false;
+	try {
+		await page.getByRole('button', { name: 'Refresh automation controls' }).click();
+		await expect(pause).toBeDisabled();
+	} finally { releaseTerminal(); }
+	await expect(pause).toBeEnabled();
+	await expect(page.locator('.automation-record').filter({ hasText: jobId })).not.toContainText('Change pending approval');
+});
+
+test('replays a disconnected run stream on refresh before restoring job controls', async ({ page }) => {
+	const jobId = '05e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	let streams = 0;
+	await page.route('**/api/v1/workspaces/*/runs/run-job/events', async (route) => {
+		streams++;
+		if (streams === 1) {
+			await route.fulfill({ contentType: 'text/event-stream', body: 'id: 1\nevent: run.awaiting_approval\ndata: {}\n\n' });
+		} else {
+			expect(route.request().headers()['last-event-id']).toBe('1');
+			await route.fulfill({ contentType: 'text/event-stream', body: 'id: 2\nevent: run.failed\ndata: {}\n\n' });
+		}
+	});
+	await page.goto('/automation');
+	const pause = page.getByRole('button', { name: `Pause job ${jobId}` });
+	await pause.click();
+	await expect(page.getByText('Run status stream ended before a final state.')).toBeVisible();
+	await expect(pause).toBeDisabled();
+	await page.getByRole('button', { name: 'Refresh automation controls' }).click();
+	await expect(pause).toBeEnabled();
+	expect(streams).toBe(2);
+});
+
+test('recovers a terminal run after event replay is lost', async ({ page }) => {
+	const jobId = '05e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	let persistedState = 'awaiting_approval';
+	let jobFetches = 0;
+	await page.route('**/api/v1/workspaces/*/runs/run-job/status', async (route) => {
+		await route.fulfill({ json: { run_id: 'run-job', state: persistedState } });
+	});
+	await page.route('**/api/v1/workspaces/*/runs/run-job/events', async (route) => {
+		await route.fulfill({ contentType: 'text/event-stream', body: 'id: 1\nevent: run.awaiting_approval\ndata: {}\n\n' });
+	});
+	await page.unroute('**/api/v1/workspaces/*/automation/jobs');
+	await page.route('**/api/v1/workspaces/*/automation/jobs', async (route) => {
+		jobFetches++;
+		const latest = persistedState === 'completed' && jobFetches > 1;
+		await route.fulfill({ json: { jobs: [{
+			job_id: jobId, revision: latest ? 3 : 2, workspace_id: workspaceId,
+			service: { provider: 'service', subject: 'nightly' },
+			owner: { provider: 'local', subject: 'operator' },
+			schedule: { kind: 'once', run_at: 1000 }, prompt: 'Nightly reviewer',
+			data_class: 'workspace', max_model_turns: 4, max_actions: 8,
+			enabled: !latest, next_due_at: latest ? null : 2000, idempotent: true, created_at: 10
+		}] } });
+	});
+	await page.goto('/automation');
+	const pause = page.getByRole('button', { name: `Pause job ${jobId}` });
+	await pause.click();
+	await expect(page.getByText('Run status stream ended before a final state.')).toBeVisible();
+	persistedState = 'completed';
+	await page.getByRole('button', { name: 'Refresh automation controls' }).click();
+	await expect(page.getByRole('button', { name: `Resume job ${jobId}` })).toBeEnabled();
+	await expect(page.locator('.automation-record').filter({ hasText: jobId })).toContainText('revision 3');
+	expect(jobFetches).toBeGreaterThan(2);
+});
+
+test('checks persisted run state even while replay waits for a missing event', async ({ page }) => {
+	const jobId = '05e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	let started!: () => void;
+	let release!: () => void;
+	const streamRequested = new Promise<void>((resolve) => { started = resolve; });
+	const streamReleased = new Promise<void>((resolve) => { release = resolve; });
+	await page.route('**/api/v1/workspaces/*/runs/run-job/events', async (route) => {
+		started();
+		await streamReleased;
+		await route.fulfill({ contentType: 'text/event-stream', body: '' });
+	});
+	await page.route('**/api/v1/workspaces/*/runs/run-job/status', async (route) => {
+		await route.fulfill({ json: { run_id: 'run-job', state: 'failed' } });
+	});
+	await page.goto('/automation');
+	const pause = page.getByRole('button', { name: `Pause job ${jobId}` });
+	await pause.click();
+	await streamRequested;
+	try {
+		await page.getByRole('button', { name: 'Refresh automation controls' }).click();
+		await expect(pause).toBeEnabled();
+	} finally { release(); }
+});
+
+test('refetches jobs when a run finishes during a stale refresh', async ({ page }) => {
+	const jobId = '05e0bb38-b491-4532-b9b6-0ac57ec4f357';
+	let jobFetches = 0;
+	let refreshStarted!: () => void;
+	let releaseRefresh!: () => void;
+	const refreshRequested = new Promise<void>((resolve) => { refreshStarted = resolve; });
+	const refreshReleased = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+	await page.unroute('**/api/v1/workspaces/*/automation/jobs');
+	await page.route('**/api/v1/workspaces/*/automation/jobs', async (route) => {
+		jobFetches++;
+		if (jobFetches === 2) { refreshStarted(); await refreshReleased; }
+		const latest = jobFetches > 2;
+		await route.fulfill({ json: { jobs: [{
+			job_id: jobId, revision: latest ? 3 : 2, workspace_id: workspaceId,
+			service: { provider: 'service', subject: 'nightly' },
+			owner: { provider: 'local', subject: 'operator' },
+			schedule: { kind: 'once', run_at: 1000 }, prompt: 'Nightly reviewer',
+			data_class: 'workspace', max_model_turns: 4, max_actions: 8,
+			enabled: !latest, next_due_at: latest ? null : 2000, idempotent: true, created_at: 10
+		}] } });
+	});
+	await page.route('**/api/v1/workspaces/*/runs/run-job/events', async (route) => {
+		await refreshRequested;
+		await route.fulfill({ contentType: 'text/event-stream', body: 'id: 1\nevent: run.completed\ndata: {}\n\n' });
+	});
+	await page.goto('/automation');
+	const pause = page.getByRole('button', { name: `Pause job ${jobId}` });
+	await pause.click();
+	await page.getByRole('button', { name: 'Refresh automation controls' }).click();
+	await refreshRequested;
+	try {
+		await page.waitForTimeout(200);
+	} finally { releaseRefresh(); }
+	await expect(page.getByRole('button', { name: `Resume job ${jobId}` })).toBeEnabled();
+	await expect(page.locator('.automation-record').filter({ hasText: jobId })).toContainText('revision 3');
+	expect(jobFetches).toBeGreaterThan(2);
+});
+
+test('distinguishes paused, completed, failed, and unscheduled job states', async ({ page }) => {
+	const job = (jobId: string, prompt: string, enabled: boolean, lastRunState: string | null) => ({
+		job_id: jobId,
+		revision: 3,
+		workspace_id: workspaceId,
+		service: { provider: 'service', subject: 'nightly' },
+		owner: { provider: 'local', subject: 'operator' },
+		schedule: { kind: 'once', run_at: 1767225600000 },
+		prompt,
+		data_class: 'workspace',
+		max_model_turns: 4,
+		max_actions: 8,
+		enabled,
+		next_due_at: null,
+		idempotent: true,
+		last_run_state: lastRunState,
+		created_at: 10
+	});
+	await page.unroute('**/api/v1/workspaces/*/automation/jobs');
+	await page.route('**/api/v1/workspaces/*/automation/jobs', async (route) => {
+		await route.fulfill({ json: { jobs: [
+			job('15e0bb38-b491-4532-b9b6-0ac57ec4f357', 'Paused job', false, null),
+			job('25e0bb38-b491-4532-b9b6-0ac57ec4f357', 'Completed job', true, 'succeeded'),
+			job('35e0bb38-b491-4532-b9b6-0ac57ec4f357', 'Failed job', true, 'failed'),
+			job('45e0bb38-b491-4532-b9b6-0ac57ec4f357', 'No occurrence job', true, null)
+		] } });
+	});
+	await page.goto('/automation');
+	await expect(page.locator('.automation-record').filter({ hasText: 'Paused job' })).toContainText('Paused');
+	await expect(page.locator('.automation-record').filter({ hasText: 'Completed job' })).toContainText('Completed');
+	await expect(page.locator('.automation-record').filter({ hasText: 'Failed job' })).toContainText('Failed');
+	await expect(page.locator('.automation-record').filter({ hasText: 'No occurrence job' })).toContainText('No next occurrence');
 });
 
 test('shows skill reviews and publishes capture drafts without revealing secrets', async ({ page }, testInfo) => {

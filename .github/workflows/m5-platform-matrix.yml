@@ -1,0 +1,185 @@
+name: M5 platform matrix
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  M5_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-workspace:
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.M5_HEAD_SHA }}
+      - name: Select verified Windows Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - name: Record platform and run named Rust workspace suite
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          git rev-parse HEAD | Set-Content evidence/context.txt
+          rustc -vV | Add-Content evidence/context.txt
+          cargo --version | Add-Content evidence/context.txt
+          [System.Runtime.InteropServices.RuntimeInformation]::OSDescription | Add-Content evidence/context.txt
+          'features=workspace defaults; CARGO_INCREMENTAL=0' | Add-Content evidence/context.txt
+          'cargo test --workspace --locked -- --list' | Set-Content evidence/commands.txt
+          'cargo test --workspace --locked' | Add-Content evidence/commands.txt
+          cargo test --workspace --locked -- --list 2>&1 | Tee-Object evidence/inventory.txt | Select-Object -Last 20
+          $code = $LASTEXITCODE
+          "inventory_exit=$code" | Add-Content evidence/exit-codes.txt
+          if ($code -ne 0) { exit $code }
+          cargo test --workspace --locked 2>&1 | Tee-Object evidence/run.txt | Select-Object -Last 30
+          $code = $LASTEXITCODE
+          "run_exit=$code" | Add-Content evidence/exit-codes.txt
+          exit $code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m5-windows-workspace-${{ env.M5_HEAD_SHA }}
+          path: evidence/
+          if-no-files-found: warn
+
+  linux-server-sandbox:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.M5_HEAD_SHA }}
+      - name: Run named non-desktop suite in privileged sandbox test container
+        shell: bash
+        run: |
+          mkdir -p evidence
+          { git rev-parse HEAD; uname -a; printf '%s\n' 'runner=ubuntu-24.04; container=rust:1.97.0-slim --privileged; features=workspace defaults; excluded=lumen-desktop; CARGO_INCREMENTAL=0'; } > evidence/context.txt
+          printf '%s\n' 'docker run --rm --privileged rust:1.97.0-slim' 'cargo test --workspace --exclude lumen-desktop --locked -- --list' 'cargo test --workspace --exclude lumen-desktop --locked' 'bash scripts/verify-linux-plugin-sandbox.sh' > evidence/commands.txt
+          if docker run --rm --privileged \
+            --volume "$PWD:/workspace" --workdir /workspace \
+            --env CARGO_INCREMENTAL=0 --env CARGO_TARGET_DIR=/tmp/lumen-target \
+            rust:1.97.0-slim bash -lc '
+              set -u
+              apt-get update > evidence/setup.txt 2>&1 || exit $?
+              apt-get install -y --no-install-recommends bubblewrap ca-certificates pkg-config >> evidence/setup.txt 2>&1 || exit $?
+              { rustc -vV; cargo --version; bwrap --version; } >> evidence/context.txt
+              if cargo test --workspace --exclude lumen-desktop --locked -- --list > evidence/inventory.txt 2>&1; then code=0; else code=$?; fi
+              echo "inventory_exit=$code" >> evidence/exit-codes.txt
+              tail -n 20 evidence/inventory.txt
+              if (( code != 0 )); then exit "$code"; fi
+              if cargo test --workspace --exclude lumen-desktop --locked > evidence/run.txt 2>&1; then code=0; else code=$?; fi
+              echo "run_exit=$code" >> evidence/exit-codes.txt
+              tail -n 30 evidence/run.txt
+              if (( code != 0 )); then exit "$code"; fi
+              if bash scripts/verify-linux-plugin-sandbox.sh > evidence/sandbox-run.txt 2>&1; then code=0; else code=$?; fi
+              echo "sandbox_run_exit=$code" >> evidence/exit-codes.txt
+              tail -n 30 evidence/sandbox-run.txt
+              exit "$code"
+            '; then code=0; else code=$?; fi
+          echo "container_exit=$code" >> evidence/exit-codes.txt
+          exit "$code"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m5-linux-server-${{ env.M5_HEAD_SHA }}
+          path: evidence/
+          if-no-files-found: warn
+
+  linux-desktop-native:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.M5_HEAD_SHA }}
+      - name: Select verified Linux Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+      - name: Install Tauri 2 native desktop prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libdbus-1-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Record platform and run named desktop suite
+        shell: bash
+        run: |
+          mkdir -p evidence
+          { git rev-parse HEAD; rustc -vV; cargo --version; uname -a; pkg-config --modversion gtk+-3.0 webkit2gtk-4.1; printf '%s\n' 'features=lumen-desktop defaults; CARGO_INCREMENTAL=0'; } > evidence/context.txt
+          printf '%s\n' 'cargo test -p lumen-desktop --locked -- --list' 'cargo test -p lumen-desktop --locked' > evidence/commands.txt
+          if cargo test -p lumen-desktop --locked -- --list > evidence/inventory.txt 2>&1; then code=0; else code=$?; fi
+          echo "inventory_exit=$code" >> evidence/exit-codes.txt
+          tail -n 20 evidence/inventory.txt
+          if (( code != 0 )); then exit "$code"; fi
+          if cargo test -p lumen-desktop --locked > evidence/run.txt 2>&1; then code=0; else code=$?; fi
+          echo "run_exit=$code" >> evidence/exit-codes.txt
+          tail -n 30 evidence/run.txt
+          exit "$code"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m5-linux-desktop-${{ env.M5_HEAD_SHA }}
+          path: evidence/
+          if-no-files-found: warn
+
+  web-unit-browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.M5_HEAD_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+      - name: Install pinned pnpm dependencies and Chromium
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.4.2 --activate
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm --dir apps/web exec playwright install --with-deps chromium
+      - name: Record platform and run web checks
+        shell: bash
+        run: |
+          mkdir -p evidence
+          { git rev-parse HEAD; node --version; corepack pnpm --version; uname -a; printf '%s\n' 'browser=Playwright Chromium desktop+mobile; workers=1'; } > evidence/context.txt
+          printf '%s\n' 'corepack pnpm --dir apps/web check' 'corepack pnpm --dir apps/web exec vitest run --reporter=verbose' 'corepack pnpm --dir apps/web build' 'corepack pnpm --dir apps/web exec playwright test --list' 'corepack pnpm --dir apps/web exec playwright test --workers=1' > evidence/commands.txt
+          if corepack pnpm --dir apps/web check > evidence/check.txt 2>&1; then code=0; else code=$?; fi
+          echo "check_exit=$code" >> evidence/exit-codes.txt
+          tail -n 15 evidence/check.txt
+          if (( code != 0 )); then exit "$code"; fi
+          if corepack pnpm --dir apps/web exec vitest run --reporter=verbose > evidence/unit.txt 2>&1; then code=0; else code=$?; fi
+          echo "unit_exit=$code" >> evidence/exit-codes.txt
+          tail -n 20 evidence/unit.txt
+          if (( code != 0 )); then exit "$code"; fi
+          if corepack pnpm --dir apps/web build > evidence/build.txt 2>&1; then code=0; else code=$?; fi
+          echo "build_exit=$code" >> evidence/exit-codes.txt
+          tail -n 15 evidence/build.txt
+          if (( code != 0 )); then exit "$code"; fi
+          if corepack pnpm --dir apps/web exec playwright test --list > evidence/browser-inventory.txt 2>&1; then code=0; else code=$?; fi
+          echo "browser_inventory_exit=$code" >> evidence/exit-codes.txt
+          tail -n 20 evidence/browser-inventory.txt
+          if (( code != 0 )); then exit "$code"; fi
+          if corepack pnpm --dir apps/web exec playwright test --workers=1 > evidence/browser-run.txt 2>&1; then code=0; else code=$?; fi
+          echo "browser_run_exit=$code" >> evidence/exit-codes.txt
+          tail -n 30 evidence/browser-run.txt
+          exit "$code"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m5-web-${{ env.M5_HEAD_SHA }}
+          path: |
+            evidence/
+            apps/web/test-results/
+          if-no-files-found: warn
