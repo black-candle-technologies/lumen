@@ -4,9 +4,11 @@ import { resolve } from 'node:path';
 let suffix;
 if (process.arch === 'x64' && process.platform === 'win32') suffix = 'win32-x64-msvc';
 else if (process.arch === 'x64' && process.platform === 'linux' && process.report.getReport().header.glibcVersionRuntime) suffix = 'linux-x64-gnu';
+else if (process.arch === 'x64' && process.platform === 'darwin') suffix = 'darwin-x64';
+else if (process.arch === 'arm64' && process.platform === 'darwin') suffix = 'darwin-arm64';
 
 if (!suffix) {
-  console.error(`Unsupported native dependency host: ${process.platform}/${process.arch}. Tested hosts: Windows x64 and Linux x64/glibc.`);
+  console.error(`Unsupported native dependency host: ${process.platform}/${process.arch}. Tested hosts: Windows x64, Linux x64/glibc, and macOS x64/arm64.`);
   process.exitCode = 1;
 } else {
   const web = createRequire(resolve('apps/web/package.json'));

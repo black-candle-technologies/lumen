@@ -4975,15 +4975,18 @@ impl ModelPort for EgressCheckedModel {
                     return Err(ModelError::new(error.to_string()));
                 }
             };
-            self.audit_model_egress_success(data_class, &decision)
+            self.audit_model_egress_pending(data_class, &decision)
                 .await?;
-            self.inner.generate(input).await
+            let result = self.inner.generate(input).await;
+            self.audit_model_egress_result(data_class, &decision, result.is_ok())
+                .await?;
+            result
         })
     }
 }
 
 impl EgressCheckedModel {
-    async fn audit_model_egress_success(
+    async fn audit_model_egress_pending(
         &self,
         data_class: DataClass,
         decision: &lumen_core::egress::RoutingDecision,
@@ -4993,14 +4996,53 @@ impl EgressCheckedModel {
                 AuditEventId::new(),
                 now(),
                 AuditEventKind::ModelEgress,
-                AuditOutcome::Success,
+                AuditOutcome::Pending,
+                Some(self.workspace_id),
+                CanonicalValue::object([
+                    ("run_id", CanonicalValue::from(self.run_id.to_string())),
+                    ("data_class", CanonicalValue::from(data_class.as_str())),
+                    ("egress_occurred", CanonicalValue::from(false)),
+                    (
+                        "endpoint_class",
+                        CanonicalValue::from(endpoint_class_name(decision.endpoint_class())),
+                    ),
+                    (
+                        "provider_id",
+                        CanonicalValue::from(decision.provider().as_str().to_owned()),
+                    ),
+                ]),
+            ))
+            .await
+            .map_err(|error| ModelError::new(format!("model egress audit failed: {error}")))
+    }
+
+    async fn audit_model_egress_result(
+        &self,
+        data_class: DataClass,
+        decision: &lumen_core::egress::RoutingDecision,
+        succeeded: bool,
+    ) -> Result<(), ModelError> {
+        self.audit
+            .record(AuditEvent::new(
+                AuditEventId::new(),
+                now(),
+                AuditEventKind::ModelEgress,
+                if succeeded {
+                    AuditOutcome::Success
+                } else {
+                    AuditOutcome::Failure
+                },
                 Some(self.workspace_id),
                 CanonicalValue::object([
                     ("run_id", CanonicalValue::from(self.run_id.to_string())),
                     ("data_class", CanonicalValue::from(data_class.as_str())),
                     (
                         "egress_occurred",
-                        CanonicalValue::from(decision.egress_occurred()),
+                        if succeeded {
+                            CanonicalValue::from(decision.egress_occurred())
+                        } else {
+                            CanonicalValue::from("unknown")
+                        },
                     ),
                     (
                         "endpoint_class",

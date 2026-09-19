@@ -6,8 +6,12 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 const script = resolve(import.meta.dirname, 'check_native_deps.mjs');
-const host = process.platform === 'win32' ? 'win32-x64-msvc' : 'linux-x64-gnu';
-const other = process.platform === 'win32' ? 'linux-x64-gnu' : 'win32-x64-msvc';
+const host = process.platform === 'win32'
+  ? 'win32-x64-msvc'
+  : process.platform === 'darwin'
+    ? (process.arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64')
+    : 'linux-x64-gnu';
+const other = host === 'win32-x64-msvc' ? 'linux-x64-gnu' : 'win32-x64-msvc';
 
 function packageAt(root, path, name) {
   const file = join(root, path, 'package.json');

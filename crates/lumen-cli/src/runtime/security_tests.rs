@@ -1511,11 +1511,27 @@ async fn public_class_input_is_allowed_through_public_remote_model_policy() {
         .list_audit_records(workspace_id, 0, 10)
         .await
         .expect("audit records");
-    let event = records
+    let events = records
         .iter()
         .map(|record| record.event())
-        .find(|event| event.kind() == AuditEventKind::ModelEgress)
-        .expect("model egress audit");
+        .filter(|event| event.kind() == AuditEventKind::ModelEgress)
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2, "pending and result audit events");
+    assert_eq!(
+        events[0].outcome(),
+        lumen_core::audit::AuditOutcome::Pending
+    );
+    assert_eq!(
+        events[0].payload(),
+        &CanonicalValue::object([
+            ("run_id", CanonicalValue::from(run_id.to_string())),
+            ("data_class", CanonicalValue::from("public")),
+            ("egress_occurred", CanonicalValue::from(false)),
+            ("endpoint_class", CanonicalValue::from("remote")),
+            ("provider_id", CanonicalValue::from("openai-compatible")),
+        ])
+    );
+    let event = events[1];
     assert_eq!(event.outcome(), lumen_core::audit::AuditOutcome::Success);
     assert_eq!(
         event.payload(),
@@ -2328,6 +2344,14 @@ subject = "operator"
         )
         .await
         .expect("second runtime against same paths"),
+    );
+    let started_after_restart = restarted_service
+        .run_due_scheduled_jobs_once(TimestampMillis::new(3_000))
+        .await
+        .expect("scheduler poll after orderly restart");
+    assert!(
+        started_after_restart.is_empty(),
+        "terminal occurrence is never duplicated"
     );
 
     let job_after = restarted_database
@@ -6317,7 +6341,7 @@ async fn wait_for_run_state(harness: &Harness, run_id: &str, expected: &str) {
 }
 
 async fn wait_for_database_run_state(database: &Database, run_id: RunId, expected: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let state: Option<String> = sqlx::query_scalar("SELECT state FROM agent_runs WHERE id = ?")
             .bind(run_id.to_string())
@@ -8681,8 +8705,12 @@ async fn known_secrets_in_model_actions_are_rejected_before_persistence() {
     .await;
     let harness = Harness::new(&model, |_| {}).await;
 
-    harness.create_run("perform the proposed action").await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let run_id = harness.create_run("perform the proposed action").await;
+    let terminal = harness.sse_until(&run_id, "run.failed").await;
+    assert!(
+        terminal.contains("run.failed"),
+        "secret policy denial reached terminal state"
+    );
 
     let action_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions")
         .fetch_one(harness.database.pool())

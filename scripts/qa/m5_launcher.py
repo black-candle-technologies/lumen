@@ -2,7 +2,10 @@
 """Owned, WSL-only M5 manual QA fixture and evidence helper."""
 
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows runs portable helper tests; main() remains WSL-only.
+    fcntl = None
 import hashlib
 import ipaddress
 import json
@@ -175,10 +178,14 @@ def init_fixture(name, source_sha, dirty, model, endpoint, port):
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = BASE / "init.lock"
     fail_unless(not lock.is_symlink(), "fixture init lock is symlinked")
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    # O_NOFOLLOW is a Unix hardening flag.  Keep it where available while
+    # allowing the portable fixture helpers to be exercised on Windows; main()
+    # remains explicitly WSL-only.
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "r+b") as handle:
         # ponytail: one short global init lock; split per fixture only if concurrent setup becomes useful.
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
         return _init_fixture(name, source_sha, dirty, model, endpoint, port)
 
 

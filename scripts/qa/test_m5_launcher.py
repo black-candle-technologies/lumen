@@ -22,6 +22,22 @@ import m5_launcher as qa
 SHA = "a" * 40
 
 
+def is_wsl():
+    if sys.platform != "linux":
+        return False
+    try:
+        version = Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+    return "microsoft" in version or bool(os.environ.get("WSL_INTEROP"))
+
+
+def symlink_tests_supported():
+    # Windows runners commonly lack the Developer Mode/privilege required to
+    # create symlinks.  The non-symlink helper contract remains portable.
+    return sys.platform != "win32" or bool(os.environ.get("LUMEN_M5_WINDOWS_SYMLINK_TESTS"))
+
+
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -61,6 +77,7 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((self.base / "fixtures" / "sample").exists())
         self.assertEqual(self.init()["name"], "sample")
 
+    @unittest.skipUnless(symlink_tests_supported(), "Windows symlink privilege is unavailable")
     def test_retry_reclaims_only_a_marked_interrupted_stage_with_token(self):
         fixture = self.init()
         stage = self.base / "fixtures" / f".sample.init-{uuid.uuid4().hex}"
@@ -76,6 +93,7 @@ class LauncherTests(unittest.TestCase):
             qa.init_fixture("sample", SHA, False, "qwen3:4b", "http://127.0.0.1:11434/v1/", 0)
         self.assertTrue(foreign.is_symlink())
 
+    @unittest.skipUnless(symlink_tests_supported(), "Windows symlink privilege is unavailable")
     def test_invalid_name_and_symlinked_fixture_are_refused_without_cleanup(self):
         with self.assertRaises(qa.QaError):
             self.init("../outside")
@@ -88,6 +106,7 @@ class LauncherTests(unittest.TestCase):
             qa.cleanup_fixture("linked")
         self.assertEqual((foreign / "keep").read_text(), "safe")
 
+    @unittest.skipUnless(symlink_tests_supported(), "Windows symlink privilege is unavailable")
     def test_symlinked_fixture_parent_is_refused_without_writing_outside_base(self):
         foreign = Path(self.temporary.name) / "foreign-parent"
         foreign.mkdir()
@@ -163,6 +182,7 @@ class LauncherTests(unittest.TestCase):
             qa.snapshot_fixture("sample", "healthy")
         self.assertFalse(db.exists())
 
+    @unittest.skipUnless(symlink_tests_supported(), "Windows symlink privilege is unavailable")
     def test_snapshot_refuses_symlinked_snapshot_directory(self):
         fixture = self.init()
         with sqlite3.connect(fixture["database_path"]) as connection:
@@ -212,6 +232,7 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(qa.QaError):
             qa.load_fixture("sample")
 
+    @unittest.skipUnless(symlink_tests_supported(), "Windows symlink privilege is unavailable")
     def test_changed_runtime_path_and_symlinked_workspace_are_refused_before_start(self):
         fixture = self.init()
         root = self.base / "fixtures" / "sample"
@@ -431,6 +452,7 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(qa.QaError):
             qa.inspect_approval(fixture, token, run_id, "skill.publish")
 
+    @unittest.skipUnless(is_wsl(), "M5 launcher CLI contract is WSL-specific; portable helpers still run")
     def test_cli_fresh_shell_selection_and_destructive_confirmation(self):
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):

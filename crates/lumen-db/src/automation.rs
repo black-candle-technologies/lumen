@@ -1466,28 +1466,6 @@ impl Database {
         Ok(())
     }
 
-    pub async fn advance_scheduled_job_next_due(
-        &self,
-        job_id: JobId,
-        revision: JobRevision,
-        next_due_at: Option<TimestampMillis>,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "UPDATE scheduled_job_revisions
-             SET next_due_at = ?
-             WHERE job_id = ? AND revision = ?",
-        )
-        .bind(next_due_at.map(timestamp_to_i64).transpose()?)
-        .bind(job_id.to_string())
-        .bind(
-            i64::try_from(revision.as_u64())
-                .map_err(|_| RepositoryError::InvalidAutomationState)?,
-        )
-        .execute(self.pool())
-        .await?;
-        Ok(())
-    }
-
     pub async fn insert_skill_version(
         &self,
         skill: &SkillVersionRecord,

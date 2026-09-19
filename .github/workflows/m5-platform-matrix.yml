@@ -183,3 +183,47 @@ jobs:
             evidence/
             apps/web/test-results/
           if-no-files-found: warn
+
+  qa-helpers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.M5_HEAD_SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+      - name: Build owned launcher binary and run portable QA helpers
+        shell: bash
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+          cargo build -p lumen-cli --bin lumen --locked
+          export LUMEN_M5_QA_TEST_BINARY="$PWD/target/debug/lumen"
+          python -W error -m unittest discover -s scripts/qa -p 'test_audit_inspect.py' -v
+          python -W error -m unittest discover -s scripts/qa -p 'test_m5_delay_provider.py' -v
+          python -W error -m unittest discover -s scripts/qa -p 'test_m5_launcher.py' -v
+          node --test scripts/qa/check_native_deps.test.mjs
+          corepack pnpm run check:native
+
+  macos-workspace:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.M5_HEAD_SHA }}
+      - name: Select pinned Rust and verify workspace
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.97.1
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+      - name: Verify native JavaScript dependencies
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm run check:native

@@ -188,6 +188,29 @@ fn authenticated_plugin_disablement_is_allowed_after_capability_validation() {
 }
 
 #[test]
+fn arbitrary_plugin_disable_kind_cannot_bypass_approval() {
+    let required = Capability::new(
+        CapabilityName::PluginEnable,
+        ResourceScope::workspace(workspace_id()),
+    );
+    let action = ActionEnvelope::new(
+        action_id(),
+        run_id(),
+        workspace_id(),
+        PrincipalId::new("local", "admin").expect("principal"),
+        ComponentId::new("runtime.extensions").expect("component"),
+        ActionKind::new("plugin.disable").expect("kind"),
+        CanonicalValue::object([] as [(&str, CanonicalValue); 0]),
+        vec![required.clone()],
+    );
+    let effective = EffectiveCapabilities::new([CapabilitySet::new([required])]);
+    assert_eq!(
+        Policy::default().evaluate(&action, &effective),
+        PolicyDecision::RequireApproval
+    );
+}
+
+#[test]
 fn extension_provenance_and_input_bind_the_action_fingerprint() {
     let original = invocation(provenance(), CanonicalValue::from("first"));
     let changed_input = invocation(provenance(), CanonicalValue::from("second"));

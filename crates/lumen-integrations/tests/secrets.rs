@@ -27,6 +27,19 @@ async fn unavailable_secret_store_fails_closed_for_every_operation() {
     assert!(store.delete("ref").await.is_err());
 }
 
+#[tokio::test]
+async fn in_memory_secret_store_debug_redacts_secret_bytes() {
+    let store = InMemorySecretStore::new();
+    let secret = "distinct-secret-value-never-log";
+    store
+        .put("workspace/ref", secret.as_bytes().to_vec())
+        .await
+        .expect("secret stored");
+    let rendered = format!("{store:?}");
+    assert!(!rendered.contains(secret));
+    assert!(rendered.contains("entries"));
+}
+
 #[test]
 #[cfg(feature = "native-secrets")]
 fn os_keyring_adapter_rejects_invalid_service_names() {

@@ -307,7 +307,9 @@ impl Database {
                     actions.run_id, actions.workspace_id
              FROM execution_attempts AS attempts
              JOIN actions ON actions.id = attempts.action_id
+             JOIN agent_runs ON agent_runs.id = actions.run_id
              WHERE attempts.state IN ('reserved', 'running')
+               AND agent_runs.state IN ('created', 'running', 'awaiting_approval')
              ORDER BY attempts.reserved_at, attempts.id",
         )
         .fetch_all(&mut *transaction)
@@ -339,7 +341,7 @@ impl Database {
                      SELECT actions.run_id FROM actions
                      JOIN execution_attempts ON execution_attempts.action_id = actions.id
                      WHERE execution_attempts.state IN ('reserved', 'running')
-                 )",
+                 ) AND state IN ('created', 'running', 'awaiting_approval')",
             )
             .bind(recovered_at)
             .execute(&mut *transaction)
