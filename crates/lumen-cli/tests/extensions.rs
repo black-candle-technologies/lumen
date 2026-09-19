@@ -7,6 +7,9 @@ use lumen_integrations::secrets::InMemorySecretStore;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
+mod support;
+use support::toml_path;
+
 fn write_config(root: &std::path::Path) -> std::path::PathBuf {
     let workspace = root.join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -15,20 +18,20 @@ fn write_config(root: &std::path::Path) -> std::path::PathBuf {
         &path,
         format!(
             r#"[database]
-path = "{}"
+path = {}
 [model]
 endpoint = "http://127.0.0.1:8080/v1/"
 model = "local-model"
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
-path = "{}"
+path = {}
 [bootstrap_admin]
 provider = "local"
 subject = "operator"
 "#,
-            root.join("lumen.sqlite3").display(),
-            workspace.display()
+            toml_path(root.join("lumen.sqlite3")),
+            toml_path(&workspace)
         ),
     )
     .expect("config");
@@ -252,16 +255,22 @@ async fn install_command_creates_approval_bound_action_without_installing_direct
     let database = Database::connect(root.path().join("lumen.sqlite3"))
         .await
         .expect("database");
-    let action: (String, String) =
-        sqlx::query_as("SELECT kind, state FROM actions ORDER BY created_at DESC LIMIT 1")
-            .fetch_one(database.pool())
-            .await
-            .expect("stored action");
+    let action: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT kind, state, terminal_reason FROM actions ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored action");
     let approvals: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
             .fetch_one(database.pool())
             .await
             .expect("approval count");
+    let invalidated: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'invalidated'")
+            .fetch_one(database.pool())
+            .await
+            .expect("invalidated approval count");
     let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_attempts")
         .fetch_one(database.pool())
         .await
@@ -272,7 +281,11 @@ async fn install_command_creates_approval_bound_action_without_installing_direct
         .expect("installed count");
     assert_eq!(
         action,
-        ("plugin.install".to_owned(), "normalized".to_owned())
+        (
+            "plugin.install".to_owned(),
+            "cancelled".to_owned(),
+            Some("run_cancelled".to_owned())
+        )
     );
-    assert_eq!((approvals, attempts, installed), (1, 0, 0));
+    assert_eq!((approvals, invalidated, attempts, installed), (0, 1, 0, 0));
 }

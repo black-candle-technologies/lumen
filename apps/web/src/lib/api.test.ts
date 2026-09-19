@@ -9,6 +9,30 @@ const settings: ConnectionSettings = {
 };
 
 describe('ApiClient', () => {
+	it('does not treat a malformed successful audit body as an empty list', async () => {
+		const fetchMock = vi.fn(async () => new Response('{"error":{"code":"bad_request"}}', {
+			status: 200,
+			headers: { 'content-type': 'application/json' }
+		}));
+		const client = new ApiClient(settings, fetchMock as typeof fetch);
+
+		await expect(client.listAudit()).rejects.toMatchObject({ code: 'invalid_response' });
+	});
+
+	it('retains the audit API status and error code before selecting events', async () => {
+		const fetchMock = vi.fn(async () => new Response(
+			'{"error":{"code":"bad_request","message":"invalid audit page bounds"}}',
+			{ status: 400, headers: { 'content-type': 'application/json' } }
+		));
+		const client = new ApiClient(settings, fetchMock as typeof fetch);
+
+		await expect(client.listAudit()).rejects.toMatchObject({
+			status: 400,
+			code: 'bad_request',
+			message: 'invalid audit page bounds'
+		});
+	});
+
 	it('parses authenticated SSE frames and resumes from the last event ID', async () => {
 		const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
 			expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer local-test-token');
@@ -454,6 +478,9 @@ describe('ApiClient', () => {
 							source_digest: 'a'.repeat(64),
 							reviewed: true,
 							enabled: true,
+							required: false,
+							load_status: 'loaded',
+							exclusion_reason: null,
 							created_by: { provider: 'local', subject: 'operator' },
 							reviewed_by: { provider: 'local', subject: 'reviewer' },
 							created_at: 10,
@@ -499,6 +526,7 @@ describe('ApiClient', () => {
 		expect(jobs[0].next_due_at).toBe(2000);
 		expect(jobRequest.state).toBe('approval_requested');
 		expect(skills[0].source_digest).toBe('a'.repeat(64));
+		expect(skills[0].load_status).toBe('loaded');
 		expect(drafts[0].body).not.toContain('secret-value');
 		expect(draft.draft_id).toBe('00000000-0000-0000-0000-000000000000');
 		expect(publish.run_id).toBe('run-skill');

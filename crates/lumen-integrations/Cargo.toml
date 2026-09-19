@@ -35,6 +35,9 @@ wasmtime = { version = "46", default-features = false, features = ["component-mo
 nix = { version = "0.30", features = ["fs", "process", "resource", "signal"] }
 rustix = { version = "1", features = ["fs"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
 [dev-dependencies]
 tempfile = "3"
 wat = "1"

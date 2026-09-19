@@ -4,8 +4,9 @@ mod runtime;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::{Future, IntoFuture},
     io::Read,
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -28,6 +29,18 @@ use lumen_integrations::{
 use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
 use sha2::Digest as _;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+fn relative_storage_path(path: &Path) -> Option<String> {
+    let segments = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
 
 #[derive(Clone, Debug, Eq, Parser, PartialEq)]
 #[command(name = "lumen", version, about = "Local-first AI agent runtime")]
@@ -188,6 +201,16 @@ pub struct PluginActionRequest {
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
+    if matches!(
+        &cli.command,
+        Command::Sandbox {
+            command: SandboxCommand::Report
+        }
+    ) {
+        return Ok(CommandOutput::SandboxReport(
+            SystemSandbox::detect().report(),
+        ));
+    }
     let secret_input = if matches!(
         &cli.command,
         Command::Secret {
@@ -212,6 +235,16 @@ pub async fn execute_with_secret_store(
     secret_store: Arc<dyn SecretStore>,
     secret_input: Option<Vec<u8>>,
 ) -> Result<CommandOutput, CliError> {
+    if matches!(
+        &cli.command,
+        Command::Sandbox {
+            command: SandboxCommand::Report
+        }
+    ) {
+        return Ok(CommandOutput::SandboxReport(
+            SystemSandbox::detect().report(),
+        ));
+    }
     let config = Config::load(&cli.config)?;
     prepare_directories(&config)?;
     match cli.command {
@@ -240,7 +273,7 @@ pub async fn execute_with_secret_store(
             execute_secret_command(&config, command, secret_store, secret_input).await
         }
         Command::Plugin { command } => execute_plugin_command(&config, command, secret_store).await,
-        Command::Serve => serve(config, secret_store).await,
+        Command::Serve => serve(config, secret_store, &cli.config).await,
     }
 }
 
@@ -274,9 +307,9 @@ async fn execute_plugin_command(
             let relative = staged
                 .quarantine_path()
                 .strip_prefix(&data_root)
-                .map_err(|_| CliError::Runtime("quarantine escaped the data directory".into()))?
-                .to_string_lossy()
-                .into_owned();
+                .map_err(|_| CliError::Runtime("quarantine escaped the data directory".into()))?;
+            let relative = relative_storage_path(relative)
+                .ok_or_else(|| CliError::Runtime("quarantine path is not portable".into()))?;
             let stage_id = uuid::Uuid::new_v4();
             let record = StagedPluginPackage::new(
                 stage_id,
@@ -391,7 +424,11 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            service.shutdown().await;
+            if !service.drain_submitted_work().await.is_clean() {
+                return Err(CliError::Runtime(
+                    "plugin invocation drain left unresolved work".into(),
+                ));
+            }
             CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
         }
         command => {
@@ -420,7 +457,11 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            service.shutdown().await;
+            if !service.drain_submitted_work().await.is_clean() {
+                return Err(CliError::Runtime(
+                    "plugin action drain left unresolved work".into(),
+                ));
+            }
             CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
         }
     };
@@ -703,12 +744,23 @@ fn validate_secret_input(value: &[u8]) -> Result<(), CliError> {
 async fn serve(
     config: Config,
     secret_store: Arc<dyn SecretStore>,
+    config_path: &Path,
 ) -> Result<CommandOutput, CliError> {
     let sandbox: Arc<dyn SandboxBackend> = Arc::new(SystemSandbox::detect());
-    config.validate_sandbox(&sandbox.report())?;
+    let sandbox_report = sandbox.report();
+    eprintln!(
+        "event=server_starting bind={} config={config_path:?} workspace={} backend={} strength={} pid={}",
+        config.server.bind,
+        config.workspace_id(),
+        sandbox_report.backend(),
+        sandbox_report.strength().as_str(),
+        std::process::id()
+    );
+    config.validate_sandbox(&sandbox_report)?;
     let token = std::env::var(&config.authentication.token_environment).map_err(|_| {
         CliError::MissingEnvironment(config.authentication.token_environment.clone())
     })?;
+    let owner_guard = Arc::new(acquire_runtime_ownership(&config.database.path)?);
     let database = Database::connect(&config.database.path).await?;
     database.verify_audit_chain().await?;
     let now = runtime::now();
@@ -747,33 +799,132 @@ async fn serve(
             .await?;
     }
 
+    let listener = match tokio::net::TcpListener::bind(config.server.bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!(
+                "event=server_bind_failed bind={} config={config_path:?} workspace={} pid={} error={error}",
+                config.server.bind,
+                config.workspace_id(),
+                std::process::id()
+            );
+            database.close().await;
+            return Err(CliError::Io(error));
+        }
+    };
+
     let events = EventBroker::new(1024);
     let service = Arc::new(
-        runtime::LocalRuntimeService::build_with_secret_store(
+        runtime::LocalRuntimeService::build_with_runtime_owner(
             &config,
             database.clone(),
             events.clone(),
             Arc::clone(&sandbox),
             vec![token.clone()],
             secret_store,
+            Arc::clone(&owner_guard),
         )
         .await?,
     );
     let state = ApiState::new(
         service.clone(),
-        events,
+        events.clone(),
         token,
         config.bootstrap_principal(),
         BTreeSet::from([config.workspace_id()]),
-        api_sandbox_report(&sandbox.report()),
+        api_sandbox_report(&sandbox_report),
     )?;
-    let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    service.shutdown().await;
-    database.close().await;
+    let server_result = serve_listener_until_shutdown(
+        listener,
+        router(state),
+        events,
+        service,
+        (
+            config_path,
+            &config.workspace_id().to_string(),
+            &sandbox_report,
+        ),
+        shutdown_signal(),
+    )
+    .await;
+    let close_result =
+        tokio::time::timeout(std::time::Duration::from_millis(500), database.close()).await;
+    let outcome = match (server_result, close_result) {
+        (Err(error), _) => Err(CliError::Io(error)),
+        (_, Err(_)) => Err(CliError::Runtime("database close deadline exceeded".into())),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    if outcome.is_err() {
+        // An aborted native worker may still be running until bounded Tokio teardown.
+        // Keep the process-held ownership lock until process exit in that case.
+        std::mem::forget(owner_guard);
+    }
+    outcome?;
     Ok(CommandOutput::ServerStopped)
+}
+
+async fn serve_listener_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    events: EventBroker,
+    service: Arc<runtime::LocalRuntimeService>,
+    diagnostics: (&Path, &str, &SandboxReport),
+    signal: impl Future<Output = ()>,
+) -> Result<(), std::io::Error> {
+    let (config_path, workspace_id, sandbox_report) = diagnostics;
+    let bind = listener.local_addr()?;
+    eprintln!(
+        "event=server_started bind={bind} config={config_path:?} workspace={workspace_id} backend={} strength={} pid={}",
+        sandbox_report.backend(),
+        sandbox_report.strength().as_str(),
+        std::process::id()
+    );
+    let stop_accepting = CancellationToken::new();
+    let server_result = {
+        let shutdown = stop_accepting.clone();
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+            })
+            .into_future();
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result,
+            () = signal => {
+                eprintln!("event=server_stopping bind={bind} pid={}", std::process::id());
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+                stop_accepting.cancel();
+                events.close();
+                let report = service.shutdown().await;
+                let drained = match tokio::time::timeout_at(deadline, &mut server).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        eprintln!("event=server_shutdown_forced bind={bind} pid={}", std::process::id());
+                        Err(std::io::Error::other("HTTP drain deadline exceeded"))
+                    }
+                };
+                if !report.is_clean() {
+                    Err(std::io::Error::other("runtime shutdown left unresolved work"))
+                } else { drained }
+            }
+        }
+    };
+    stop_accepting.cancel();
+    events.close();
+    let report = service.shutdown().await;
+    let server_result = if report.is_clean() {
+        server_result
+    } else {
+        Err(std::io::Error::other(
+            "runtime shutdown left unresolved work",
+        ))
+    };
+    eprintln!(
+        "event=server_stopped bind={bind} pid={} result={}",
+        std::process::id(),
+        if server_result.is_ok() { "ok" } else { "error" }
+    );
+    server_result
 }
 
 fn api_sandbox_report(report: &SandboxReport) -> SandboxCapabilityReport {
@@ -798,8 +949,85 @@ fn prepare_directories(config: &Config) -> Result<(), CliError> {
     Ok(())
 }
 
+fn acquire_runtime_ownership(database_path: &Path) -> Result<std::fs::File, CliError> {
+    if std::fs::symlink_metadata(database_path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(CliError::Runtime(
+            "database path must not be a symlink".into(),
+        ));
+    }
+    let parent = database_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent)?;
+    let name = database_path
+        .file_name()
+        .ok_or_else(|| CliError::Runtime("database path has no file name".into()))?;
+    let lock_path = parent.join(format!(".{}.lumen-owner.lock", name.to_string_lossy()));
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(CliError::Runtime(
+            "runtime lock path must not be a symlink".into(),
+        ));
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock.try_lock().map_err(|error| {
+        CliError::Runtime(format!(
+            "runtime ownership unavailable for {}: {error}",
+            database_path.display()
+        ))
+    })?;
+    Ok(lock)
+}
+
+#[cfg(test)]
+mod runtime_ownership_tests {
+    use super::acquire_runtime_ownership;
+
+    #[test]
+    fn a_second_runtime_cannot_own_the_same_database_until_the_first_releases_it() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("lumen.sqlite3");
+        let first = acquire_runtime_ownership(&database).expect("first owner");
+        assert!(acquire_runtime_ownership(&database).is_err());
+        drop(first);
+        acquire_runtime_ownership(&database).expect("owner after release");
+    }
+}
+
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            eprintln!("event=shutdown_signal_failed signal=ctrl_c diagnostic={error:?}");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                eprintln!("event=shutdown_signal_failed signal=terminate diagnostic={error:?}");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    eprintln!("event=shutdown_signal_failed signal=ctrl_c diagnostic={error:?}");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("event=shutdown_signal_failed signal=ctrl_c diagnostic={error:?}");
+    }
 }
 
 #[derive(Debug, Error)]

@@ -3038,6 +3038,7 @@ dependencies = [
  "lumen-extension-sdk",
  "lumen-integrations",
  "lumen-server",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3074,6 +3075,7 @@ dependencies = [
 name = "lumen-db"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "lumen-core",
  "serde_json",
  "sha2 0.10.9",
@@ -3132,6 +3134,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wat",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
@@ -5648,6 +5651,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

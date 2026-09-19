@@ -9,6 +9,8 @@ use std::{
 };
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+#[cfg(windows)]
+use cap_std::fs::OpenOptionsExt as _;
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
@@ -44,7 +46,9 @@ impl WorkspaceReader {
             return Err(FilesystemError::InvalidWriteLimit);
         }
 
-        let directory = Dir::open_ambient_dir(root, ambient_authority())
+        let root = std::fs::canonicalize(root)
+            .map_err(|error| FilesystemError::OpenWorkspace(error.to_string()))?;
+        let directory = Dir::open_ambient_dir(&root, ambient_authority())
             .map_err(|error| FilesystemError::OpenWorkspace(error.to_string()))?;
         Ok(Self {
             directory: Arc::new(directory),
@@ -260,7 +264,7 @@ fn replace_text_blocking(
 
     let temp_name = next_temp_name();
     let result = write_and_replace(
-        &parent, file_name, &temp_name, prepared, directory, read_limit,
+        &parent, &temp_name, file_name, prepared, directory, read_limit,
     );
     if result.is_err() {
         let _ = parent.remove_file(&temp_name);
@@ -270,8 +274,8 @@ fn replace_text_blocking(
 
 fn write_and_replace(
     parent: &Dir,
-    file_name: &OsStr,
     temp_name: &str,
+    file_name: &OsStr,
     prepared: &PreparedFileWrite,
     root: &Dir,
     read_limit: usize,
@@ -281,6 +285,11 @@ fn write_and_replace(
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    options.access_mode(
+        windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+            | windows_sys::Win32::Storage::FileSystem::DELETE,
+    );
     let mut temp = parent
         .open_with(temp_name, &options)
         .map_err(|error| FilesystemError::Write(error.to_string()))?;
@@ -297,16 +306,15 @@ fn write_and_replace(
         .map_err(|error| FilesystemError::Write(error.to_string()))?;
     temp.sync_all()
         .map_err(|error| FilesystemError::Write(error.to_string()))?;
-
     if snapshot(root, prepared.path(), read_limit)? != prepared.before {
         return Err(FilesystemError::WriteConflict);
     }
 
     if prepared.before.exists {
-        parent
-            .rename(temp_name, parent, file_name)
-            .map_err(|error| FilesystemError::Write(error.to_string()))?;
+        replace_existing(parent, &temp, temp_name, file_name)?;
+        drop(temp);
     } else {
+        drop(temp);
         parent
             .hard_link(temp_name, parent, file_name)
             .map_err(|error| match error.kind() {
@@ -319,6 +327,75 @@ fn write_and_replace(
     }
 
     sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn replace_existing(
+    parent: &Dir,
+    _temp: &cap_std::fs::File,
+    temp_name: &str,
+    file_name: &OsStr,
+) -> Result<(), FilesystemError> {
+    parent
+        .rename(temp_name, parent, file_name)
+        .map_err(|error| FilesystemError::Write(error.to_string()))
+}
+
+#[cfg(windows)]
+fn replace_existing(
+    parent: &Dir,
+    temp: &cap_std::fs::File,
+    _temp_name: &str,
+    file_name: &OsStr,
+) -> Result<(), FilesystemError> {
+    use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+            RtlNtStatusToDosErrorNoTeb,
+        },
+        Win32::System::IO::IO_STATUS_BLOCK,
+    };
+
+    let file_name = file_name.encode_wide().collect::<Vec<_>>();
+    let file_name_byte_len = file_name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| FilesystemError::Write("target file name is too long".into()))?;
+    let byte_len = std::mem::size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(file_name_byte_len)
+        .ok_or_else(|| FilesystemError::Write("target file name is too long".into()))?;
+    let mut storage = vec![0_usize; byte_len.div_ceil(std::mem::size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).RootDirectory = parent.as_raw_handle();
+        (*info).FileNameLength = u32::try_from(file_name_byte_len)
+            .map_err(|_| FilesystemError::Write("target file name is too long".into()))?;
+        std::ptr::copy_nonoverlapping(
+            file_name.as_ptr(),
+            (*info).FileName.as_mut_ptr(),
+            file_name.len(),
+        );
+    }
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtSetInformationFile(
+            temp.as_raw_handle(),
+            &mut status_block,
+            info.cast(),
+            u32::try_from(byte_len)
+                .map_err(|_| FilesystemError::Write("target file name is too long".into()))?,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosErrorNoTeb(status) };
+        return Err(FilesystemError::Write(
+            std::io::Error::from_raw_os_error(i32::try_from(error).unwrap_or(i32::MAX)).to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -335,7 +412,12 @@ fn sync_directory(directory: &Dir) -> Result<(), FilesystemError> {
         .map_err(|error| FilesystemError::Write(error.to_string()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(_directory: &Dir) -> Result<(), FilesystemError> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(directory: &Dir) -> Result<(), FilesystemError> {
     clone_dir(directory)?
         .into_std_file()

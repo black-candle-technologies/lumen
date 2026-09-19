@@ -4,8 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use lumen_core::identity::{PrincipalId, WorkspaceId};
-use lumen_integrations::sandbox::{SandboxReport, SandboxStrength};
+use lumen_core::{
+    automation::{SkillId, SkillVersion},
+    identity::{PrincipalId, WorkspaceId},
+};
+use lumen_integrations::{
+    openai_compatible::OllamaGpuPolicy,
+    sandbox::{SandboxReport, SandboxStrength},
+};
 use serde::Deserialize;
 use thiserror::Error;
 use url::{Host, Url};
@@ -81,6 +87,14 @@ impl Config {
         .expect("configuration validation checked principal")
     }
 
+    pub fn required_skills(&self) -> BTreeSet<(SkillId, SkillVersion)> {
+        self.runtime
+            .required_skills
+            .iter()
+            .map(|value| parse_required_skill(value).expect("validated required skill"))
+            .collect()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if !self.server.bind.ip().is_loopback() {
             return Err(ConfigError::NonLoopbackBind(self.server.bind.ip()));
@@ -97,6 +111,16 @@ impl Config {
                 .ok_or(ConfigError::RemoteModelPolicyRequired)?;
             validate_remote_provider(provider)?;
         }
+        if self.model.gpu_policy != OllamaGpuPolicy::Off {
+            let url =
+                Url::parse(&self.model.endpoint).map_err(|_| ConfigError::InvalidModelEndpoint)?;
+            if endpoint_class != ModelEndpointClass::Local
+                || url.scheme() != "http"
+                || !matches!(url.path(), "/v1" | "/v1/")
+            {
+                return Err(ConfigError::InvalidOllamaGpuEndpoint);
+            }
+        }
         if self.model.model.trim().is_empty() {
             return Err(ConfigError::InvalidModel);
         }
@@ -109,6 +133,9 @@ impl Config {
             &self.bootstrap_admin.subject,
         )
         .map_err(|_| ConfigError::InvalidBootstrapIdentity)?;
+        for required_skill in &self.runtime.required_skills {
+            parse_required_skill(required_skill)?;
+        }
         if self.authentication.token_environment.trim().is_empty()
             || self
                 .authentication
@@ -141,10 +168,27 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn toml_string(value: impl Into<String>) -> String {
+    toml::Value::String(value.into()).to_string()
+}
+
 fn resolve_relative(path: &mut PathBuf, base: &Path) {
     if path.is_relative() {
         *path = base.join(&*path);
     }
+}
+
+fn parse_required_skill(value: &str) -> Result<(SkillId, SkillVersion), ConfigError> {
+    let (skill_id, version) = value
+        .rsplit_once('@')
+        .ok_or_else(|| ConfigError::InvalidRequiredSkill(value.to_owned()))?;
+    let skill_id = Uuid::parse_str(skill_id)
+        .map(SkillId::from_uuid)
+        .map_err(|_| ConfigError::InvalidRequiredSkill(value.to_owned()))?;
+    let version = SkillVersion::parse(version)
+        .map_err(|_| ConfigError::InvalidRequiredSkill(value.to_owned()))?;
+    Ok((skill_id, version))
 }
 
 fn classify_model_endpoint(value: &str) -> Result<ModelEndpointClass, ConfigError> {
@@ -237,6 +281,7 @@ pub struct ModelConfig {
     pub streaming: bool,
     pub timeout_seconds: u64,
     pub max_response_bytes: usize,
+    pub gpu_policy: OllamaGpuPolicy,
 }
 
 impl Default for ModelConfig {
@@ -249,6 +294,7 @@ impl Default for ModelConfig {
             streaming: true,
             timeout_seconds: 120,
             max_response_bytes: 4 * 1024 * 1024,
+            gpu_policy: OllamaGpuPolicy::Off,
         }
     }
 }
@@ -330,6 +376,7 @@ pub struct RuntimeConfig {
     pub max_wall_time_seconds: u64,
     pub max_captured_result_bytes: usize,
     pub approval_ttl_seconds: u64,
+    pub required_skills: BTreeSet<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -343,6 +390,7 @@ impl Default for RuntimeConfig {
             max_wall_time_seconds: 300,
             max_captured_result_bytes: 4 * 1024 * 1024,
             approval_ttl_seconds: 300,
+            required_skills: BTreeSet::new(),
         }
     }
 }
@@ -380,6 +428,8 @@ pub enum ConfigError {
     InvalidRemoteDataClass,
     #[error("model endpoint is invalid")]
     InvalidModelEndpoint,
+    #[error("Ollama GPU policy requires an HTTP loopback /v1/ endpoint")]
+    InvalidOllamaGpuEndpoint,
     #[error("model name must be non-empty")]
     InvalidModel,
     #[error("workspace ID must be a UUID")]
@@ -392,6 +442,101 @@ pub enum ConfigError {
     InvalidTokenEnvironment,
     #[error("runtime limits must be greater than zero")]
     InvalidLimit,
+    #[error("required skill must use <uuid>@<version>: {0}")]
+    InvalidRequiredSkill(String),
     #[error("required sandbox is unavailable: {0}")]
     SandboxUnavailable(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use lumen_integrations::sandbox::{SandboxReport, SandboxStrength};
+
+    use super::{Config, ConfigError, toml_string};
+
+    fn config_with_runtime(runtime: &str) -> String {
+        format!(
+            r#"[database]
+path = "ignored.sqlite3"
+[model]
+endpoint = "http://127.0.0.1:8080/v1/"
+model = "local-model"
+[runtime]
+{runtime}
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "workspace"
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#
+        )
+    }
+
+    #[test]
+    fn required_skills_use_immutable_id_and_version_references() {
+        let value = "7f2d9ac7-2e61-46d4-9c1e-6adf6b2bd763@1.2.3";
+        let config = Config::parse(&config_with_runtime(&format!(
+            "required_skills = [{}]",
+            toml_string(value)
+        )))
+        .expect("required skill config");
+        assert_eq!(config.required_skills().len(), 1);
+
+        assert!(matches!(
+            Config::parse(&config_with_runtime("required_skills = [\"not-a-skill\"]")),
+            Err(ConfigError::InvalidRequiredSkill(value)) if value == "not-a-skill"
+        ));
+    }
+
+    #[test]
+    fn required_kernel_sandbox_stays_fail_closed_when_unavailable() {
+        let config = Config::parse(&config_with_runtime("")).expect("default config");
+        let report = SandboxReport::new(
+            "unavailable-host",
+            SandboxStrength::Unavailable,
+            Some("kernel backend not installed".into()),
+        );
+        assert!(matches!(
+            config.validate_sandbox(&report),
+            Err(ConfigError::SandboxUnavailable(detail)) if detail.contains("kernel backend not installed")
+        ));
+    }
+
+    #[test]
+    fn runtime_config_round_trips_platform_paths() {
+        for path in [
+            r"C:\Users\Test User\Lumen\workspace",
+            r"C:\Temp\foo\bar",
+            "/tmp/lumen/workspace",
+            "path with spaces",
+            "Unicode path/燈",
+        ] {
+            let config = Config::parse(&format!(
+                r#"[database]
+path = "ignored.sqlite3"
+[model]
+endpoint = "http://127.0.0.1:8080/v1/"
+model = "local-model"
+[runtime]
+data_directory = {path}
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = {path}
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+                path = toml_string(path)
+            ))
+            .expect("serialized path must parse");
+
+            assert_eq!(config.runtime.data_directory, PathBuf::from(path));
+            assert_eq!(config.workspace.path, PathBuf::from(path));
+        }
+    }
 }

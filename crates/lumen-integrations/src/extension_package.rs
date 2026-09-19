@@ -469,23 +469,26 @@ fn collect_files(
 }
 
 fn normalize_path(path: &Path) -> Result<String, PackageStageError> {
-    let value = path
-        .to_str()
-        .ok_or_else(|| PackageStageError::InvalidPath(path.display().to_string()))?;
-    if value.is_empty()
-        || value.len() > 4096
-        || !value.is_ascii()
-        || value.contains('\\')
-        || value.split('/').any(|segment| {
-            segment.is_empty()
-                || segment == "."
-                || segment == ".."
-                || segment.bytes().any(|byte| byte.is_ascii_control())
-        })
-    {
-        return Err(PackageStageError::InvalidPath(value.to_owned()));
+    let invalid = || PackageStageError::InvalidPath(path.display().to_string());
+    let mut segments = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(invalid());
+        };
+        let segment = segment.to_str().ok_or_else(&invalid)?;
+        if !segment.is_ascii()
+            || segment.contains('\\')
+            || segment.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(invalid());
+        }
+        segments.push(segment);
     }
-    Ok(value.to_owned())
+    let value = segments.join("/");
+    if value.is_empty() || value.len() > 4096 {
+        return Err(invalid());
+    }
+    Ok(value)
 }
 
 fn snapshot<'a>(
@@ -682,4 +685,18 @@ fn file_identity(metadata: &fs::Metadata) -> u128 {
 #[cfg(not(unix))]
 fn file_identity(_metadata: &fs::Metadata) -> u128 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_path;
+
+    #[test]
+    fn package_paths_use_portable_separators() {
+        assert_eq!(
+            normalize_path(&std::path::Path::new("schemas").join("input.json"))
+                .expect("portable path"),
+            "schemas/input.json"
+        );
+    }
 }

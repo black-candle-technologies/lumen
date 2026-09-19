@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use crate::{Database, RepositoryError, timestamp_to_i64};
 
+type ExpiredRunRow = (String, String, String, Option<String>, Option<String>);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceIdentity {
     principal: PrincipalId,
@@ -232,6 +234,14 @@ pub struct SkillVersionRecord {
     reviewed_by: Option<PrincipalId>,
     created_at: TimestampMillis,
     reviewed_at: Option<TimestampMillis>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SkillPublicationIntent {
+    pub intent_id: Uuid,
+    pub draft_id: Uuid,
+    pub skill: SkillVersionRecord,
+    pub state: String,
 }
 
 impl SkillVersionRecord {
@@ -502,7 +512,7 @@ impl Database {
         &self,
         revision: &ScheduledJobRevision,
     ) -> Result<(), RepositoryError> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT OR IGNORE INTO scheduled_jobs (
                 job_id, workspace_id, service_provider, service_subject,
@@ -518,6 +528,38 @@ impl Database {
         .bind(timestamp_to_i64(revision.created_at)?)
         .execute(&mut *transaction)
         .await?;
+        let identity: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT workspace_id, service_provider, service_subject, owner_provider, owner_subject
+             FROM scheduled_jobs WHERE job_id = ?",
+        )
+        .bind(revision.job_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if identity
+            != (
+                revision.workspace_id.to_string(),
+                revision.service.provider().to_owned(),
+                revision.service.subject().to_owned(),
+                revision.owner.provider().to_owned(),
+                revision.owner.subject().to_owned(),
+            )
+        {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        let revision_number = i64::try_from(revision.revision.as_u64())
+            .map_err(|_| RepositoryError::InvalidAutomationState)?;
+        let latest: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(revision) FROM scheduled_job_revisions WHERE job_id = ?",
+        )
+        .bind(revision.job_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let expected_revision = latest
+            .map_or(Some(1), |value| value.checked_add(1))
+            .ok_or(RepositoryError::InvalidAutomationState)?;
+        if revision_number != expected_revision {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
         let (schedule_kind, schedule_start_at, interval_millis) = schedule_parts(revision.schedule);
         sqlx::query(
             "INSERT INTO scheduled_job_revisions (
@@ -527,10 +569,7 @@ impl Database {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(revision.job_id.to_string())
-        .bind(
-            i64::try_from(revision.revision.as_u64())
-                .map_err(|_| RepositoryError::InvalidAutomationState)?,
-        )
+        .bind(revision_number)
         .bind(schedule_kind)
         .bind(timestamp_to_i64(schedule_start_at)?)
         .bind(
@@ -631,7 +670,40 @@ impl Database {
     ) -> Result<bool, RepositoryError> {
         let now_i64 = timestamp_to_i64(now)?;
         let expires_i64 = timestamp_to_i64(expires_at)?;
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let eligible: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM scheduled_jobs job
+                JOIN scheduled_job_revisions revision ON revision.job_id = job.job_id
+                JOIN service_identities service
+                  ON service.workspace_id = job.workspace_id
+                 AND service.provider = job.service_provider
+                 AND service.subject = job.service_subject
+                WHERE job.job_id = ?
+                  AND revision.revision = ?
+                  AND revision.revision = (
+                      SELECT MAX(latest.revision)
+                      FROM scheduled_job_revisions latest
+                      WHERE latest.job_id = job.job_id
+                  )
+                  AND revision.enabled = 1
+                  AND revision.next_due_at = ?
+                  AND service.enabled = 1
+             )",
+        )
+        .bind(key.job_id().to_string())
+        .bind(
+            i64::try_from(key.revision().as_u64())
+                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+        )
+        .bind(timestamp_to_i64(key.scheduled_for())?)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if eligible == 0 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO scheduled_job_runs (
                 occurrence_key, job_id, revision, scheduled_for, state, created_at, updated_at
@@ -732,27 +804,563 @@ impl Database {
         .transpose()
     }
 
-    pub async fn mark_scheduled_occurrence_running(
+    pub async fn ready_scheduled_run_handoffs(
+        &self,
+    ) -> Result<
+        Vec<(
+            OccurrenceKey,
+            lumen_core::action::RunId,
+            ScheduledJobRevision,
+        )>,
+        RepositoryError,
+    > {
+        let rows = sqlx::query(
+            "SELECT job.workspace_id, job.service_provider, job.service_subject,
+                    job.owner_provider, job.owner_subject, job.job_id,
+                    revision.revision, revision.schedule_kind, revision.schedule_start_at,
+                    revision.interval_millis, revision.prompt, revision.data_class,
+                    revision.max_model_turns, revision.max_actions, revision.enabled,
+                    revision.next_due_at, revision.idempotent, revision.created_at,
+                    occurrence.scheduled_for, occurrence.run_id
+             FROM scheduled_job_runs occurrence
+             JOIN scheduled_jobs job ON job.job_id = occurrence.job_id
+             JOIN scheduled_job_revisions revision
+               ON revision.job_id = occurrence.job_id
+              AND revision.revision = occurrence.revision
+             WHERE occurrence.state = 'claimed' AND occurrence.run_id IS NOT NULL
+             ORDER BY occurrence.created_at, occurrence.occurrence_key",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let job_id = JobId::from_uuid(
+                    row.try_get::<String, _>("job_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                );
+                let revision = JobRevision::new(
+                    u64::try_from(row.try_get::<i64, _>("revision")?)
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                )
+                .map_err(|_| RepositoryError::InvalidAutomationState)?;
+                let scheduled_for = TimestampMillis::new(
+                    u64::try_from(row.try_get::<i64, _>("scheduled_for")?)
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                );
+                let run_id = lumen_core::action::RunId::from_uuid(
+                    row.try_get::<String, _>("run_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                );
+                let job = scheduled_job_revision_from_row(job_id, &row)?;
+                Ok((
+                    OccurrenceKey::new(job_id, revision, scheduled_for),
+                    run_id,
+                    job,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn claim_ready_scheduled_run(
         &self,
         key: &OccurrenceKey,
-        run_id: lumen_core::action::RunId,
+        lease_id: Uuid,
         now: TimestampMillis,
-    ) -> Result<(), RepositoryError> {
+        expires_at: TimestampMillis,
+    ) -> Result<bool, RepositoryError> {
+        let now_i64 = timestamp_to_i64(now)?;
         let updated = sqlx::query(
-            "UPDATE scheduled_job_runs
-             SET run_id = ?, state = 'running', updated_at = ?
-             WHERE occurrence_key = ? AND (run_id IS NULL OR state = 'unknown')",
+            "UPDATE scheduled_job_leases
+             SET lease_id = ?, leased_at = ?, expires_at = ?
+             WHERE occurrence_key = ? AND expires_at <= ?
+               AND EXISTS (
+                   SELECT 1 FROM scheduled_job_runs occurrence
+                   WHERE occurrence.occurrence_key = scheduled_job_leases.occurrence_key
+                     AND occurrence.state = 'claimed' AND occurrence.run_id IS NOT NULL
+               )",
         )
-        .bind(run_id.to_string())
-        .bind(timestamp_to_i64(now)?)
+        .bind(lease_id.to_string())
+        .bind(now_i64)
+        .bind(timestamp_to_i64(expires_at)?)
         .bind(key.as_str())
+        .bind(now_i64)
         .execute(self.pool())
         .await?
         .rows_affected();
-        if updated == 0 {
+        Ok(updated == 1)
+    }
+
+    pub async fn recover_expired_running_scheduled_runs(
+        &self,
+        now: TimestampMillis,
+    ) -> Result<Vec<lumen_core::action::RunId>, RepositoryError> {
+        let now_i64 = timestamp_to_i64(now)?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let rows: Vec<ExpiredRunRow> = sqlx::query_as(
+            "SELECT occurrence.run_id, run.state, run.workspace_id,
+                    lifecycle.phase, lifecycle.effect_certainty
+             FROM scheduled_job_runs occurrence
+             JOIN scheduled_job_leases lease
+               ON lease.occurrence_key = occurrence.occurrence_key
+             JOIN agent_runs run ON run.id = occurrence.run_id
+             LEFT JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id
+             WHERE occurrence.state = 'running' AND lease.expires_at <= ?
+               AND occurrence.run_id IS NOT NULL",
+        )
+        .bind(now_i64)
+        .fetch_all(&mut *transaction)
+        .await?;
+        for (run_id, run_state, workspace_id, phase, certainty) in &rows {
+            if phase
+                .as_deref()
+                .is_some_and(|phase| !matches!(phase, "terminal" | "reconciliation_required"))
+            {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+            let (mut occurrence_state, fail_run) = match run_state.as_str() {
+                "completed" => ("succeeded", false),
+                "failed" => ("failed", false),
+                "cancelled" => ("cancelled", false),
+                "created" | "running" | "awaiting_approval" => ("unknown", true),
+                _ => return Err(RepositoryError::InvalidAutomationState),
+            };
+            if phase.is_some() {
+                if fail_run {
+                    return Err(RepositoryError::ExecutionStateConflict);
+                }
+                if certainty.as_deref() == Some("unknown") {
+                    occurrence_state = "unknown";
+                }
+            }
+            let occurrence = sqlx::query(
+                "UPDATE scheduled_job_runs SET state = ?, updated_at = ?
+                 WHERE run_id = ? AND state = 'running'",
+            )
+            .bind(occurrence_state)
+            .bind(now_i64)
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if occurrence != 1 {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+            if fail_run {
+                let run = sqlx::query(
+                    "UPDATE agent_runs SET state = 'failed', completed_at = ?
+                     WHERE id = ? AND state IN ('created', 'running', 'awaiting_approval')",
+                )
+                .bind(now_i64)
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                if run != 1 {
+                    return Err(RepositoryError::ExecutionStateConflict);
+                }
+                sqlx::query(
+                    "UPDATE execution_attempts SET state = 'unknown', completed_at = ?
+                     WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)
+                       AND state IN ('reserved', 'running')",
+                )
+                .bind(now_i64)
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE actions SET state = 'unknown' WHERE run_id = ? AND state = 'running'",
+                )
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE actions SET state = 'failed', terminal_reason = 'run_failed_before_dispatch'
+                     WHERE run_id = ? AND state = 'normalized'",
+                )
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "UPDATE approval_requests SET state = 'invalidated'
+                     WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)
+                       AND state IN ('pending', 'granted')",
+                )
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+                let audit_id = Uuid::new_v4().to_string();
+                let payload = serde_json::json!({
+                    "run_id": run_id,
+                    "terminal_code": "legacy_lease_expired",
+                    "effect_certainty": "unknown",
+                    "primary_diagnostic": "legacy scheduled lease expired before durable ownership",
+                })
+                .to_string();
+                sqlx::query(
+                    "INSERT INTO run_lifecycle (
+                        run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                        terminal_code, primary_diagnostic, terminal_audit_id,
+                        terminal_audit_pending, terminal_audit_occurred_at,
+                        terminal_audit_payload_json, created_at, updated_at
+                     ) VALUES (?, ?, ?, 'reconciliation_required', 'unknown',
+                               'legacy_lease_expired', ?, ?, 1, ?, ?, ?, ?)",
+                )
+                .bind(run_id)
+                .bind(workspace_id)
+                .bind(Uuid::nil().to_string())
+                .bind("legacy scheduled lease expired before durable ownership")
+                .bind(audit_id)
+                .bind(now_i64)
+                .bind(payload)
+                .bind(now_i64)
+                .bind(now_i64)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        transaction.commit().await?;
+        rows.into_iter()
+            .map(|(run_id, _, _, _, _)| {
+                Ok(lumen_core::action::RunId::from_uuid(
+                    run_id
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn persist_scheduled_run_handoff(
+        &self,
+        job: &ScheduledJobRevision,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        next_due_at: Option<TimestampMillis>,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.persist_scheduled_run_handoff_with_owner(
+            job,
+            key,
+            lease_id,
+            run_id,
+            None,
+            next_due_at,
+            now,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn persist_owned_scheduled_run_handoff(
+        &self,
+        job: &ScheduledJobRevision,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Uuid,
+        next_due_at: Option<TimestampMillis>,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.persist_scheduled_run_handoff_with_owner(
+            job,
+            key,
+            lease_id,
+            run_id,
+            Some(owner_instance_id),
+            next_due_at,
+            now,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_scheduled_run_handoff_with_owner(
+        &self,
+        job: &ScheduledJobRevision,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Option<Uuid>,
+        next_due_at: Option<TimestampMillis>,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        if key.job_id() != job.job_id()
+            || key.revision() != job.revision()
+            || Some(key.scheduled_for()) != job.next_due_at()
+            || next_due_at
+                != job
+                    .schedule()
+                    .next_after(key.scheduled_for(), job.enabled())
+        {
             return Err(RepositoryError::ExecutionStateConflict);
         }
+        let now_i64 = timestamp_to_i64(now)?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let eligible: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM scheduled_job_runs occurrence
+                JOIN scheduled_job_leases lease
+                  ON lease.occurrence_key = occurrence.occurrence_key
+                JOIN scheduled_jobs job ON job.job_id = occurrence.job_id
+                JOIN scheduled_job_revisions revision
+                  ON revision.job_id = occurrence.job_id
+                 AND revision.revision = occurrence.revision
+                JOIN service_identities service
+                  ON service.workspace_id = job.workspace_id
+                 AND service.provider = job.service_provider
+                 AND service.subject = job.service_subject
+                WHERE occurrence.occurrence_key = ?
+                  AND (
+                      (occurrence.state = 'claimed' AND occurrence.run_id IS NULL)
+                      OR (occurrence.state = 'unknown' AND revision.idempotent = 1)
+                  )
+                  AND lease.lease_id = ?
+                  AND lease.expires_at > ?
+                  AND revision.revision = (
+                      SELECT MAX(latest.revision)
+                      FROM scheduled_job_revisions latest
+                      WHERE latest.job_id = occurrence.job_id
+                  )
+                  AND revision.enabled = 1
+                  AND revision.next_due_at = occurrence.scheduled_for
+                  AND job.workspace_id = ?
+                  AND job.service_provider = ?
+                  AND job.service_subject = ?
+                  AND service.enabled = 1
+             )",
+        )
+        .bind(key.as_str())
+        .bind(lease_id.to_string())
+        .bind(now_i64)
+        .bind(job.workspace_id().to_string())
+        .bind(job.service().provider())
+        .bind(job.service().subject())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if eligible == 0 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO identities (provider, subject, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(job.service().provider())
+        .bind(job.service().subject())
+        .bind(now_i64)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_runs (
+                id, workspace_id, actor_provider, actor_subject, state, created_at
+             ) VALUES (?, ?, ?, ?, 'created', ?)",
+        )
+        .bind(run_id.to_string())
+        .bind(job.workspace_id().to_string())
+        .bind(job.service().provider())
+        .bind(job.service().subject())
+        .bind(now_i64)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(owner_instance_id) = owner_instance_id {
+            sqlx::query(
+                "INSERT INTO run_lifecycle (
+                    run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, 'admitted', 'no_effect', ?, ?)",
+            )
+            .bind(run_id.to_string())
+            .bind(job.workspace_id().to_string())
+            .bind(owner_instance_id.to_string())
+            .bind(now_i64)
+            .bind(now_i64)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        let linked = sqlx::query(
+            "UPDATE scheduled_job_runs
+             SET run_id = ?, state = 'claimed', updated_at = ?
+             WHERE occurrence_key = ?
+               AND ((state = 'claimed' AND run_id IS NULL) OR state = 'unknown')",
+        )
+        .bind(run_id.to_string())
+        .bind(now_i64)
+        .bind(key.as_str())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let advanced = sqlx::query(
+            "UPDATE scheduled_job_revisions
+             SET next_due_at = ?
+             WHERE job_id = ? AND revision = ? AND next_due_at = ?",
+        )
+        .bind(next_due_at.map(timestamp_to_i64).transpose()?)
+        .bind(job.job_id().to_string())
+        .bind(
+            i64::try_from(job.revision().as_u64())
+                .map_err(|_| RepositoryError::InvalidAutomationState)?,
+        )
+        .bind(timestamp_to_i64(key.scheduled_for())?)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if linked != 1 || advanced != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn start_scheduled_run(
+        &self,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        now: TimestampMillis,
+        expires_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.start_scheduled_run_with_owner(key, lease_id, run_id, None, now, expires_at)
+            .await
+    }
+
+    pub async fn start_owned_scheduled_run(
+        &self,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Uuid,
+        now: TimestampMillis,
+        expires_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.start_scheduled_run_with_owner(
+            key,
+            lease_id,
+            run_id,
+            Some(owner_instance_id),
+            now,
+            expires_at,
+        )
+        .await
+    }
+
+    async fn start_scheduled_run_with_owner(
+        &self,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+        owner_instance_id: Option<Uuid>,
+        now: TimestampMillis,
+        expires_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let now_i64 = timestamp_to_i64(now)?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let occurrence = sqlx::query(
+            "UPDATE scheduled_job_runs
+             SET state = 'running', start_lease_id = ?, updated_at = ?
+             WHERE occurrence_key = ? AND run_id = ? AND state = 'claimed'
+               AND EXISTS (
+                   SELECT 1 FROM scheduled_job_leases lease
+                   WHERE lease.occurrence_key = scheduled_job_runs.occurrence_key
+                     AND lease.lease_id = ? AND lease.expires_at > ?
+               )",
+        )
+        .bind(lease_id.to_string())
+        .bind(now_i64)
+        .bind(key.as_str())
+        .bind(run_id.to_string())
+        .bind(lease_id.to_string())
+        .bind(now_i64)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let run = sqlx::query(
+            "UPDATE agent_runs SET state = 'running' WHERE id = ? AND state = 'created'",
+        )
+        .bind(run_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let lease = sqlx::query(
+            "UPDATE scheduled_job_leases SET expires_at = ?
+             WHERE occurrence_key = ? AND lease_id = ? AND expires_at > ?",
+        )
+        .bind(timestamp_to_i64(expires_at)?)
+        .bind(key.as_str())
+        .bind(lease_id.to_string())
+        .bind(now_i64)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if occurrence != 1 || run != 1 || lease != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        if let Some(owner_instance_id) = owner_instance_id {
+            let existing: Option<String> =
+                sqlx::query_scalar("SELECT phase FROM run_lifecycle WHERE run_id = ?")
+                    .bind(run_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            let changed = if existing.is_some() {
+                sqlx::query(
+                    "UPDATE run_lifecycle SET owner_instance_id = ?, phase = 'running', updated_at = ?
+                     WHERE run_id = ? AND phase = 'admitted' AND effect_certainty = 'no_effect'",
+                )
+                .bind(owner_instance_id.to_string())
+                .bind(now_i64)
+                .bind(run_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+            } else {
+                sqlx::query(
+                    "INSERT INTO run_lifecycle (
+                        run_id, workspace_id, owner_instance_id, phase, effect_certainty,
+                        created_at, updated_at
+                     ) SELECT id, workspace_id, ?, 'running', 'no_effect', created_at, ?
+                       FROM agent_runs WHERE id = ?",
+                )
+                .bind(owner_instance_id.to_string())
+                .bind(now_i64)
+                .bind(run_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+            };
+            if changed != 1 {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn scheduled_run_lease_is_current(
+        &self,
+        key: &OccurrenceKey,
+        lease_id: Uuid,
+        run_id: lumen_core::action::RunId,
+    ) -> Result<bool, RepositoryError> {
+        let current: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM scheduled_job_runs occurrence
+                JOIN scheduled_job_leases lease
+                  ON lease.occurrence_key = occurrence.occurrence_key
+                WHERE occurrence.occurrence_key = ?
+                  AND occurrence.run_id = ?
+                  AND occurrence.state = 'running'
+                  AND lease.lease_id = ?
+                  AND occurrence.start_lease_id = lease.lease_id
+             )",
+        )
+        .bind(key.as_str())
+        .bind(run_id.to_string())
+        .bind(lease_id.to_string())
+        .fetch_one(self.pool())
+        .await?;
+        Ok(current == 1)
     }
 
     pub async fn complete_scheduled_occurrence_for_run(
@@ -764,16 +1372,29 @@ impl Database {
         if !matches!(state, "succeeded" | "failed" | "cancelled" | "unknown") {
             return Err(RepositoryError::ExecutionStateConflict);
         }
-        sqlx::query(
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let updated = sqlx::query(
             "UPDATE scheduled_job_runs
              SET state = ?, updated_at = ?
-             WHERE run_id = ?",
+             WHERE run_id = ? AND state = 'running'",
         )
         .bind(state)
         .bind(timestamp_to_i64(now)?)
         .bind(run_id.to_string())
-        .execute(self.pool())
-        .await?;
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT state FROM scheduled_job_runs WHERE run_id = ?")
+                    .bind(run_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            if current.as_deref() != Some(state) {
+                return Err(RepositoryError::ExecutionStateConflict);
+            }
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -803,7 +1424,47 @@ impl Database {
         &self,
         skill: &SkillVersionRecord,
     ) -> Result<(), RepositoryError> {
+        self.insert_skill_version_with_state(skill, None).await
+    }
+
+    pub async fn publish_skill_version(
+        &self,
+        skill: &SkillVersionRecord,
+        updated_at: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        self.insert_skill_version_with_state(skill, Some(updated_at))
+            .await
+    }
+
+    async fn insert_skill_version_with_state(
+        &self,
+        skill: &SkillVersionRecord,
+        enabled_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
         let mut transaction = self.pool().begin().await?;
+        Self::insert_skill_version_transaction(&mut transaction, skill, enabled_at).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_skill_version_transaction(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        skill: &SkillVersionRecord,
+        enabled_at: Option<TimestampMillis>,
+    ) -> Result<(), RepositoryError> {
+        let existing = sqlx::query(
+            "SELECT workspace_id, name, description FROM agent_skills WHERE skill_id = ?",
+        )
+        .bind(skill.skill_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(existing) = existing
+            && (existing.try_get::<String, _>("workspace_id")? != skill.workspace_id.to_string()
+                || existing.try_get::<String, _>("name")? != skill.name
+                || existing.try_get::<String, _>("description")? != skill.description)
+        {
+            return Err(RepositoryError::SkillMetadataConflict);
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO agent_skills (skill_id, workspace_id, name, description, created_at)
              VALUES (?, ?, ?, ?, ?)",
@@ -813,7 +1474,7 @@ impl Database {
         .bind(&skill.name)
         .bind(&skill.description)
         .bind(timestamp_to_i64(skill.created_at)?)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         sqlx::query(
             "INSERT INTO skill_versions (
@@ -833,10 +1494,175 @@ impl Database {
         .bind(skill.reviewed_by.as_ref().map(PrincipalId::subject))
         .bind(timestamp_to_i64(skill.created_at)?)
         .bind(skill.reviewed_at.map(timestamp_to_i64).transpose()?)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
+        if let Some(updated_at) = enabled_at {
+            sqlx::query(
+                "INSERT INTO skill_workspace_state (workspace_id, skill_id, version, enabled, updated_at)
+                 VALUES (?, ?, ?, 1, ?)
+                 ON CONFLICT(workspace_id, skill_id) DO UPDATE SET
+                    version = excluded.version,
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(skill.workspace_id.to_string())
+            .bind(skill.skill_id.to_string())
+            .bind(skill.version.as_str())
+            .bind(timestamp_to_i64(updated_at)?)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn prepare_skill_publication(
+        &self,
+        intent_id: Uuid,
+        draft_id: Uuid,
+        skill: &SkillVersionRecord,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO skill_publication_intents (
+                intent_id, draft_id, workspace_id, skill_id, version, name, description,
+                source_format, source_digest, created_provider, created_subject, created_at, state
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared')",
+        )
+        .bind(intent_id.to_string())
+        .bind(draft_id.to_string())
+        .bind(skill.workspace_id.to_string())
+        .bind(skill.skill_id.to_string())
+        .bind(skill.version.as_str())
+        .bind(&skill.name)
+        .bind(&skill.description)
+        .bind(&skill.source_format)
+        .bind(&skill.source_digest)
+        .bind(skill.created_by.provider())
+        .bind(skill.created_by.subject())
+        .bind(timestamp_to_i64(skill.created_at)?)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_skill_publication_state(
+        &self,
+        intent_id: Uuid,
+        state: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(
+            state,
+            "materialized" | "reconciliation_required" | "abandoned"
+        ) {
+            return Err(RepositoryError::InvalidAutomationState);
+        }
+        let updated = sqlx::query(
+            "UPDATE skill_publication_intents SET state = ?, diagnostic = ?
+             WHERE intent_id = ? AND state IN ('prepared', 'materialized', 'reconciliation_required')",
+        )
+        .bind(state)
+        .bind(diagnostic)
+        .bind(intent_id.to_string())
+        .execute(self.pool())
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::InvalidAutomationState);
+        }
+        Ok(())
+    }
+
+    pub async fn commit_skill_publication(
+        &self,
+        intent_id: Uuid,
+        skill: &SkillVersionRecord,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool().begin().await?;
+        let row = sqlx::query(
+            "SELECT workspace_id, skill_id, version, name, description, source_format,
+                    source_digest, created_provider, created_subject, created_at, state
+             FROM skill_publication_intents WHERE intent_id = ?",
+        )
+        .bind(intent_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if row.try_get::<String, _>("workspace_id")? != skill.workspace_id.to_string()
+            || row.try_get::<String, _>("skill_id")? != skill.skill_id.to_string()
+            || row.try_get::<String, _>("version")? != skill.version.as_str()
+            || row.try_get::<String, _>("name")? != skill.name
+            || row.try_get::<String, _>("description")? != skill.description
+            || row.try_get::<String, _>("source_format")? != skill.source_format
+            || row.try_get::<String, _>("source_digest")? != skill.source_digest
+            || row.try_get::<String, _>("created_provider")? != skill.created_by.provider()
+            || row.try_get::<String, _>("created_subject")? != skill.created_by.subject()
+            || row.try_get::<i64, _>("created_at")? != timestamp_to_i64(skill.created_at)?
+            || row.try_get::<String, _>("state")? != "materialized"
+        {
+            return Err(RepositoryError::InvalidAutomationState);
+        }
+        Self::insert_skill_version_transaction(&mut transaction, skill, Some(skill.created_at))
+            .await?;
+        sqlx::query("UPDATE skill_publication_intents SET state = 'committed', diagnostic = NULL WHERE intent_id = ?")
+            .bind(intent_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn recoverable_skill_publications(
+        &self,
+    ) -> Result<Vec<SkillPublicationIntent>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT * FROM skill_publication_intents WHERE state != 'abandoned' ORDER BY created_at, intent_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let workspace_id = WorkspaceId::from_uuid(
+                    row.try_get::<String, _>("workspace_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                );
+                let actor = PrincipalId::new(
+                    row.try_get::<String, _>("created_provider")?,
+                    row.try_get::<String, _>("created_subject")?,
+                )
+                .map_err(|_| RepositoryError::InvalidAutomationState)?;
+                let created_at = timestamp_from_row(&row, "created_at")?;
+                let skill = SkillVersionRecord::new(
+                    SkillId::from_uuid(
+                        row.try_get::<String, _>("skill_id")?
+                            .parse()
+                            .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    ),
+                    SkillVersion::parse(row.try_get::<String, _>("version")?)
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    workspace_id,
+                    row.try_get::<String, _>("name")?,
+                    row.try_get::<String, _>("description")?,
+                    row.try_get::<String, _>("source_format")?,
+                    row.try_get::<String, _>("source_digest")?,
+                    true,
+                    actor.clone(),
+                    Some(actor),
+                    created_at,
+                    Some(created_at),
+                )?;
+                Ok(SkillPublicationIntent {
+                    intent_id: row
+                        .try_get::<String, _>("intent_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    draft_id: row
+                        .try_get::<String, _>("draft_id")?
+                        .parse()
+                        .map_err(|_| RepositoryError::InvalidAutomationState)?,
+                    skill,
+                    state: row.try_get("state")?,
+                })
+            })
+            .collect()
     }
 
     pub async fn set_skill_workspace_state(
@@ -879,7 +1705,7 @@ impl Database {
              JOIN agent_skills skill ON skill.skill_id = state.skill_id
              JOIN skill_versions version
                ON version.skill_id = state.skill_id AND version.version = state.version
-             WHERE state.workspace_id = ? AND state.enabled = 1 AND version.reviewed = 1
+             WHERE state.workspace_id = ? AND state.enabled = 1
              ORDER BY skill.name, version.version",
         )
         .bind(workspace_id.to_string())
@@ -888,6 +1714,32 @@ impl Database {
         rows.into_iter()
             .map(|row| skill_version_from_row(workspace_id, &row))
             .collect()
+    }
+
+    pub async fn skill_version(
+        &self,
+        workspace_id: WorkspaceId,
+        skill_id: SkillId,
+        version: &SkillVersion,
+    ) -> Result<Option<SkillVersionRecord>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT skill.skill_id, skill.name, skill.description, version.version,
+                    version.source_format, version.source_digest, version.reviewed,
+                    version.created_provider, version.created_subject,
+                    version.reviewed_provider, version.reviewed_subject,
+                    version.created_at, version.reviewed_at
+             FROM agent_skills skill
+             JOIN skill_versions version ON version.skill_id = skill.skill_id
+             WHERE skill.workspace_id = ? AND skill.skill_id = ? AND version.version = ?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(skill_id.to_string())
+        .bind(version.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref()
+            .map(|row| skill_version_from_row(workspace_id, row))
+            .transpose()
     }
 
     pub async fn insert_workflow_capture_draft(
@@ -981,7 +1833,9 @@ fn grant_scope_parts(scope: &ResourceScope) -> Result<ScopeParts, RepositoryErro
     })
 }
 
-fn scope_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ResourceScope, RepositoryError> {
+pub(crate) fn scope_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ResourceScope, RepositoryError> {
     match row.try_get::<String, _>("scope_kind")?.as_str() {
         "workspace" => Ok(ResourceScope::workspace(WorkspaceId::from_uuid(
             row.try_get::<String, _>("scope_workspace_id")?
