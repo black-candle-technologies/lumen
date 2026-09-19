@@ -4,6 +4,7 @@ mod audit;
 mod automation;
 mod egress;
 mod extensions;
+mod lifecycle;
 mod migrations;
 mod repositories;
 
@@ -13,7 +14,8 @@ use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
 pub use automation::{
-    ScheduledJobRevision, ServiceIdentity, SkillVersionRecord, WorkflowCaptureDraft,
+    ScheduledJobRevision, ServiceIdentity, SkillPublicationIntent, SkillVersionRecord,
+    WorkflowCaptureDraft,
 };
 pub use egress::{
     ChannelIdentityMapping, DestinationRevision, ModelEndpointClass, ModelProviderRevision,
@@ -23,6 +25,7 @@ pub use extensions::{
     InstallResult, InstalledPluginVersion, PluginGrantRevision, PluginGrantScope,
     PluginSettingRevision, PluginSettingScope, PluginWorkspaceState, StagedPluginPackage,
 };
+pub use lifecycle::{EffectCertainty, RunLifecycleView, TerminalSpec, TerminalState};
 pub use repositories::{
     DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
     SecretReferenceError,
@@ -71,6 +74,14 @@ pub enum RepositoryError {
     MissingAction,
     #[error("approval decision conflicts with its stored state or workspace")]
     ApprovalDecisionConflict,
+    #[error("approval decision uses a stale fingerprint or policy revision")]
+    ApprovalStale,
+    #[error("approval action changed after review")]
+    ApprovalActionChanged,
+    #[error("approval expired before the decision completed")]
+    ApprovalExpired,
+    #[error("approval was already consumed")]
+    ApprovalConsumed,
     #[error("run state is invalid: {0}")]
     InvalidRunState(String),
     #[error("execution attempt conflicts with its stored action or state")]
@@ -91,6 +102,8 @@ pub enum RepositoryError {
     InvalidEgressPolicy,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
+    #[error("skill version metadata conflicts with the pinned skill identity")]
+    SkillMetadataConflict,
 }
 
 pub(crate) fn timestamp_to_i64(

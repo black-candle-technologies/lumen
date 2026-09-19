@@ -115,4 +115,31 @@ describe('ApprovalItem', () => {
 		expect(screen.getByText('API_TOKEN')).toBeInTheDocument();
 		expect(screen.queryByText('actual-secret-must-not-render')).not.toBeInTheDocument();
 	});
+
+	it('expires against server time, disables decisions, and offers renewal', async () => {
+		const onDecision = vi.fn();
+		const onRenew = vi.fn();
+		render(ApprovalItem, {
+			approval: {
+				approval_id: 'approval-expired',
+				run_id: 'run-expired',
+				kind: 'process.spawn',
+				arguments: { program: '/bin/echo', args: [] },
+				capabilities: [],
+				fingerprint: 'e'.repeat(64),
+				created_at: 1000,
+				expires_at: 2000
+			},
+			now: 2000,
+			onDecision,
+			onRenew
+		});
+
+		expect(screen.getByText('Expired')).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: 'Grant approval' })).toBeDisabled();
+		expect(screen.getByRole('button', { name: 'Reject approval' })).toBeDisabled();
+		await fireEvent.click(screen.getByRole('button', { name: 'Renew approval' }));
+		expect(onRenew).toHaveBeenCalledWith('approval-expired');
+		expect(onDecision).not.toHaveBeenCalled();
+	});
 });

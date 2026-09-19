@@ -203,6 +203,8 @@ impl AuditEvent {
         self.id
     }
 
+    /// Wall-clock time captured when the event was recorded. Use the persisted
+    /// audit sequence, not this value, for ordering when the system clock moves.
     pub const fn timestamp(&self) -> TimestampMillis {
         self.timestamp
     }
