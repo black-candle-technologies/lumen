@@ -147,6 +147,39 @@ fn rejects_symlinks_and_hard_links() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_symlinked_quarantine_and_installation_roots() {
+    use std::os::unix::fs::symlink;
+
+    let source = tempdir().expect("source");
+    let storage = tempdir().expect("storage");
+    let foreign = tempdir().expect("foreign");
+    write_package(source.path(), b"component");
+    let linked_quarantine = storage.path().join("quarantine");
+    symlink(foreign.path(), &linked_quarantine).expect("quarantine link");
+    let stager = PackageStager::default();
+    assert!(matches!(
+        stager.stage(source.path(), &linked_quarantine),
+        Err(PackageStageError::QuarantineConflict)
+    ));
+
+    let quarantine = tempdir().expect("quarantine");
+    let staged = stager
+        .stage(source.path(), quarantine.path())
+        .expect("stage");
+    let linked_installed = storage.path().join("installed");
+    symlink(foreign.path(), &linked_installed).expect("installation link");
+    assert!(matches!(
+        stager.install_staged(
+            staged.quarantine_path(),
+            &linked_installed,
+            &PackageIdentity::from(&staged),
+        ),
+        Err(PackageStageError::InstalledContentConflict)
+    ));
+}
+
 #[test]
 fn rejects_invalid_manifest_artifact_and_package_bounds() {
     let quarantine = tempdir().expect("quarantine");

@@ -80,6 +80,11 @@ impl PackageStager {
             return Err(PackageStageError::InvalidSource);
         }
         fs::create_dir_all(quarantine_root.as_ref())?;
+        let quarantine_metadata = fs::symlink_metadata(quarantine_root.as_ref())?;
+        if quarantine_metadata.file_type().is_symlink() || !quarantine_metadata.file_type().is_dir()
+        {
+            return Err(PackageStageError::QuarantineConflict);
+        }
         let quarantine_root = fs::canonicalize(quarantine_root.as_ref())?;
         if quarantine_root.starts_with(&source) {
             return Err(PackageStageError::InvalidQuarantine);
@@ -149,11 +154,11 @@ impl PackageStager {
         installed_root: impl AsRef<Path>,
         approved: &PackageIdentity,
     ) -> Result<InstalledPackage, PackageStageError> {
-        let staged_path = fs::canonicalize(staged_path.as_ref())?;
-        let metadata = fs::symlink_metadata(&staged_path)?;
-        if !metadata.file_type().is_dir() {
+        let staged_metadata = fs::symlink_metadata(staged_path.as_ref())?;
+        if staged_metadata.file_type().is_symlink() || !staged_metadata.file_type().is_dir() {
             return Err(PackageStageError::ApprovedIdentityMismatch);
         }
+        let staged_path = fs::canonicalize(staged_path.as_ref())?;
 
         let mut snapshots = Vec::new();
         collect_files(&staged_path, &staged_path, 0, self.limits, &mut snapshots)
@@ -186,6 +191,10 @@ impl PackageStager {
         }
 
         fs::create_dir_all(installed_root.as_ref())?;
+        let installed_metadata = fs::symlink_metadata(installed_root.as_ref())?;
+        if installed_metadata.file_type().is_symlink() || !installed_metadata.file_type().is_dir() {
+            return Err(PackageStageError::InstalledContentConflict);
+        }
         let installed_root = fs::canonicalize(installed_root.as_ref())?;
         if installed_root.starts_with(&staged_path) {
             return Err(PackageStageError::InvalidInstalledRoot);
@@ -217,6 +226,10 @@ impl PackageStager {
         installed_path: impl AsRef<Path>,
         approved: &PackageIdentity,
     ) -> Result<(), PackageStageError> {
+        let installed_metadata = fs::symlink_metadata(installed_path.as_ref())?;
+        if installed_metadata.file_type().is_symlink() || !installed_metadata.file_type().is_dir() {
+            return Err(PackageStageError::ApprovedIdentityMismatch);
+        }
         let installed_path = fs::canonicalize(installed_path.as_ref())?;
         let mut snapshots = Vec::new();
         collect_files(
