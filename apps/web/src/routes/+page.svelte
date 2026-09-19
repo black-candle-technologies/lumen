@@ -4,7 +4,7 @@
 	import Square from '@lucide/svelte/icons/square';
 	import User from '@lucide/svelte/icons/user';
 	import { ApiClient, ApiError, type JsonValue, type RunEvent } from '$lib/api';
-	import { connection, isConfigured } from '$lib/connection';
+	import { connection, connectionState } from '$lib/connection';
 
 	type Message = { role: 'user' | 'assistant'; text: string };
 
@@ -14,15 +14,17 @@
 	let stopping = $state(false);
 	let runId = $state<string | null>(null);
 	let error = $state('');
+	let warnings = $state<string[]>([]);
 
 	async function send() {
 		const text = prompt.trim();
-		if (!text || running || !isConfigured($connection)) return;
+		if (!text || running || $connectionState.kind !== 'connected') return;
 		messages = [...messages, { role: 'user', text }];
 		prompt = '';
 		running = true;
 		stopping = false;
 		error = '';
+		warnings = [];
 		try {
 			const client = new ApiClient($connection);
 			const created = await client.createRun(text);
@@ -37,11 +39,20 @@
 	}
 
 	function receiveEvent(event: RunEvent) {
+		if (event.event === 'skill.excluded') {
+			const data = event.data as { skill_id?: JsonValue; version?: JsonValue; reason?: JsonValue; required?: JsonValue };
+			warnings = [...warnings, `${data.required ? 'Required' : 'Optional'} skill ${String(data.skill_id ?? '')}@${String(data.version ?? '')} excluded: ${String(data.reason ?? 'unavailable')}.`];
+		}
 		if (event.event === 'run.completed') {
 			const data = event.data as { text?: JsonValue };
 			messages = [...messages, { role: 'assistant', text: String(data.text ?? '') }];
 		}
-		if (event.event === 'run.failed') error = String(event.data);
+		if (event.event === 'run.failed') {
+			const data = event.data as { code?: JsonValue; skill_id?: JsonValue; version?: JsonValue; reason?: JsonValue };
+			error = data.code === 'required_skill_unavailable'
+				? `Required skill ${String(data.skill_id ?? '')}@${String(data.version ?? '')} is unavailable: ${String(data.reason ?? 'unavailable')}.`
+				: String(event.data);
+		}
 		if (event.event === 'run.cancelled') error = 'Run cancelled.';
 	}
 
@@ -88,17 +99,18 @@
 			<div class="run-state"><span></span>{stopping ? 'Stopping' : 'Working locally'}</div>
 		{/if}
 		{#if error}<div class="notice error">{error}</div>{/if}
+		{#each warnings as warning}<div class="notice">{warning}</div>{/each}
 	</div>
 
 	<div class="composer-wrap">
 		<div class="composer">
-			<textarea bind:value={prompt} onkeydown={keydown} placeholder="Message Lumen" rows="1" disabled={running}></textarea>
+			<textarea bind:value={prompt} onkeydown={keydown} placeholder="Message Lumen" rows="1" disabled={running || $connectionState.kind !== 'connected'}></textarea>
 			{#if running}
 				<button class="stop-button" type="button" aria-label="Stop run" title="Stop run" onclick={stop} disabled={stopping}>
 					<Square size={15} fill="currentColor" />
 				</button>
 			{:else}
-				<button class="send-button" type="button" aria-label="Send message" title="Send" onclick={send} disabled={!prompt.trim() || !isConfigured($connection)}>
+				<button class="send-button" type="button" aria-label="Send message" title="Send" onclick={send} disabled={!prompt.trim() || $connectionState.kind !== 'connected'}>
 					<Send size={17} />
 				</button>
 			{/if}

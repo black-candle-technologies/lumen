@@ -140,7 +140,7 @@ async fn migration_adds_durable_automation_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 7);
+    assert_eq!(migrations, 13);
 }
 
 #[tokio::test]
@@ -586,6 +586,115 @@ async fn scheduled_run_handoff_is_atomic_lease_fenced_and_terminal_idempotent() 
 }
 
 #[tokio::test]
+async fn owned_scheduled_handoff_commits_run_occurrence_and_lifecycle_together() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let job = database
+        .latest_scheduled_job_revision(job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+    let lease = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let run_id = RunId::new();
+    assert!(
+        database
+            .claim_job_occurrence(
+                &key,
+                lease,
+                TimestampMillis::new(2_100),
+                TimestampMillis::new(3_000)
+            )
+            .await
+            .expect("claim")
+    );
+    database
+        .persist_owned_scheduled_run_handoff(
+            &job,
+            &key,
+            lease,
+            run_id,
+            owner,
+            None,
+            TimestampMillis::new(2_200),
+        )
+        .await
+        .expect("owned handoff");
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT occurrence.run_id, lifecycle.phase, lifecycle.owner_instance_id
+         FROM scheduled_job_runs occurrence JOIN run_lifecycle lifecycle
+         ON lifecycle.run_id = occurrence.run_id WHERE occurrence.occurrence_key = ?",
+    )
+    .bind(key.as_str())
+    .fetch_one(database.pool())
+    .await
+    .expect("paired handoff");
+    assert_eq!(
+        row,
+        (run_id.to_string(), "admitted".into(), owner.to_string())
+    );
+    let recovered_owner = Uuid::new_v4();
+    let recovered_lease = Uuid::new_v4();
+    assert!(
+        database
+            .claim_ready_scheduled_run(
+                &key,
+                recovered_lease,
+                TimestampMillis::new(3_001),
+                TimestampMillis::new(4_000)
+            )
+            .await
+            .expect("recovery claim")
+    );
+    database
+        .start_owned_scheduled_run(
+            &key,
+            recovered_lease,
+            run_id,
+            recovered_owner,
+            TimestampMillis::new(3_100),
+            TimestampMillis::new(5_000),
+        )
+        .await
+        .expect("owned start");
+    let started: (String, String, String) = sqlx::query_as(
+        "SELECT run.state, lifecycle.phase, lifecycle.owner_instance_id
+         FROM agent_runs run JOIN run_lifecycle lifecycle ON lifecycle.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("started state");
+    assert_eq!(
+        started,
+        (
+            "running".into(),
+            "running".into(),
+            recovered_owner.to_string()
+        )
+    );
+    let next_owner = Uuid::new_v4();
+    assert_eq!(
+        database
+            .reconcile_abandoned_owned_runs(next_owner, TimestampMillis::new(3_200))
+            .await
+            .expect("owner loss"),
+        vec![run_id]
+    );
+    let reconciled: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state FROM agent_runs run
+         JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("reconciled state");
+    assert_eq!(reconciled, ("failed".into(), "unknown".into()));
+}
+
+#[tokio::test]
 async fn expired_started_handoff_recovers_as_unknown_without_redispatch() {
     let database = database().await;
     insert_service_and_job(&database).await;
@@ -645,6 +754,35 @@ async fn expired_started_handoff_recovers_as_unknown_without_redispatch() {
     .await
     .expect("recovered states");
     assert_eq!(states, ("unknown".into(), "failed".into()));
+    let lifecycle = database
+        .get_run_lifecycle(workspace_id(), run_id)
+        .await
+        .expect("recovery lifecycle lookup")
+        .expect("legacy active run receives durable reconciliation marker");
+    assert_eq!(lifecycle.phase(), "reconciliation_required");
+    assert_eq!(
+        lifecycle.effect_certainty(),
+        lumen_db::EffectCertainty::Unknown
+    );
+    assert_eq!(lifecycle.terminal_code(), Some("legacy_lease_expired"));
+    assert!(lifecycle.terminal_audit_pending());
+    database
+        .flush_terminal_audit(workspace_id(), run_id)
+        .await
+        .expect("legacy recovery audit is replayable");
+    assert_eq!(
+        database
+            .list_audit_records_for_run(workspace_id(), run_id)
+            .await
+            .expect("legacy audit")
+            .iter()
+            .filter(|record| {
+                record.event().kind()
+                    == lumen_core::audit::AuditEventKind::RunReconciliationRequired
+            })
+            .count(),
+        1
+    );
     assert!(
         database
             .recover_expired_running_scheduled_runs(TimestampMillis::new(4_000))
@@ -743,6 +881,66 @@ async fn scheduled_terminalization_rolls_back_both_records_on_write_failure() {
         )
         .await
         .expect("idempotent terminalization");
+}
+
+#[tokio::test]
+async fn forced_shutdown_marks_active_scheduled_work_unknown() {
+    let database = database().await;
+    insert_service_and_job(&database).await;
+    let job = database
+        .latest_scheduled_job_revision(job_id())
+        .await
+        .expect("job load")
+        .expect("job");
+    let key = OccurrenceKey::new(job_id(), job.revision(), TimestampMillis::new(2_000));
+    let lease = Uuid::new_v4();
+    let run_id = RunId::new();
+    database
+        .claim_job_occurrence(
+            &key,
+            lease,
+            TimestampMillis::new(2_100),
+            TimestampMillis::new(3_000),
+        )
+        .await
+        .expect("claim");
+    database
+        .persist_scheduled_run_handoff(&job, &key, lease, run_id, None, TimestampMillis::new(2_200))
+        .await
+        .expect("handoff");
+    database
+        .start_scheduled_run(
+            &key,
+            lease,
+            run_id,
+            TimestampMillis::new(2_300),
+            TimestampMillis::new(4_000),
+        )
+        .await
+        .expect("start");
+
+    assert!(
+        database
+            .force_fail_run_on_shutdown(run_id, TimestampMillis::new(2_400))
+            .await
+            .expect("forced shutdown")
+    );
+    let states: (String, String) = sqlx::query_as(
+        "SELECT run.state, occurrence.state
+         FROM agent_runs run JOIN scheduled_job_runs occurrence ON occurrence.run_id = run.id
+         WHERE run.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("shutdown states");
+    assert_eq!(states, ("failed".into(), "unknown".into()));
+    assert!(
+        !database
+            .force_fail_run_on_shutdown(run_id, TimestampMillis::new(2_500))
+            .await
+            .expect("idempotent shutdown")
+    );
 }
 
 #[tokio::test]
@@ -1116,4 +1314,52 @@ async fn skill_versions_and_capture_drafts_are_separate_immutable_records() {
         .try_get("count")
         .expect("count");
     assert_eq!(skill_count, 1);
+}
+
+#[tokio::test]
+async fn a_new_skill_version_cannot_silently_change_the_pinned_name() {
+    let database = database().await;
+    let first = SkillVersionRecord::new(
+        skill_id(),
+        SkillVersion::parse("1.0.0").expect("version"),
+        workspace_id(),
+        "Daily Brief",
+        "Reviewed brief",
+        "markdown",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+        owner(),
+        Some(owner()),
+        TimestampMillis::new(1_000),
+        Some(TimestampMillis::new(1_000)),
+    )
+    .expect("first version");
+    database
+        .insert_skill_version(&first)
+        .await
+        .expect("first stored");
+    let changed = SkillVersionRecord::new(
+        skill_id(),
+        SkillVersion::parse("2.0.0").expect("version"),
+        workspace_id(),
+        "Different Name",
+        "Reviewed brief",
+        "markdown",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        true,
+        owner(),
+        Some(owner()),
+        TimestampMillis::new(2_000),
+        Some(TimestampMillis::new(2_000)),
+    )
+    .expect("changed version");
+
+    assert!(database.insert_skill_version(&changed).await.is_err());
+    assert!(
+        database
+            .skill_version(workspace_id(), skill_id(), changed.version())
+            .await
+            .expect("version lookup")
+            .is_none()
+    );
 }

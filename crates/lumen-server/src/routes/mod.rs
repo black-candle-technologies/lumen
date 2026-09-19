@@ -16,15 +16,16 @@ use lumen_core::{
     egress::{DataClass, DestinationScope, ProviderId},
     extension::{PluginId, PluginVersion, Sha256Digest},
     identity::{ExternalChannelIdentity, PrincipalId, WorkspaceId},
+    run::{Clock, SystemClock},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, AuditQuery,
-    CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery,
-    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, JobActionCommand,
-    JobReviewQuery, PluginActionCommand, PluginDetailsQuery, PluginReviewQuery,
+    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalQuery, ApprovalRenewalCommand,
+    AuditQuery, CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand,
+    ChannelMappingQuery, CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery,
+    JobActionCommand, JobReviewQuery, PluginActionCommand, PluginDetailsQuery, PluginReviewQuery,
     ProviderPolicyCommand, ProviderPolicyQuery, ServiceError, ServiceIdentityCommand,
     ServiceIdentityQuery, SkillActionCommand, SkillReviewQuery,
 };
@@ -37,6 +38,10 @@ pub fn router(state: ApiState) -> Router {
             post(decide_approval),
         )
         .route(
+            "/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/renew",
+            post(renew_approval),
+        )
+        .route(
             "/api/v1/workspaces/{workspace_id}/approvals",
             get(list_approvals),
         )
@@ -47,6 +52,14 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/api/v1/workspaces/{workspace_id}/runs/{run_id}/events",
             get(run_events),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/{run_id}/status",
+            get(run_status),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/reconciliation",
+            get(list_reconciliation_runs),
         )
         .route("/api/v1/workspaces/{workspace_id}/audit", get(list_audit))
         .route(
@@ -104,17 +117,35 @@ pub fn router(state: ApiState) -> Router {
 
 #[derive(Serialize)]
 struct RuntimeCapabilitiesResponse {
+    server: &'static str,
+    workspace: &'static str,
     sandbox: crate::SandboxCapabilityReport,
+    model: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCapabilityParameters {
+    #[serde(default)]
+    probe_model: bool,
 }
 
 async fn runtime_capabilities(
     State(state): State<ApiState>,
     Path(workspace): Path<String>,
+    Query(parameters): Query<RuntimeCapabilityParameters>,
 ) -> Result<Json<RuntimeCapabilitiesResponse>, ApiError> {
     let workspace_id = parse_workspace(&workspace)?;
     ensure_workspace(&state, workspace_id)?;
     Ok(Json(RuntimeCapabilitiesResponse {
+        server: "listening",
+        workspace: "ready",
         sandbox: state.sandbox().clone(),
+        model: if parameters.probe_model {
+            state.service.model_readiness(workspace_id).await?
+        } else {
+            "not_checked".into()
+        },
     }))
 }
 
@@ -638,9 +669,30 @@ async fn decide_approval(
     Ok(Json(result))
 }
 
+async fn renew_approval(
+    State(state): State<ApiState>,
+    Extension(actor): Extension<PrincipalId>,
+    Path((workspace, approval)): Path<(String, String)>,
+) -> Result<Json<crate::ApprovalRenewal>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let approval_id = parse_approval(&approval)?;
+    Ok(Json(
+        state
+            .service
+            .renew_approval(ApprovalRenewalCommand::new(
+                workspace_id,
+                approval_id,
+                actor,
+            ))
+            .await?,
+    ))
+}
+
 #[derive(Serialize)]
 struct ApprovalListResponse {
     approvals: Vec<crate::ApprovalPreview>,
+    server_time: lumen_core::approval::TimestampMillis,
 }
 
 async fn list_approvals(
@@ -654,7 +706,10 @@ async fn list_approvals(
         .service
         .list_approvals(ApprovalQuery::new(workspace_id, actor))
         .await?;
-    Ok(Json(ApprovalListResponse { approvals }))
+    Ok(Json(ApprovalListResponse {
+        approvals,
+        server_time: SystemClock.now(),
+    }))
 }
 
 async fn cancel_run(
@@ -696,6 +751,42 @@ async fn run_events(
         run_id,
         after,
     )))
+}
+
+#[derive(Serialize)]
+struct RunStatusResponse {
+    run_id: RunId,
+    #[serde(flatten)]
+    status: crate::RunStatus,
+}
+
+async fn run_status(
+    State(state): State<ApiState>,
+    Path((workspace, run)): Path<(String, String)>,
+) -> Result<Json<RunStatusResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let run_id = parse_run(&run)?;
+    let status = state
+        .service
+        .run_status_detail(workspace_id, run_id)
+        .await?;
+    Ok(Json(RunStatusResponse { run_id, status }))
+}
+
+#[derive(Serialize)]
+struct ReconciliationRunsResponse {
+    runs: Vec<crate::RunReconciliation>,
+}
+
+async fn list_reconciliation_runs(
+    State(state): State<ApiState>,
+    Path(workspace): Path<String>,
+) -> Result<Json<ReconciliationRunsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let runs = state.service.list_reconciliation_runs(workspace_id).await?;
+    Ok(Json(ReconciliationRunsResponse { runs }))
 }
 
 #[derive(Deserialize)]
@@ -931,6 +1022,11 @@ impl IntoResponse for ApiError {
             Self::Service(ServiceError::Conflict(message)) => {
                 (StatusCode::CONFLICT, "conflict", message)
             }
+            Self::Service(ServiceError::ApprovalConflict(reason)) => (
+                StatusCode::CONFLICT,
+                reason.code(),
+                reason.message().to_owned(),
+            ),
             Self::Service(ServiceError::Unavailable(message)) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
             }

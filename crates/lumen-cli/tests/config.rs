@@ -5,7 +5,10 @@ use lumen_cli::{
     AuditCommand, Cli, Command, SandboxCommand,
     config::{Config, ConfigError, RequiredSandboxStrength},
 };
-use lumen_integrations::sandbox::{SandboxReport, SandboxStrength};
+use lumen_integrations::{
+    openai_compatible::OllamaGpuPolicy,
+    sandbox::{SandboxReport, SandboxStrength},
+};
 
 const MINIMAL_CONFIG: &str = r#"
 [database]
@@ -43,6 +46,7 @@ fn secure_defaults_are_local_and_fail_closed() {
         "LUMEN_BEARER_TOKEN"
     );
     assert!(!config.model.allow_remote);
+    assert_eq!(config.model.gpu_policy, OllamaGpuPolicy::Off);
     assert_eq!(
         config.sandbox.required_strength,
         RequiredSandboxStrength::KernelEnforced
@@ -56,6 +60,47 @@ fn secure_defaults_are_local_and_fail_closed() {
     assert!(config.process.max_processes > 0);
     assert!(config.runtime.max_wall_time_seconds > 0);
     assert!(config.runtime.max_captured_result_bytes > 0);
+}
+
+#[test]
+fn gpu_policy_is_explicit_and_scoped_to_local_ollama() {
+    for (value, expected) in [
+        ("off", OllamaGpuPolicy::Off),
+        ("require_full", OllamaGpuPolicy::RequireFull),
+        ("allow_mixed", OllamaGpuPolicy::AllowMixed),
+    ] {
+        let config = MINIMAL_CONFIG.replace(
+            "model = \"local-model\"",
+            &format!("model = \"local-model\"\ngpu_policy = \"{value}\""),
+        );
+        assert_eq!(
+            Config::parse(&config).expect(value).model.gpu_policy,
+            expected
+        );
+    }
+
+    let no_trailing_slash = MINIMAL_CONFIG.replace("8080/v1/", "8080/v1").replace(
+        "model = \"local-model\"",
+        "model = \"local-model\"\ngpu_policy = \"require_full\"",
+    );
+    assert!(Config::parse(&no_trailing_slash).is_ok());
+
+    let invalid_path = MINIMAL_CONFIG.replace("8080/v1/", "8080/other/").replace(
+        "model = \"local-model\"",
+        "model = \"local-model\"\ngpu_policy = \"require_full\"",
+    );
+    assert_eq!(
+        Config::parse(&invalid_path).expect_err("non-Ollama endpoint"),
+        ConfigError::InvalidOllamaGpuEndpoint
+    );
+
+    let remote = MINIMAL_CONFIG
+        .replace("127.0.0.1:8080", "models.example.com")
+        .replace("model = \"local-model\"", "model = \"local-model\"\ngpu_policy = \"require_full\"\nallow_remote = true\nremote_provider = { id = \"remote\", allowed_data_classes = [\"public\"] }");
+    assert_eq!(
+        Config::parse(&remote).expect_err("remote GPU policy"),
+        ConfigError::InvalidOllamaGpuEndpoint
+    );
 }
 
 #[test]

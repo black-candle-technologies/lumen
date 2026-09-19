@@ -19,18 +19,18 @@ use lumen_core::{
     secret::SecretRefId,
 };
 use lumen_server::{
-    ApiState, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview, ApprovalQuery,
-    ApprovalResult, ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested,
-    CancelRunCommand, CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery,
-    ChannelMappingReview, CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery,
-    DestinationPolicyReview, EventBroker, JobActionCommand, JobReview, JobReviewQuery,
-    PluginActionCommand, PluginActionRequested, PluginComponentReview, PluginDetailsQuery,
-    PluginFailureReview, PluginReviewQuery, PluginSettingReview, PluginVersionDetails,
-    PrincipalSummary, ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview,
-    RunCancellation, RunCreated, RuntimeService, SandboxCapabilityReport, ServiceError,
-    ServiceFuture, ServiceIdentityCommand, ServiceIdentityQuery, ServiceIdentityReview,
-    SkillActionCommand, SkillReview, SkillReviewQuery, StagedPluginReview,
-    WorkflowCaptureDraftReview, WorkspaceModelPolicyReview, router,
+    ApiState, ApprovalConflict, ApprovalDecision, ApprovalDecisionCommand, ApprovalPreview,
+    ApprovalQuery, ApprovalRenewal, ApprovalRenewalCommand, ApprovalResult,
+    ApprovalSecretReference, AuditEntry, AuditQuery, AutomationActionRequested, CancelRunCommand,
+    CaptureWorkflowCommand, ChannelMappingCommand, ChannelMappingQuery, ChannelMappingReview,
+    CreateRunCommand, DestinationPolicyCommand, DestinationPolicyQuery, DestinationPolicyReview,
+    EventBroker, JobActionCommand, JobReview, JobReviewQuery, PluginActionCommand,
+    PluginActionRequested, PluginComponentReview, PluginDetailsQuery, PluginFailureReview,
+    PluginReviewQuery, PluginSettingReview, PluginVersionDetails, PrincipalSummary,
+    ProviderPolicyCommand, ProviderPolicyQuery, ProviderPolicyReview, RunCancellation, RunCreated,
+    RuntimeService, SandboxCapabilityReport, ServiceError, ServiceFuture, ServiceIdentityCommand,
+    ServiceIdentityQuery, ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery,
+    StagedPluginReview, WorkflowCaptureDraftReview, WorkspaceModelPolicyReview, router,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -40,7 +40,15 @@ const TOKEN: &str = "local-test-token";
 #[derive(Default)]
 struct FakeService {
     run_commands: Mutex<Vec<CreateRunCommand>>,
+    model_probe_queries: Mutex<Vec<WorkspaceId>>,
+    model_probe_state: Mutex<String>,
+    run_status_queries: Mutex<Vec<(WorkspaceId, RunId)>>,
+    run_status: Mutex<Option<String>>,
+    reconciliation_queries: Mutex<Vec<WorkspaceId>>,
+    reconciliation_runs: Mutex<Vec<lumen_server::RunReconciliation>>,
     approval_commands: Mutex<Vec<ApprovalDecisionCommand>>,
+    approval_conflict: Mutex<Option<ApprovalConflict>>,
+    renewal_commands: Mutex<Vec<ApprovalRenewalCommand>>,
     audit_queries: Mutex<Vec<AuditQuery>>,
     audit_entries: Mutex<Vec<AuditEntry>>,
     approval_queries: Mutex<Vec<ApprovalQuery>>,
@@ -80,6 +88,36 @@ impl RuntimeService for FakeService {
         Box::pin(async { Ok(RunCreated::new(RunId::new())) })
     }
 
+    fn model_readiness(&self, workspace_id: WorkspaceId) -> ServiceFuture<'_, String> {
+        self.model_probe_queries
+            .lock()
+            .expect("probe queries")
+            .push(workspace_id);
+        let state = self.model_probe_state.lock().expect("model state").clone();
+        Box::pin(async move { Ok(state) })
+    }
+
+    fn run_status(&self, workspace_id: WorkspaceId, run_id: RunId) -> ServiceFuture<'_, String> {
+        self.run_status_queries
+            .lock()
+            .expect("queries")
+            .push((workspace_id, run_id));
+        let status = self.run_status.lock().expect("run status").clone();
+        Box::pin(async move { status.ok_or(ServiceError::NotFound) })
+    }
+
+    fn list_reconciliation_runs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> ServiceFuture<'_, Vec<lumen_server::RunReconciliation>> {
+        self.reconciliation_queries
+            .lock()
+            .expect("queries")
+            .push(workspace_id);
+        let runs = self.reconciliation_runs.lock().expect("runs").clone();
+        Box::pin(async move { Ok(runs) })
+    }
+
     fn decide_approval(
         &self,
         command: ApprovalDecisionCommand,
@@ -90,7 +128,31 @@ impl RuntimeService for FakeService {
             .lock()
             .expect("approval commands")
             .push(command);
-        Box::pin(async move { Ok(ApprovalResult::new(approval_id, decision)) })
+        let conflict = *self.approval_conflict.lock().expect("approval conflict");
+        Box::pin(async move {
+            match conflict {
+                Some(conflict) => Err(ServiceError::ApprovalConflict(conflict)),
+                None => Ok(ApprovalResult::new(approval_id, decision)),
+            }
+        })
+    }
+
+    fn renew_approval(
+        &self,
+        command: ApprovalRenewalCommand,
+    ) -> ServiceFuture<'_, ApprovalRenewal> {
+        let previous = command.approval_id();
+        self.renewal_commands
+            .lock()
+            .expect("renewal commands")
+            .push(command);
+        Box::pin(async move {
+            Ok(ApprovalRenewal::new(
+                previous,
+                ApprovalId::new(),
+                RunId::new(),
+            ))
+        })
     }
 
     fn list_audit(&self, query: AuditQuery) -> ServiceFuture<'_, Vec<AuditEntry>> {
@@ -479,7 +541,7 @@ fn test_app(workspace_id: WorkspaceId) -> (axum::Router, Arc<FakeService>, Event
 #[tokio::test]
 async fn runtime_capability_report_is_authenticated_and_workspace_scoped() {
     let workspace_id = WorkspaceId::new();
-    let (app, _, _) = test_app(workspace_id);
+    let (app, service, _) = test_app(workspace_id);
 
     let response = app
         .clone()
@@ -495,9 +557,71 @@ async fn runtime_capability_report_is_authenticated_and_workspace_scoped() {
     let body = json_body(response).await;
     assert_eq!(body["sandbox"]["backend"], "test-sandbox");
     assert_eq!(body["sandbox"]["strength"], "kernel_enforced");
+    assert_eq!(body["server"], "listening");
+    assert_eq!(body["workspace"], "ready");
+    assert_eq!(body["model"], "not_checked");
+    assert!(
+        service
+            .model_probe_queries
+            .lock()
+            .expect("probe queries")
+            .is_empty()
+    );
     assert_eq!(
         body["sandbox"]["guarantees"],
         serde_json::json!(["filesystem_isolation", "network_isolation"])
+    );
+}
+
+#[tokio::test]
+async fn model_probe_is_explicit_authenticated_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    *service.model_probe_state.lock().expect("model state") = "listed".into();
+    let uri = format!("/api/v1/workspaces/{workspace_id}/runtime/capabilities?probe_model=true");
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", uri.clone(), Body::empty()))
+        .await
+        .expect("probe response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["model"], "listed");
+    assert_eq!(
+        *service.model_probe_queries.lock().expect("probe queries"),
+        vec![workspace_id]
+    );
+
+    let mut wrong_token = request("GET", uri, Body::empty());
+    wrong_token.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer wrong".parse().expect("header"),
+    );
+    let rejected = app
+        .clone()
+        .oneshot(wrong_token)
+        .await
+        .expect("bad token response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let other = app
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{}/runtime/capabilities?probe_model=true",
+                WorkspaceId::new()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("other workspace response");
+    assert_ne!(other.status(), StatusCode::OK);
+    assert_eq!(
+        service
+            .model_probe_queries
+            .lock()
+            .expect("probe queries")
+            .len(),
+        1
     );
 }
 
@@ -896,6 +1020,7 @@ async fn automation_control_routes_are_authenticated_scoped_and_validated() {
             true,
             Some(TimestampMillis::new(2_000)),
             true,
+            Some("succeeded".to_owned()),
             TimestampMillis::new(10),
         ));
     service
@@ -984,6 +1109,7 @@ async fn automation_control_routes_are_authenticated_scoped_and_validated() {
     let body = json_body(jobs).await;
     assert_eq!(body["jobs"][0]["job_id"], job_id.to_string());
     assert_eq!(body["jobs"][0]["schedule"]["kind"], "interval");
+    assert_eq!(body["jobs"][0]["last_run_state"], "succeeded");
 
     let job_update = app
         .clone()
@@ -1290,6 +1416,60 @@ async fn approval_grant_and_reject_are_forwarded_as_decisions_not_dispatches() {
 }
 
 #[tokio::test]
+async fn approval_conflicts_preserve_machine_readable_reasons() {
+    let workspace_id = WorkspaceId::new();
+    let approval_id = ApprovalId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    for (conflict, code) in [
+        (ApprovalConflict::Expired, "approval_expired"),
+        (ApprovalConflict::Stale, "approval_stale"),
+        (ApprovalConflict::AlreadyDecided, "approval_already_decided"),
+        (ApprovalConflict::Consumed, "approval_consumed"),
+        (ApprovalConflict::ActionChanged, "approval_action_changed"),
+    ] {
+        *service.approval_conflict.lock().expect("approval conflict") = Some(conflict);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                format!("/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/decision"),
+                Body::from(r#"{"decision":"grant"}"#),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(response).await["error"]["code"], code);
+    }
+}
+
+#[tokio::test]
+async fn approval_renewal_is_scoped_and_attributed() {
+    let workspace_id = WorkspaceId::new();
+    let approval_id = ApprovalId::new();
+    let (app, service, _) = test_app(workspace_id);
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/renew"),
+            Body::empty(),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["previous_approval_id"], approval_id.to_string());
+    assert_eq!(body["state"], "pending");
+    assert!(body["approval_id"].as_str().is_some());
+    let commands = service.renewal_commands.lock().expect("renewal commands");
+    assert_eq!(commands[0].workspace_id(), workspace_id);
+    assert_eq!(commands[0].approval_id(), approval_id);
+    assert_eq!(commands[0].actor().subject(), "operator");
+}
+
+#[tokio::test]
 async fn sse_replays_events_after_last_event_id() {
     let workspace_id = WorkspaceId::new();
     let run_id = RunId::new();
@@ -1391,6 +1571,104 @@ async fn audit_listing_is_workspace_scoped_and_bounded() {
 }
 
 #[tokio::test]
+async fn audit_query_contract_preserves_bounds_auth_and_error_status() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    let path = format!("/api/v1/workspaces/{workspace_id}/audit");
+
+    for (query, after, limit) in [
+        ("", 0, 100),
+        ("?limit=1", 0, 1),
+        ("?limit=200&after=7", 7, 200),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", format!("{path}{query}"), Body::empty()))
+            .await
+            .expect("valid audit page");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_body(response).await["events"].is_array());
+        let queries = service.audit_queries.lock().expect("audit queries");
+        let recorded = queries.last().expect("recorded query");
+        assert_eq!(recorded.after(), after);
+        assert_eq!(recorded.limit(), limit);
+    }
+    assert_eq!(
+        service.audit_queries.lock().expect("audit queries").len(),
+        3
+    );
+
+    for query in ["?limit=0", "?limit=201", "?limit=250", "?after=-1"] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", format!("{path}{query}"), Body::empty()))
+            .await
+            .expect("invalid bound response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "bad_request", "{query}");
+        assert!(body.get("events").is_none(), "{query}");
+    }
+
+    for query in ["?limit=oops", "?limit=-1", "?after=oops"] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", format!("{path}{query}"), Body::empty()))
+            .await
+            .expect("malformed query response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("query body")
+            .to_bytes();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_err(),
+            "{query}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("\"events\""),
+            "{query}"
+        );
+    }
+
+    let mut bad_token = request("GET", path.clone(), Body::empty());
+    bad_token.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer wrong".parse().expect("header"),
+    );
+    let unauthorized = app
+        .clone()
+        .oneshot(bad_token)
+        .await
+        .expect("bad token response");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_body(unauthorized).await["error"]["code"],
+        "unauthorized"
+    );
+
+    let forbidden = app
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{}/audit", WorkspaceId::new()),
+            Body::empty(),
+        ))
+        .await
+        .expect("wrong workspace response");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(forbidden).await["error"]["code"],
+        "workspace_forbidden"
+    );
+    assert_eq!(
+        service.audit_queries.lock().expect("audit queries").len(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn approval_listing_returns_exact_action_previews() {
     let workspace_id = WorkspaceId::new();
     let approval_id = ApprovalId::new();
@@ -1434,6 +1712,7 @@ async fn approval_listing_returns_exact_action_previews() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
+    assert!(body["server_time"].as_u64().is_some());
     assert_eq!(body["approvals"][0]["kind"], "process.spawn");
     assert_eq!(body["approvals"][0]["arguments"]["program"], "/bin/echo");
     assert_eq!(body["approvals"][0]["fingerprint"], "a".repeat(64));
@@ -1457,6 +1736,108 @@ async fn approval_listing_returns_exact_action_previews() {
     let queries = service.approval_queries.lock().expect("approval queries");
     assert_eq!(queries[0].workspace_id(), workspace_id);
     assert_eq!(queries[0].actor().subject(), "operator");
+}
+
+#[tokio::test]
+async fn run_status_is_read_only_and_workspace_scoped() {
+    let workspace_id = WorkspaceId::new();
+    let run_id = RunId::new();
+    let (app, service, _) = test_app(workspace_id);
+    *service.run_status.lock().expect("run status") = Some("completed".into());
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/workspaces/{workspace_id}/runs/{run_id}/status"),
+            Body::empty(),
+        ))
+        .await
+        .expect("status response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["run_id"], run_id.to_string());
+    assert_eq!(body["state"], "completed");
+    assert_eq!(
+        service.run_status_queries.lock().expect("queries")[0],
+        (workspace_id, run_id)
+    );
+
+    let other = app
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{}/runs/{run_id}/status",
+                WorkspaceId::new()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("other workspace response");
+    assert_ne!(other.status(), StatusCode::OK);
+    assert_eq!(service.run_status_queries.lock().expect("queries").len(), 1);
+}
+
+#[tokio::test]
+async fn reconciliation_listing_requires_auth_and_matching_workspace() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    let run_id = RunId::new();
+    service
+        .reconciliation_runs
+        .lock()
+        .expect("runs")
+        .push(lumen_server::RunReconciliation::new(
+            run_id,
+            "unknown",
+            "owner_lost",
+            Some("redacted".into()),
+            None,
+            true,
+        ));
+    let route = format!("/api/v1/workspaces/{workspace_id}/runs/reconciliation");
+    let accepted = app
+        .clone()
+        .oneshot(request("GET", route.clone(), Body::empty()))
+        .await
+        .expect("response");
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = json_body(accepted).await;
+    assert_eq!(body["runs"][0]["run_id"], run_id.to_string());
+    assert_eq!(body["runs"][0]["effect_certainty"], "unknown");
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&route)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("unauthenticated response");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let foreign = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{}/runs/reconciliation",
+                WorkspaceId::new()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("foreign response");
+    assert_ne!(foreign.status(), StatusCode::OK);
+    assert_eq!(
+        service
+            .reconciliation_queries
+            .lock()
+            .expect("queries")
+            .as_slice(),
+        &[workspace_id]
+    );
 }
 
 #[tokio::test]
