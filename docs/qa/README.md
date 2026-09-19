@@ -7,6 +7,10 @@ The current audit cursor and full-run QA procedure is in [M5 audit pagination ac
 The current Windows/WSL build-cache procedure and measurements are in [M5 Cargo cache guide](M5_CARGO_CACHE_GUIDE.md).
 The current Windows/WSL pnpm dependency procedure is in [M5 JavaScript dependencies guide](M5_JS_DEPENDENCIES_GUIDE.md).
 The scoped Ollama GPU residency policy and issue #28 evidence are in [M5 GPU policy guide](M5_GPU_POLICY_GUIDE.md).
+The measured WSL memory triage and shutdown procedure for issue #26 are in [M5 WSL memory guide](M5_WSL_MEMORY_GUIDE.md).
+The reproducible disposable fixture and evidence lifecycle for issue #21 are in [M5 QA launcher guide](M5_QA_LAUNCHER_GUIDE.md).
+The named Windows/WSL/web inventories, first failures, and native desktop CI status for issue #27 are in [M5 platform matrix](M5_PLATFORM_MATRIX_2026-09-17.md).
+The final live, browser, fault-injection, and cross-platform acceptance outcomes for issue #8 are in [M5 final acceptance report](M5_FINAL_ACCEPTANCE_2026-09-18.md) and its [machine-readable matrix](M5_FINAL_ACCEPTANCE_2026-09-18.json).
 
 ## Repository policy
 

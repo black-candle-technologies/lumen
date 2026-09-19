@@ -44,6 +44,8 @@ struct FakeService {
     model_probe_state: Mutex<String>,
     run_status_queries: Mutex<Vec<(WorkspaceId, RunId)>>,
     run_status: Mutex<Option<String>>,
+    reconciliation_queries: Mutex<Vec<WorkspaceId>>,
+    reconciliation_runs: Mutex<Vec<lumen_server::RunReconciliation>>,
     approval_commands: Mutex<Vec<ApprovalDecisionCommand>>,
     approval_conflict: Mutex<Option<ApprovalConflict>>,
     renewal_commands: Mutex<Vec<ApprovalRenewalCommand>>,
@@ -102,6 +104,18 @@ impl RuntimeService for FakeService {
             .push((workspace_id, run_id));
         let status = self.run_status.lock().expect("run status").clone();
         Box::pin(async move { status.ok_or(ServiceError::NotFound) })
+    }
+
+    fn list_reconciliation_runs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> ServiceFuture<'_, Vec<lumen_server::RunReconciliation>> {
+        self.reconciliation_queries
+            .lock()
+            .expect("queries")
+            .push(workspace_id);
+        let runs = self.reconciliation_runs.lock().expect("runs").clone();
+        Box::pin(async move { Ok(runs) })
     }
 
     fn decide_approval(
@@ -1762,6 +1776,68 @@ async fn run_status_is_read_only_and_workspace_scoped() {
         .expect("other workspace response");
     assert_ne!(other.status(), StatusCode::OK);
     assert_eq!(service.run_status_queries.lock().expect("queries").len(), 1);
+}
+
+#[tokio::test]
+async fn reconciliation_listing_requires_auth_and_matching_workspace() {
+    let workspace_id = WorkspaceId::new();
+    let (app, service, _) = test_app(workspace_id);
+    let run_id = RunId::new();
+    service
+        .reconciliation_runs
+        .lock()
+        .expect("runs")
+        .push(lumen_server::RunReconciliation::new(
+            run_id,
+            "unknown",
+            "owner_lost",
+            Some("redacted".into()),
+            None,
+            true,
+        ));
+    let route = format!("/api/v1/workspaces/{workspace_id}/runs/reconciliation");
+    let accepted = app
+        .clone()
+        .oneshot(request("GET", route.clone(), Body::empty()))
+        .await
+        .expect("response");
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = json_body(accepted).await;
+    assert_eq!(body["runs"][0]["run_id"], run_id.to_string());
+    assert_eq!(body["runs"][0]["effect_certainty"], "unknown");
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&route)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("unauthenticated response");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let foreign = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!(
+                "/api/v1/workspaces/{}/runs/reconciliation",
+                WorkspaceId::new()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .expect("foreign response");
+    assert_ne!(foreign.status(), StatusCode::OK);
+    assert_eq!(
+        service
+            .reconciliation_queries
+            .lock()
+            .expect("queries")
+            .as_slice(),
+        &[workspace_id]
+    );
 }
 
 #[tokio::test]
