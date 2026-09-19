@@ -10,7 +10,7 @@ On Windows, a report of unavailable kernel enforcement is a host diagnostic, not
 
 ## Start and check each layer
 
-Start with your local `lumen.toml` and `LUMEN_BEARER_TOKEN` set to a disposable token: `cargo run -p lumen-cli -- --config lumen.toml serve`. `event=server_starting` reports the intended bind address, config path, workspace ID, sandbox backend and strength, and owned process PID before database/runtime initialization; it is **not** a listening claim. `event=server_started` reports the same fields only after the socket has bound and initialization completed. A bind conflict prints `event=server_bind_failed` and exits nonzero; it does not claim readiness. Ctrl+C prints `event=server_stopping` followed by `event=server_stopped result=ok` after bounded shutdown.
+Start with your local `lumen.toml` and `LUMEN_BEARER_TOKEN` set to a disposable token: `cargo run -p lumen-cli -- --config lumen.toml serve`. For repeated QA operations, build once and run the exact binary as described in the [Cargo cache guide](M5_CARGO_CACHE_GUIDE.md). `event=server_starting` reports the intended bind address, config path, workspace ID, sandbox backend and strength, and owned process PID before database/runtime initialization; it is **not** a listening claim. `event=server_started` reports the same fields only after the socket has bound and initialization completed. A bind conflict prints `event=server_bind_failed` and exits nonzero; it does not claim readiness. Ctrl+C prints `event=server_stopping` followed by `event=server_stopped result=ok` after bounded shutdown.
 
 Replace the bind address and workspace ID below with those from your own startup line. In PowerShell:
 
