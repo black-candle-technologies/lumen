@@ -53,6 +53,14 @@ pub fn router(state: ApiState) -> Router {
             "/api/v1/workspaces/{workspace_id}/runs/{run_id}/events",
             get(run_events),
         )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/{run_id}/status",
+            get(run_status),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/runs/reconciliation",
+            get(list_reconciliation_runs),
+        )
         .route("/api/v1/workspaces/{workspace_id}/audit", get(list_audit))
         .route(
             "/api/v1/workspaces/{workspace_id}/plugins/staged",
@@ -109,17 +117,35 @@ pub fn router(state: ApiState) -> Router {
 
 #[derive(Serialize)]
 struct RuntimeCapabilitiesResponse {
+    server: &'static str,
+    workspace: &'static str,
     sandbox: crate::SandboxCapabilityReport,
+    model: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCapabilityParameters {
+    #[serde(default)]
+    probe_model: bool,
 }
 
 async fn runtime_capabilities(
     State(state): State<ApiState>,
     Path(workspace): Path<String>,
+    Query(parameters): Query<RuntimeCapabilityParameters>,
 ) -> Result<Json<RuntimeCapabilitiesResponse>, ApiError> {
     let workspace_id = parse_workspace(&workspace)?;
     ensure_workspace(&state, workspace_id)?;
     Ok(Json(RuntimeCapabilitiesResponse {
+        server: "listening",
+        workspace: "ready",
         sandbox: state.sandbox().clone(),
+        model: if parameters.probe_model {
+            state.service.model_readiness(workspace_id).await?
+        } else {
+            "not_checked".into()
+        },
     }))
 }
 
@@ -725,6 +751,42 @@ async fn run_events(
         run_id,
         after,
     )))
+}
+
+#[derive(Serialize)]
+struct RunStatusResponse {
+    run_id: RunId,
+    #[serde(flatten)]
+    status: crate::RunStatus,
+}
+
+async fn run_status(
+    State(state): State<ApiState>,
+    Path((workspace, run)): Path<(String, String)>,
+) -> Result<Json<RunStatusResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let run_id = parse_run(&run)?;
+    let status = state
+        .service
+        .run_status_detail(workspace_id, run_id)
+        .await?;
+    Ok(Json(RunStatusResponse { run_id, status }))
+}
+
+#[derive(Serialize)]
+struct ReconciliationRunsResponse {
+    runs: Vec<crate::RunReconciliation>,
+}
+
+async fn list_reconciliation_runs(
+    State(state): State<ApiState>,
+    Path(workspace): Path<String>,
+) -> Result<Json<ReconciliationRunsResponse>, ApiError> {
+    let workspace_id = parse_workspace(&workspace)?;
+    ensure_workspace(&state, workspace_id)?;
+    let runs = state.service.list_reconciliation_runs(workspace_id).await?;
+    Ok(Json(ReconciliationRunsResponse { runs }))
 }
 
 #[derive(Deserialize)]
