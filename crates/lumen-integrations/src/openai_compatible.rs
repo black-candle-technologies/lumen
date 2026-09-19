@@ -17,6 +17,8 @@ use url::{Host, Url};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const MODEL_PROBE_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointPolicy {
@@ -30,6 +32,15 @@ pub enum EndpointClass {
     Remote,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaGpuPolicy {
+    #[default]
+    Off,
+    RequireFull,
+    AllowMixed,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenAiCompatibleConfig {
     endpoint: Url,
@@ -38,6 +49,7 @@ pub struct OpenAiCompatibleConfig {
     streaming: bool,
     timeout: Duration,
     max_response_bytes: usize,
+    ollama_gpu_policy: OllamaGpuPolicy,
 }
 
 impl OpenAiCompatibleConfig {
@@ -86,6 +98,7 @@ impl OpenAiCompatibleConfig {
             streaming: false,
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            ollama_gpu_policy: OllamaGpuPolicy::Off,
         })
     }
 
@@ -102,6 +115,21 @@ impl OpenAiCompatibleConfig {
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
         self.max_response_bytes = max_response_bytes;
         self
+    }
+
+    pub fn with_ollama_gpu_policy(
+        mut self,
+        policy: OllamaGpuPolicy,
+    ) -> Result<Self, ModelConfigError> {
+        if policy != OllamaGpuPolicy::Off
+            && (self.endpoint_class != EndpointClass::Local
+                || self.endpoint.scheme() != "http"
+                || self.endpoint.path() != "/v1/")
+        {
+            return Err(ModelConfigError::InvalidOllamaGpuEndpoint);
+        }
+        self.ollama_gpu_policy = policy;
+        Ok(self)
     }
 
     pub const fn endpoint_class(&self) -> EndpointClass {
@@ -166,6 +194,34 @@ impl OpenAiCompatibleClient {
         &self.identity
     }
 
+    pub async fn probe_local_model(&self) -> Result<bool, ModelError> {
+        if self.config.endpoint_class != EndpointClass::Local {
+            return Err(ModelError::new("remote model catalog probe is not allowed"));
+        }
+        tokio::time::timeout(MODEL_PROBE_TIMEOUT, async {
+            let url =
+                self.config.endpoint.join("models").map_err(|error| {
+                    ModelError::new(format!("invalid model catalog URL: {error}"))
+                })?;
+            let response = self.client.get(url).send().await.map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(ModelError::new(format!(
+                    "model catalog returned HTTP {}",
+                    response.status()
+                )));
+            }
+            let body = read_limited(response, MODEL_PROBE_MAX_RESPONSE_BYTES).await?;
+            let catalog: ModelCatalog = serde_json::from_slice(&body)
+                .map_err(|_| ModelError::new("model catalog response is invalid"))?;
+            Ok(catalog
+                .data
+                .iter()
+                .any(|model| model.id == self.config.model))
+        })
+        .await
+        .map_err(|_| ModelError::new("model catalog probe timed out"))?
+    }
+
     pub async fn generate_cancellable(
         &self,
         input: ModelInput,
@@ -179,6 +235,17 @@ impl OpenAiCompatibleClient {
     }
 
     async fn send(&self, input: ModelInput) -> Result<ModelOutput, ModelError> {
+        if self.config.ollama_gpu_policy != OllamaGpuPolicy::Off {
+            self.check_ollama_residency(true).await?;
+        }
+        let output = self.send_chat(input).await?;
+        if self.config.ollama_gpu_policy != OllamaGpuPolicy::Off {
+            self.check_ollama_residency(false).await?;
+        }
+        Ok(output)
+    }
+
+    async fn send_chat(&self, input: ModelInput) -> Result<ModelOutput, ModelError> {
         let url = self
             .config
             .endpoint
@@ -217,6 +284,30 @@ impl OpenAiCompatibleClient {
                     choices.len()
                 ))
             })?;
+            let finish = choice.finish_reason.as_deref().ok_or_else(|| {
+                ModelError::new("model response completed without terminal finish reason")
+            })?;
+            match finish {
+                "length" | "content_filter" => {
+                    return Err(ModelError::new(format!(
+                        "model response terminated without a complete usable result: {finish}"
+                    )));
+                }
+                "stop" if choice.message.tool_calls.is_empty() => {}
+                "tool_calls"
+                    if !choice.message.tool_calls.is_empty()
+                        && choice.message.content.as_deref().unwrap_or("").is_empty() => {}
+                "stop" | "tool_calls" => {
+                    return Err(ModelError::new(format!(
+                        "model response content conflicts with finish reason: {finish}"
+                    )));
+                }
+                other => {
+                    return Err(ModelError::new(format!(
+                        "unsupported model finish reason: {other}"
+                    )));
+                }
+            }
             output_from_parts(
                 choice.message.content.unwrap_or_default(),
                 choice.message.tool_calls,
@@ -224,6 +315,132 @@ impl OpenAiCompatibleClient {
             )
         }
     }
+
+    async fn check_ollama_residency(&self, may_preload: bool) -> Result<(), ModelError> {
+        let mut residency = self.ollama_residency().await?;
+        if residency == OllamaResidency::NotLoaded && may_preload {
+            self.preload_ollama_model().await?;
+            residency = self.ollama_residency().await?;
+        }
+        let allowed = match self.config.ollama_gpu_policy {
+            OllamaGpuPolicy::Off => true,
+            OllamaGpuPolicy::RequireFull => residency == OllamaResidency::Full,
+            OllamaGpuPolicy::AllowMixed => {
+                matches!(residency, OllamaResidency::Full | OllamaResidency::Mixed)
+            }
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(ModelError::new(format!(
+                "Ollama GPU policy rejected model residency: {}",
+                residency.label()
+            )))
+        }
+    }
+
+    async fn ollama_residency(&self) -> Result<OllamaResidency, ModelError> {
+        tokio::time::timeout(MODEL_PROBE_TIMEOUT, async {
+            let url = self.config.endpoint.join("/api/ps").map_err(|error| {
+                ModelError::new(format!("invalid Ollama residency URL: {error}"))
+            })?;
+            let response = self.client.get(url).send().await.map_err(|error| {
+                ModelError::new(format!("Ollama GPU telemetry unavailable: {error}"))
+            })?;
+            if !response.status().is_success() {
+                return Err(ModelError::new(format!(
+                    "Ollama GPU telemetry unavailable: HTTP {}",
+                    response.status()
+                )));
+            }
+            let body = read_limited(response, MODEL_PROBE_MAX_RESPONSE_BYTES)
+                .await
+                .map_err(|error| {
+                    ModelError::new(format!("Ollama GPU telemetry unavailable: {error}"))
+                })?;
+            let status: OllamaRunningModels = serde_json::from_slice(&body)
+                .map_err(|_| ModelError::new("Ollama GPU telemetry unknown: invalid response"))?;
+            let Some(model) = status
+                .models
+                .iter()
+                .find(|model| model.name == self.config.model)
+            else {
+                return Ok(OllamaResidency::NotLoaded);
+            };
+            Ok(match (model.size, model.size_vram) {
+                (Some(size), Some(vram)) if size > 0 && vram == size => OllamaResidency::Full,
+                (Some(size), Some(vram)) if size > 0 && vram > 0 && vram < size => {
+                    OllamaResidency::Mixed
+                }
+                (Some(size), Some(0)) if size > 0 => OllamaResidency::CpuOnly,
+                _ => OllamaResidency::Unknown,
+            })
+        })
+        .await
+        .map_err(|_| ModelError::new("Ollama GPU telemetry unavailable: timed out"))?
+    }
+
+    async fn preload_ollama_model(&self) -> Result<(), ModelError> {
+        let url = self
+            .config
+            .endpoint
+            .join("/api/generate")
+            .map_err(|error| ModelError::new(format!("invalid Ollama preload URL: {error}")))?;
+        let response = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({
+                "model": self.config.model,
+                "prompt": "",
+                "stream": false
+            }))
+            .send()
+            .await
+            .map_err(|error| ModelError::new(format!("Ollama GPU preload unavailable: {error}")))?;
+        if !response.status().is_success() {
+            return Err(ModelError::new(format!(
+                "Ollama GPU preload unavailable: HTTP {}",
+                response.status()
+            )));
+        }
+        read_limited(response, MODEL_PROBE_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| ModelError::new(format!("Ollama GPU preload unavailable: {error}")))?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OllamaResidency {
+    Full,
+    Mixed,
+    CpuOnly,
+    NotLoaded,
+    Unknown,
+}
+
+impl OllamaResidency {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full GPU",
+            Self::Mixed => "mixed GPU/CPU",
+            Self::CpuOnly => "CPU-only",
+            Self::NotLoaded => "unavailable (model not loaded)",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OllamaRunningModels {
+    models: Vec<OllamaRunningModel>,
+}
+
+#[derive(Deserialize)]
+struct OllamaRunningModel {
+    name: String,
+    size: Option<u64>,
+    size_vram: Option<u64>,
 }
 
 impl ModelPort for OpenAiCompatibleClient {
@@ -268,11 +485,14 @@ async fn parse_stream(
     let mut events = limited.eventsource();
     let mut text = String::new();
     let mut tool_call = None::<AccumulatedToolCall>;
+    let mut saw_done = false;
+    let mut terminal_finish = None::<&'static str>;
 
     while let Some(event) = events.next().await {
         let event =
             event.map_err(|error| ModelError::new(format!("invalid model stream: {error}")))?;
         if event.data == "[DONE]" {
+            saw_done = true;
             break;
         }
         let chunk: StreamChunk = serde_json::from_str(&event.data)
@@ -282,6 +502,26 @@ async fn parse_stream(
                 return Err(ModelError::new(
                     "multiple model response choices are unsupported",
                 ));
+            }
+            if let Some(reason) = choice.finish_reason.as_deref() {
+                let finish = match reason {
+                    "stop" => "stop",
+                    "tool_calls" => "tool_calls",
+                    "length" | "content_filter" => {
+                        return Err(ModelError::new(format!(
+                            "model response terminated without a complete usable result: {reason}"
+                        )));
+                    }
+                    other => {
+                        return Err(ModelError::new(format!(
+                            "unsupported model finish reason: {other}"
+                        )));
+                    }
+                };
+                if terminal_finish.is_some_and(|previous| previous != finish) {
+                    return Err(ModelError::new("conflicting model finish reasons"));
+                }
+                terminal_finish = Some(finish);
             }
             if let Some(content) = choice.delta.content {
                 text.push_str(&content);
@@ -312,6 +552,19 @@ async fn parse_stream(
                 }
             }
         }
+    }
+
+    if !saw_done {
+        return Err(ModelError::new("model stream ended before [DONE]"));
+    }
+    let finish = terminal_finish
+        .ok_or_else(|| ModelError::new("model stream completed without terminal finish reason"))?;
+    if (tool_call.is_some() && (finish != "tool_calls" || !text.is_empty()))
+        || (tool_call.is_none() && finish != "stop")
+    {
+        return Err(ModelError::new(
+            "model stream content conflicts with finish reason",
+        ));
     }
 
     output_from_accumulated(text, tool_call, tools)
@@ -540,6 +793,7 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ResponseChoice {
     message: ResponseMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -572,6 +826,7 @@ struct StreamChunk {
 struct StreamChoice {
     index: usize,
     delta: StreamDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -588,6 +843,16 @@ struct StreamToolCall {
     #[serde(rename = "type")]
     kind: Option<String>,
     function: StreamToolFunction,
+}
+
+#[derive(Deserialize)]
+struct ModelCatalog {
+    data: Vec<ModelCatalogEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelCatalogEntry {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -622,6 +887,8 @@ pub enum ModelConfigError {
     InvalidTimeout,
     #[error("model response byte limit must be greater than zero")]
     InvalidResponseLimit,
+    #[error("Ollama GPU policy requires an HTTP loopback /v1/ endpoint")]
+    InvalidOllamaGpuEndpoint,
     #[error("could not construct HTTP client: {0}")]
     Client(#[from] reqwest::Error),
 }
