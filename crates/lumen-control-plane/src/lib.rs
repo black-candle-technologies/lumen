@@ -1,6 +1,6 @@
 use lumen_core::{
     approval::TimestampMillis,
-    artifact::{MAX_ARTIFACT_PREVIEW_BYTES, RetryMode},
+    artifact::RetryMode,
     context::{
         ContextDigest, ContextSource, ContextSourceId, ModelDataPolicy, ProjectionId,
         ProjectionTaskKey, SourceProvenance, SourceProvenanceKind, TaskProjection,
@@ -14,6 +14,7 @@ use lumen_core::{
     orchestration::{OrchestrationId, TaskGraph, TaskGraphProposal, TaskNode, TaskNodeState},
     provider::{ModelProfile, ProviderAdapter, ProviderConfig, ProviderKind},
     routing::{OrchestrationBudget, RoutingPolicy},
+    trust_gate::evaluate_exact_projection,
     worker::{OwnedProjectedModel, WorkerAssignment, WorkerCapabilityGrant, WorkerRunBudget},
 };
 use lumen_db::{ControlEvent, Database, RepositoryError};
@@ -244,36 +245,7 @@ impl DatabaseCandidateCatalog {
         actor: &PrincipalId,
         now: TimestampMillis,
     ) -> Result<Vec<RoutedWorkerCandidate>, ControlPlaneError> {
-        let mut sources = self
-            .db
-            .orchestration_input_sources(g.orchestration_id())
-            .await?;
-        for (child, dep) in g.dependency_edges() {
-            if child == n.id() {
-                for id in self
-                    .db
-                    .handoff_artifact_ids(g.orchestration_id(), g.revision(), dep)
-                    .await?
-                {
-                    if let Some(r) = self
-                        .db
-                        .artifact_reference_for_handoff(id, MAX_ARTIFACT_PREVIEW_BYTES)
-                        .await?
-                    {
-                        let s = r
-                            .to_context_source(
-                                ContextSourceId::new(),
-                                g.workspace_id(),
-                                actor.clone(),
-                                now,
-                            )
-                            .map_err(|e| ControlPlaneError::Control(e.to_string()))?;
-                        self.db.append_context_source(&s).await?;
-                        sources.push(s)
-                    }
-                }
-            }
-        }
+        let sources = self.db.gate_sources_for_task(g, n, actor, now).await?;
         let mut out = Vec::new();
         for m in self.db.list_latest_model_profiles().await? {
             let Some(policy) = self
@@ -293,18 +265,37 @@ impl DatabaseCandidateCatalog {
             else {
                 continue;
             };
-            let Ok(proj) = TaskProjection::build(
+            let selection = evaluate_exact_projection(
+                g.workspace_id(),
+                g.orchestration_id(),
+                g.revision(),
+                n,
+                &m,
+                &policy,
+                sources.clone(),
+                now,
+            )
+            .map_err(|e| ControlPlaneError::Control(e.to_string()))?;
+            let mut evaluation = selection.evaluation;
+            if !evaluation.allowed {
+                self.db.append_trust_gate_evaluation(&evaluation).await?;
+                continue;
+            }
+            let proj = TaskProjection::build(
                 ProjectionId::new(),
                 ProjectionTaskKey::parse(n.key().as_str())
                     .map_err(|e| ControlPlaneError::Control(e.to_string()))?,
                 &m,
                 &policy,
-                sources.clone(),
+                selection.selected_sources,
                 now,
-            ) else {
-                continue;
-            };
+            )
+            .map_err(|e| ControlPlaneError::Control(e.to_string()))?;
             self.db.insert_task_projection(&proj).await?;
+            evaluation = evaluation
+                .bind_projection(proj.id(), proj.digest())
+                .map_err(|e| ControlPlaneError::Control(e.to_string()))?;
+            self.db.append_trust_gate_evaluation(&evaluation).await?;
             out.push(RoutedWorkerCandidate {
                 provider: p,
                 profile: m,
@@ -399,6 +390,9 @@ impl OrchestrationControl {
     }
     async fn drive(&self, id: OrchestrationId) -> Result<(), ControlPlaneError> {
         loop {
+            if self.db.orchestration_quarantine(id).await?.is_some() {
+                return Ok(());
+            }
             let now = clock();
             self.db.reconcile_task_readiness(id, now).await?;
             let Some(s) = self.db.latest_orchestration_snapshot(id).await? else {
@@ -445,6 +439,22 @@ impl OrchestrationControl {
                     .catalog
                     .candidates(s.graph(), &n, s.graph().created_by(), now)
                     .await?;
+                if cs.is_empty() {
+                    let st = s
+                        .state(tid)
+                        .ok_or_else(|| ControlPlaneError::Control("task state missing".into()))?;
+                    self.db
+                        .transition_task_state(
+                            id,
+                            s.graph().revision(),
+                            tid,
+                            st.revision(),
+                            TaskNodeState::Blocked,
+                            now,
+                        )
+                        .await?;
+                    continue;
+                }
                 let scheduler = Arc::clone(&self.scheduler);
                 let g = s.graph().clone();
                 let actor = s.graph().created_by().clone();
@@ -476,6 +486,14 @@ impl OrchestrationControl {
             .orchestration_ids_for_workspace(self.workspace)
             .await?
         {
+            self.db
+                .ensure_recovered_unknown_failure_metadata(id, now)
+                .await?;
+            let report = self.db.verify_orchestration_integrity(id, now).await?;
+            self.db.record_recovery_integrity(&report).await?;
+            if !report.ok() {
+                continue;
+            }
             if let Some(s) = self.db.latest_orchestration_snapshot(id).await?
                 && s.states().any(|x| {
                     !matches!(
@@ -494,11 +512,27 @@ impl OrchestrationControl {
         Ok(())
     }
     async fn view(&self, w: WorkspaceId, id: OrchestrationId) -> Result<Value, ServiceError> {
-        self.db
+        let mut v = self
+            .db
             .orchestration_view(w, id, clock())
             .await
             .map_err(map)?
-            .ok_or(ServiceError::NotFound)
+            .ok_or(ServiceError::NotFound)?;
+        if let Some(o) = v.as_object_mut() {
+            o.insert(
+                "trust_gate".into(),
+                Value::Array(self.db.trust_gate_evaluations(id).await.map_err(map)?),
+            );
+            o.insert(
+                "quarantine".into(),
+                self.db
+                    .orchestration_quarantine(id)
+                    .await
+                    .map_err(map)?
+                    .unwrap_or(Value::Null),
+            );
+        }
+        Ok(v)
     }
 }
 impl OrchestrationService for OrchestrationControl {
@@ -653,6 +687,18 @@ impl OrchestrationService for OrchestrationControl {
             self.auth(c.workspace_id, &c.actor, op, Some(c.orchestration_id))
                 .await?;
             let snap = self.snap(c.workspace_id, c.orchestration_id).await?;
+            if self
+                .db
+                .orchestration_quarantine(c.orchestration_id)
+                .await
+                .map_err(map)?
+                .is_some()
+                && !matches!(&c.action, ControlAction::Cancel)
+            {
+                return Err(ServiceError::Conflict(
+                    "orchestration is security-quarantined".into(),
+                ));
+            }
             match c.action {
                 ControlAction::Cancel => self
                     .scheduler

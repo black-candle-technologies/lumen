@@ -264,7 +264,7 @@ impl WorkerAssignment {
             projection_id: projection.id(),
             projection_digest: projection.digest().clone(),
             data_class: node.requirements().data_class(),
-            prompt: node.description().to_owned(),
+            prompt: "Execute the task described in the verified projection.".to_owned(),
             grants: grants.into_iter().collect(),
             allowed_tools: node
                 .requirements()
@@ -351,7 +351,7 @@ impl WorkerAssignment {
             || graph.revision() != self.graph_revision
             || graph.workspace_id() != self.workspace_id
             || node.id() != self.task_node_id
-            || node.description() != self.prompt
+            || self.prompt != "Execute the task described in the verified projection."
             || provider.id() != &self.provider_id
             || provider.revision() != self.provider_revision
             || profile.id() != &self.model_profile_id

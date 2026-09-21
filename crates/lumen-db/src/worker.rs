@@ -83,6 +83,7 @@ impl Database {
             return Err(RepositoryError::InvalidWorkerState);
         }
         validate_assignment(&mut tx, assignment).await?;
+        crate::trust_gate::verify_trust_gate_binding_tx(&mut tx, assignment).await?;
         let row = sqlx::query("SELECT state_revision,state,attempt_count FROM orchestration_task_state_revisions WHERE orchestration_id=? AND graph_revision=? AND task_node_id=? ORDER BY state_revision DESC LIMIT 1")
             .bind(assignment.orchestration_id().to_string()).bind(pos(assignment.graph_revision())?).bind(assignment.task_node_id().to_string()).fetch_optional(&mut *tx).await?.ok_or(RepositoryError::InvalidWorkerState)?;
         if row.try_get::<String, _>("state")? != "ready" {

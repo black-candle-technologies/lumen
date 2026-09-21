@@ -22,6 +22,8 @@ export type OrchestrationView = {
 	usage: { calls: number; input_tokens: number; output_tokens: number; remote_cost_micros: number };
 	budget: any;
 	control: any;
+	trust_gate: unknown[];
+	quarantine: { check_id: string; reason_digest: string; created_at: number } | null;
 };
 export type CreateOrchestrationRequest = {
 	prompt: string; data_class: 'public' | 'workspace' | 'sensitive'; compartments: string[];

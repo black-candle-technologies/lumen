@@ -127,6 +127,30 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+    pub async fn latest_artifact_validation(
+        &self,
+        id: ArtifactId,
+    ) -> Result<Option<ArtifactValidation>, RepositoryError> {
+        let row = sqlx::query("SELECT * FROM artifact_validation_revisions WHERE artifact_id=? ORDER BY revision DESC LIMIT 1")
+            .bind(id.to_string()).fetch_optional(self.pool()).await?;
+        row.map(|row| {
+            ArtifactValidation::new(
+                id,
+                positive_row(&row, "revision")?,
+                ArtifactValidationState::parse(&row.try_get::<String, _>("state")?)
+                    .ok_or(RepositoryError::InvalidArtifactState)?,
+                row.try_get::<String, _>("method")?,
+                PrincipalId::new(
+                    row.try_get::<String, _>("validator_provider")?,
+                    row.try_get::<String, _>("validator_subject")?,
+                )
+                .map_err(|_| RepositoryError::InvalidArtifactState)?,
+                TimestampMillis::new(positive_or_zero(&row, "created_at")?),
+            )
+            .map_err(|_| RepositoryError::InvalidArtifactState)
+        })
+        .transpose()
+    }
 
     pub async fn artifact_reference_for_handoff(
         &self,
@@ -186,6 +210,28 @@ impl Database {
             return Err(RepositoryError::InvalidArtifactState);
         }
         Ok(())
+    }
+    pub async fn worker_failure(
+        &self,
+        attempt_id: WorkerAttemptId,
+    ) -> Result<Option<WorkerFailure>, RepositoryError> {
+        let row = sqlx::query("SELECT * FROM worker_attempt_failures WHERE attempt_id=?")
+            .bind(attempt_id.to_string())
+            .fetch_optional(self.pool())
+            .await?;
+        row.map(|row| {
+            WorkerFailure::new(
+                attempt_id,
+                FailureClass::parse(&row.try_get::<String, _>("failure_class")?)
+                    .ok_or(RepositoryError::InvalidArtifactState)?,
+                EffectRisk::parse(&row.try_get::<String, _>("effect_risk")?)
+                    .ok_or(RepositoryError::InvalidArtifactState)?,
+                row.try_get::<Option<String>, _>("diagnostic")?,
+                TimestampMillis::new(positive_or_zero(&row, "created_at")?),
+            )
+            .map_err(|_| RepositoryError::InvalidArtifactState)
+        })
+        .transpose()
     }
 
     pub async fn reconcile_unknown_retry(

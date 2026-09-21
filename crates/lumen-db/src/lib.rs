@@ -13,6 +13,7 @@ mod model_registry;
 mod orchestration;
 mod repositories;
 mod routing;
+mod trust_gate;
 mod worker;
 
 use std::path::Path;
@@ -126,6 +127,8 @@ pub enum RepositoryError {
     InvalidArtifactState,
     #[error("orchestration control state conflicts with repository constraints")]
     InvalidControlState,
+    #[error("mixed-trust/recovery gate conflicts with repository constraints")]
+    InvalidTrustGateState,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]

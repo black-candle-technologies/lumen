@@ -1,0 +1,33 @@
+name: m6h-acceptance
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: apps/web/package-lock.json }
+      - run: npm ci
+        working-directory: apps/web
+      - name: acceptance
+        shell: bash
+        env:
+          LUMEN_ACCEPT_OPENAI_KEY: ${{ secrets.LUMEN_ACCEPT_OPENAI_KEY }}
+          LUMEN_ACCEPT_OPENAI_MODEL: ${{ vars.LUMEN_ACCEPT_OPENAI_MODEL }}
+          LUMEN_ACCEPT_ANTHROPIC_KEY: ${{ secrets.LUMEN_ACCEPT_ANTHROPIC_KEY }}
+          LUMEN_ACCEPT_ANTHROPIC_MODEL: ${{ vars.LUMEN_ACCEPT_ANTHROPIC_MODEL }}
+        run: cargo run -p lumen-acceptance
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m6h-${{ matrix.os }}-${{ github.sha }}
+          path: target/m6h-acceptance/

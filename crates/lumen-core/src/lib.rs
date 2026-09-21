@@ -19,4 +19,5 @@ pub mod provider;
 pub mod routing;
 pub mod run;
 pub mod secret;
+pub mod trust_gate;
 pub mod worker;
