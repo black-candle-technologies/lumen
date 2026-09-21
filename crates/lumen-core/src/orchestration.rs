@@ -771,6 +771,36 @@ impl TaskStateRevision {
             created_at,
         })
     }
+    pub fn retry(
+        &self,
+        max_attempts: u32,
+        unknown_reconciled: bool,
+        created_at: TimestampMillis,
+    ) -> Result<Self, OrchestrationError> {
+        if self.attempt_count >= max_attempts {
+            return Err(OrchestrationError::AttemptLimitExceeded);
+        }
+        if self.state != TaskNodeState::Failed
+            && !(self.state == TaskNodeState::Unknown && unknown_reconciled)
+        {
+            return Err(OrchestrationError::InvalidStateTransition {
+                from: self.state,
+                to: TaskNodeState::Ready,
+            });
+        }
+        Ok(Self {
+            orchestration_id: self.orchestration_id,
+            graph_revision: self.graph_revision,
+            task_node_id: self.task_node_id,
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or(OrchestrationError::RevisionOverflow)?,
+            state: TaskNodeState::Ready,
+            attempt_count: self.attempt_count,
+            created_at,
+        })
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrchestrationSnapshot {

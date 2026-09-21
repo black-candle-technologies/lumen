@@ -1,5 +1,6 @@
 //! SQLite persistence for Lumen runtime state.
 
+mod artifact;
 mod audit;
 mod automation;
 mod context;
@@ -119,6 +120,8 @@ pub enum RepositoryError {
     InvalidRoutingState,
     #[error("routing budget changed or no longer has sufficient capacity")]
     RoutingBudgetConflict,
+    #[error("artifact/retry state conflicts with repository constraints")]
+    InvalidArtifactState,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]

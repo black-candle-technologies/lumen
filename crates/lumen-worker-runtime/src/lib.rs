@@ -1,5 +1,8 @@
 //! Bounded orchestration worker execution over Lumen's existing run kernel.
+mod artifacts;
+mod retry;
 mod routing;
+pub use retry::RetryDispatch;
 pub use routing::{DatabaseUsageSink, RoutedWorkerCandidate};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
@@ -173,6 +176,7 @@ impl WorkerScheduler {
                 .orchestration_cancelled(assignment.orchestration_id())
                 .await?
         {
+            let _ = self.record_pre_dispatch_cancel(&record, now).await?;
             self.db
                 .terminalize_worker_attempt(
                     record.attempt_id(),
@@ -262,13 +266,32 @@ impl WorkerScheduler {
         if active.cancellation.is_cancelled() {
             active.state.cancel();
         }
-        let permits = self
+        let permits = match self
             .limits(
                 active.record.assignment(),
                 active.profile_limit,
                 &active.cancellation,
             )
-            .await?;
+            .await
+        {
+            Ok(permits) => Some(permits),
+            Err(WorkerRuntimeError::Cancelled) => {
+                active.state.cancel();
+                let now = self.ports.clock.now();
+                let _ = self.record_pre_dispatch_cancel(&active.record, now).await?;
+                self.db
+                    .terminalize_worker_attempt(
+                        id,
+                        Some(self.owner),
+                        WorkerAttemptState::Cancelled,
+                        Some("cancelled before dispatch"),
+                        now,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let normalizer = ToolRestrictedNormalizer::new(
             self.ports.normalizer.as_ref(),
             active.record.assignment().allowed_tools(),
@@ -313,12 +336,37 @@ impl WorkerScheduler {
                 Ok(())
             }
             Ok(outcome) => {
+                let mut terminal = state(&outcome);
+                let mut detail = diagnostic(&outcome);
+                if let RunOutcome::Completed { text } = &outcome {
+                    if let Err(error) = self
+                        .persist_completed_artifact(&active.record, text, now)
+                        .await
+                    {
+                        let risk = self
+                            .record_persistence_failure(&active.record, error.to_string(), now)
+                            .await?;
+                        terminal = if risk == lumen_core::artifact::EffectRisk::UnknownEffect {
+                            WorkerAttemptState::Unknown
+                        } else {
+                            WorkerAttemptState::Failed
+                        };
+                        detail = Some(bounded(&error.to_string()));
+                    }
+                } else if let Some(risk) = self
+                    .record_outcome_failure(&active.record, &outcome, now)
+                    .await?
+                    && terminal == WorkerAttemptState::Failed
+                    && risk == lumen_core::artifact::EffectRisk::UnknownEffect
+                {
+                    terminal = WorkerAttemptState::Unknown;
+                }
                 self.db
                     .terminalize_worker_attempt(
                         id,
                         Some(self.owner),
-                        state(&outcome),
-                        diagnostic(&outcome).as_deref(),
+                        terminal,
+                        detail.as_deref(),
                         now,
                     )
                     .await?;
@@ -337,11 +385,16 @@ impl WorkerScheduler {
                 Ok(())
             }
             Err(error) => {
+                let risk = self.record_run_error(&active.record, &error, now).await?;
                 self.db
                     .terminalize_worker_attempt(
                         id,
                         Some(self.owner),
-                        WorkerAttemptState::Unknown,
+                        if risk == lumen_core::artifact::EffectRisk::UnknownEffect {
+                            WorkerAttemptState::Unknown
+                        } else {
+                            WorkerAttemptState::Failed
+                        },
                         Some(&bounded(&error.to_string())),
                         now,
                     )
@@ -510,6 +563,10 @@ pub enum WorkerRuntimeError {
     Configuration(String),
     #[error("worker routing: {0}")]
     Routing(String),
+    #[error("worker artifact: {0}")]
+    Artifact(String),
+    #[error("retry denied: {0}")]
+    RetryDenied(String),
     #[error("worker internal: {0}")]
     Internal(String),
 }

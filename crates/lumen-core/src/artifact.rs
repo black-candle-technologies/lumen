@@ -63,6 +63,19 @@ pub enum ArtifactKind {
     Blob,
 }
 impl ArtifactKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "text" => Self::Text,
+            "patch" => Self::Patch,
+            "design" => Self::Design,
+            "test" => Self::Test,
+            "task_plan" => Self::TaskPlan,
+            "code_review" => Self::CodeReview,
+            "diagnostic_report" => Self::DiagnosticReport,
+            "blob" => Self::Blob,
+            _ => return None,
+        })
+    }
     pub const fn from_task_output(value: TaskOutputKind) -> Self {
         match value {
             TaskOutputKind::Text => Self::Text,
@@ -107,11 +120,55 @@ pub enum ArtifactValidationState {
     Rejected,
 }
 impl ArtifactValidationState {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "accepted" => Self::Accepted,
+            "rejected" => Self::Rejected,
+            _ => return None,
+        })
+    }
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
         }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactValidation {
+    pub artifact_id: ArtifactId,
+    pub revision: u64,
+    pub state: ArtifactValidationState,
+    pub method: String,
+    pub validator: PrincipalId,
+    pub created_at: TimestampMillis,
+}
+impl ArtifactValidation {
+    pub fn new(
+        artifact_id: ArtifactId,
+        revision: u64,
+        state: ArtifactValidationState,
+        method: impl Into<String>,
+        validator: PrincipalId,
+        created_at: TimestampMillis,
+    ) -> Result<Self, ArtifactError> {
+        let method = method.into();
+        if revision == 0
+            || method.is_empty()
+            || method.len() > 128
+            || method.trim() != method
+            || method.chars().any(char::is_control)
+        {
+            return Err(ArtifactError::InvalidValidation);
+        }
+        Ok(Self {
+            artifact_id,
+            revision,
+            state,
+            method,
+            validator,
+            created_at,
+        })
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +287,7 @@ impl WorkerArtifact {
             created_at,
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn from_text(
         id: ArtifactId,
         workspace_id: WorkspaceId,
@@ -251,6 +309,35 @@ impl WorkerArtifact {
             provenance,
             created_at,
         )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_stored_parts(
+        id: ArtifactId,
+        workspace_id: WorkspaceId,
+        kind: ArtifactKind,
+        media_type: impl Into<String>,
+        content: Vec<u8>,
+        expected_hash: ContextDigest,
+        classification: DataClass,
+        compartments: impl IntoIterator<Item = CompartmentId>,
+        provenance: ArtifactProvenance,
+        created_at: TimestampMillis,
+    ) -> Result<Self, ArtifactError> {
+        let artifact = Self::new(
+            id,
+            workspace_id,
+            kind,
+            media_type,
+            content,
+            classification,
+            compartments,
+            provenance,
+            created_at,
+        )?;
+        if artifact.content_hash != expected_hash {
+            return Err(ArtifactError::DigestMismatch);
+        }
+        Ok(artifact)
     }
     pub fn verify(&self) -> Result<(), ArtifactError> {
         if digest(&self.content) != self.content_hash {
@@ -344,6 +431,51 @@ pub enum EffectRisk {
     KnownEffect,
     UnknownEffect,
 }
+impl EffectRisk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoEffect => "no_effect",
+            Self::KnownEffect => "known_effect",
+            Self::UnknownEffect => "unknown_effect",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "no_effect" => Self::NoEffect,
+            "known_effect" => Self::KnownEffect,
+            "unknown_effect" => Self::UnknownEffect,
+            _ => return None,
+        })
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerFailure {
+    pub attempt_id: WorkerAttemptId,
+    pub failure_class: FailureClass,
+    pub effect_risk: EffectRisk,
+    pub diagnostic: Option<String>,
+    pub created_at: TimestampMillis,
+}
+impl WorkerFailure {
+    pub fn new(
+        attempt_id: WorkerAttemptId,
+        failure_class: FailureClass,
+        effect_risk: EffectRisk,
+        diagnostic: Option<String>,
+        created_at: TimestampMillis,
+    ) -> Result<Self, ArtifactError> {
+        if diagnostic.as_ref().is_some_and(|value| value.len() > 1024) {
+            return Err(ArtifactError::InvalidFailure);
+        }
+        Ok(Self {
+            attempt_id,
+            failure_class,
+            effect_risk,
+            diagnostic,
+            created_at,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
@@ -362,11 +494,58 @@ pub enum FailureClass {
     RequiredSkillUnavailable,
     UnknownFailure,
 }
+impl FailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelFailure => "model_failure",
+            Self::InvalidModelOutput => "invalid_model_output",
+            Self::ApprovalInfrastructure => "approval_infrastructure",
+            Self::AuditFailure => "audit_failure",
+            Self::PersistenceFailure => "persistence_failure",
+            Self::DispatchFailure => "dispatch_failure",
+            Self::ExecutorFailure => "executor_failure",
+            Self::PolicyDenied => "policy_denied",
+            Self::ApprovalRejected => "approval_rejected",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::Cancelled => "cancelled",
+            Self::ExecutionTimedOut => "execution_timed_out",
+            Self::RequiredSkillUnavailable => "required_skill_unavailable",
+            Self::UnknownFailure => "unknown_failure",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "model_failure" => Self::ModelFailure,
+            "invalid_model_output" => Self::InvalidModelOutput,
+            "approval_infrastructure" => Self::ApprovalInfrastructure,
+            "audit_failure" => Self::AuditFailure,
+            "persistence_failure" => Self::PersistenceFailure,
+            "dispatch_failure" => Self::DispatchFailure,
+            "executor_failure" => Self::ExecutorFailure,
+            "policy_denied" => Self::PolicyDenied,
+            "approval_rejected" => Self::ApprovalRejected,
+            "budget_exhausted" => Self::BudgetExhausted,
+            "cancelled" => Self::Cancelled,
+            "execution_timed_out" => Self::ExecutionTimedOut,
+            "required_skill_unavailable" => Self::RequiredSkillUnavailable,
+            "unknown_failure" => Self::UnknownFailure,
+            _ => return None,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryMode {
     SameWorker,
     Reassign,
+}
+impl RetryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SameWorker => "same_worker",
+            Self::Reassign => "reassign",
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -379,6 +558,16 @@ pub enum RetryDisposition {
     NoRetry,
 }
 impl RetryDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SameWorker => "same_worker",
+            Self::Reassign => "reassign",
+            Self::Either => "either",
+            Self::ReconciliationRequired => "reconciliation_required",
+            Self::ManualOnly => "manual_only",
+            Self::NoRetry => "no_retry",
+        }
+    }
     pub const fn allows(self, mode: RetryMode) -> bool {
         matches!(
             (self, mode),
@@ -386,6 +575,72 @@ impl RetryDisposition {
                 | (Self::Reassign, RetryMode::Reassign)
                 | (Self::Either, _)
         )
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryDecision {
+    pub id: RetryDecisionId,
+    pub prior_attempt_id: WorkerAttemptId,
+    pub orchestration_id: OrchestrationId,
+    pub graph_revision: u64,
+    pub task_node_id: TaskNodeId,
+    pub mode: RetryMode,
+    pub failure_class: FailureClass,
+    pub effect_risk: EffectRisk,
+    pub disposition: RetryDisposition,
+    pub allowed: bool,
+    pub requested_by: PrincipalId,
+    pub previous_provider_id: ProviderId,
+    pub previous_provider_revision: u64,
+    pub previous_profile_id: ModelProfileId,
+    pub previous_profile_revision: u64,
+    pub created_at: TimestampMillis,
+}
+impl RetryDecision {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: RetryDecisionId,
+        prior_attempt_id: WorkerAttemptId,
+        orchestration_id: OrchestrationId,
+        graph_revision: u64,
+        task_node_id: TaskNodeId,
+        mode: RetryMode,
+        failure_class: FailureClass,
+        effect_risk: EffectRisk,
+        disposition: RetryDisposition,
+        allowed: bool,
+        requested_by: PrincipalId,
+        previous_provider_id: ProviderId,
+        previous_provider_revision: u64,
+        previous_profile_id: ModelProfileId,
+        previous_profile_revision: u64,
+        created_at: TimestampMillis,
+    ) -> Result<Self, ArtifactError> {
+        if graph_revision == 0
+            || previous_provider_revision == 0
+            || previous_profile_revision == 0
+            || (allowed && !disposition.allows(mode))
+        {
+            return Err(ArtifactError::InvalidRetryDecision);
+        }
+        Ok(Self {
+            id,
+            prior_attempt_id,
+            orchestration_id,
+            graph_revision,
+            task_node_id,
+            mode,
+            failure_class,
+            effect_risk,
+            disposition,
+            allowed,
+            requested_by,
+            previous_provider_id,
+            previous_provider_revision,
+            previous_profile_id,
+            previous_profile_revision,
+            created_at,
+        })
     }
 }
 pub const fn retry_disposition(
@@ -452,6 +707,12 @@ pub enum ArtifactError {
     InvalidPreviewLimit,
     #[error("artifact reference is invalid")]
     InvalidReference,
+    #[error("artifact validation is invalid")]
+    InvalidValidation,
+    #[error("retry decision is invalid")]
+    InvalidRetryDecision,
+    #[error("worker failure is invalid")]
+    InvalidFailure,
 }
 #[cfg(test)]
 mod tests {
