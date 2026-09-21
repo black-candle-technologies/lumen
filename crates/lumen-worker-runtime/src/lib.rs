@@ -1,11 +1,14 @@
 //! Bounded orchestration worker execution over Lumen's existing run kernel.
+mod routing;
+pub use routing::{DatabaseUsageSink, RoutedWorkerCandidate};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use lumen_core::{
     capability::CapabilitySet,
+    model::ModelGenerationConfig,
     orchestration::OrchestrationId,
     policy::{Policy, PolicyVersion},
-    provider::ModelProfileId,
+    provider::{ModelProfileId, ProviderUsageSink},
     run::{
         ActionNormalizer, ActionPort, ApprovalPort, AuditPort, Clock, RunOrchestrator, RunOutcome,
         RunState,
@@ -30,6 +33,8 @@ pub trait WorkerMaterializer: Send + Sync {
     fn materialize<'a>(
         &'a self,
         assignment: &'a WorkerAssignment,
+        generation: Option<ModelGenerationConfig>,
+        usage_sink: Option<Arc<dyn ProviderUsageSink>>,
         cancellation: CancellationToken,
     ) -> MaterializeFuture<'a>;
 }
@@ -128,7 +133,7 @@ impl WorkerScheduler {
         }
         Ok(result)
     }
-    async fn reserve_and_start(
+    pub(crate) async fn reserve_and_start(
         self: &Arc<Self>,
         assignment: WorkerAssignment,
         now: lumen_core::approval::TimestampMillis,
@@ -179,9 +184,27 @@ impl WorkerScheduler {
                 .await?;
             return Ok(());
         }
+        let dispatch = self
+            .db
+            .active_routing_dispatch(
+                assignment.orchestration_id(),
+                assignment.graph_revision(),
+                assignment.task_node_id(),
+            )
+            .await?;
+        let (generation, usage_sink) = match dispatch {
+            Some(dispatch) => (
+                Some(dispatch.generation),
+                Some(Arc::new(routing::DatabaseUsageSink::new(
+                    self.db.clone(),
+                    dispatch.reservation_id,
+                )) as Arc<dyn ProviderUsageSink>),
+            ),
+            None => (None, None),
+        };
         let material = self
             .materializer
-            .materialize(&assignment, token.child_token())
+            .materialize(&assignment, generation, usage_sink, token.child_token())
             .await?;
         if material.profile_id != *assignment.model_profile_id()
             || material.profile_revision != assignment.model_profile_revision()
@@ -299,6 +322,15 @@ impl WorkerScheduler {
                         now,
                     )
                     .await?;
+                let _ = self
+                    .db
+                    .settle_active_routing_for_task(
+                        active.record.assignment().orchestration_id(),
+                        active.record.assignment().graph_revision(),
+                        active.record.assignment().task_node_id(),
+                        now,
+                    )
+                    .await?;
                 self.db
                     .reconcile_task_readiness(active.record.assignment().orchestration_id(), now)
                     .await?;
@@ -311,6 +343,15 @@ impl WorkerScheduler {
                         Some(self.owner),
                         WorkerAttemptState::Unknown,
                         Some(&bounded(&error.to_string())),
+                        now,
+                    )
+                    .await?;
+                let _ = self
+                    .db
+                    .settle_active_routing_for_task(
+                        active.record.assignment().orchestration_id(),
+                        active.record.assignment().graph_revision(),
+                        active.record.assignment().task_node_id(),
                         now,
                     )
                     .await?;
@@ -467,6 +508,8 @@ pub enum WorkerRuntimeError {
     Cancelled,
     #[error("worker configuration: {0}")]
     Configuration(String),
+    #[error("worker routing: {0}")]
+    Routing(String),
     #[error("worker internal: {0}")]
     Internal(String),
 }

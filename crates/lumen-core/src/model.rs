@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{action::CanonicalValue, egress::DataClass};
@@ -12,11 +12,87 @@ pub trait ModelPort: Send + Sync {
     fn generate(&self, input: ModelInput) -> ModelFuture<'_>;
 }
 
+/// The normalized reasoning request.  Adapters never infer this from a prompt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningProfile {
+    Fast,
+    Balanced,
+    Deep,
+    Maximum,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningWireFormat {
+    None,
+    OpenAi,
+    AnthropicAdaptive,
+    OpenAiCompatible,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelGenerationConfig {
+    reasoning: ReasoningProfile,
+    wire: ReasoningWireFormat,
+    provider_effort: Option<String>,
+    max_output_tokens: u32,
+}
+impl ModelGenerationConfig {
+    pub fn new(
+        reasoning: ReasoningProfile,
+        wire: ReasoningWireFormat,
+        provider_effort: Option<String>,
+        max_output_tokens: u32,
+    ) -> Result<Self, ModelError> {
+        if max_output_tokens == 0 {
+            return Err(ModelError::new(
+                "max output tokens must be greater than zero",
+            ));
+        }
+        match (wire, provider_effort.as_deref()) {
+            (ReasoningWireFormat::None, None) => {}
+            (ReasoningWireFormat::None, Some(_)) => {
+                return Err(ModelError::new(
+                    "reasoning wire none cannot carry provider effort",
+                ));
+            }
+            (_, Some(value))
+                if !value.is_empty()
+                    && value.len() <= 32
+                    && value.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)
+                    }) => {}
+            _ => return Err(ModelError::new("provider reasoning effort is invalid")),
+        }
+        Ok(Self {
+            reasoning,
+            wire,
+            provider_effort,
+            max_output_tokens,
+        })
+    }
+    pub const fn reasoning(&self) -> ReasoningProfile {
+        self.reasoning
+    }
+    pub const fn wire(&self) -> ReasoningWireFormat {
+        self.wire
+    }
+    pub fn provider_effort(&self) -> Option<&str> {
+        self.provider_effort.as_deref()
+    }
+    pub const fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInput {
     messages: Vec<ModelMessage>,
     data_class: DataClass,
     tools: Vec<ModelTool>,
+    generation: Option<ModelGenerationConfig>,
 }
 
 impl ModelInput {
@@ -25,6 +101,7 @@ impl ModelInput {
             messages,
             data_class: DataClass::Workspace,
             tools: Vec::new(),
+            generation: None,
         }
     }
 
@@ -48,6 +125,14 @@ impl ModelInput {
 
     pub fn tools(&self) -> &[ModelTool] {
         &self.tools
+    }
+
+    pub fn with_generation(mut self, generation: ModelGenerationConfig) -> Self {
+        self.generation = Some(generation);
+        self
+    }
+    pub fn generation(&self) -> Option<&ModelGenerationConfig> {
+        self.generation.as_ref()
     }
 }
 

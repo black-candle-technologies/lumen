@@ -10,6 +10,7 @@ mod migrations;
 mod model_registry;
 mod orchestration;
 mod repositories;
+mod routing;
 mod worker;
 
 use std::path::Path;
@@ -34,6 +35,7 @@ pub use repositories::{
     DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
     SecretReferenceError,
 };
+pub use routing::RoutingDispatchRecord;
 pub use worker::WorkerAttemptRecord;
 
 #[derive(Clone, Debug)]
@@ -113,6 +115,10 @@ pub enum RepositoryError {
     InvalidOrchestrationState,
     #[error("worker execution state conflicts with repository constraints")]
     InvalidWorkerState,
+    #[error("routing/accounting state conflicts with repository constraints")]
+    InvalidRoutingState,
+    #[error("routing budget changed or no longer has sufficient capacity")]
+    RoutingBudgetConflict,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]

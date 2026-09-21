@@ -14,6 +14,7 @@ pub mod model;
 pub mod orchestration;
 pub mod policy;
 pub mod provider;
+pub mod routing;
 pub mod run;
 pub mod secret;
 pub mod worker;

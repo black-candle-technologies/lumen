@@ -58,7 +58,13 @@ impl LocalOpenAiCompatibleAdapter {
             .endpoint()
             .join("chat/completions")
             .map_err(|error| ProviderError::configuration(error.to_string()))?;
-        let body = json!({"model":profile.model_name(),"messages":messages(input.messages()),"tools":tools(input.tools()),"parallel_tool_calls":false,"stream":false});
+        let mut body = json!({"model":profile.model_name(),"messages":messages(input.messages()),"tools":tools(input.tools()),"parallel_tool_calls":false,"stream":false});
+        if let Some(generation) = input.generation() {
+            body["max_tokens"] = json!(generation.max_output_tokens());
+            if let Some(effort) = generation.provider_effort() {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
         parse(
             profile,
             input.tools(),

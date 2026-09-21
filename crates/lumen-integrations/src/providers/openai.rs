@@ -51,7 +51,13 @@ impl OpenAiAdapter {
             .endpoint()
             .join("responses")
             .map_err(|error| ProviderError::configuration(error.to_string()))?;
-        let body = json!({"model": profile.model_name(), "input": messages(input.messages()), "tools": tools(input.tools()), "parallel_tool_calls": false, "store": false});
+        let mut body = json!({"model": profile.model_name(), "input": messages(input.messages()), "tools": tools(input.tools()), "parallel_tool_calls": false, "store": false});
+        if let Some(generation) = input.generation() {
+            body["max_output_tokens"] = json!(generation.max_output_tokens());
+            if let Some(effort) = generation.provider_effort() {
+                body["reasoning"] = json!({"effort": effort});
+            }
+        }
         parse(
             profile,
             input.tools(),

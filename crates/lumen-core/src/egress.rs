@@ -140,6 +140,9 @@ impl ProviderRoute {
                 .is_some_and(|classes| classes.contains(&data_class)),
         }
     }
+    pub fn allows_data_class(&self, data_class: DataClass) -> bool {
+        self.allows(data_class)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

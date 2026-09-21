@@ -51,7 +51,13 @@ impl AnthropicAdapter {
             .endpoint()
             .join("messages")
             .map_err(|error| ProviderError::configuration(error.to_string()))?;
-        let body = json!({"model":profile.model_name(),"max_tokens":8192,"messages":messages(input.messages()),"tools":tools(input.tools())});
+        let mut body = json!({"model":profile.model_name(),"max_tokens":8192,"messages":messages(input.messages()),"tools":tools(input.tools())});
+        if let Some(generation) = input.generation() {
+            body["max_tokens"] = json!(generation.max_output_tokens());
+            if generation.provider_effort().is_some() {
+                body["thinking"] = json!({"type":"adaptive"});
+            }
+        }
         parse(
             profile,
             input.tools(),

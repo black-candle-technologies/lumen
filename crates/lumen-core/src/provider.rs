@@ -1,4 +1,6 @@
-use std::{collections::BTreeSet, future::Future, net::IpAddr, pin::Pin, time::Duration};
+use std::{
+    collections::BTreeSet, future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,6 +15,12 @@ use crate::{
 
 pub const DEFAULT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_PROVIDER_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+pub type ProviderUsageSinkFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>>;
+pub trait ProviderUsageSink: Send + Sync {
+    fn record<'a>(&'a self, event: ProviderUsageEvent) -> ProviderUsageSinkFuture<'a>;
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -361,6 +369,35 @@ pub struct ProviderUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderUsageEvent {
+    resolved_model: String,
+    usage: ProviderUsage,
+}
+impl ProviderUsageEvent {
+    pub fn new(
+        resolved_model: impl Into<String>,
+        usage: ProviderUsage,
+    ) -> Result<Self, ProviderError> {
+        let resolved_model = resolved_model.into();
+        if resolved_model.is_empty() || resolved_model.chars().any(char::is_control) {
+            return Err(ProviderError::protocol(
+                "invalid resolved model in usage event",
+            ));
+        }
+        Ok(Self {
+            resolved_model,
+            usage,
+        })
+    }
+    pub fn resolved_model(&self) -> &str {
+        &self.resolved_model
+    }
+    pub const fn usage(&self) -> ProviderUsage {
+        self.usage
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderResponse {
     pub resolved_model: String,
@@ -399,6 +436,7 @@ pub struct ProviderModelPort<'a> {
     provider: &'a dyn ProviderAdapter,
     profile: &'a ModelProfile,
     cancel: CancellationToken,
+    usage_sink: Option<Arc<dyn ProviderUsageSink>>,
 }
 impl<'a> ProviderModelPort<'a> {
     pub fn new(
@@ -410,21 +448,35 @@ impl<'a> ProviderModelPort<'a> {
             provider,
             profile,
             cancel: CancellationToken::new(),
+            usage_sink: None,
         })
     }
     pub fn with_cancellation(mut self, cancel: CancellationToken) -> Self {
         self.cancel = cancel;
         self
     }
+    pub fn with_usage_sink(mut self, usage_sink: Arc<dyn ProviderUsageSink>) -> Self {
+        self.usage_sink = Some(usage_sink);
+        self
+    }
 }
 impl ModelPort for ProviderModelPort<'_> {
     fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
         Box::pin(async move {
-            self.provider
+            let response = self
+                .provider
                 .generate(self.profile, input, self.cancel.child_token())
                 .await
-                .map(|response| response.output)
-                .map_err(|error| crate::model::ModelError::new(error.to_string()))
+                .map_err(|error| crate::model::ModelError::new(error.to_string()))?;
+            if let Some(sink) = &self.usage_sink {
+                sink.record(
+                    ProviderUsageEvent::new(response.resolved_model.clone(), response.usage)
+                        .map_err(|error| crate::model::ModelError::new(error.to_string()))?,
+                )
+                .await
+                .map_err(|error| crate::model::ModelError::new(error.to_string()))?;
+            }
+            Ok(response.output)
         })
     }
 }
