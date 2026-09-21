@@ -8,6 +8,7 @@ mod extensions;
 mod lifecycle;
 mod migrations;
 mod model_registry;
+mod orchestration;
 mod repositories;
 
 use std::path::Path;
@@ -106,6 +107,8 @@ pub enum RepositoryError {
     InvalidModelRegistry,
     #[error("secure context state conflicts with repository constraints")]
     InvalidContextState,
+    #[error("orchestration state conflicts with repository constraints")]
+    InvalidOrchestrationState,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]
