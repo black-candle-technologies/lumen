@@ -2,6 +2,7 @@
 
 mod audit;
 mod automation;
+mod context;
 mod egress;
 mod extensions;
 mod lifecycle;
@@ -103,6 +104,8 @@ pub enum RepositoryError {
     InvalidEgressPolicy,
     #[error("model registry state conflicts with repository constraints")]
     InvalidModelRegistry,
+    #[error("secure context state conflicts with repository constraints")]
+    InvalidContextState,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]

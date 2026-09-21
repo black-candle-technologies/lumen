@@ -132,6 +132,10 @@ async fn migration_adds_durable_automation_schema() {
         "model_provider_runtime_revisions",
         "model_profiles",
         "model_profile_revisions",
+        "context_sources",
+        "model_data_policy_revisions",
+        "task_projections",
+        "task_projection_sources",
     ] {
         assert!(
             tables.iter().any(|table| table == required),
@@ -143,7 +147,7 @@ async fn migration_adds_durable_automation_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 14);
+    assert_eq!(migrations, 15);
 }
 
 #[tokio::test]

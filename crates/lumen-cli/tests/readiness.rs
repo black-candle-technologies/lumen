@@ -52,9 +52,9 @@ data_directory = {}
 provider = "local"
 subject = "operator"
 "#,
-            toml_path(&root.join("lumen.sqlite3")),
+            toml_path(root.join("lumen.sqlite3")),
             toml_path(&workspace),
-            toml_path(&root.join("data"))
+            toml_path(root.join("data"))
         ),
     )
     .expect("owned config");
@@ -79,10 +79,8 @@ fn stderr_lines(child: &mut OwnedChild) -> Receiver<String> {
     let stderr = child.0.stderr.take().expect("owned stderr");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines() {
-            if let Ok(line) = line {
-                let _ = sender.send(line);
-            }
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
         }
     });
     receiver

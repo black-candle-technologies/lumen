@@ -73,7 +73,7 @@ async fn migration_adds_controlled_egress_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 14);
+    assert_eq!(migrations, 15);
 }
 
 #[tokio::test]
