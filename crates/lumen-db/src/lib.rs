@@ -10,6 +10,7 @@ mod migrations;
 mod model_registry;
 mod orchestration;
 mod repositories;
+mod worker;
 
 use std::path::Path;
 
@@ -33,6 +34,7 @@ pub use repositories::{
     DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
     SecretReferenceError,
 };
+pub use worker::WorkerAttemptRecord;
 
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -109,6 +111,8 @@ pub enum RepositoryError {
     InvalidContextState,
     #[error("orchestration state conflicts with repository constraints")]
     InvalidOrchestrationState,
+    #[error("worker execution state conflicts with repository constraints")]
+    InvalidWorkerState,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]

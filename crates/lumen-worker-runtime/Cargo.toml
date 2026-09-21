@@ -1,0 +1,12 @@
+[package]
+name = "lumen-worker-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lumen-core = { path = "../lumen-core" }
+lumen-db = { path = "../lumen-db" }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4"] }

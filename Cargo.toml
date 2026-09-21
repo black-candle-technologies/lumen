@@ -7,6 +7,7 @@ members = [
     "crates/lumen-extension-sdk",
     "crates/lumen-integrations",
     "crates/lumen-server",
+    "crates/lumen-worker-runtime",
 ]
 resolver = "3"
 

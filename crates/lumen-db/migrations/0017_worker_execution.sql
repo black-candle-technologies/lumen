@@ -1,0 +1,51 @@
+CREATE TABLE worker_attempts(
+ attempt_id TEXT PRIMARY KEY,
+ orchestration_id TEXT NOT NULL,
+ graph_revision INTEGER NOT NULL CHECK(graph_revision>0),
+ task_node_id TEXT NOT NULL,
+ task_attempt INTEGER NOT NULL CHECK(task_attempt>0),
+ workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+ actor_provider TEXT NOT NULL,
+ actor_subject TEXT NOT NULL,
+ provider_id TEXT NOT NULL,
+ provider_revision INTEGER NOT NULL CHECK(provider_revision>0),
+ profile_id TEXT NOT NULL,
+ profile_revision INTEGER NOT NULL CHECK(profile_revision>0),
+ policy_revision INTEGER NOT NULL CHECK(policy_revision>0),
+ projection_id TEXT NOT NULL,
+ projection_digest TEXT NOT NULL CHECK(length(projection_digest)=64 AND projection_digest NOT GLOB '*[^0-9a-f]*'),
+ data_class TEXT NOT NULL CHECK(data_class IN('public','workspace','sensitive')),
+ prompt TEXT NOT NULL CHECK(length(prompt) BETWEEN 1 AND 8192),
+ capability_grants_json TEXT NOT NULL CHECK(json_valid(capability_grants_json)),
+ allowed_tools_json TEXT NOT NULL CHECK(json_valid(allowed_tools_json)),
+ max_model_turns INTEGER NOT NULL CHECK(max_model_turns>0),
+ max_actions INTEGER NOT NULL CHECK(max_actions>0),
+ max_wall_time_millis INTEGER NOT NULL CHECK(max_wall_time_millis>0),
+ max_captured_result_bytes INTEGER NOT NULL CHECK(max_captured_result_bytes>0),
+ run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE RESTRICT,
+ state TEXT NOT NULL CHECK(state IN('reserved','running','awaiting_approval','completed','failed','cancelled','unknown')),
+ lease_owner TEXT NOT NULL CHECK(length(lease_owner)=36),
+ lease_expires_at INTEGER NOT NULL CHECK(lease_expires_at>=0),
+ created_at INTEGER NOT NULL CHECK(created_at>=0),
+ started_at INTEGER,
+ completed_at INTEGER,
+ diagnostic TEXT CHECK(diagnostic IS NULL OR length(diagnostic)<=1024),
+ UNIQUE(orchestration_id,graph_revision,task_node_id,task_attempt),
+ FOREIGN KEY(orchestration_id,graph_revision,task_node_id) REFERENCES orchestration_task_nodes(orchestration_id,graph_revision,task_node_id) ON DELETE RESTRICT,
+ FOREIGN KEY(actor_provider,actor_subject) REFERENCES identities(provider,subject) ON DELETE RESTRICT,
+ FOREIGN KEY(provider_id,provider_revision) REFERENCES model_provider_runtime_revisions(provider_id,revision) ON DELETE RESTRICT,
+ FOREIGN KEY(profile_id,profile_revision) REFERENCES model_profile_revisions(profile_id,revision) ON DELETE RESTRICT,
+ FOREIGN KEY(workspace_id,profile_id,policy_revision) REFERENCES model_data_policy_revisions(workspace_id,profile_id,revision) ON DELETE RESTRICT,
+ FOREIGN KEY(projection_id) REFERENCES task_projections(projection_id) ON DELETE RESTRICT,
+ CHECK((state='reserved' AND started_at IS NULL AND completed_at IS NULL) OR (state IN('running','awaiting_approval') AND started_at IS NOT NULL AND completed_at IS NULL) OR (state IN('completed','failed','cancelled','unknown') AND completed_at IS NOT NULL))
+) STRICT;
+CREATE TABLE orchestration_cancellations(
+ orchestration_id TEXT PRIMARY KEY REFERENCES orchestrations(orchestration_id) ON DELETE CASCADE,
+ requested_by_provider TEXT NOT NULL,
+ requested_by_subject TEXT NOT NULL,
+ requested_at INTEGER NOT NULL CHECK(requested_at>=0),
+ FOREIGN KEY(requested_by_provider,requested_by_subject) REFERENCES identities(provider,subject) ON DELETE RESTRICT
+) STRICT;
+CREATE INDEX worker_attempt_task_idx ON worker_attempts(orchestration_id,graph_revision,task_node_id,task_attempt DESC);
+CREATE INDEX worker_attempt_state_lease_idx ON worker_attempts(state,lease_expires_at,created_at);
+CREATE INDEX worker_attempt_run_idx ON worker_attempts(run_id);

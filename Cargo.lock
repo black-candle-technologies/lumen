@@ -3158,6 +3158,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-worker-runtime"
+version = "0.1.0"
+dependencies = [
+ "lumen-core",
+ "lumen-db",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

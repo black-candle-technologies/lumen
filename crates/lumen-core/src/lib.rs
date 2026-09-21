@@ -16,3 +16,4 @@ pub mod policy;
 pub mod provider;
 pub mod run;
 pub mod secret;
+pub mod worker;
