@@ -31,6 +31,7 @@ use lumen_core::{
         RunOutcome, RunState, SkillLoadMetadata, SystemClock,
     },
     secret::SecretRefId,
+    worker::WorkerCapabilityGrant,
 };
 use lumen_db::{
     ChannelIdentityMapping, Database, DestinationRevision, DispatchReservation, EffectCertainty,
@@ -62,6 +63,7 @@ use lumen_server::{
     ServiceIdentityQuery, ServiceIdentityReview, SkillActionCommand, SkillReview, SkillReviewQuery,
     StagedPluginReview, WorkflowCaptureDraftReview, WorkspaceModelPolicyReview,
 };
+use lumen_worker_runtime::{WorkerKernelPorts, WorkerScheduler};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -136,6 +138,7 @@ pub(crate) struct LocalRuntimeService {
     shutdown_deadline: Arc<StdMutex<Option<tokio::time::Instant>>>,
     shutdown_report: Arc<watch::Sender<Option<Arc<ShutdownReport>>>>,
     redactor: Arc<SecretRedactor>,
+    worker_scheduler: Arc<Mutex<Option<Arc<WorkerScheduler>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +177,50 @@ struct PluginInvocationCommand {
 }
 
 impl LocalRuntimeService {
+    pub(crate) fn planner_model(
+        &self,
+        _workspace: lumen_core::identity::WorkspaceId,
+    ) -> Arc<dyn ModelPort> {
+        Arc::clone(&self.model)
+    }
+    pub(crate) const fn worker_owner_id(&self) -> uuid::Uuid {
+        self.owner_instance_id
+    }
+    pub(crate) fn worker_kernel_ports(&self) -> WorkerKernelPorts {
+        WorkerKernelPorts {
+            normalizer: Arc::clone(&self.normalizer),
+            executor: Arc::clone(&self.executor),
+            approvals: Arc::clone(&self.approvals) as Arc<dyn ApprovalPort>,
+            audit: Arc::clone(&self.audit) as Arc<dyn AuditPort>,
+            actions: Arc::clone(&self.actions) as Arc<dyn ActionPort>,
+            clock: Arc::new(SystemClock),
+            policy: self.policy.clone(),
+            policy_version: self.policy_version.clone(),
+            ambient_capabilities: self.ambient_capabilities.clone(),
+        }
+    }
+    pub(crate) fn worker_grants(&self) -> Result<Vec<WorkerCapabilityGrant>, CliError> {
+        self.ambient_capabilities
+            .capabilities()
+            .map(|capability| match capability.scope() {
+                ResourceScope::Workspace { .. } => {
+                    Ok(WorkerCapabilityGrant::workspace(capability.name()))
+                }
+                ResourceScope::Path { path, .. } => {
+                    WorkerCapabilityGrant::path(capability.name(), path.as_str())
+                        .map_err(|error| CliError::Runtime(error.to_string()))
+                }
+                ResourceScope::Exact {
+                    resource_type,
+                    value,
+                } => WorkerCapabilityGrant::exact(capability.name(), resource_type, value)
+                    .map_err(|error| CliError::Runtime(error.to_string())),
+            })
+            .collect()
+    }
+    pub(crate) async fn attach_worker_scheduler(&self, scheduler: Arc<WorkerScheduler>) {
+        *self.worker_scheduler.lock().await = Some(scheduler);
+    }
     async fn settle_unprepared_owned_run(
         &self,
         run_id: RunId,
@@ -226,7 +273,22 @@ impl LocalRuntimeService {
                 )]),
             )
             .map_err(|error| ServiceError::Internal(error.to_string()))?;
-        self.spawn_advance(run_id).await;
+        if let Some(worker) = self
+            .database
+            .worker_attempt_by_run_id(run_id)
+            .await
+            .map_err(repository_service_error)?
+        {
+            let scheduler = self.worker_scheduler.lock().await.clone().ok_or_else(|| {
+                ServiceError::Unavailable("worker scheduler is not attached".into())
+            })?;
+            scheduler
+                .resume_after_approval(worker.attempt_id(), now())
+                .await
+                .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        } else {
+            self.spawn_advance(run_id).await;
+        }
         Ok(result)
     }
 
@@ -597,6 +659,7 @@ impl LocalRuntimeService {
             shutdown_deadline: Arc::new(StdMutex::new(None)),
             shutdown_report: Arc::new(shutdown_report),
             redactor,
+            worker_scheduler: Arc::new(Mutex::new(None)),
         };
         if service._owner_guard.is_some() {
             recover_skill_publications(&service.database, &service.data_root)

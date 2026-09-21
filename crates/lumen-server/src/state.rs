@@ -20,7 +20,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::EventBroker;
+use crate::{EventBroker, OrchestrationService};
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>;
 
@@ -152,6 +152,7 @@ pub struct ApiState {
     pub(crate) events: EventBroker,
     authentication: Arc<LocalAuthentication>,
     sandbox: SandboxCapabilityReport,
+    orchestration: Option<Arc<dyn OrchestrationService>>,
 }
 
 impl ApiState {
@@ -179,6 +180,7 @@ impl ApiState {
                 allowed_workspaces,
             }),
             sandbox,
+            orchestration: None,
         })
     }
 
@@ -197,6 +199,17 @@ impl ApiState {
 
     pub(crate) const fn sandbox(&self) -> &SandboxCapabilityReport {
         &self.sandbox
+    }
+    pub fn with_orchestration_service(mut self, service: Arc<dyn OrchestrationService>) -> Self {
+        self.orchestration = Some(service);
+        self
+    }
+    pub(crate) fn orchestration_service(
+        &self,
+    ) -> Result<Arc<dyn OrchestrationService>, ServiceError> {
+        self.orchestration.clone().ok_or_else(|| {
+            ServiceError::Unavailable("orchestration control plane is not configured".into())
+        })
     }
 }
 

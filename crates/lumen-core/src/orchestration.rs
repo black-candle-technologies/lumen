@@ -16,7 +16,7 @@ use uuid::Uuid;
 pub const MAX_TASK_NODES: usize = 256;
 pub const MAX_DEPENDENCIES_PER_NODE: usize = 32;
 pub const MAX_TASK_DESCRIPTION_BYTES: usize = 8 * 1024;
-macro_rules!uuid_id{($name:ident)=>{#[derive(Clone,Copy,Debug,Eq,Hash,Ord,PartialEq,PartialOrd,Serialize)]#[serde(transparent)]pub struct$name(Uuid);impl$name{pub fn new()->Self{Self(Uuid::new_v4())}pub const fn from_uuid(value:Uuid)->Self{Self(value)}pub const fn as_uuid(&self)->&Uuid{&self.0}}impl Default for$name{fn default()->Self{Self::new()}}impl fmt::Display for$name{fn fmt(&self,formatter:&mut fmt::Formatter<'_>)->fmt::Result{self.0.fmt(formatter)}}};}
+macro_rules!uuid_id{($name:ident)=>{#[derive(Clone,Copy,Debug,Deserialize,Eq,Hash,Ord,PartialEq,PartialOrd,Serialize)]#[serde(transparent)]pub struct$name(Uuid);impl$name{pub fn new()->Self{Self(Uuid::new_v4())}pub const fn from_uuid(value:Uuid)->Self{Self(value)}pub const fn as_uuid(&self)->&Uuid{&self.0}}impl Default for$name{fn default()->Self{Self::new()}}impl fmt::Display for$name{fn fmt(&self,formatter:&mut fmt::Formatter<'_>)->fmt::Result{self.0.fmt(formatter)}}};}
 uuid_id!(OrchestrationId);
 uuid_id!(TaskNodeId);
 pub type TaskNodeKey = ProjectionTaskKey;
@@ -165,6 +165,18 @@ impl TaskRequirements {
     }
     pub fn allowed_model_profiles(&self) -> &BTreeSet<ModelProfileRef> {
         &self.allowed_model_profiles
+    }
+    pub fn with_allowed_model_profiles(
+        &self,
+        profiles: impl IntoIterator<Item = ModelProfileRef>,
+    ) -> Result<Self, OrchestrationError> {
+        Self::new(
+            self.required_model_capabilities.clone(),
+            profiles,
+            self.data_class,
+            self.required_compartments.clone(),
+            self.required_tools.clone(),
+        )
     }
     pub const fn data_class(&self) -> DataClass {
         self.data_class
@@ -349,6 +361,51 @@ pub struct TaskGraph {
     digest: ContextDigest,
 }
 impl TaskGraph {
+    pub fn proposal_with_profile_pin(
+        &self,
+        target: TaskNodeId,
+        profiles: impl IntoIterator<Item = ModelProfileRef>,
+    ) -> Result<TaskGraphProposal, OrchestrationError> {
+        let profiles = profiles.into_iter().collect::<BTreeSet<_>>();
+        if profiles.is_empty() || self.node(target).is_none() {
+            return Err(OrchestrationError::InvalidModelReference);
+        }
+        let keys = self
+            .nodes
+            .values()
+            .map(|node| (node.id, node.key.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for node in self.nodes.values() {
+            let requirements = if node.id == target {
+                node.requirements
+                    .with_allowed_model_profiles(profiles.clone())?
+            } else {
+                node.requirements.clone()
+            };
+            let dependencies = self
+                .dependencies
+                .get(&node.id)
+                .ok_or(OrchestrationError::InvalidDependencyMap)?
+                .iter()
+                .map(|id| {
+                    keys.get(id)
+                        .cloned()
+                        .ok_or(OrchestrationError::InvalidDependencyMap)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            nodes.push(TaskNodeProposal::new(
+                node.key.clone(),
+                node.description.clone(),
+                node.expected_output,
+                dependencies,
+                requirements,
+                node.limits,
+                node.deadline_at,
+            )?);
+        }
+        Ok(TaskGraphProposal::new(nodes))
+    }
     pub fn from_proposal(
         orchestration_id: OrchestrationId,
         workspace_id: WorkspaceId,

@@ -95,6 +95,34 @@ impl Database {
     ) -> Result<Option<ModelProfile>, RepositoryError> {
         sqlx::query("SELECT profile_id,provider_id,revision,provider_revision,model_name,enabled,capabilities_json,context_window_tokens,trust_zone,concurrency_limit,priority FROM model_profile_revisions WHERE profile_id=? ORDER BY revision DESC LIMIT 1").bind(id.as_str()).fetch_optional(self.pool()).await?.map(profile_from_row).transpose()
     }
+    pub async fn provider_config_revision(
+        &self,
+        id: &ProviderId,
+        revision: u64,
+    ) -> Result<Option<ProviderConfig>, RepositoryError> {
+        sqlx::query("SELECT provider_id,revision,provider_kind,endpoint_class,endpoint_url,local_runtime,enabled,credential_secret_ref FROM model_provider_runtime_revisions WHERE provider_id=? AND revision=?")
+            .bind(id.as_str()).bind(i64::try_from(revision).map_err(|_| RepositoryError::InvalidModelRegistry)?)
+            .fetch_optional(self.pool()).await?.map(provider_from_row).transpose()
+    }
+    pub async fn model_profile_revision(
+        &self,
+        id: &ModelProfileId,
+        revision: u64,
+    ) -> Result<Option<ModelProfile>, RepositoryError> {
+        sqlx::query("SELECT * FROM model_profile_revisions WHERE profile_id=? AND revision=?")
+            .bind(id.as_str())
+            .bind(i64::try_from(revision).map_err(|_| RepositoryError::InvalidModelRegistry)?)
+            .fetch_optional(self.pool())
+            .await?
+            .map(profile_from_row)
+            .transpose()
+    }
+    pub async fn list_latest_provider_configs(
+        &self,
+    ) -> Result<Vec<ProviderConfig>, RepositoryError> {
+        sqlx::query("WITH x AS(SELECT provider_id,MAX(revision) r FROM model_provider_runtime_revisions GROUP BY provider_id)SELECT p.provider_id,p.revision,p.provider_kind,p.endpoint_class,p.endpoint_url,p.local_runtime,p.enabled,p.credential_secret_ref FROM x JOIN model_provider_runtime_revisions p ON p.provider_id=x.provider_id AND p.revision=x.r ORDER BY p.provider_id")
+            .fetch_all(self.pool()).await?.into_iter().map(provider_from_row).collect()
+    }
 
     pub async fn list_latest_model_profiles(&self) -> Result<Vec<ModelProfile>, RepositoryError> {
         sqlx::query("SELECT p.profile_id,p.provider_id,p.revision,p.provider_revision,p.model_name,p.enabled,p.capabilities_json,p.context_window_tokens,p.trust_zone,p.concurrency_limit,p.priority FROM model_profile_revisions p JOIN (SELECT profile_id,MAX(revision) revision FROM model_profile_revisions GROUP BY profile_id) latest ON latest.profile_id=p.profile_id AND latest.revision=p.revision ORDER BY p.priority,p.profile_id").fetch_all(self.pool()).await?.into_iter().map(profile_from_row).collect()

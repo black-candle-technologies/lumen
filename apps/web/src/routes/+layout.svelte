@@ -10,6 +10,7 @@
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import Settings from '@lucide/svelte/icons/settings';
 	import Timer from '@lucide/svelte/icons/timer';
+	import GitBranch from '@lucide/svelte/icons/git-branch';
 	import favicon from '$lib/assets/favicon.svg';
 	import ConnectionDialog from '$lib/components/ConnectionDialog.svelte';
 	import {
@@ -43,6 +44,7 @@
 
 	const navigation = [
 		{ href: '/', label: 'Chat', icon: Bot },
+		{ href: '/orchestrations', label: 'Orchestrations', icon: GitBranch },
 		{ href: '/approvals', label: 'Approvals', icon: CheckSquare },
 		{ href: '/automation', label: 'Automation', icon: Timer },
 		{ href: '/skills', label: 'Skills', icon: BookOpenCheck },

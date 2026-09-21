@@ -1,3 +1,4 @@
+mod orchestration;
 use std::str::FromStr;
 
 use axum::{
@@ -111,6 +112,7 @@ pub fn router(state: ApiState) -> Router {
             "/api/v1/workspaces/{workspace_id}/skills/capture-drafts/{draft_id}/publish",
             post(publish_capture_draft),
         )
+        .merge(orchestration::router())
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
 }

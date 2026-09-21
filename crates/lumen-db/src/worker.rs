@@ -127,6 +127,31 @@ impl Database {
             .map(row)
             .transpose()
     }
+    pub async fn worker_attempt_by_run_id(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<WorkerAttemptRecord>, RepositoryError> {
+        sqlx::query("SELECT * FROM worker_attempts WHERE run_id=?")
+            .bind(run_id.to_string())
+            .fetch_optional(self.pool())
+            .await?
+            .map(row)
+            .transpose()
+    }
+    pub async fn worker_attempts_for_orchestration(
+        &self,
+        orchestration_id: OrchestrationId,
+    ) -> Result<Vec<WorkerAttemptRecord>, RepositoryError> {
+        sqlx::query(
+            "SELECT * FROM worker_attempts WHERE orchestration_id=? ORDER BY created_at,attempt_id",
+        )
+        .bind(orchestration_id.to_string())
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(row)
+        .collect()
+    }
     pub async fn start_worker_attempt(
         &self,
         id: WorkerAttemptId,

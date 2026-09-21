@@ -8,15 +8,21 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
 use config::{Config, ConfigError};
+use lumen_control_plane::{
+    BootstrapOperatorAuthority, DatabaseCandidateCatalog, DatabaseWorkerMaterializer,
+    JsonModelPlanner, OrchestrationControl,
+};
 use lumen_core::audit::AuditIntegrityError;
 use lumen_core::{
     action::{CanonicalValue, RunId},
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
     secret::SecretRefId,
+    worker::WorkerRunBudget,
 };
 use lumen_db::{
     Database, RepositoryError, SecretReference, SecretReferenceError, StagedPluginPackage,
@@ -27,6 +33,7 @@ use lumen_integrations::{
     secrets::{OsKeyringSecretStore, SecretStore, SecretStoreError},
 };
 use lumen_server::{ApiState, EventBroker, SandboxCapabilityReport, router};
+use lumen_worker_runtime::{WorkerScheduler, WorkerSchedulerConfig};
 use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -821,12 +828,19 @@ async fn serve(
             events.clone(),
             Arc::clone(&sandbox),
             vec![token.clone()],
-            secret_store,
+            Arc::clone(&secret_store),
             Arc::clone(&owner_guard),
         )
         .await?,
     );
-    let state = ApiState::new(
+    let profiles = database.list_latest_model_profiles().await?;
+    let mut provider_limits = BTreeMap::<String, usize>::new();
+    for profile in &profiles {
+        *provider_limits
+            .entry(profile.provider_id().as_str().to_owned())
+            .or_default() += usize::try_from(profile.concurrency_limit()).unwrap_or(usize::MAX / 4);
+    }
+    let mut state = ApiState::new(
         service.clone(),
         events.clone(),
         token,
@@ -834,6 +848,52 @@ async fn serve(
         BTreeSet::from([config.workspace_id()]),
         api_sandbox_report(&sandbox_report),
     )?;
+    if !provider_limits.is_empty() {
+        let global = provider_limits
+            .values()
+            .copied()
+            .fold(0usize, usize::saturating_add)
+            .max(1);
+        let scheduler = WorkerScheduler::new(
+            database.clone(),
+            Arc::new(DatabaseWorkerMaterializer::new(
+                database.clone(),
+                Arc::clone(&secret_store),
+            )),
+            service.worker_kernel_ports(),
+            WorkerSchedulerConfig::new(global, provider_limits, Duration::from_secs(30))
+                .map_err(|error| CliError::Runtime(error.to_string()))?,
+            service.worker_owner_id(),
+        );
+        service
+            .attach_worker_scheduler(Arc::clone(&scheduler))
+            .await;
+        let budget = WorkerRunBudget::new(
+            config.runtime.max_model_turns,
+            config.runtime.max_actions,
+            config.runtime.max_wall_time_seconds.saturating_mul(1_000),
+            config.runtime.max_captured_result_bytes,
+        )
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+        let control = Arc::new(OrchestrationControl::new(
+            database.clone(),
+            scheduler,
+            Arc::new(JsonModelPlanner::new(
+                service.planner_model(config.workspace_id()),
+            )),
+            Arc::new(BootstrapOperatorAuthority::new(
+                config.bootstrap_principal(),
+                config.workspace_id(),
+            )),
+            DatabaseCandidateCatalog::new(database.clone(), service.worker_grants()?, budget),
+            config.workspace_id(),
+        ));
+        control
+            .recover(lumen_core::approval::TimestampMillis::new(0))
+            .await
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
+        state = state.with_orchestration_service(control);
+    }
     let server_result = serve_listener_until_shutdown(
         listener,
         router(state),

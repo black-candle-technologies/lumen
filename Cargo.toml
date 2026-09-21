@@ -8,6 +8,7 @@ members = [
     "crates/lumen-integrations",
     "crates/lumen-server",
     "crates/lumen-worker-runtime",
+    "crates/lumen-control-plane",
 ]
 resolver = "3"
 

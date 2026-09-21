@@ -12,6 +12,7 @@ pub mod executor;
 pub mod extension;
 pub mod identity;
 pub mod model;
+pub mod operator;
 pub mod orchestration;
 pub mod policy;
 pub mod provider;

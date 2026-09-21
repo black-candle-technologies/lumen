@@ -3033,11 +3033,13 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "lumen-control-plane",
  "lumen-core",
  "lumen-db",
  "lumen-extension-sdk",
  "lumen-integrations",
  "lumen-server",
+ "lumen-worker-runtime",
  "same-file",
  "serde",
  "serde_json",
@@ -3053,6 +3055,22 @@ dependencies = [
  "uuid",
  "wat",
  "wiremock",
+]
+
+[[package]]
+name = "lumen-control-plane"
+version = "0.1.0"
+dependencies = [
+ "lumen-core",
+ "lumen-db",
+ "lumen-integrations",
+ "lumen-server",
+ "lumen-worker-runtime",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -3077,6 +3095,7 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "lumen-core",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",

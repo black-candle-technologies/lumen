@@ -4,6 +4,7 @@ mod artifact;
 mod audit;
 mod automation;
 mod context;
+mod control;
 mod egress;
 mod extensions;
 mod lifecycle;
@@ -23,6 +24,7 @@ pub use automation::{
     ScheduledJobRevision, ServiceIdentity, SkillPublicationIntent, SkillVersionRecord,
     WorkflowCaptureDraft,
 };
+pub use control::ControlEvent;
 pub use egress::{
     ChannelIdentityMapping, DestinationRevision, ModelEndpointClass, ModelProviderRevision,
     WorkspaceModelEgressRevision,
@@ -122,6 +124,8 @@ pub enum RepositoryError {
     RoutingBudgetConflict,
     #[error("artifact/retry state conflicts with repository constraints")]
     InvalidArtifactState,
+    #[error("orchestration control state conflicts with repository constraints")]
+    InvalidControlState,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]

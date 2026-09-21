@@ -1,9 +1,14 @@
 //! HTTP API and streaming server surface for Lumen.
 
+mod orchestration;
 mod routes;
 mod sse;
 mod state;
 
+pub use orchestration::{
+    ControlAction, ControlOrchestrationCommand, CreateOrchestrationCommand, OrchestrationEvent,
+    OrchestrationFuture, OrchestrationService,
+};
 pub use routes::router;
 pub use sse::{EventBroker, EventBrokerError, RunEvent};
 pub use state::{

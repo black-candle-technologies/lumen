@@ -12,6 +12,24 @@ export type RunEvent = {
 	data: JsonValue;
 };
 
+export type OrchestrationView = {
+	orchestration_id: string;
+	graph_revision: number;
+	graph_digest: string;
+	tasks: any[];
+	routing: any[];
+	artifacts: any[];
+	usage: { calls: number; input_tokens: number; output_tokens: number; remote_cost_micros: number };
+	budget: any;
+	control: any;
+};
+export type CreateOrchestrationRequest = {
+	prompt: string; data_class: 'public' | 'workspace' | 'sensitive'; compartments: string[];
+	reasoning: 'fast' | 'balanced' | 'deep' | 'maximum'; remote_allowed: boolean; prefer_local: boolean;
+	max_model_calls: number; max_input_tokens: number; max_output_tokens: number; max_remote_cost_micros: number;
+	max_concurrent_workers: number; max_wall_time_millis: number;
+};
+
 export type Approval = {
 	approval_id: string;
 	run_id: string;
@@ -289,6 +307,27 @@ export class ApiClient {
 
 	async createRun(prompt: string): Promise<{ run_id: string }> {
 		return this.request('runs', { method: 'POST', body: JSON.stringify({ prompt }) });
+	}
+
+	async listOrchestrations(): Promise<OrchestrationView[]> {
+		return (await this.request<{ orchestrations: OrchestrationView[] }>('orchestrations')).orchestrations;
+	}
+	async createOrchestration(body: CreateOrchestrationRequest): Promise<OrchestrationView> {
+		return this.request('orchestrations', { method: 'POST', body: JSON.stringify(body) });
+	}
+	async getOrchestration(id: string): Promise<OrchestrationView> {
+		return this.request(`orchestrations/${encodeURIComponent(id)}`);
+	}
+	async orchestrationAction(id: string, body: Record<string, unknown>): Promise<OrchestrationView> {
+		return this.request(`orchestrations/${encodeURIComponent(id)}/actions`, { method: 'POST', body: JSON.stringify(body) });
+	}
+	async listOrchestrationModels(): Promise<any[]> { return (await this.request<{ models: any[] }>('orchestrations/models')).models; }
+	async streamOrchestrationEvents(id: string, after: number, onEvent: (event: RunEvent) => void, signal?: AbortSignal): Promise<void> {
+		const response = await this.fetcher(this.url(`orchestrations/${encodeURIComponent(id)}/events/stream?after=${after}`), { headers: this.headers(), signal: signal ?? this.signal });
+		if (!response.ok) await this.throwResponse(response);
+		if (!response.body) throw new ApiError(0, 'stream_unavailable', 'Orchestration event stream is unavailable');
+		const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+		while (true) { const { done, value } = await reader.read(); buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n'); let boundary = buffer.indexOf('\n\n'); while (boundary !== -1) { const event = parseFrame(buffer.slice(0, boundary)); buffer = buffer.slice(boundary + 2); if (event) onEvent(event); boundary = buffer.indexOf('\n\n'); } if (done) break; }
 	}
 
 	async cancelRun(runId: string): Promise<{ run_id: string; state: string }> {
