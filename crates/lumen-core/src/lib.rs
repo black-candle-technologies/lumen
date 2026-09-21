@@ -11,5 +11,6 @@ pub mod extension;
 pub mod identity;
 pub mod model;
 pub mod policy;
+pub mod provider;
 pub mod run;
 pub mod secret;

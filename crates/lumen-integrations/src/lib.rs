@@ -10,5 +10,7 @@ pub mod filesystem;
 #[cfg(feature = "model-client")]
 pub mod openai_compatible;
 pub mod process;
+#[cfg(feature = "model-client")]
+pub mod providers;
 pub mod sandbox;
 pub mod secrets;

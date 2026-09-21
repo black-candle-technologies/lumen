@@ -129,6 +129,9 @@ async fn migration_adds_durable_automation_schema() {
         "skill_versions",
         "skill_workspace_state",
         "workflow_capture_drafts",
+        "model_provider_runtime_revisions",
+        "model_profiles",
+        "model_profile_revisions",
     ] {
         assert!(
             tables.iter().any(|table| table == required),
@@ -140,7 +143,7 @@ async fn migration_adds_durable_automation_schema() {
         .fetch_one(database.pool())
         .await
         .expect("migration count");
-    assert_eq!(migrations, 13);
+    assert_eq!(migrations, 14);
 }
 
 #[tokio::test]

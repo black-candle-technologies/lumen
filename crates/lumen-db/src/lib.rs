@@ -6,6 +6,7 @@ mod egress;
 mod extensions;
 mod lifecycle;
 mod migrations;
+mod model_registry;
 mod repositories;
 
 use std::path::Path;
@@ -100,6 +101,8 @@ pub enum RepositoryError {
     PluginSettingConflict,
     #[error("egress policy conflicts with repository constraints")]
     InvalidEgressPolicy,
+    #[error("model registry state conflicts with repository constraints")]
+    InvalidModelRegistry,
     #[error("automation state conflicts with repository constraints")]
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]
