@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod approval;
+pub mod artifact;
 pub mod audit;
 pub mod automation;
 pub mod capability;
