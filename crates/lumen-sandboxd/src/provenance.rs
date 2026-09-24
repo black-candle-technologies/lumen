@@ -9,6 +9,9 @@
 
 use std::{
     collections::BTreeMap,
+    fs::File,
+    os::unix::fs::OpenOptionsExt,
+    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
 };
 
@@ -194,9 +197,78 @@ fn sort_value(v: serde_json::Value) -> serde_json::Value {
 }
 
 /// sha256 of a file's bytes, as `sha256:<hex>`.
+///
+/// Opens the file with `O_NOFOLLOW`: a symlink at this path is rejected
+/// instead of followed.
 pub fn digest_file(path: &Path) -> Result<String, SandboxdError> {
-    let bytes = std::fs::read(path).map_err(SandboxdError::Io)?;
-    Ok(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))))
+    let file = open_nofollow(path)?;
+    digest_open_file(&file)
+}
+
+/// sha256 of the bytes readable from an already-open file handle, as
+/// `sha256:<hex>`. The handle's file offset is left untouched (a cloned
+/// descriptor is hashed).
+pub fn digest_open_file(file: &File) -> Result<String, SandboxdError> {
+    use std::io::{Read, Seek};
+    let mut view = file.try_clone().map_err(SandboxdError::Io)?;
+    view.rewind().map_err(SandboxdError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = view.read(&mut buf).map_err(SandboxdError::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Open `path` for reading, refusing to follow a trailing symlink.
+///
+/// A symlink anywhere in the store is treated as hostile: resolution must
+/// never silently read through one. `ELOOP` (symlink encountered) maps to
+/// [`SandboxdError::UnapprovedImage`]; any other I/O failure maps to
+/// [`SandboxdError::Io`].
+pub fn open_nofollow(path: &Path) -> Result<File, SandboxdError> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                SandboxdError::UnapprovedImage(format!(
+                    "symlink rejected in image store: {}",
+                    path.display()
+                ))
+            } else {
+                SandboxdError::Io(e)
+            }
+        })
+}
+
+/// Open a store entry directory itself, refusing a symlinked final
+/// component. Artifact opens below go through `/proc/self/fd/<dirfd>/name`
+/// so the directory cannot be swapped for a symlink between this open and
+/// the artifact opens.
+fn open_store_dir(dir: &Path) -> Result<File, SandboxdError> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                SandboxdError::UnapprovedImage(format!(
+                    "symlink rejected in image store: {}",
+                    dir.display()
+                ))
+            } else {
+                SandboxdError::UnapprovedImage(format!(
+                    "image not in store: {} ({e})",
+                    dir.display()
+                ))
+            }
+        })
 }
 
 /// sha256 of in-memory bytes.
@@ -240,17 +312,228 @@ pub fn load_signing_key(path: &Path) -> Result<SigningKey, SandboxdError> {
 }
 
 /// Approved image on disk: `<store>/<image_digest>/`.
-#[derive(Debug, Clone)]
+///
+/// The `artifacts` are pinned open file descriptors (`O_NOFOLLOW`),
+/// digest-verified at open time. Launch code must hand these descriptors
+/// onward and re-hash them immediately before use — it must never re-join
+/// `dir` by path, which would re-open the TOCTOU window between
+/// verification and launch.
+///
+/// `File` is neither `Clone` nor `Debug`, so this struct is intentionally
+/// neither: pinned descriptors are moved, never copied, and never logged.
 pub struct StoredImage {
     pub dir: PathBuf,
     pub manifest: ImageManifest,
     pub image_digest: String,
+    pub artifacts: Vec<PinnedArtifact>,
+}
+
+/// One launch artifact with its descriptor pinned.
+///
+/// `file` was opened `O_NOFOLLOW` (through a pinned, non-symlink store
+/// directory) and its bytes hashed against `expected_digest` at open time.
+/// The descriptor pins the exact inode that was verified: replacing the
+/// path in the store afterwards does not affect this handle. Callers must
+/// still re-hash via [`digest_open_file`] immediately before use, because
+/// the bytes of a still-writable inode could change under the open handle.
+pub struct PinnedArtifact {
+    /// File name inside the store entry (`vmlinux`, `rootfs.ext4`, ...).
+    pub name: String,
+    /// Pinned open descriptor of the verified bytes.
+    pub file: File,
+    /// `sha256:<hex>` from the signed manifest.
+    pub expected_digest: String,
+}
+
+impl PinnedArtifact {
+    /// `/proc/self/fd/<n>` path for this pinned descriptor. Always resolves
+    /// to the verified inode regardless of what the store directory
+    /// contains now. For inspection only — hard links must go through
+    /// [`Self::hard_link_into`], not this path.
+    pub fn fd_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    /// Create a hard link to the pinned inode at `dst`.
+    ///
+    /// Uses `linkat(AT_EMPTY_PATH)` on the descriptor itself — never a
+    /// path — so the link always refers to the verified inode even if the
+    /// store changed underneath us. (Linking through the `/proc/self/fd`
+    /// magic symlink is rejected with `EXDEV` by the kernel; `AT_EMPTY_PATH`
+    /// is the supported API for descriptor-relative linking.)
+    pub fn hard_link_into(&self, dst: &Path) -> Result<(), SandboxdError> {
+        let c_dst = std::ffi::CString::new(dst.as_os_str().as_encoded_bytes())
+            .map_err(|e| SandboxdError::Host(format!("link destination contains NUL: {e}")))?;
+        // SAFETY: with AT_EMPTY_PATH, `oldfd` names the file to link and
+        // the empty oldpath is ignored; c_dst is a valid NUL-terminated
+        // path; AT_FDCWD interprets it relative to the cwd.
+        let rc = unsafe {
+            libc::linkat(
+                self.file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_FDCWD,
+                c_dst.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if rc != 0 {
+            return Err(SandboxdError::Host(format!(
+                "hard-link {}: {}",
+                self.name,
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+}
+
+// Manual Debug: name the artifacts, never the descriptors.
+impl std::fmt::Debug for PinnedArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedArtifact")
+            .field("name", &self.name)
+            .field("expected_digest", &self.expected_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for StoredImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredImage")
+            .field("dir", &self.dir)
+            .field("image_digest", &self.image_digest)
+            .field(
+                "artifacts",
+                &self
+                    .artifacts
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Open one artifact through the pinned store-directory descriptor and
+/// verify its bytes against the manifest digest. The returned
+/// [`PinnedArtifact`] pins the verified inode.
+fn open_pinned_artifact(
+    store_dir: &File,
+    name: &str,
+    expected_digest: &str,
+) -> Result<PinnedArtifact, SandboxdError> {
+    // Resolve `name` against the open directory descriptor: immune to
+    // renames/symlink swaps of the store path after the dir was opened.
+    // `name` is a fixed literal chosen by us, never caller input.
+    let via_fd = PathBuf::from(format!("/proc/self/fd/{}/{}", store_dir.as_raw_fd(), name));
+    let file = open_nofollow(&via_fd)?;
+    let actual = digest_open_file(&file)?;
+    if actual != expected_digest {
+        return Err(SandboxdError::BadSignature(format!(
+            "artifact {name} digest mismatch: {actual} != {expected_digest}"
+        )));
+    }
+    Ok(PinnedArtifact {
+        name: name.to_string(),
+        file,
+        expected_digest: expected_digest.to_string(),
+    })
+}
+
+/// Harden one image-store entry: the daemon runs as root and the store is
+/// a trust root, so every resolve re-asserts tight ownership and modes.
+///
+/// - Entry dir: root:root, 0755. Artifact/manifest files: root:root, 0644.
+/// - Symlinks inside the entry are left untouched (never followed, never
+///   re-owned); resolution rejects them anyway.
+/// - When running as root, `chattr +i` is applied best-effort to the
+///   artifact and manifest files so even a privileged writer cannot mutate
+///   them without first clearing the flag. Filesystems that do not support
+///   immutable flags (tmpfs, some overlays) simply skip it.
+///
+/// Assumption (documented, not enforced here): the store is populated by a
+/// privileged promotion flow running under a restrictive umask (027), and
+/// no uid other than root can write to the store. The jailer uids that run
+/// guests never gain store write access.
+pub fn harden_store_entry(dir: &Path) -> Result<(), SandboxdError> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+
+    // lchown: never follow a trailing symlink. Best-effort: a failed
+    // chown must not break resolution in odd environments (and is skipped
+    // entirely when not root, e.g. dev-machine tests).
+    let lchown = |path: &Path| {
+        if !is_root {
+            return;
+        }
+        if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+            // SAFETY: c_path is a valid NUL-terminated path; lchown has no
+            // other preconditions.
+            let _ = unsafe { libc::lchown(c_path.as_ptr(), 0, 0) };
+        }
+    };
+    let chmod = |path: &Path, mode: u32| {
+        let c = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        // SAFETY: c is a valid NUL-terminated path; chmod has no other
+        // preconditions. Applied to the entry dir and regular files only —
+        // symlinks are skipped by the caller (fchmodat would be needed to
+        // touch a link itself, and we want links untouched).
+        unsafe {
+            libc::chmod(c.as_ptr(), mode);
+        }
+    };
+
+    lchown(dir);
+    chmod(dir, 0o755);
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        SandboxdError::Host(format!("cannot harden image store {}: {e}", dir.display()))
+    })?;
+    let mut immutables = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            SandboxdError::Host(format!("cannot harden image store {}: {e}", dir.display()))
+        })?;
+        let meta = entry.metadata().map_err(|e| {
+            SandboxdError::Host(format!("cannot harden image store {}: {e}", dir.display()))
+        })?;
+        // Never touch symlinks: resolution rejects them, and following one
+        // here would chmod/chown an attacker-chosen target.
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        lchown(&path);
+        if meta.is_dir() {
+            chmod(&path, 0o755);
+        } else if meta.is_file() {
+            chmod(&path, 0o644);
+            immutables.push(path);
+        }
+    }
+    // Immutable flag where feasible: gated on root, best-effort, failures
+    // ignored (unsupported fs, missing binary, containers, ...).
+    if is_root {
+        for path in &immutables {
+            let _ = std::process::Command::new("chattr")
+                .args(["+i", &path.to_string_lossy()])
+                .output();
+        }
+    }
+    Ok(())
 }
 
 /// Resolve and authenticate an image by digest. Fails closed when: the
 /// digest is malformed, the store entry is missing, the manifest signature
 /// is invalid, the computed digest mismatches, or any artifact digest in
 /// the manifest mismatches the bytes on disk.
+///
+/// Every open in this function is `O_NOFOLLOW` (symlinks rejected), the
+/// store directory itself is pinned before artifacts are opened through
+/// it, and the returned [`StoredImage`] carries pinned descriptors — not
+/// paths — for the launch artifacts. [`harden_store_entry`] re-asserts
+/// store ownership and modes on every successful resolve.
 pub fn resolve_image(
     store: &Path,
     image_digest: &str,
@@ -261,10 +544,17 @@ pub fn resolve_image(
             "malformed digest: {image_digest}"
         )));
     }
-    // Digest is `[0-9a-f:]` only — safe to join as a path component.
+    // Digest is `[0-9a-f:]` only — safe to join as a path component, and it
+    // cannot name a different directory. The dir itself is then opened
+    // O_NOFOLLOW|O_DIRECTORY so a symlinked entry is rejected outright.
     let dir = store.join(image_digest);
-    let manifest_path = dir.join("manifest.json");
-    let text = std::fs::read_to_string(&manifest_path).map_err(|_| {
+    let store_dir = open_store_dir(&dir)?;
+    let manifest_path = PathBuf::from(format!(
+        "/proc/self/fd/{}/manifest.json",
+        store_dir.as_raw_fd()
+    ));
+    let manifest_file = open_nofollow(&manifest_path)?;
+    let text = std::io::read_to_string(manifest_file).map_err(|_| {
         SandboxdError::UnapprovedImage(format!("image not in store: {image_digest}"))
     })?;
     let manifest: ImageManifest = serde_json::from_str(&text)
@@ -278,8 +568,12 @@ pub fn resolve_image(
         )));
     }
 
-    // Verify every referenced artifact against the bytes on disk. This is
-    // what makes the digest a real binding, not a label.
+    // Verify every referenced artifact against the bytes on disk, pinning
+    // the verified descriptors. This is what makes the digest a real
+    // binding, not a label. Launch artifacts are pinned; snapshot files
+    // (not used at launch — snapshots restore via the API load path, and
+    // JailSpec carries `snapshot: None`) are digest-verified but not pinned.
+    let mut artifacts = Vec::new();
     for (name, expected) in [
         ("vmlinux", manifest.kernel_digest.as_str()),
         ("rootfs.ext4", manifest.rootfs_digest.as_str()),
@@ -288,31 +582,28 @@ pub fn resolve_image(
             manifest.workspace_template_digest.as_str(),
         ),
     ] {
-        let actual = digest_file(&dir.join(name))?;
-        if actual != expected {
-            return Err(SandboxdError::BadSignature(format!(
-                "artifact {name} digest mismatch: {actual} != {expected}"
-            )));
-        }
+        artifacts.push(open_pinned_artifact(&store_dir, name, expected)?);
     }
     if let Some(snap) = &manifest.snapshot {
+        // Snapshot files are digest-verified (not pinned: snapshots restore
+        // via the API load path and JailSpec carries `snapshot: None`, so
+        // they are not launch artifacts). Opened through the pinned store
+        // dir like everything else — never via a re-joined mutable path.
         for (name, expected) in [
             ("snapshot.mem", snap.mem_digest.as_str()),
             ("snapshot.vmstate", snap.vmstate_digest.as_str()),
         ] {
-            let actual = digest_file(&dir.join(name))?;
-            if actual != expected {
-                return Err(SandboxdError::BadSignature(format!(
-                    "artifact {name} digest mismatch"
-                )));
-            }
+            let _ = open_pinned_artifact(&store_dir, name, expected)?;
         }
     }
+
+    harden_store_entry(&dir)?;
 
     Ok(StoredImage {
         dir,
         manifest,
         image_digest: image_digest.to_string(),
+        artifacts,
     })
 }
 
@@ -456,5 +747,135 @@ mod tests {
         assert!(!is_digest(
             "../sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
+    }
+
+    /// Build a fully valid store entry; returns (store tmpdir, image
+    /// digest, signing key).
+    fn valid_store() -> (tempfile::TempDir, String, SigningKey) {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = key(0x77);
+        let kernel = b"vmlinux-bytes";
+        let rootfs = b"rootfs-bytes";
+        let ws = b"workspace-bytes";
+        let mut m = test_manifest();
+        m.kernel_digest = digest_bytes(kernel);
+        m.rootfs_digest = digest_bytes(rootfs);
+        m.workspace_template_digest = digest_bytes(ws);
+        m.sign(&k).unwrap();
+        let digest = m.image_digest().unwrap();
+        let dir = tmp.path().join(&digest);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        std::fs::write(dir.join("vmlinux"), kernel).unwrap();
+        std::fs::write(dir.join("rootfs.ext4"), rootfs).unwrap();
+        std::fs::write(dir.join("workspace-template.raw"), ws).unwrap();
+        (tmp, digest, k)
+    }
+
+    #[test]
+    fn resolve_image_rejects_symlinked_artifact() {
+        let (store, digest, k) = valid_store();
+        let dir = store.path().join(&digest);
+        // Swap one artifact for a symlink: resolution must fail closed
+        // instead of following it.
+        std::fs::remove_file(dir.join("vmlinux")).unwrap();
+        std::os::unix::fs::symlink(dir.join("rootfs.ext4"), dir.join("vmlinux")).unwrap();
+        let err = resolve_image(store.path(), &digest, &[k.verifying_key()]).unwrap_err();
+        assert!(
+            matches!(err, SandboxdError::UnapprovedImage(_)),
+            "expected UnapprovedImage, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_image_rejects_symlinked_store_dir() {
+        let (store, digest, k) = valid_store();
+        let dir = store.path().join(&digest);
+        let real = store.path().join("real-entry");
+        std::fs::rename(&dir, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &dir).unwrap();
+        let err = resolve_image(store.path(), &digest, &[k.verifying_key()]).unwrap_err();
+        assert!(
+            matches!(err, SandboxdError::UnapprovedImage(_)),
+            "expected UnapprovedImage, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_image_rejects_symlinked_manifest() {
+        let (store, digest, k) = valid_store();
+        let dir = store.path().join(&digest);
+        std::fs::rename(dir.join("manifest.json"), dir.join("manifest.json.real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("manifest.json.real"), dir.join("manifest.json"))
+            .unwrap();
+        assert!(resolve_image(store.path(), &digest, &[k.verifying_key()]).is_err());
+    }
+
+    #[test]
+    fn open_nofollow_rejects_symlink_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"data").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = open_nofollow(&link).unwrap_err();
+        assert!(
+            matches!(err, SandboxdError::UnapprovedImage(_)),
+            "expected UnapprovedImage, got {err:?}"
+        );
+        // A regular file still opens.
+        assert!(open_nofollow(&target).is_ok());
+    }
+
+    #[test]
+    fn resolve_image_pins_verified_descriptors() {
+        let (store, digest, k) = valid_store();
+        let stored = resolve_image(store.path(), &digest, &[k.verifying_key()]).unwrap();
+        assert_eq!(stored.artifacts.len(), 3);
+        let names: Vec<&str> = stored.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["vmlinux", "rootfs.ext4", "workspace-template.raw"]);
+        // The pinned descriptors hash to the manifest digests, and their
+        // /proc/self/fd paths resolve to real files.
+        for a in &stored.artifacts {
+            assert_eq!(digest_open_file(&a.file).unwrap(), a.expected_digest);
+            assert!(a.fd_path().exists());
+        }
+        assert_eq!(
+            stored.artifacts[0].expected_digest,
+            stored.manifest.kernel_digest
+        );
+    }
+
+    #[test]
+    fn harden_store_entry_sets_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("vmlinux");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        harden_store_entry(&dir).unwrap();
+        let fm = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+        let dm = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fm, 0o644, "file mode");
+        assert_eq!(dm, 0o755, "dir mode");
+    }
+
+    #[test]
+    fn harden_store_entry_skips_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"secret").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("evil-link")).unwrap();
+        // Must not fail, and must not touch the link target's mode.
+        harden_store_entry(&dir).unwrap();
+        let m = std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o600, "link target must be untouched");
     }
 }
