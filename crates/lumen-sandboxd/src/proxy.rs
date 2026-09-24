@@ -83,6 +83,12 @@ pub fn parse_request(head: &[u8]) -> Result<ProxyRequest, SandboxdError> {
         let port = port.filter(|p| *p != 0).ok_or_else(|| {
             SandboxdError::Protocol("CONNECT requires an explicit nonzero port".into())
         })?;
+        // CONNECT carries no scheme, and this proxy never terminates or
+        // validates TLS — it is a raw TCP tunnel. The tunnel is therefore
+        // authorized against `tcp` scope for this host:port. An
+        // `https://host` lease does NOT authorize a CONNECT tunnel: scope
+        // narrowing is exact, and the proxy cannot distinguish TLS from
+        // raw TCP (SSH, database wire protocols, ...) inside a tunnel.
         Ok(ProxyRequest {
             scheme: "tcp".into(),
             host,
@@ -436,6 +442,33 @@ mod tests {
         assert_eq!(r.host, "api.example.com");
         assert_eq!(r.port, 443);
         assert!(r.is_connect);
+    }
+
+    #[test]
+    fn connect_is_authorized_as_tcp_scope_not_https() {
+        // CONNECT carries no scheme and the proxy never terminates TLS, so
+        // a CONNECT tunnel is raw TCP authority: it must be authorized
+        // against `tcp` scope for host:port. An `https://host` lease must
+        // NOT authorize it (scope confusion), per design invariant 3 —
+        // scope narrowing is exact.
+        let req = parse_request(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n").unwrap();
+        assert!(req.is_connect);
+        assert_eq!(req.scheme, "tcp");
+
+        // Lease scoped to https://api.example.com:443: CONNECT denied.
+        let https_only = policy(&["https://api.example.com:443"]);
+        assert!(
+            network::check_destination(&https_only, &req.scheme, &req.host, req.port).is_err(),
+            "an https-scope lease must not authorize a CONNECT tunnel"
+        );
+
+        // Lease scoped to tcp://api.example.com:443: CONNECT allowed.
+        let tcp_scoped = policy(&["tcp://api.example.com:443"]);
+        let dest =
+            network::check_destination(&tcp_scoped, &req.scheme, &req.host, req.port).unwrap();
+        assert_eq!(dest.scheme, "tcp");
+        assert_eq!(dest.host, "api.example.com");
+        assert_eq!(dest.port, 443);
     }
 
     #[test]
