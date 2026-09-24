@@ -139,20 +139,38 @@ impl SystemSandbox {
         #[cfg(target_os = "linux")]
         {
             if let Some(executable) = find_linux_bubblewrap(Path::is_file) {
-                if probe_linux_bubblewrap(&executable) {
-                    return Self {
-                        report: linux_sandbox_report(executable.clone()),
-                        executable: Some(executable),
-                    };
+                match probe_linux_bubblewrap(&executable) {
+                    Ok(()) => {
+                        return Self {
+                            report: linux_sandbox_report(executable.clone()),
+                            executable: Some(executable),
+                        };
+                    }
+                    Err(probe_detail) => {
+                        // Surface the probe's own diagnostic (e.g. bwrap's
+                        // "setting up uid map: Permission denied" when the
+                        // host restricts unprivileged user namespaces) so a
+                        // failed sandbox is actionable instead of opaque.
+                        let mut detail = String::from(
+                            "the complete bubblewrap isolation profile could not start",
+                        );
+                        let probe_detail = probe_detail.trim();
+                        if !probe_detail.is_empty() {
+                            detail.push_str(": ");
+                            // The probe only ever emits bwrap's short
+                            // diagnostics; still, bound it.
+                            detail.push_str(&probe_detail.chars().take(500).collect::<String>());
+                        }
+                        return Self {
+                            executable: None,
+                            report: SandboxReport::new(
+                                "linux-bubblewrap",
+                                SandboxStrength::Unavailable,
+                                Some(detail),
+                            ),
+                        };
+                    }
                 }
-                return Self {
-                    executable: None,
-                    report: SandboxReport::new(
-                        "linux-bubblewrap",
-                        SandboxStrength::Unavailable,
-                        Some("the complete bubblewrap isolation profile could not start".into()),
-                    ),
-                };
             }
             Self {
                 executable: None,
@@ -449,38 +467,47 @@ fn linux_bubblewrap_command(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn probe_linux_bubblewrap(executable: &Path) -> bool {
-    use std::{process::Stdio, thread, time::Instant};
+fn probe_linux_bubblewrap(executable: &Path) -> Result<(), String> {
+    use std::{io::Read, process::Stdio, thread, time::Instant};
 
-    let Ok(workspace) = std::env::current_dir() else {
-        return false;
-    };
-    let Ok(command) = linux_bubblewrap_command(
+    let workspace =
+        std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
+    let command = linux_bubblewrap_command(
         executable.to_path_buf(),
         &MonitoredCommand::new("/bin/true").current_dir(workspace),
         SandboxProfile::WorkspaceReadOnly,
-    ) else {
-        return false;
-    };
+    )
+    .map_err(|e| format!("cannot build probe command: {e}"))?;
     let mut process = std::process::Command::new(command.program());
     process
         .args(command.arguments())
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let Ok(mut child) = process.spawn() else {
-        return false;
-    };
+        .stderr(Stdio::piped());
+    let mut child = process
+        .spawn()
+        .map_err(|e| format!("cannot spawn {}: {e}", executable.display()))?;
+    let mut stderr = child.stderr.take();
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => {
+                let mut probe_stderr = String::new();
+                if let Some(mut err) = stderr.take() {
+                    let _ = err.read_to_string(&mut probe_stderr);
+                }
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(probe_stderr)
+                };
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return Err("probe did not exit within 2s".to_owned());
             }
         }
     }
@@ -1054,9 +1081,7 @@ mod tests {
 
         assert_eq!(selected, Some(PathBuf::from("/bin/bwrap")));
         assert_eq!(LINUX_BWRAP_PATHS, ["/usr/bin/bwrap", "/bin/bwrap"]);
-        assert!(!probe_linux_bubblewrap(Path::new(
-            "/definitely-not-a-lumen-bubblewrap"
-        )));
+        assert!(probe_linux_bubblewrap(Path::new("/definitely-not-a-lumen-bubblewrap")).is_err());
     }
 
     #[cfg(target_os = "linux")]

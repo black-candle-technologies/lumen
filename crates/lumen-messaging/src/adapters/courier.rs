@@ -1801,7 +1801,15 @@ mod tests {
         let (mut adapter, binding, config) = bind_config();
         // Absolute path but no digest pin: bind must fail closed before the
         // binary is ever executed (no `courier` on disk needed).
-        adapter.config.binary = PathBuf::from("/usr/local/bin/courier");
+        //
+        // The dummy path lives under /usr/bin (not /usr/local/bin): the
+        // parent-directory trust check runs before the pin checks, and
+        // /usr/local/bin is group-writable for unprivileged users on some
+        // hosts (e.g. GitHub Actions runners), which would fail the test
+        // with BinaryParentWritable instead of exercising the pin check.
+        // /usr/bin is root-owned and non-writable on every supported
+        // platform, so the pin check is what actually fires here.
+        adapter.config.binary = PathBuf::from("/usr/bin/courier");
         let err = adapter.bind(binding, &config).await.unwrap_err();
         assert_eq!(
             err,
@@ -1828,7 +1836,10 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_malformed_pin() {
         let (mut adapter, binding, config) = bind_config();
-        adapter.config.binary = PathBuf::from("/usr/local/bin/courier");
+        // /usr/bin, not /usr/local/bin: see bind_rejects_unpinned_binary
+        // for why the dummy path must sit under a root-owned,
+        // non-group-writable parent on every host.
+        adapter.config.binary = PathBuf::from("/usr/bin/courier");
         adapter.config.expected_binary_sha256 = Some("not-hex".to_owned());
         let err = adapter.bind(binding, &config).await.unwrap_err();
         assert_eq!(
