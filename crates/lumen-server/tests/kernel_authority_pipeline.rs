@@ -365,7 +365,7 @@ async fn restart_preserves_budget_consumption() {
                 scope: ResourceScope::default(),
                 limits: LeaseLimits {
                     not_before_ms: 0,
-                    expires_at_ms: i64::MAX,
+                    expires_at_ms: now_ms() + 24 * 60 * 60 * 1000,
                     budget: Budget::new().set(BudgetDimension::Executions, 2),
                     max_executions: None,
                     single_use: false,
