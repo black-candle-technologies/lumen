@@ -1,0 +1,1 @@
+{"command":["cat","/workspace/report.txt"],"egress_allowlist":[],"image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","profile":"strict","quotas":{"memory_mb":512,"output_bytes":1048576,"vcpus":2,"wall_time_ms":30000},"version":1}

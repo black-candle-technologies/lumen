@@ -10,6 +10,7 @@ members = [
     "crates/lumen-worker-runtime",
     "crates/lumen-control-plane",
     "crates/lumen-acceptance",
+    "crates/lumen-protocol",
 ]
 resolver = "3"
 

@@ -1,0 +1,10 @@
+[package]
+name = "lumen-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lumen-core = { path = "../lumen-core" }
+
+[dev-dependencies]
+serde_json = "1"
