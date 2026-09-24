@@ -1,0 +1,1 @@
+{"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","noEmit":true,"paths":{"@earendil-works/pi-ai":["./types/pi-ai.d.ts"],"@earendil-works/pi-coding-agent":["./types/pi-coding-agent.d.ts"]},"skipLibCheck":true,"strict":true,"target":"ES2022","types":["node"]},"include":["src/**/*.ts","types/**/*.d.ts"]}

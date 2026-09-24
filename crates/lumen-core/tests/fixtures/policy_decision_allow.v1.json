@@ -1,0 +1,1 @@
+{"decision":"allow","obligations":[{"max_bytes":65536,"type":"truncate_output"},{"type":"redact_secrets"}],"version":1}

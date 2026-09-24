@@ -14,6 +14,7 @@ pub mod identity;
 pub mod model;
 pub mod operator;
 pub mod orchestration;
+pub mod pi_boundary;
 pub mod policy;
 pub mod provider;
 pub mod routing;

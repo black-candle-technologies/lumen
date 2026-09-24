@@ -1,0 +1,186 @@
+{
+ "generated_at": "2026-09-24T05:47:01.495Z",
+ "kernel": {
+  "socket_path": "/tmp/lumen-spike-82478/kernel.sock",
+  "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3",
+  "lease_ids": [
+   "b8ce4013-98f3-45fd-8905-ebef4ee4848d",
+   "c8ac7825-cea7-4016-8e13-d2f85f610faa"
+  ]
+ },
+ "expected": {
+  "allowed_content": "LUMEN-SPIKE-EXPECTED-CONTENT\n",
+  "denied_file": "/etc/hostname"
+ },
+ "cases": {
+  "SPIKE_ALLOW": [
+   {
+    "type": "tool_execution_end",
+    "toolCallId": "spike-SPIKE_ALLOW",
+    "toolName": "bct.read_file",
+    "result": {
+     "content": [
+      {
+       "type": "text",
+       "text": "LUMEN-SPIKE-EXPECTED-CONTENT\n"
+      }
+     ],
+     "details": {
+      "action_digest": "17e2d27568de07173f613e81ada36196143bcffde0aac8d9f045d04ce319d017",
+      "audit_sequence": 1,
+      "decision": "allow"
+     }
+    },
+    "isError": false
+   }
+  ],
+  "SPIKE_DENY": [
+   {
+    "type": "tool_execution_end",
+    "toolCallId": "spike-SPIKE_DENY",
+    "toolName": "bct.read_file",
+    "result": {
+     "content": [
+      {
+       "type": "text",
+       "text": "Denied by Lumen kernel [scope_exceeded]: path '/etc/hostname' is outside the leaf lease scope"
+      }
+     ],
+     "details": {}
+    },
+    "isError": true
+   }
+  ],
+  "SPIKE_PENDING": [
+   {
+    "type": "tool_execution_end",
+    "toolCallId": "spike-SPIKE_PENDING",
+    "toolName": "bct.read_file",
+    "result": {
+     "content": [
+      {
+       "type": "text",
+       "text": "Action requires human approval (apr-71380975e775cae1): path '/tmp/lumen-spike-82478/approvable/needs-approval.txt' is outside the lease; human approval required. Action digest: 71380975e775cae10981a8692a6ab653626911749c08126a872bc52b9bb711ad"
+      }
+     ],
+     "details": {}
+    },
+    "isError": true
+   }
+  ]
+ },
+ "audit": [
+  {
+   "action_digest": "17e2d27568de07173f613e81ada36196143bcffde0aac8d9f045d04ce319d017",
+   "actor": {
+    "actor": "session",
+    "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3"
+   },
+   "detail": "tool bct.read_file",
+   "event_id": "f430c498-fa55-4aae-b4e2-e9b9ea8a8212",
+   "hash": "f8aff3b6de7ea088b8a2190424b6d7bf05202f19df2959a2edacb21a001063e8",
+   "kind": "action_proposed",
+   "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+   "sequence": 0,
+   "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3",
+   "timestamp_ms": 1790228821302,
+   "version": 1
+  },
+  {
+   "action_digest": "17e2d27568de07173f613e81ada36196143bcffde0aac8d9f045d04ce319d017",
+   "actor": {
+    "actor": "session",
+    "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3"
+   },
+   "decision": "allow",
+   "detail": "within lease scope",
+   "event_id": "363c50d1-b63b-468f-9d29-22df905b00b3",
+   "hash": "dfe4853c68fba0c43b3ae0883f9c81485e28b2b704dfb0ca220c9c1132cf936b",
+   "kind": "policy_allowed",
+   "prev_hash": "f8aff3b6de7ea088b8a2190424b6d7bf05202f19df2959a2edacb21a001063e8",
+   "sequence": 1,
+   "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3",
+   "timestamp_ms": 1790228821302,
+   "version": 1
+  },
+  {
+   "action_digest": "779707c1565001f465fcf12c1776dc7f165567e44570da9d205e6fd74b2d86d1",
+   "actor": {
+    "actor": "session",
+    "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3"
+   },
+   "detail": "tool bct.read_file",
+   "event_id": "d47168a5-c59d-4d65-bc31-1e7bc9cdd813",
+   "hash": "aacb8ec780baec5b510f0cbeda54497183499aa9b95b42dff58f5c0f3e6685f0",
+   "kind": "action_proposed",
+   "prev_hash": "dfe4853c68fba0c43b3ae0883f9c81485e28b2b704dfb0ca220c9c1132cf936b",
+   "sequence": 2,
+   "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3",
+   "timestamp_ms": 1790228821344,
+   "version": 1
+  },
+  {
+   "action_digest": "779707c1565001f465fcf12c1776dc7f165567e44570da9d205e6fd74b2d86d1",
+   "actor": {
+    "actor": "session",
+    "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3"
+   },
+   "decision": "deny",
+   "detail": "scope_exceeded: path '/etc/hostname' is outside the leaf lease scope",
+   "event_id": "1d1d4c1a-8f6f-45b9-9034-d006625f0db8",
+   "hash": "c75e6c10b4fc221cf47cc46c080e5ad8a28eaa268f815ffaa973a2c109682905",
+   "kind": "policy_denied",
+   "prev_hash": "aacb8ec780baec5b510f0cbeda54497183499aa9b95b42dff58f5c0f3e6685f0",
+   "sequence": 3,
+   "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3",
+   "timestamp_ms": 1790228821344,
+   "version": 1
+  },
+  {
+   "action_digest": "71380975e775cae10981a8692a6ab653626911749c08126a872bc52b9bb711ad",
+   "actor": {
+    "actor": "session",
+    "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3"
+   },
+   "detail": "tool bct.read_file",
+   "event_id": "606d87e8-fc86-4255-9b14-f521a82a179e",
+   "hash": "62e5f8f6da304665730838b5114c5d6e4cc7bd8dcfae408e1f81405ed293c878",
+   "kind": "action_proposed",
+   "prev_hash": "c75e6c10b4fc221cf47cc46c080e5ad8a28eaa268f815ffaa973a2c109682905",
+   "sequence": 4,
+   "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3",
+   "timestamp_ms": 1790228821387,
+   "version": 1
+  },
+  {
+   "action_digest": "71380975e775cae10981a8692a6ab653626911749c08126a872bc52b9bb711ad",
+   "actor": {
+    "actor": "session",
+    "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3"
+   },
+   "decision": "pending",
+   "detail": "apr-71380975e775cae1: path '/tmp/lumen-spike-82478/approvable/needs-approval.txt' is outside the lease; human approval required",
+   "event_id": "c3950423-18a8-4b7c-ad21-6ca1454874c4",
+   "hash": "bf537ffe71af9b85404c9676243673635578afa8afdfacdccc561c2f0a7e002e",
+   "kind": "approval_requested",
+   "prev_hash": "62e5f8f6da304665730838b5114c5d6e4cc7bd8dcfae408e1f81405ed293c878",
+   "sequence": 5,
+   "session_id": "spike-022bedee-f720-4c23-95db-c82e97e757d3",
+   "timestamp_ms": 1790228821387,
+   "version": 1
+  }
+ ],
+ "pi": {
+  "commit": "b45597504eeaba1f11a9920a1d1048c361ed4b8e",
+  "version": "0.87.1",
+  "package_lock_sha256": "95dbf4d7aa54eebf235edccd6926efac42fbf4e1c6a92c625c9ac706a8b367f7",
+  "artifact": "packages/coding-agent/dist/bundle/cli.js",
+  "artifact_sha256": "e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774",
+  "build": "npm ci --no-audit --no-fund && npm run build"
+ },
+ "harness": {
+  "note": "Scaffolding (kernel example, scripted model extension, node driver) was used to produce this run and removed before commit; it is not part of the deliverable.",
+  "model": "spike-echo: scripted deterministic provider emitting one bct.read_file tool call per marked prompt, then a text reply so the agent settles.",
+  "kernel": "LocalKernel over a Unix socket with SO_PEERCRED + per-session nonce; root lease narrowed to work/, child lease identical; approvable root is a sibling outside the lease."
+ }
+}
