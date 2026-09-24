@@ -118,9 +118,19 @@ impl<U: DnsUpstream> HostPolicyResolver<U> {
 
     /// Resolve a name to validated, pinned addresses.
     pub fn resolve(&mut self, name: &str) -> Result<Vec<IpAddr>, SandboxdError> {
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let name = Self::normalize_name(name);
         if name.is_empty() || name.len() > 253 {
             return Err(SandboxdError::DnsDenied("bad name".into()));
+        }
+        // Exfil guard: the query name itself reaches the upstream resolver
+        // (and the name's authoritative servers), so only names covered by
+        // the run's egress allowlist may be resolved at all — before any
+        // pin lookup or upstream query. An unleased name never reaches the
+        // upstream.
+        if !name_is_leased(&self.policy, &name) {
+            return Err(SandboxdError::DnsDenied(format!(
+                "name not on egress allowlist: {name}"
+            )));
         }
         // Rebinding defense: a pinned name is never re-resolved.
         if let Some(addrs) = self.pins.get(&name) {
@@ -142,6 +152,34 @@ impl<U: DnsUpstream> HostPolicyResolver<U> {
         self.pins.pin(&name, valid.clone())?;
         Ok(valid)
     }
+
+    /// Normalize a query name the way `resolve` does.
+    fn normalize_name(name: &str) -> String {
+        name.trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    /// Pin-cache lookup without any I/O. The proxy uses this for its fast
+    /// path so the resolver lock is never held across blocking upstream
+    /// resolution. Returns `None` for malformed names (the slow path then
+    /// fails closed through `resolve`).
+    pub fn cached(&self, name: &str) -> Option<Vec<IpAddr>> {
+        let name = Self::normalize_name(name);
+        if name.is_empty() || name.len() > 253 {
+            return None;
+        }
+        self.pins.get(&name)
+    }
+}
+
+/// True when `name` is covered by the run's egress allowlist (exact or
+/// `*.` wildcard host match). Scheme and port are irrelevant for DNS: if
+/// the guest may egress to the host, it may resolve it.
+fn name_is_leased(policy: &crate::contracts::NetworkPolicy, name: &str) -> bool {
+    policy
+        .allow_egress
+        .iter()
+        .filter_map(|entry| network::parse_destination(entry).ok())
+        .any(|dest| network::host_matches(&dest.host, name))
 }
 
 // ---------------------------------------------------------------------------
@@ -397,9 +435,9 @@ mod tests {
         }
     }
 
-    fn policy() -> crate::contracts::NetworkPolicy {
+    fn policy(entries: &[&str]) -> crate::contracts::NetworkPolicy {
         crate::contracts::NetworkPolicy {
-            allow_egress: vec![],
+            allow_egress: entries.iter().map(|s| s.to_string()).collect(),
             deny_metadata: true,
             deny_private_ranges: true,
         }
@@ -446,7 +484,12 @@ mod tests {
             vec!["169.254.169.254".parse().unwrap()],
         );
         let upstream = FakeUpstream::new(answers);
-        let mut r = HostPolicyResolver::new(tmp.path(), upstream, policy()).unwrap();
+        let mut r = HostPolicyResolver::new(
+            tmp.path(),
+            upstream,
+            policy(&["https://metadata.attack:443"]),
+        )
+        .unwrap();
         assert!(r.resolve("metadata.attack").is_err());
     }
 
@@ -456,8 +499,70 @@ mod tests {
         let mut answers = HashMap::new();
         answers.insert("db.internal".into(), vec!["10.0.0.5".parse().unwrap()]);
         let upstream = FakeUpstream::new(answers);
-        let mut r = HostPolicyResolver::new(tmp.path(), upstream, policy()).unwrap();
+        let mut r =
+            HostPolicyResolver::new(tmp.path(), upstream, policy(&["https://db.internal:443"]))
+                .unwrap();
         assert!(r.resolve("db.internal").is_err());
+    }
+
+    #[test]
+    fn unleased_name_never_reaches_upstream() {
+        // Data-exfil guard: the query name itself reaches the upstream
+        // resolver (and the name's authoritative servers), so a name that
+        // is not on the egress allowlist must be refused before any
+        // upstream query — the upstream must see nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(HashMap::new());
+        let mut r = HostPolicyResolver::new(
+            tmp.path(),
+            upstream,
+            policy(&["https://api.example.com:443"]),
+        )
+        .unwrap();
+        assert!(r.resolve("exfil.attacker.example").is_err());
+        assert!(
+            r.into_upstream().calls().is_empty(),
+            "unleased name reached the upstream resolver"
+        );
+    }
+
+    #[test]
+    fn leased_name_resolves_and_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good: IpAddr = "93.184.216.34".parse().unwrap();
+        let mut answers = HashMap::new();
+        answers.insert("api.example.com".into(), vec![good]);
+        let upstream = FakeUpstream::new(answers);
+        let mut r = HostPolicyResolver::new(
+            tmp.path(),
+            upstream,
+            policy(&["https://api.example.com:443", "https://*.example.net:443"]),
+        )
+        .unwrap();
+        assert_eq!(r.resolve("api.example.com").unwrap(), vec![good]);
+        // Second query is answered from the pin store: one upstream call.
+        assert_eq!(r.resolve("api.example.com").unwrap(), vec![good]);
+        assert_eq!(
+            r.into_upstream().calls(),
+            vec!["api.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn wildcard_lease_covers_subdomain_but_not_bare_domain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good: IpAddr = "93.184.216.34".parse().unwrap();
+        let mut answers = HashMap::new();
+        answers.insert("a.example.net".into(), vec![good]);
+        let upstream = FakeUpstream::new(answers);
+        let mut r =
+            HostPolicyResolver::new(tmp.path(), upstream, policy(&["https://*.example.net:443"]))
+                .unwrap();
+        assert!(r.resolve("a.example.net").is_ok());
+        // The bare domain is not covered by `*.example.net`.
+        assert!(r.resolve("example.net").is_err());
+        // Only the leased name reached the upstream.
+        assert_eq!(r.into_upstream().calls(), vec!["a.example.net".to_string()]);
     }
 
     #[test]
@@ -472,7 +577,12 @@ mod tests {
         let mut answers = HashMap::new();
         answers.insert("victim.example".into(), vec![good]);
         let upstream = FakeUpstream::new(answers);
-        let mut r = HostPolicyResolver::new(tmp.path(), upstream, policy()).unwrap();
+        let mut r = HostPolicyResolver::new(
+            tmp.path(),
+            upstream,
+            policy(&["https://victim.example:443"]),
+        )
+        .unwrap();
 
         assert_eq!(r.resolve("victim.example").unwrap(), vec![good]);
 
@@ -481,7 +591,12 @@ mod tests {
         let mut answers2 = HashMap::new();
         answers2.insert("victim.example".into(), vec![evil]);
         let upstream2 = FakeUpstream::new(answers2);
-        let mut r2 = HostPolicyResolver::new(tmp.path(), upstream2, policy()).unwrap();
+        let mut r2 = HostPolicyResolver::new(
+            tmp.path(),
+            upstream2,
+            policy(&["https://victim.example:443"]),
+        )
+        .unwrap();
         // Pinned good address served; the evil rebind never reaches the guest.
         assert_eq!(r2.resolve("victim.example").unwrap(), vec![good]);
         // And the upstream flip was never even consulted (pin hit first).
@@ -501,12 +616,20 @@ mod tests {
         let good: IpAddr = "93.184.216.34".parse().unwrap();
         let mut answers = HashMap::new();
         answers.insert("x.example".into(), vec![good]);
-        let mut r =
-            HostPolicyResolver::new(tmp.path(), FakeUpstream::new(answers), policy()).unwrap();
+        let mut r = HostPolicyResolver::new(
+            tmp.path(),
+            FakeUpstream::new(answers),
+            policy(&["https://x.example:443"]),
+        )
+        .unwrap();
         r.resolve("x.example").unwrap();
         drop(r);
-        let r2 = HostPolicyResolver::new(tmp.path(), FakeUpstream::new(HashMap::new()), policy())
-            .unwrap();
+        let r2 = HostPolicyResolver::new(
+            tmp.path(),
+            FakeUpstream::new(HashMap::new()),
+            policy(&["https://x.example:443"]),
+        )
+        .unwrap();
         assert_eq!(r2.pins.get("x.example"), Some(vec![good]));
     }
 }

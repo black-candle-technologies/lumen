@@ -172,7 +172,7 @@ pub fn check_destination(
     )))
 }
 
-fn host_matches(pattern: &str, host: &str) -> bool {
+pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
     if pattern == host {
         return true;
     }
@@ -227,11 +227,18 @@ pub fn is_metadata_ip(ip: IpAddr) -> bool {
 /// True only for globally-reachable unicast addresses.
 ///
 /// Deny-by-default: every IANA special-purpose range (RFC 6890 / RFC 8190)
-/// is excluded — private, loopback, link-local, shared/CGNAT, reserved,
-/// documentation, benchmarking, and protocol-assignment space, plus
-/// multicast. IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are judged by
-/// their inner IPv4 address, so the mapping cannot smuggle a non-global
-/// address past the check.
+/// that is not globally reachable is excluded — private, loopback,
+/// link-local, shared/CGNAT, reserved, documentation, benchmarking,
+/// transition mechanisms (6to4, Teredo), NAT64 local-use, SRv6 SIDs, and
+/// protocol-assignment space, plus multicast. IPv4-mapped IPv6 addresses
+/// (`::ffff:a.b.c.d`) are judged by their inner IPv4 address, so the
+/// mapping cannot smuggle a non-global address past the check.
+///
+/// Note on `2001::/23` (IETF Protocol Assignments): the registry marks it
+/// not globally reachable *unless allowed by a more specific allocation*
+/// (RFC 8190 footnote), and large parts of it ARE globally routed
+/// (e.g. `2001:4860::/32`). Excluding the whole /23 would deny legitimate
+/// global unicast, so only its non-global sub-prefixes are excluded.
 pub fn is_global_unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -268,8 +275,16 @@ pub fn is_global_unicast(ip: IpAddr) -> bool {
                 v6.is_unspecified() // ::/128
                 || v6.is_loopback() // ::1/128
                 || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0) // 64:ff9b::/96 — NAT64 WKP (RFC 6052)
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // 64:ff9b:1::/48 — NAT64 local-use (RFC 8219)
                 || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // 100::/64 — discard (RFC 6666)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0x0001) // 100:0:0:1::/64 — dummy prefix (RFC 9780)
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 — documentation (RFC 3849)
+                || (s[0] == 0x2001 && s[1] == 0x0000) // 2001::/32 — Teredo (RFC 4380); embeds an IPv4 address
+                || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0x0000) // 2001:2::/48 — benchmarking (RFC 5180)
+                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010) // 2001:10::/28 — ORCHID, deprecated (RFC 4843)
+                || s[0] == 0x2002 // 2002::/16 — 6to4 (RFC 3056); embeds an IPv4 address
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0) // 3fff::/20 — documentation (RFC 9637)
+                || s[0] == 0x5f00 // 5f00::/16 — SRv6 SIDs (RFC 9602)
                 || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 — unique-local (RFC 4193)
                 || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 — link-local (RFC 4291)
                 || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 — site-local, deprecated (RFC 3879)
@@ -303,9 +318,18 @@ pub fn plan_net(
     tap_prefix: &str,
     netns_prefix: &str,
 ) -> Result<NetPlan, SandboxdError> {
-    let (base, _) = pod_cidr
+    let (base, prefix_len) = pod_cidr
         .split_once('/')
         .ok_or_else(|| SandboxdError::State(format!("bad pod_cidr: {pod_cidr}")))?;
+    let prefix_len: u8 = prefix_len
+        .parse()
+        .map_err(|_| SandboxdError::State(format!("bad pod_cidr: {pod_cidr}")))?;
+    // A /30 is carved per run, so the pod prefix must be /30 or shorter.
+    if prefix_len > 30 {
+        return Err(SandboxdError::State(format!(
+            "pod_cidr prefix /{prefix_len} cannot hold a /30"
+        )));
+    }
     let base_ip: IpAddr = base
         .parse()
         .map_err(|_| SandboxdError::State(format!("bad pod_cidr: {pod_cidr}")))?;
@@ -313,15 +337,46 @@ pub fn plan_net(
         return Err(SandboxdError::State("pod_cidr must be IPv4".into()));
     };
     let base_u32 = u32::from(base_v4);
+    // The base must be the aligned network address: an unaligned base
+    // would let slots overlap each other or escape the CIDR.
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    if base_u32 & !mask != 0 {
+        return Err(SandboxdError::State(format!(
+            "pod_cidr base {base} is not aligned to /{prefix_len}"
+        )));
+    }
+    // One /30 per run: slot * 4 addresses. Bounding the slot to the
+    // prefix's /30 count keeps every carved address inside the CIDR and
+    // makes net+1 / net+2 overflow-impossible.
+    let slots = 1u32 << (30 - prefix_len);
+    if slot >= slots {
+        return Err(SandboxdError::State(format!(
+            "pod slot {slot} outside pod_cidr {pod_cidr}"
+        )));
+    }
     // One /30 per run: network = base + slot*4; .1 host, .2 guest.
+    // The slot bound above guarantees these cannot overflow; the checked
+    // arithmetic fails closed regardless.
     let net = base_u32
         .checked_add(
             slot.checked_mul(4)
                 .ok_or_else(|| SandboxdError::State("pod slot overflow".into()))?,
         )
         .ok_or_else(|| SandboxdError::State("pod slot overflow".into()))?;
-    let host_ip = std::net::Ipv4Addr::from(net + 1).to_string();
-    let guest_ip = std::net::Ipv4Addr::from(net + 2).to_string();
+    let host_ip = std::net::Ipv4Addr::from(
+        net.checked_add(1)
+            .ok_or_else(|| SandboxdError::State("pod slot overflow".into()))?,
+    )
+    .to_string();
+    let guest_ip = std::net::Ipv4Addr::from(
+        net.checked_add(2)
+            .ok_or_else(|| SandboxdError::State("pod slot overflow".into()))?,
+    )
+    .to_string();
     Ok(NetPlan {
         netns_name: format!("{netns_prefix}{tag}"),
         tap_name: format!("{tap_prefix}{tag}"),
@@ -489,6 +544,47 @@ mod tests {
     }
 
     #[test]
+    fn plan_net_validates_slot_against_prefix() {
+        // The finding's case: with 10.244.0.0/16, slot 16384 used to
+        // produce 10.245.0.1/10.245.0.2 — outside the pod CIDR.
+        assert!(plan_net("t", "10.244.0.0/16", 16384, 18080, "lmnt-", "lmn-").is_err());
+        assert!(plan_net("t", "10.244.0.0/16", u32::MAX, 18080, "lmnt-", "lmn-").is_err());
+        // Last valid slot of the /16 stays inside.
+        let plan = plan_net("t", "10.244.0.0/16", 16383, 18080, "lmnt-", "lmn-").unwrap();
+        assert_eq!(plan.host_ip, "10.244.255.253");
+        assert_eq!(plan.guest_ip, "10.244.255.254");
+        // A /30 holds exactly one slot.
+        let plan = plan_net("t", "10.244.0.0/30", 0, 18080, "lmnt-", "lmn-").unwrap();
+        assert_eq!(plan.host_ip, "10.244.0.1");
+        assert_eq!(plan.guest_ip, "10.244.0.2");
+        assert!(plan_net("t", "10.244.0.0/30", 1, 18080, "lmnt-", "lmn-").is_err());
+    }
+
+    #[test]
+    fn plan_net_rejects_unaligned_base_and_bad_prefix() {
+        // Unaligned base: slots would overlap or escape the CIDR.
+        assert!(plan_net("t", "10.244.0.1/16", 0, 18080, "lmnt-", "lmn-").is_err());
+        assert!(plan_net("t", "10.244.0.5/24", 0, 18080, "lmnt-", "lmn-").is_err());
+        // No room for a /30.
+        assert!(plan_net("t", "10.244.0.0/31", 0, 18080, "lmnt-", "lmn-").is_err());
+        assert!(plan_net("t", "10.244.0.0/32", 0, 18080, "lmnt-", "lmn-").is_err());
+        // Not IPv4 / malformed.
+        assert!(plan_net("t", "fd00::/64", 0, 18080, "lmnt-", "lmn-").is_err());
+        assert!(plan_net("t", "10.244.0.0", 0, 18080, "lmnt-", "lmn-").is_err());
+        assert!(plan_net("t", "10.244.0.0/xx", 0, 18080, "lmnt-", "lmn-").is_err());
+    }
+
+    #[test]
+    fn plan_net_cannot_overflow_near_u32_max() {
+        // Top of the address space: the last /30 of 255.255.255.0/24.
+        // net+1/net+2 must not panic (debug) or wrap (release).
+        let plan = plan_net("t", "255.255.255.0/24", 63, 18080, "lmnt-", "lmn-").unwrap();
+        assert_eq!(plan.host_ip, "255.255.255.253");
+        assert_eq!(plan.guest_ip, "255.255.255.254");
+        assert!(plan_net("t", "255.255.255.0/24", 64, 18080, "lmnt-", "lmn-").is_err());
+    }
+
+    #[test]
     fn metadata_ip_detection() {
         assert!(is_metadata_ip("169.254.169.254".parse().unwrap()));
         assert!(!is_metadata_ip("169.254.169.253".parse().unwrap()));
@@ -546,17 +642,31 @@ mod tests {
             ("2001:4860:4860::8888", true),
             ("::ffff:8.8.8.8", true), // v4-mapped global
             // Denied IPv6.
-            ("::", false),                     // unspecified
-            ("::1", false),                    // loopback
-            ("fe80::1", false),                // fe80::/10
-            ("febf::1234", false),             // fe80::/10 top edge
-            ("fc00::1", false),                // fc00::/7
-            ("fd12:3456::1", false),           // fc00::/7
-            ("fec0::1", false),                // fec0::/10 deprecated site-local
-            ("ff02::1", false),                // ff00::/8 multicast
-            ("2001:db8::1", false),            // documentation
-            ("::ffff:10.0.0.1", false),        // v4-mapped private
-            ("::ffff:169.254.169.254", false), // v4-mapped link-local/metadata
+            ("::", false),                                   // unspecified
+            ("::1", false),                                  // loopback
+            ("fe80::1", false),                              // fe80::/10
+            ("febf::1234", false),                           // fe80::/10 top edge
+            ("fc00::1", false),                              // fc00::/7
+            ("fd12:3456::1", false),                         // fc00::/7
+            ("fec0::1", false),                              // fec0::/10 deprecated site-local
+            ("ff02::1", false),                              // ff00::/8 multicast
+            ("2001:db8::1", false),                          // documentation
+            ("2002:0a00:0001::1", false),                    // 2002::/16 6to4 wrapping 10.0.0.1
+            ("2002:c000:0201::1", false),                    // 2002::/16 6to4 wrapping 192.0.2.1
+            ("2001:0:ce49:7601:e866:efff:62c3:fffe", false), // 2001::/32 Teredo
+            ("2001:2::1", false),                            // 2001:2::/48 benchmarking
+            ("2001:10::1", false),                           // 2001:10::/28 deprecated ORCHID
+            ("64:ff9b:1::c000:201", false),                  // 64:ff9b:1::/48 NAT64 local-use
+            ("3fff::1", false),                              // 3fff::/20 documentation
+            ("3fff:0fff::1", false),                         // 3fff::/20 top edge
+            ("5f00::1", false),                              // 5f00::/16 SRv6 SIDs
+            ("100:0:0:1::1", false),                         // 100:0:0:1::/64 dummy prefix
+            ("::ffff:10.0.0.1", false),                      // v4-mapped private
+            ("::ffff:169.254.169.254", false),               // v4-mapped link-local/metadata
+            // Still allowed: inside 2001::/23 but globally routed by a more
+            // specific allocation (RFC 8190: "unless allowed by a more
+            // specific allocation"), and just outside 3fff::/20.
+            ("3fff:1000::1", true),
         ];
         for (addr, want) in cases {
             let ip: IpAddr = addr.parse().unwrap();

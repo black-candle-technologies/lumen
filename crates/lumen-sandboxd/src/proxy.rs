@@ -17,17 +17,17 @@
 //!    verdict}` — request/response bodies are never logged.
 
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
 };
 
 use crate::{
@@ -35,6 +35,20 @@ use crate::{
     error::SandboxdError,
     network,
 };
+
+/// Max concurrent proxied connections per run. Bounds task, FD, and memory
+/// use when the guest opens many connections at once (intentionally or
+/// not); excess connections wait at the accept queue (backpressure).
+pub const MAX_PROXY_CONNECTIONS: usize = 64;
+/// How long the guest has to deliver a complete request head before the
+/// connection is dropped.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// A relayed connection with no bytes in either direction for this long is
+/// closed, so idle connections cannot pin relay tasks and permits forever.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Pause after an `accept()` error so a persistent failure cannot spin the
+/// accept loop at 100% CPU.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Per-run proxy configuration.
 #[derive(Debug, Clone)]
@@ -163,7 +177,12 @@ fn split_host_port(authority: &str) -> Result<(String, Option<u16>), SandboxdErr
 }
 
 /// Read a request head, bounded at 16 KiB.
-pub async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, SandboxdError> {
+///
+/// Returns the head plus any bytes that arrived after the header terminator
+/// in the same read(s). The caller must forward those trailing bytes (an
+/// absolute-form POST body, or a client that wrote early after CONNECT)
+/// before relaying — dropping them would hang or corrupt the request.
+pub async fn read_head(stream: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>), SandboxdError> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     loop {
@@ -176,11 +195,10 @@ pub async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, SandboxdError>
             return Err(SandboxdError::Protocol("request head too large".into()));
         }
         if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            // Trim to the end of the head; the body (if any) is handled by
-            // the relay, not parsed here.
             let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let pending = buf[end..].to_vec();
             buf.truncate(end);
-            return Ok(buf);
+            return Ok((buf, pending));
         }
     }
 }
@@ -244,6 +262,8 @@ async fn audit(
 
 /// Relay with a total byte cap. Returns (egress_bytes, ingress_bytes).
 /// When the cap is hit, both directions are shut down: `capped` is true.
+/// A connection with no bytes in either direction for RELAY_IDLE_TIMEOUT
+/// is closed (idle, not capped).
 pub async fn relay_capped(
     guest: &mut TcpStream,
     upstream: &mut TcpStream,
@@ -254,6 +274,10 @@ pub async fn relay_capped(
     let mut capped = false;
     let mut gbuf = [0u8; 8192];
     let mut ubuf = [0u8; 8192];
+    // Idle connections are closed: without this a guest can hold relay
+    // tasks (and semaphore permits) open forever at zero cost.
+    let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
+    tokio::pin!(idle);
 
     loop {
         if egress + ingress >= cap {
@@ -265,6 +289,7 @@ pub async fn relay_capped(
                 match r {
                     Ok(0) => break,
                     Ok(n) => {
+                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
                         let allowed = (cap - egress - ingress).min(n as u64) as usize;
                         if upstream.write_all(&gbuf[..allowed]).await.is_err() { break; }
                         egress += allowed as u64;
@@ -277,6 +302,7 @@ pub async fn relay_capped(
                 match r {
                     Ok(0) => break,
                     Ok(n) => {
+                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
                         let allowed = (cap - egress - ingress).min(n as u64) as usize;
                         if guest.write_all(&ubuf[..allowed]).await.is_err() { break; }
                         ingress += allowed as u64;
@@ -285,6 +311,7 @@ pub async fn relay_capped(
                     Err(_) => break,
                 }
             }
+            _ = &mut idle => break,
         }
     }
     (egress, ingress, capped)
@@ -294,6 +321,7 @@ pub async fn relay_capped(
 pub struct Proxy<U: DnsUpstream> {
     cfg: ProxyConfig,
     resolver: Arc<Mutex<HostPolicyResolver<U>>>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl<U: DnsUpstream + 'static> Proxy<U> {
@@ -301,26 +329,94 @@ impl<U: DnsUpstream + 'static> Proxy<U> {
         Self {
             cfg,
             resolver: Arc::new(Mutex::new(resolver)),
+            semaphore: Arc::new(Semaphore::new(MAX_PROXY_CONNECTIONS)),
         }
     }
 
     /// Serve forever on `listener`.
     pub async fn serve(&self, listener: TcpListener) -> ! {
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
+            let (stream, _peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => {
+                    // A persistent accept failure (fd exhaustion, ...)
+                    // must not spin the loop at 100% CPU.
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
             };
+            // Bound concurrent connections: when the guest already holds
+            // every permit, the accept loop waits here (backpressure)
+            // instead of spawning unbounded tasks.
+            let permit = self
+                .semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("proxy semaphore is never closed");
             let cfg = self.cfg.clone();
             let resolver = self.resolver.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 handle_one(stream, &cfg, &resolver).await;
             });
         }
     }
 }
 
+/// Resolve an authorized destination to a dialable IP.
+///
+/// IP literals never touch DNS: the resolver cannot parse the bracketed
+/// form (`ToSocketAddrs` rejects brackets), and a literal needs no
+/// resolution. The literal already passed `deny_ip` inside
+/// `check_destination` (deny flags beat the allowlist); it is re-checked
+/// here as defense in depth.
+///
+/// For DNS names the pin cache is consulted first under a briefly-held
+/// async lock (no I/O there). On a miss the blocking upstream resolution
+/// (`getaddrinfo` + pin-file write) runs on the blocking pool with the
+/// lock held there — never on a tokio worker — so one slow authoritative
+/// server cannot stall every other connection of the run.
+async fn resolve_destination<U: DnsUpstream + 'static>(
+    resolver: &Arc<Mutex<HostPolicyResolver<U>>>,
+    dest: &network::EgressDestination,
+    policy: &crate::contracts::NetworkPolicy,
+) -> Result<IpAddr, SandboxdError> {
+    if let Ok(literal) = dest
+        .host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    {
+        network::deny_ip(literal, policy)?;
+        return Ok(literal);
+    }
+    // Fast path: pinned names need no I/O, so the async lock is held only
+    // for a HashMap lookup. (A name can only be pinned after passing the
+    // allowlist gate in `HostPolicyResolver::resolve`.)
+    let cached = {
+        let r = resolver.lock().await;
+        r.cached(&dest.host)
+    };
+    let addrs = match cached {
+        Some(addrs) => addrs,
+        None => {
+            let resolver = resolver.clone();
+            let host = dest.host.clone();
+            tokio::task::spawn_blocking(move || resolver.blocking_lock().resolve(&host))
+                .await
+                .map_err(|e| SandboxdError::State(format!("dns resolver task failed: {e}")))??
+        }
+    };
+    let ip = *addrs
+        .first()
+        .ok_or_else(|| SandboxdError::DnsDenied("no address".into()))?;
+    network::deny_ip(ip, policy)?;
+    Ok(ip)
+}
+
 /// Authorize + resolve + relay one guest connection.
-async fn handle_one<U: DnsUpstream>(
+async fn handle_one<U: DnsUpstream + 'static>(
     mut guest: TcpStream,
     cfg: &ProxyConfig,
     resolver: &Arc<Mutex<HostPolicyResolver<U>>>,
@@ -339,19 +435,20 @@ async fn handle_one<U: DnsUpstream>(
     };
 
     let outcome: Result<(), SandboxdError> = async {
-        let head = read_head(&mut guest).await?;
+        // The guest gets HEAD_TIMEOUT to deliver a request head; a
+        // slowloris must not pin a connection (and a semaphore permit)
+        // forever. `pending` holds bytes that arrived after the header
+        // terminator in the same read(s).
+        let (head, pending) = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut guest))
+            .await
+            .map_err(|_| SandboxdError::Protocol("request head timeout".into()))??;
         req = parse_request(&head)?;
         // 1. Allowlist authorization (typed scheme/host/port).
         let dest = network::check_destination(&cfg.network, &req.scheme, &req.host, req.port)?;
-        // 2. Pinned resolution + literal re-validation (defense in depth).
-        let ip = {
-            let mut r = resolver.lock().await;
-            let addrs = r.resolve(&dest.host)?;
-            *addrs
-                .first()
-                .ok_or_else(|| SandboxdError::DnsDenied("no address".into()))?
-        };
-        network::deny_ip(ip, &cfg.network)?;
+        // 2. Resolution (literals skip DNS) + literal re-validation
+        //    (defense in depth: even a compromised resolver path cannot
+        //    smuggle a metadata/private address through).
+        let ip = resolve_destination(resolver, &dest, &cfg.network).await?;
         ip_str = ip.to_string();
 
         let mut upstream = TcpStream::connect(SocketAddr::new(ip, dest.port))
@@ -372,7 +469,23 @@ async fn handle_one<U: DnsUpstream>(
                 .map_err(SandboxdError::Io)?;
             egress += req.head.len() as u64;
         }
-        let (e, i, capped) = relay_capped(&mut guest, &mut upstream, cfg.byte_cap).await;
+        // Bytes that arrived with the head (an absolute-form POST body, or
+        // a client that wrote early after CONNECT) are forwarded before
+        // the relay — dropping them would hang or corrupt the request —
+        // and count toward the byte cap like any other egress bytes.
+        if !pending.is_empty() {
+            upstream
+                .write_all(&pending)
+                .await
+                .map_err(SandboxdError::Io)?;
+            egress += pending.len() as u64;
+        }
+        let (e, i, capped) = relay_capped(
+            &mut guest,
+            &mut upstream,
+            cfg.byte_cap.saturating_sub(egress),
+        )
+        .await;
         egress += e;
         ingress += i;
         if capped {
@@ -523,6 +636,53 @@ mod tests {
         let (e, i, capped) = relay_capped(&mut g1, &mut u1, 100).await;
         assert!(capped, "cap was not hit");
         assert!(e + i <= 100, "e={e} i={i}");
+    }
+
+    #[tokio::test]
+    async fn read_head_returns_trailing_bytes() {
+        // An absolute-form POST usually arrives with the body in the same
+        // segment as the head. read_head must return those trailing bytes
+        // so the caller can forward them instead of dropping them.
+        async fn pair() -> (TcpStream, TcpStream) {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            let c = tokio::spawn(async move { TcpStream::connect(a).await.unwrap() });
+            let (s, _) = l.accept().await.unwrap();
+            (s, c.await.unwrap())
+        }
+        let (mut server, mut client) = pair().await;
+        let full = b"POST http://api.example.com:8080/submit HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 11\r\n\r\nhello world";
+        client.write_all(full).await.unwrap();
+
+        let (head, pending) = read_head(&mut server).await.unwrap();
+        assert!(head.ends_with(b"\r\n\r\n"));
+        assert_eq!(pending, b"hello world");
+        assert_eq!([head.clone(), pending].concat(), full);
+        // The head alone still parses.
+        let req = parse_request(&head).unwrap();
+        assert_eq!(req.scheme, "http");
+        assert_eq!(req.host, "api.example.com");
+        assert_eq!(req.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_skips_dns() {
+        // An allowlisted IPv6 literal must connect without DNS: the
+        // resolver cannot parse the bracketed form (ToSocketAddrs rejects
+        // brackets), and a literal needs no resolution.
+        struct PanicUpstream;
+        impl DnsUpstream for PanicUpstream {
+            fn resolve(&self, _name: &str) -> Result<Vec<IpAddr>, SandboxdError> {
+                panic!("DNS must not be consulted for IP literals");
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let pol = policy(&["tcp://[2606:4700:4700::1111]:443"]);
+        let resolver = HostPolicyResolver::new(tmp.path(), PanicUpstream, pol.clone()).unwrap();
+        let resolver = Arc::new(Mutex::new(resolver));
+        let dest = network::check_destination(&pol, "tcp", "[2606:4700:4700::1111]", 443).unwrap();
+        let ip = resolve_destination(&resolver, &dest, &pol).await.unwrap();
+        assert_eq!(ip, "2606:4700:4700::1111".parse::<IpAddr>().unwrap());
     }
 
     #[tokio::test]
