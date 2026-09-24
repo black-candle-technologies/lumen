@@ -3173,6 +3173,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-protocol"
+version = "0.1.0"
+dependencies = [
+ "lumen-core",
+ "serde_json",
+]
+
+[[package]]
 name = "lumen-server"
 version = "0.1.0"
 dependencies = [
