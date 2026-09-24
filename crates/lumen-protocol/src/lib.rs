@@ -55,14 +55,14 @@ pub use lumen_core::pi_boundary::{canonical_digest, canonical_json};
 // Policy decision contract
 // ---------------------------------------------------------------------------
 pub use lumen_core::pi_boundary::{
-    POLICY_DECISION_VERSION, DecisionOutcome, DenyReason, Obligation, PolicyDecision,
+    DecisionOutcome, DenyReason, Obligation, POLICY_DECISION_VERSION, PolicyDecision,
 };
 
 // ---------------------------------------------------------------------------
 // Pi bridge contract
 // ---------------------------------------------------------------------------
 pub use lumen_core::pi_boundary::{
-    PIBRIDGE_VERSION, BridgeCancellation, BridgeEvent, BridgeToolRequest,
+    BridgeCancellation, BridgeEvent, BridgeToolRequest, PIBRIDGE_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ pub use lumen_core::pi_boundary::{
 // Sandbox driver contract
 // ---------------------------------------------------------------------------
 pub use lumen_core::pi_boundary::{
-    SANDBOX_DRIVER_VERSION, ExportedFile, NullSandboxDriver, OutputChunk, OutputSink,
+    ExportedFile, NullSandboxDriver, OutputChunk, OutputSink, SANDBOX_DRIVER_VERSION,
     SandboxDriver, SandboxHandle, SandboxOutcome, SandboxProfile, SandboxQuotas, SandboxSpec,
     StreamStats,
 };
@@ -85,8 +85,7 @@ pub use lumen_core::pi_boundary::{
 // Kernel wire protocol contract
 // ---------------------------------------------------------------------------
 pub use lumen_core::pi_boundary::{
-    KERNEL_MAX_RECORD_BYTES, KERNEL_WIRE_PROTOCOL, KernelWireRequest, KernelWireResponse,
-    WireError,
+    KERNEL_MAX_RECORD_BYTES, KERNEL_WIRE_PROTOCOL, KernelWireRequest, KernelWireResponse, WireError,
 };
 
 // ---------------------------------------------------------------------------

@@ -76,7 +76,10 @@ fn facade_sandbox_driver_fixture() {
 fn facade_kernel_wire_fixtures() {
     let request: KernelWireRequest =
         serde_json::from_value(fixture("kernel_wire_request.v1.json")).unwrap();
-    request.envelope.validate().expect("wire envelope validates");
+    request
+        .envelope
+        .validate()
+        .expect("wire envelope validates");
 
     let response: KernelWireResponse =
         serde_json::from_value(fixture("kernel_wire_response.v1.json")).unwrap();
