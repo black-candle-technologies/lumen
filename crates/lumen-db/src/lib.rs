@@ -17,7 +17,7 @@ mod routing;
 mod trust_gate;
 mod vhl;
 
-pub use lease::KernelKeyGenerationRow;
+pub use lease::{KernelKeyGenerationRow, KernelSessionRow, PurgeOutcome};
 pub use vhl::VhlRequestRow;
 mod worker;
 

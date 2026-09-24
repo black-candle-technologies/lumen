@@ -1850,7 +1850,7 @@ mod tests {
     fn finite_execution_budget_depletes() {
         let (keys, _, session_vk) = test_keys();
         let mut sessions = SessionRegistry::new();
-        sessions.register("ed25519:parent-session".to_string(), None, session_vk);
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
         let ledger = BudgetLedger::new();
         let nonces = NonceStore::new();
         let r = FakeResolver::default();
@@ -2086,7 +2086,7 @@ mod tests {
         let (keys, _, session_vk) = test_keys();
         let vhl_key = SigningKey::generate(&mut OsRng);
         let mut sessions = SessionRegistry::new();
-        sessions.register("ed25519:parent-session".to_string(), None, session_vk);
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
         let ledger = BudgetLedger::new();
         let nonces = NonceStore::new();
         let r = FakeResolver::default();

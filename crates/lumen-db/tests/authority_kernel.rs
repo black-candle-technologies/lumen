@@ -65,11 +65,12 @@ fn fixture() -> Fixture {
     let session_vk = session_key.verifying_key();
     let child_key = SigningKey::generate(&mut OsRng);
     let mut sessions = SessionRegistry::new();
-    sessions.register("ed25519:parent-session".to_string(), None, session_vk);
+    sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
     sessions.register(
         "ed25519:child-session".to_string(),
         Some("ed25519:parent-session".to_string()),
         child_key.verifying_key(),
+        0,
     );
     Fixture {
         keys,

@@ -67,6 +67,7 @@ async fn insert_lease(db: &Database, ws: &WorkspaceId, lease_id: &str) {
         "ed25519:parent-session".to_string(),
         None,
         keys.issuer_verifying(),
+        0,
     );
     let ledger = BudgetLedger::new();
     let nonces = NonceStore::new();
@@ -574,6 +575,7 @@ async fn one_shot_use_is_single_use() {
         "ed25519:parent-session".to_string(),
         None,
         keys.issuer_verifying(),
+        0,
     );
     let ledger = BudgetLedger::new();
     let nonces = NonceStore::new();

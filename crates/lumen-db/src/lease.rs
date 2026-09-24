@@ -1389,6 +1389,336 @@ impl Database {
             })
             .collect()
     }
+
+    // ------------------------------------------------------------------
+    // Kernel sessions (migration 0027)
+    // ------------------------------------------------------------------
+
+    /// Insert a session record: public identity only (subject, parent,
+    /// verifying key, liveness). Fails closed on a duplicate subject: a
+    /// session row is created once, at session start.
+    pub async fn insert_kernel_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        subject: &str,
+        parent_subject: Option<&str>,
+        verifying_key_hex: &str,
+        created_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO kernel_sessions(workspace_id,subject,parent_subject,verifying_key_hex,
+             active,created_at_ms,destroyed_at_ms)
+             VALUES(?,?,?,?,1,?,NULL)",
+        )
+        .bind(ws(workspace_id))
+        .bind(subject)
+        .bind(parent_subject)
+        .bind(verifying_key_hex)
+        .bind(created_at_ms)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Perform the destroy transition (active 1 -> 0 with a destroy
+    /// timestamp). The `kernel_sessions_destroy_only` trigger enforces the
+    /// transition shape; the `active=1` predicate makes a repeated destroy
+    /// a no-op instead of an error. Returns true when a row changed.
+    pub async fn destroy_kernel_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        subject: &str,
+        destroyed_at_ms: i64,
+    ) -> Result<bool, RepositoryError> {
+        let res = sqlx::query(
+            "UPDATE kernel_sessions SET active=0,destroyed_at_ms=?
+             WHERE workspace_id=? AND subject=? AND active=1",
+        )
+        .bind(destroyed_at_ms)
+        .bind(ws(workspace_id))
+        .bind(subject)
+        .execute(self.pool())
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// One session row by subject, or None.
+    pub async fn kernel_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        subject: &str,
+    ) -> Result<Option<KernelSessionRow>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT subject,parent_subject,verifying_key_hex,active,created_at_ms,destroyed_at_ms
+             FROM kernel_sessions WHERE workspace_id=? AND subject=?",
+        )
+        .bind(ws(workspace_id))
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|r| session_from_row(&r)).transpose()
+    }
+
+    /// Every active session, oldest first: the set the kernel hydrates its
+    /// validating-only registry from at open.
+    pub async fn active_kernel_sessions(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<KernelSessionRow>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT subject,parent_subject,verifying_key_hex,active,created_at_ms,destroyed_at_ms
+             FROM kernel_sessions WHERE workspace_id=? AND active=1
+             ORDER BY created_at_ms,subject",
+        )
+        .bind(ws(workspace_id))
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(session_from_row).collect()
+    }
+
+    /// Destroy-transition for every active session older than `ttl_ms`
+    /// (`created_at_ms + ttl_ms <= now_ms`): the durable session-TTL
+    /// rotation that bounds the stolen-session-key window. Returns the
+    /// destroyed subjects.
+    pub async fn expire_kernel_sessions(
+        &self,
+        workspace_id: &WorkspaceId,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let subjects: Vec<String> = sqlx::query_scalar(
+            "UPDATE kernel_sessions SET active=0,destroyed_at_ms=?
+             WHERE workspace_id=? AND active=1 AND created_at_ms+?<=?
+             RETURNING subject",
+        )
+        .bind(now_ms)
+        .bind(ws(workspace_id))
+        .bind(ttl_ms)
+        .bind(now_ms)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(subjects)
+    }
+
+    /// Destroy the named sessions AND revoke the named leases in ONE
+    /// transaction: the durable counterpart of session termination. Either
+    /// every destroy transition and every revocation commits, or none do —
+    /// a restart can never resurrect a destroyed session nor lose the
+    /// revocations that termination requires.
+    pub async fn destroy_sessions_and_revoke(
+        &self,
+        workspace_id: &WorkspaceId,
+        subjects: &[String],
+        lease_ids: &[String],
+        at_ms: i64,
+        reason: &str,
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool().begin().await?;
+        if !subjects.is_empty() {
+            use sqlx::QueryBuilder;
+            let mut qb: QueryBuilder<sqlx::Sqlite> =
+                QueryBuilder::new("UPDATE kernel_sessions SET active=0,destroyed_at_ms=");
+            qb.push_bind(at_ms);
+            qb.push(" WHERE workspace_id=");
+            qb.push_bind(ws(workspace_id));
+            qb.push(" AND active=1 AND subject IN (");
+            let mut separated = qb.separated(", ");
+            for subject in subjects {
+                separated.push_bind(subject);
+            }
+            separated.push_unseparated(")");
+            qb.build().execute(&mut *tx).await?;
+        }
+        for lease_id in lease_ids {
+            sqlx::query(
+                "INSERT OR IGNORE INTO kernel_revocations(lease_id,workspace_id,revoked_at_ms,reason)
+                 VALUES(?,?,?,?)",
+            )
+            .bind(lease_id)
+            .bind(ws(workspace_id))
+            .bind(at_ms)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Kill-list and generation purge (migration 0027)
+    // ------------------------------------------------------------------
+
+    /// Record a generation kill: the compromise-response primitive.
+    /// Verification fails closed for a killed generation even though its
+    /// verifying key stays recorded. Idempotent: killing twice is a no-op.
+    /// `role` must be `issuer` or `host` (validated in Rust; the CHECK would
+    /// also reject anything else, but the caller deserves a clear error).
+    pub async fn kill_key_generation(
+        &self,
+        workspace_id: &WorkspaceId,
+        key_id: &str,
+        role: &str,
+        killed_at_ms: i64,
+        reason: &str,
+    ) -> Result<bool, RepositoryError> {
+        if role != "issuer" && role != "host" {
+            return Err(RepositoryError::InvalidKernelLeaseState(format!(
+                "kill_key_generation: invalid role {role:?}"
+            )));
+        }
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO kernel_killed_generations
+             (workspace_id,key_id,role,killed_at_ms,reason)
+             VALUES(?,?,?,?,?)",
+        )
+        .bind(ws(workspace_id))
+        .bind(key_id)
+        .bind(role)
+        .bind(killed_at_ms)
+        .bind(reason)
+        .execute(self.pool())
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Every killed generation id for the workspace: the set the kernel
+    /// loads into its in-memory kill set at open.
+    pub async fn killed_key_generation_ids(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<HashSet<String>, RepositoryError> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT key_id FROM kernel_killed_generations WHERE workspace_id=?")
+                .bind(ws(workspace_id))
+                .fetch_all(self.pool())
+                .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Live references to a generation: leases with `issuer_key_id=key_id`
+    /// that are neither revoked nor expired (`expires_at_ms > now_ms`).
+    /// This is the purge gate: a nonzero count means deleting the
+    /// generation would orphan outstanding leases, so the purge refuses.
+    pub async fn live_lease_refs_to_generation(
+        &self,
+        workspace_id: &WorkspaceId,
+        key_id: &str,
+        now_ms: i64,
+    ) -> Result<u64, RepositoryError> {
+        let mut tx = self.pool().begin().await?;
+        let n = live_lease_refs_tx(&mut tx, workspace_id, key_id, now_ms).await?;
+        tx.commit().await?;
+        Ok(n)
+    }
+
+    /// Every live lease document (unexpired, unrevoked): the set the
+    /// re-validation self-check walks at open.
+    pub async fn kernel_live_leases(
+        &self,
+        workspace_id: &WorkspaceId,
+        now_ms: i64,
+    ) -> Result<Vec<LeaseDocument>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT lease_id,parent_id,subject,issuer_key_id,issued_at_ms,protocol_version,
+             scope_json,limits_json,depth,depth_limit,lease_nonce,signature
+             FROM kernel_leases l
+             WHERE l.workspace_id=?
+               AND json_extract(l.limits_json,'$.expires_at_ms')>?
+               AND NOT EXISTS (
+                 SELECT 1 FROM kernel_revocations r
+                 WHERE r.workspace_id=l.workspace_id AND r.lease_id=l.lease_id
+               )
+             ORDER BY l.issued_at_ms,l.lease_id",
+        )
+        .bind(ws(workspace_id))
+        .bind(now_ms)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(lease_from_row).collect()
+    }
+
+    /// True when any audit checkpoint in the workspace references `key_id`
+    /// with `created_at >= since_ms`. Host generations with retained
+    /// checkpoints must not be purged, or audit history would become
+    /// unverifiable.
+    pub async fn host_generation_has_retained_checkpoints(
+        &self,
+        workspace_id: &WorkspaceId,
+        key_id: &str,
+        since_ms: i64,
+    ) -> Result<bool, RepositoryError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kernel_audit_checkpoints
+             WHERE workspace_id=? AND key_id=? AND created_at>=?",
+        )
+        .bind(ws(workspace_id))
+        .bind(key_id)
+        .bind(since_ms)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(n > 0)
+    }
+
+    /// Purge one generation row, atomically gated on the live-lease
+    /// predicate and a purge permit.
+    ///
+    /// The purge runs on a single pooled connection: the permit row is
+    /// inserted, the predicate re-verified, and the generation row deleted
+    /// inside one transaction, and the permit row is removed before commit
+    /// (a lease minted between check and delete would otherwise be
+    /// orphaned). The permit is therefore never visible outside the
+    /// purging transaction — a crashed purge rolls it back, and it cannot
+    /// leak onto a reused pooled connection to authorize an unrelated
+    /// delete. Host generations additionally refuse when retained
+    /// checkpoints reference them (the `host_retention_ms` window): purging
+    /// those would make audit history unverifiable.
+    pub async fn purge_key_generation(
+        &self,
+        workspace_id: &WorkspaceId,
+        key_id: &str,
+        now_ms: i64,
+        host_retention_ms: i64,
+    ) -> Result<PurgeOutcome, RepositoryError> {
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM kernel_key_generations WHERE workspace_id=? AND key_id=?",
+        )
+        .bind(ws(workspace_id))
+        .bind(key_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(role) = role else {
+            return Ok(PurgeOutcome::NotFound);
+        };
+        if role == "host"
+            && self
+                .host_generation_has_retained_checkpoints(
+                    workspace_id,
+                    key_id,
+                    now_ms - host_retention_ms,
+                )
+                .await?
+        {
+            return Err(RepositoryError::InvalidKernelLeaseState(format!(
+                "purge refused: host generation {key_id} has retained checkpoints"
+            )));
+        }
+        let mut conn = self.pool().acquire().await?;
+        // Defensive: a reused pooled connection must never carry a
+        // leftover permit row into the purge.
+        sqlx::query("DELETE FROM _kernel_key_purge_permit")
+            .execute(&mut *conn)
+            .await?;
+        let outcome = purge_key_generation_permitted(&mut conn, workspace_id, key_id, now_ms).await;
+        // Belt-and-braces: the permit row is inserted and removed inside
+        // the purge transaction, so it is never visible outside it; this
+        // guarantees no residue on the pooled connection whatever path the
+        // purge took.
+        sqlx::query("DELETE FROM _kernel_key_purge_permit")
+            .execute(&mut *conn)
+            .await?;
+        outcome
+    }
 }
 
 /// One recorded kernel key generation: a retired or live generation's
@@ -1399,6 +1729,108 @@ pub struct KernelKeyGenerationRow {
     pub role: String,
     pub verifying_key_hex: String,
     pub created_at_ms: i64,
+}
+
+/// One durable session registry row: public identity only — subject,
+/// parent, verifying key, liveness. Private keys are never persisted.
+#[derive(Clone, Debug)]
+pub struct KernelSessionRow {
+    pub subject: String,
+    pub parent_subject: Option<String>,
+    pub verifying_key_hex: String,
+    pub active: bool,
+    pub created_at_ms: i64,
+    pub destroyed_at_ms: Option<i64>,
+}
+
+/// Outcome of [`Database::purge_key_generation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    /// The generation row was deleted.
+    Purged,
+    /// The row was kept: at least one live lease still references it.
+    StillReferenced,
+    /// No row exists for (workspace_id, key_id).
+    NotFound,
+}
+
+fn session_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<KernelSessionRow, RepositoryError> {
+    Ok(KernelSessionRow {
+        subject: r.get("subject"),
+        parent_subject: r.get("parent_subject"),
+        verifying_key_hex: r.get("verifying_key_hex"),
+        active: r.get::<i64, _>("active") != 0,
+        created_at_ms: r.get("created_at_ms"),
+        destroyed_at_ms: r.get("destroyed_at_ms"),
+    })
+}
+
+/// Live references to a generation inside `tx`: leases with
+/// `issuer_key_id=key_id` that are neither revoked nor expired. Shared by
+/// [`Database::live_lease_refs_to_generation`] and the purge path, which
+/// must re-verify the predicate on the same connection that deletes.
+async fn live_lease_refs_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    key_id: &str,
+    now_ms: i64,
+) -> Result<u64, RepositoryError> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kernel_leases l
+         WHERE l.workspace_id=? AND l.issuer_key_id=?
+           AND json_extract(l.limits_json,'$.expires_at_ms')>?
+           AND NOT EXISTS (
+             SELECT 1 FROM kernel_revocations r
+             WHERE r.workspace_id=l.workspace_id AND r.lease_id=l.lease_id
+           )",
+    )
+    .bind(ws(workspace_id))
+    .bind(key_id)
+    .bind(now_ms)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(n as u64)
+}
+
+/// Run the guarded delete: re-verify the live-lease predicate, insert the
+/// permit row, delete the generation row, and remove the permit row in one
+/// transaction. The trigger authorizes the delete because the permit row is
+/// visible inside this transaction — and only inside it, so the permit can
+/// never authorize a delete from any other transaction or connection.
+async fn purge_key_generation_permitted(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    key_id: &str,
+    now_ms: i64,
+) -> Result<PurgeOutcome, RepositoryError> {
+    use sqlx::Acquire;
+    let mut tx = (&mut *conn).begin().await?;
+    if live_lease_refs_tx(&mut tx, workspace_id, key_id, now_ms).await? != 0 {
+        tx.rollback().await?;
+        return Ok(PurgeOutcome::StillReferenced);
+    }
+    sqlx::query("INSERT INTO _kernel_key_purge_permit(key_id) VALUES(?)")
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await?;
+    let deleted =
+        sqlx::query("DELETE FROM kernel_key_generations WHERE workspace_id=? AND key_id=?")
+            .bind(ws(workspace_id))
+            .bind(key_id)
+            .execute(&mut *tx)
+            .await?;
+    if deleted.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(PurgeOutcome::NotFound);
+    }
+    // Remove the permit before commit: it must never be visible outside
+    // this transaction.
+    sqlx::query("DELETE FROM _kernel_key_purge_permit WHERE key_id=?")
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(PurgeOutcome::Purged)
 }
 
 /// Parameters for one audit event append, mirroring the frozen v1
