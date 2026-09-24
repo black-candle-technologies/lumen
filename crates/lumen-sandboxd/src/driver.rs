@@ -1216,18 +1216,22 @@ impl Driver {
                 return Ok(r.clone());
             }
         }
-        let join = {
+        // Hold the whole `SupervisorHandle` (not just its `JoinHandle`) across
+        // the await. Dropping the handle drops its `watch::Sender`; a dropped
+        // sender makes the supervisor task's `cancel_rx.changed()` resolve
+        // with `Err`, which the supervise `select!` loop would misread as a
+        // cancel request and abort the run early (losing output/exports).
+        let sup = {
             let mut live = self.inner.live.lock().unwrap();
             let lr = live
                 .get_mut(run_id)
                 .ok_or_else(|| SandboxdError::RunState(format!("no live run: {run_id}")))?;
-            let sup = lr
-                .supervisor
+            lr.supervisor
                 .take()
-                .ok_or_else(|| SandboxdError::RunState("run not started".into()))?;
-            sup.join
+                .ok_or_else(|| SandboxdError::RunState("run not started".into()))?
         };
-        let outcome = join
+        let outcome = sup
+            .join
             .await
             .map_err(|e| SandboxdError::Host(format!("supervisor panicked: {e}")))?;
         let export_manifest = if outcome.staged.is_empty() {
@@ -1364,6 +1368,25 @@ impl Driver {
         // Remove the jailer chroot tree (best effort; the jailer owns it).
         if let Some(id_dir) = record.artifacts.chroot_dir.parent() {
             let _ = std::fs::remove_dir_all(id_dir);
+        }
+        // Remove the top-level jailer diagnostic logs. They live directly in
+        // the chroot base (`chroot_base/jailer-{id}.log` and
+        // `chroot_base/jailer-cmd-{id}.log`), not under the per-run id dir,
+        // so the `remove_dir_all` above leaves them behind.
+        // `chroot_dir` is `<chroot_base>/<exec_file_name>/<jail_id>/root`.
+        if let Some(chroot_base) = record
+            .artifacts
+            .chroot_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            for name in [
+                format!("jailer-{}.log", record.artifacts.jail_id),
+                format!("jailer-cmd-{}.log", record.artifacts.jail_id),
+            ] {
+                let _ = std::fs::remove_file(chroot_base.join(name));
+            }
         }
         // The state file lives inside the run_dir, which we just removed.
         // "No state file" IS the Destroyed state: a subsequent load fails

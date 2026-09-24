@@ -47,6 +47,6 @@ echo "--- Running KVM-gated tests ---"
 # They boot real microVMs and verify isolation properties.
 cargo test --release -p lumen-sandboxd --features kvm --offline -- \
     --test-threads=1 \
-    kvm::
+    kvm_
 
 echo "=== All KVM tests passed ==="
