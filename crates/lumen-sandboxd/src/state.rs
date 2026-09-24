@@ -716,7 +716,6 @@ mod tests {
 
     pub fn test_spec() -> SandboxRunSpec {
         SandboxRunSpec {
-            protocol_version: 1,
             image_digest: "sha256:test-image".into(),
             kernel_digest: "sha256:test-kernel".into(),
             policy_version: "sandbox-policy-v1".into(),
@@ -736,7 +735,6 @@ mod tests {
             },
             command: vec!["true".into()],
             env: vec![],
-            action_digest: "test-action".into(),
         }
     }
 

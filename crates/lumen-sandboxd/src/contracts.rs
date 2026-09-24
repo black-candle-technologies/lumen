@@ -1,42 +1,34 @@
-//! FROZEN CONTRACT COPY — DO NOT EDIT.
+//! Kernel <-> sandboxd boundary: frozen contract re-exports + runtime shapes.
 //!
-//! Verbatim copy (modulo this header and one doc-link adaptation) of
-//! `crates/lumen-protocol/src/sandbox_driver.rs` as frozen by the phase-0
-//! worker (SandboxDriver v1). The authoritative definition lives in
-//! `lumen-protocol`; this copy exists so the Phase 2 branch builds and
-//! tests standalone. At reconcile, replace this module with a dependency
-//! on `lumen-protocol` — the wire format is identical, so no behavior
-//! changes.
+//! The [`SandboxDriver`] v1 trait and its wire types are FROZEN in phase 0
+//! (`lumen_core::pi_boundary`, re-exported by the `lumen-protocol` facade).
+//! They are re-exported here verbatim and are never redefined: the
+//! Firecracker [`crate::driver::Driver`] implements exactly the trait the
+//! kernel programs against, so a spec serialized by the kernel deserializes
+//! identically here.
 //!
-//! Adaptations vs. the original (doc-only):
-//! - `` [`ActionEnvelope`](crate::ActionEnvelope`) `` rendered as plain
-//!   `ActionEnvelope` (kernel-side type; avoids a broken intra-doc link).
-//!
-//! ---
-//!
-//! SandboxDriver v1: the kernel <-> sandboxd boundary.
-//!
-//! The driver interface is deliberately narrow: prepare, start, stream,
-//! cancel, export, destroy. Policy lives in the kernel; the driver enforces
-//! the run spec it is given. The Firecracker implementation lands in Phase 2;
-//! any driver (gVisor, process jail, ...) must satisfy this same trait.
+//! The remaining types in this module are sandboxd-RUNTIME shapes: the
+//! driver's internal resource configuration, network policy, and rich
+//! result record. They are not wire contracts and may evolve with the
+//! daemon; they are kept here (rather than scattered) because the jailer,
+//! cgroups, network, proxy, export, and driver modules all share them.
 
-use async_trait::async_trait;
+pub use lumen_protocol::{
+    ExportedFile, NetworkResource, OutputChunk, OutputSink, SANDBOX_DRIVER_VERSION, SandboxDriver,
+    SandboxError, SandboxHandle, SandboxOutcome, SandboxProfile, SandboxQuotas, SandboxSpec,
+    StreamStats,
+};
+
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-/// Contract version for [`SandboxRunSpec`]/[`SandboxResult`].
-pub const SANDBOX_DRIVER_VERSION: u32 = 1;
+// ---------------------------------------------------------------------------
+// Runtime-internal shapes (NOT frozen wire contracts)
+// ---------------------------------------------------------------------------
 
-/// Execution profile. v1 implements `Strict` only: one disposable microVM
-/// per action. `Stateful` is a future, separately lease-gated profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SandboxProfile {
-    Strict,
-    Stateful,
-}
-
+/// Host-level resource configuration derived from the frozen
+/// [`SandboxQuotas`] plus daemon defaults. The frozen contract deliberately
+/// carries only the four kernel-visible quotas; knobs like the guest
+/// process cap and the workspace disk cap are daemon policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
@@ -44,19 +36,20 @@ pub struct ResourceLimits {
     pub vcpu: u32,
     /// Memory in MiB.
     pub memory_mib: u64,
-    /// Wall-clock deadline in seconds.
+    /// Wall-clock deadline in seconds (rounded UP from `wall_time_ms` so the
+    /// kernel's deadline is never shortened).
     pub wall_time_secs: u64,
-    /// Max guest processes.
+    /// Max guest processes (daemon default; the v1 contract has no field).
     pub max_processes: u32,
-    /// Writable workspace size cap in MiB.
+    /// Writable workspace size cap in MiB (daemon host limit).
     pub disk_mib: u64,
     /// Max captured stdout+stderr bytes.
     pub max_output_bytes: u64,
 }
 
-/// What the sandbox is allowed to do on the network. Default: everything
-/// denied. v1 supports an explicit allowlist of destinations; richer
-/// proxy mediation arrives with the Firecracker driver in Phase 2.
+/// Egress policy enforced by the proxy/DNS forwarder. Default-deny: an
+/// empty `allow_egress` means no egress at all, and the metadata/private
+/// denials are always enforced regardless of the allowlist.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
@@ -73,27 +66,35 @@ fn default_true() -> bool {
     true
 }
 
+/// Runtime run spec: the daemon's working view of a prepared run. Derived
+/// from the frozen [`SandboxSpec`] by the prepare adapter (see
+/// [`crate::driver::Driver`]'s `SandboxDriver::prepare`), which fills the
+/// fields the v1 contract does not carry:
+///
+/// - `kernel_digest`: resolved from the signed image manifest (the manifest
+///   is the trust root; the kernel cannot nominate a kernel different from
+///   the image's).
+/// - `policy_version`: the daemon-enforced `images.policy_version`.
+/// - `max_processes` / `disk_mib`: daemon host limits.
+/// - `env`: empty; v1 has no kernel->guest env channel (secrets arrive via
+///   the brokered `grant_secrets` path, never the spec).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxRunSpec {
-    pub protocol_version: u32,
     /// Digest of the approved guest image (never a floating tag).
     pub image_digest: String,
-    /// Digest of the guest kernel.
+    /// Digest of the guest kernel, from the signed image manifest.
     pub kernel_digest: String,
-    /// Sandbox policy document version applied to this run.
+    /// Daemon-enforced sandbox policy document version.
     pub policy_version: String,
     pub profile: SandboxProfile,
     pub limits: ResourceLimits,
     pub network: NetworkPolicy,
     /// Command to execute inside the guest.
     pub command: Vec<String>,
-    /// Environment for the guest (secret-free; secret handles arrive via a
-    /// separate one-action channel in Phase 2).
-    #[serde(default)]
+    /// Plain (secret-free) guest environment. Secret-looking names are
+    /// rejected at prepare; secrets arrive via `grant_secrets`.
     pub env: Vec<(String, String)>,
-    /// Digest of the `ActionEnvelope` (kernel-side type) being served.
-    pub action_digest: String,
 }
 
 /// One changed path exported from the guest for kernel-side validation.
@@ -122,50 +123,22 @@ pub struct SandboxUsage {
     pub ingress_bytes: u64,
 }
 
+/// Rich internal result of a completed run. The frozen trait surfaces
+/// completion to the kernel through `stream` (output chunks + [`StreamStats`]);
+/// this record keeps the full outcome for the daemon's local API, journal,
+/// and tests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxResult {
-    pub protocol_version: u32,
     pub exit_code: i32,
     pub timed_out: bool,
-    /// Bounded captured output.
+    /// Bounded captured output (`stdout` ++ `stderr`).
     pub output: String,
+    pub output_truncated: bool,
     pub usage: SandboxUsage,
     /// Manifest for kernel-side writeback validation. `None` when the run
     /// produced no exportable changes.
     pub export_manifest: Option<ExportManifest>,
-}
-
-#[derive(Debug, Error)]
-pub enum SandboxError {
-    #[error("driver fault: {0}")]
-    Driver(String),
-    #[error("run cancelled")]
-    Cancelled,
-    #[error("image digest not approved: {0}")]
-    UnapprovedImage(String),
-    #[error("protocol error: {0}")]
-    Protocol(String),
-}
-
-/// The narrow kernel -> sandboxd interface. Implementations must be
-/// crash-safe: `destroy` is idempotent and a dead run never leaks a VM,
-/// TAP device, or disk layer.
-#[async_trait]
-pub trait SandboxDriver: Send + Sync {
-    /// Reserve resources and validate the spec. Returns a run handle id.
-    async fn prepare(&self, spec: &SandboxRunSpec) -> Result<String, SandboxError>;
-    /// Boot the guest and start the command. Resolves when the guest agent
-    /// handshake completes.
-    async fn start(&self, run_id: &str) -> Result<(), SandboxError>;
-    /// Wait for completion (or deadline) and collect the bounded result.
-    async fn wait(&self, run_id: &str) -> Result<SandboxResult, SandboxError>;
-    /// Cancel a running action; the guest is terminated.
-    async fn cancel(&self, run_id: &str) -> Result<(), SandboxError>;
-    /// Export the change manifest for kernel-side writeback validation.
-    async fn export_manifest(&self, run_id: &str) -> Result<ExportManifest, SandboxError>;
-    /// Terminate the guest, detach devices, scrub disks. Idempotent.
-    async fn destroy(&self, run_id: &str) -> Result<(), SandboxError>;
 }
 
 #[cfg(test)]
@@ -175,7 +148,6 @@ mod tests {
     #[test]
     fn spec_rejects_unknown_fields() {
         let json = serde_json::json!({
-            "protocol_version": 1,
             "image_digest": "sha256:abc",
             "kernel_digest": "sha256:def",
             "policy_version": "1",
@@ -186,7 +158,7 @@ mod tests {
             },
             "network": {},
             "command": ["true"],
-            "action_digest": "abc",
+            "env": [],
             "smuggled": true
         });
         assert!(serde_json::from_value::<SandboxRunSpec>(json).is_err());
@@ -195,7 +167,6 @@ mod tests {
     #[test]
     fn default_network_policy_denies_metadata_and_private() {
         let json = serde_json::json!({
-            "protocol_version": 1,
             "image_digest": "sha256:abc",
             "kernel_digest": "sha256:def",
             "policy_version": "1",
@@ -206,11 +177,25 @@ mod tests {
             },
             "network": {},
             "command": ["true"],
-            "action_digest": "abc"
+            "env": []
         });
         let spec: SandboxRunSpec = serde_json::from_value(json).unwrap();
         assert!(spec.network.deny_metadata);
         assert!(spec.network.deny_private_ranges);
         assert!(spec.network.allow_egress.is_empty());
+    }
+
+    #[test]
+    fn frozen_handle_round_trips() {
+        // The frozen boundary types must survive a JSON round trip with the
+        // exact field names the kernel uses.
+        let handle = SandboxHandle {
+            version: SANDBOX_DRIVER_VERSION,
+            run_id: uuid::Uuid::nil(),
+        };
+        let json = serde_json::to_value(&handle).unwrap();
+        assert_eq!(json["version"], 1);
+        let back: SandboxHandle = serde_json::from_value(json).unwrap();
+        assert_eq!(back, handle);
     }
 }

@@ -22,7 +22,7 @@ use tokio::{
 
 use crate::{
     config::ApiConfig,
-    contracts::{ExportManifest, SandboxDriver, SandboxError, SandboxResult, SandboxRunSpec},
+    contracts::{SandboxDriver, SandboxError, SandboxHandle, SandboxSpec},
     driver::Driver,
     error::SandboxdError,
 };
@@ -215,24 +215,61 @@ async fn handle_conn(
 /// Map a SandboxError to an API error code.
 fn sandbox_error_code(e: &SandboxError) -> String {
     match e {
-        SandboxError::Driver(_) => "driver_fault",
-        SandboxError::Cancelled => "cancelled",
-        SandboxError::UnapprovedImage(_) => "unapproved_image",
-        SandboxError::Protocol(_) => "protocol",
+        SandboxError::Unavailable(_) => "unavailable",
+        SandboxError::RunFailed(_) => "run_failed",
+        SandboxError::QuotaExceeded(_) => "quota_exceeded",
     }
     .to_string()
 }
 
+/// Parse the frozen [`SandboxHandle`] from request params.
+fn get_handle(params: &serde_json::Value) -> Option<SandboxHandle> {
+    params
+        .get("handle")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
 /// Dispatch one API request to the driver.
+///
+/// The method set mirrors the frozen [`SandboxDriver`] trait 1:1
+/// (`prepare`/`start`/`stream`/`cancel`/`export`/`destroy`); params carry
+/// the frozen wire types (`SandboxSpec` for prepare, `SandboxHandle` for
+/// the rest).
 async fn dispatch(driver: &Arc<Driver>, req: ApiRequest) -> ApiResponse {
+    // Helper: run a handle-taking driver method and wrap errors.
+    async fn with_handle<F, Fut>(
+        driver: &Arc<Driver>,
+        params: &serde_json::Value,
+        f: F,
+    ) -> Result<serde_json::Value, ApiError>
+    where
+        F: FnOnce(Arc<Driver>, SandboxHandle) -> Fut,
+        Fut: std::future::Future<Output = Result<serde_json::Value, SandboxError>> + Send,
+    {
+        match get_handle(params) {
+            Some(h) => f(driver.clone(), h).await.map_err(|e| ApiError {
+                code: sandbox_error_code(&e),
+                message: e.to_string(),
+            }),
+            None => Err(ApiError {
+                code: "invalid_params".into(),
+                message: "missing or malformed handle".into(),
+            }),
+        }
+    }
+
     let result = match req.method.as_str() {
         "prepare" => {
-            let spec: Result<SandboxRunSpec, _> = serde_json::from_value(req.params);
+            let spec: Result<SandboxSpec, _> = serde_json::from_value(req.params);
             match spec {
                 Ok(s) => driver
                     .prepare(&s)
                     .await
-                    .map(|id| serde_json::json!({ "run_id": id }))
+                    .and_then(|h| {
+                        serde_json::to_value(&h)
+                            .map_err(|e| SandboxError::RunFailed(format!("handle encode: {e}")))
+                    })
+                    .map(|h| serde_json::json!({ "handle": h }))
                     .map_err(|e| ApiError {
                         code: sandbox_error_code(&e),
                         message: e.to_string(),
@@ -244,93 +281,42 @@ async fn dispatch(driver: &Arc<Driver>, req: ApiRequest) -> ApiResponse {
             }
         }
         "start" => {
-            let run_id = get_run_id(&req.params);
-            match run_id {
-                Some(id) => driver
-                    .start(&id)
-                    .await
-                    .map(|_| serde_json::json!({}))
-                    .map_err(|e| ApiError {
-                        code: sandbox_error_code(&e),
-                        message: e.to_string(),
-                    }),
-                None => Err(ApiError {
-                    code: "invalid_params".into(),
-                    message: "missing run_id".into(),
-                }),
-            }
+            with_handle(driver, &req.params, |d, h| async move {
+                d.start(&h).await.map(|_| serde_json::json!({}))
+            })
+            .await
         }
-        "wait" => {
-            let run_id = get_run_id(&req.params);
-            match run_id {
-                Some(id) => driver
-                    .wait(&id)
-                    .await
-                    .and_then(|r: SandboxResult| {
-                        serde_json::to_value(r).map_err(|e| SandboxError::Driver(e.to_string()))
-                    })
-                    .map_err(|e| ApiError {
-                        code: sandbox_error_code(&e),
-                        message: e.to_string(),
-                    }),
-                None => Err(ApiError {
-                    code: "invalid_params".into(),
-                    message: "missing run_id".into(),
-                }),
-            }
+        "stream" => {
+            // Uses the Send inherent method, not the trait's `stream`
+            // (whose future is !Send by construction of the frozen
+            // contract): connection tasks are spawned.
+            with_handle(driver, &req.params, |d, h| async move {
+                let (chunks, stats) = d.stream_collect(&h).await?;
+                Ok(serde_json::json!({
+                    "chunks": chunks,
+                    "stats": stats,
+                }))
+            })
+            .await
         }
         "cancel" => {
-            let run_id = get_run_id(&req.params);
-            match run_id {
-                Some(id) => driver
-                    .cancel(&id)
-                    .await
-                    .map(|_| serde_json::json!({}))
-                    .map_err(|e| ApiError {
-                        code: sandbox_error_code(&e),
-                        message: e.to_string(),
-                    }),
-                None => Err(ApiError {
-                    code: "invalid_params".into(),
-                    message: "missing run_id".into(),
-                }),
-            }
+            with_handle(driver, &req.params, |d, h| async move {
+                d.cancel(&h).await.map(|_| serde_json::json!({}))
+            })
+            .await
         }
-        "export_manifest" => {
-            let run_id = get_run_id(&req.params);
-            match run_id {
-                Some(id) => driver
-                    .export_manifest(&id)
-                    .await
-                    .and_then(|m: ExportManifest| {
-                        serde_json::to_value(m).map_err(|e| SandboxError::Driver(e.to_string()))
-                    })
-                    .map_err(|e| ApiError {
-                        code: sandbox_error_code(&e),
-                        message: e.to_string(),
-                    }),
-                None => Err(ApiError {
-                    code: "invalid_params".into(),
-                    message: "missing run_id".into(),
-                }),
-            }
+        "export" => {
+            with_handle(driver, &req.params, |d, h| async move {
+                let files = d.export(&h).await?;
+                Ok(serde_json::json!({ "files": files }))
+            })
+            .await
         }
         "destroy" => {
-            let run_id = get_run_id(&req.params);
-            match run_id {
-                Some(id) => driver
-                    .destroy(&id)
-                    .await
-                    .map(|_| serde_json::json!({}))
-                    .map_err(|e| ApiError {
-                        code: sandbox_error_code(&e),
-                        message: e.to_string(),
-                    }),
-                None => Err(ApiError {
-                    code: "invalid_params".into(),
-                    message: "missing run_id".into(),
-                }),
-            }
+            with_handle(driver, &req.params, |d, h| async move {
+                d.destroy(&h).await.map(|_| serde_json::json!({}))
+            })
+            .await
         }
         _ => Err(ApiError {
             code: "method_not_found".into(),
@@ -350,13 +336,6 @@ async fn dispatch(driver: &Arc<Driver>, req: ApiRequest) -> ApiResponse {
             error: Some(e),
         },
     }
-}
-
-fn get_run_id(params: &serde_json::Value) -> Option<String> {
-    params
-        .get("run_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
 }
 
 /// Serve the API on the configured socket. Never returns (except on fatal error).

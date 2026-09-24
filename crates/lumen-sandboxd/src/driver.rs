@@ -12,15 +12,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
+use uuid::Uuid;
 
 use crate::cgroups;
 use crate::config::DaemonConfig;
 use crate::contracts::{
-    ExportManifest, NetworkPolicy, SANDBOX_DRIVER_VERSION, SandboxDriver, SandboxError,
-    SandboxProfile, SandboxResult, SandboxRunSpec, SandboxUsage,
+    ExportManifest, ExportedFile, NetworkPolicy, OutputChunk, OutputSink, ResourceLimits,
+    SANDBOX_DRIVER_VERSION, SandboxDriver, SandboxError, SandboxHandle, SandboxProfile,
+    SandboxResult, SandboxRunSpec, SandboxSpec, SandboxUsage, StreamStats,
 };
 use crate::dns::{DnsForwarder, HostPolicyResolver, SystemUpstream};
 use crate::error::SandboxdError;
@@ -226,12 +227,31 @@ impl Driver {
         &self.inner.config
     }
 
-    /// Validate a run spec against the protocol and host limits.
-    fn validate_spec(spec: &SandboxRunSpec, config: &DaemonConfig) -> Result<(), SandboxdError> {
-        if spec.protocol_version != SANDBOX_DRIVER_VERSION {
+    /// Internal run key derived deterministically from the frozen
+    /// [`SandboxHandle`], so every trait method recovers the same journal /
+    /// live-map key without a lookup table.
+    fn run_key(handle: &SandboxHandle) -> String {
+        format!("lmn-{}", handle.run_id.simple())
+    }
+
+    /// Adapt a frozen [`SandboxSpec`] to the runtime [`SandboxRunSpec`].
+    ///
+    /// Fields the v1 contract does not carry are sourced from the daemon:
+    /// - `kernel_digest` is resolved from the signed image manifest in
+    ///   [`Self::prepare_inner`] (the manifest is the trust root; the kernel
+    ///   cannot nominate a kernel different from the image's).
+    /// - `policy_version` is the daemon-enforced `images.policy_version`.
+    /// - `max_processes` / `disk_mib` come from daemon host limits.
+    /// - `env` is empty: v1 has no kernel->guest env channel (secret handles
+    ///   arrive via the brokered `grant_secrets` path, never the spec).
+    fn adapt_spec(
+        spec: &SandboxSpec,
+        config: &DaemonConfig,
+    ) -> Result<SandboxRunSpec, SandboxdError> {
+        if spec.version != SANDBOX_DRIVER_VERSION {
             return Err(SandboxdError::InvalidSpec(format!(
-                "protocol_version {} != {}",
-                spec.protocol_version, SANDBOX_DRIVER_VERSION
+                "version {} != {SANDBOX_DRIVER_VERSION}",
+                spec.version
             )));
         }
         if spec.profile != SandboxProfile::Strict {
@@ -242,14 +262,93 @@ impl Driver {
         if !provenance::is_digest(&spec.image_digest) {
             return Err(SandboxdError::InvalidSpec("bad image_digest".into()));
         }
-        if !provenance::is_digest(&spec.kernel_digest) {
-            return Err(SandboxdError::InvalidSpec("bad kernel_digest".into()));
+        if spec.command.is_empty() {
+            return Err(SandboxdError::InvalidSpec("empty command".into()));
         }
-        if spec.policy_version != config.images.policy_version {
-            return Err(SandboxdError::InvalidSpec(format!(
-                "policy_version {} != enforced {}",
-                spec.policy_version, config.images.policy_version
-            )));
+        if spec.command.iter().any(|a| a.is_empty()) {
+            return Err(SandboxdError::InvalidSpec("empty command arg".into()));
+        }
+        // Host limits: defense in depth; the kernel lease is the primary bound.
+        let hl = &config.limits;
+        if spec.quotas.vcpus == 0 || spec.quotas.vcpus > hl.max_vcpu {
+            return Err(SandboxdError::InvalidSpec("vcpus out of host range".into()));
+        }
+        if spec.quotas.memory_mb < 64 || spec.quotas.memory_mb > hl.max_memory_mib {
+            return Err(SandboxdError::InvalidSpec(
+                "memory_mb out of host range".into(),
+            ));
+        }
+        if spec.quotas.wall_time_ms == 0 {
+            return Err(SandboxdError::InvalidSpec(
+                "wall_time_ms must be nonzero".into(),
+            ));
+        }
+        // Round UP so the kernel's deadline is never shortened.
+        let wall_time_secs = spec.quotas.wall_time_ms.div_ceil(1000);
+        if wall_time_secs > hl.max_wall_time_secs {
+            return Err(SandboxdError::InvalidSpec(
+                "wall_time out of host range".into(),
+            ));
+        }
+        if spec.quotas.output_bytes == 0 {
+            return Err(SandboxdError::InvalidSpec(
+                "output_bytes must be nonzero".into(),
+            ));
+        }
+        // The typed allowlist becomes the daemon's destination strings; each
+        // entry is re-parsed by the proxy's parser so a malformed entry can
+        // never slip past.
+        let mut allow_egress = Vec::with_capacity(spec.egress_allowlist.len());
+        for nr in &spec.egress_allowlist {
+            if nr.scheme.is_empty() || nr.host.is_empty() || nr.port == 0 {
+                return Err(SandboxdError::InvalidSpec(format!(
+                    "bad egress allowlist entry: {nr:?}"
+                )));
+            }
+            let dest = format!("{}://{}:{}", nr.scheme, nr.host, nr.port);
+            network::parse_destination(&dest).map_err(|e| {
+                SandboxdError::InvalidSpec(format!("bad egress destination {dest:?}: {e}"))
+            })?;
+            allow_egress.push(dest);
+        }
+        Ok(SandboxRunSpec {
+            image_digest: spec.image_digest.clone(),
+            // Filled from the signed manifest in prepare_inner.
+            kernel_digest: String::new(),
+            policy_version: config.images.policy_version.clone(),
+            profile: spec.profile,
+            limits: ResourceLimits {
+                vcpu: spec.quotas.vcpus,
+                memory_mib: spec.quotas.memory_mb,
+                wall_time_secs,
+                max_processes: config.limits.default_max_processes,
+                disk_mib: config.limits.max_disk_mib,
+                max_output_bytes: spec.quotas.output_bytes,
+            },
+            network: NetworkPolicy {
+                allow_egress,
+                deny_metadata: true,
+                deny_private_ranges: true,
+            },
+            command: spec.command.clone(),
+            env: Vec::new(),
+        })
+    }
+
+    /// Validate a runtime run spec against host limits. The frozen-spec
+    /// checks (version, profile, digest shape, quotas) happen in
+    /// [`Self::adapt_spec`]; this covers the daemon-derived fields.
+    fn validate_spec(spec: &SandboxRunSpec, config: &DaemonConfig) -> Result<(), SandboxdError> {
+        if spec.profile != SandboxProfile::Strict {
+            return Err(SandboxdError::InvalidSpec(
+                "only the strict profile is supported".into(),
+            ));
+        }
+        if !provenance::is_digest(&spec.image_digest) {
+            return Err(SandboxdError::InvalidSpec("bad image_digest".into()));
+        }
+        if !spec.kernel_digest.is_empty() && !provenance::is_digest(&spec.kernel_digest) {
+            return Err(SandboxdError::InvalidSpec("bad kernel_digest".into()));
         }
         if spec.command.is_empty() {
             return Err(SandboxdError::InvalidSpec("empty command".into()));
@@ -412,7 +511,11 @@ impl Driver {
         Ok(())
     }
 
-    async fn prepare_inner(&self, spec: &SandboxRunSpec) -> Result<String, SandboxdError> {
+    async fn prepare_inner(
+        &self,
+        run_id: &str,
+        spec: &SandboxRunSpec,
+    ) -> Result<(), SandboxdError> {
         Self::validate_spec(spec, &self.inner.config)?;
 
         // Concurrency gate: fail closed past max_concurrent_runs.
@@ -429,7 +532,9 @@ impl Driver {
 
         // Resolve + verify the signed image. This is the trust root: the
         // digest in the spec must match a manifest signed by a trusted key,
-        // and every artifact must hash to its manifest digest.
+        // and every artifact must hash to its manifest digest. The guest
+        // kernel always comes from that manifest — the caller cannot
+        // nominate a different kernel than the image's.
         let mut trusted_keys = Vec::new();
         for path in &self.inner.config.images.trusted_keys {
             trusted_keys.push(provenance::load_verifying_key(path)?);
@@ -439,20 +544,15 @@ impl Driver {
             &spec.image_digest,
             &trusted_keys,
         )?;
-        // The kernel digest in the spec must match the manifest's kernel.
-        if stored.manifest.kernel_digest != spec.kernel_digest {
-            return Err(SandboxdError::BadSignature(format!(
-                "spec kernel_digest does not match manifest {}",
-                stored.manifest.kernel_digest
-            )));
-        }
+        let mut spec = spec.clone();
+        spec.kernel_digest = stored.manifest.kernel_digest.clone();
         let provenance = ProvenanceRecord {
             image_digest: spec.image_digest.clone(),
             kernel_digest: stored.manifest.kernel_digest.clone(),
             rootfs_digest: stored.manifest.rootfs_digest.clone(),
             workspace_template_digest: stored.manifest.workspace_template_digest.clone(),
             toolchain_digest: stored.manifest.toolchain_digest()?,
-            policy_version: spec.policy_version.clone(),
+            policy_version: self.inner.config.images.policy_version.clone(),
             sandboxd_version: env!("CARGO_PKG_VERSION").to_string(),
             firecracker_version: self.inner.config.firecracker.version.clone(),
         };
@@ -463,25 +563,22 @@ impl Driver {
             pool.alloc()
                 .ok_or_else(|| SandboxdError::Host("UID pool exhausted".into()))?
         };
-        let mut rng = rand::rng();
-        let mut id_bytes = [0u8; 8];
-        rng.fill_bytes(&mut id_bytes);
-        let run_id = format!("lmn-{}", hex::encode(id_bytes));
 
-        let artifacts = Self::artifact_paths(&self.inner.config, &self.inner.store, &run_id, uid)?;
+        let artifacts = Self::artifact_paths(&self.inner.config, &self.inner.store, run_id, uid)?;
 
         // Canonical spec digest binds the journal to the exact spec.
-        let spec_json = serde_json::to_vec(spec).map_err(|e| SandboxdError::Host(e.to_string()))?;
+        let spec_json =
+            serde_json::to_vec(&spec).map_err(|e| SandboxdError::Host(e.to_string()))?;
         let spec_digest = crate::provenance::digest_bytes(&spec_json);
 
-        let record =
-            self.inner
-                .store
-                .create(&run_id, spec.clone(), spec_digest, artifacts.clone())?;
-        self.inner.store.set_provenance(&run_id, provenance)?;
+        let record = self
+            .inner
+            .store
+            .create(run_id, spec, spec_digest, artifacts.clone())?;
+        self.inner.store.set_provenance(run_id, provenance)?;
 
         self.inner.live.lock().unwrap().insert(
-            run_id.clone(),
+            run_id.to_string(),
             LiveRun {
                 secrets: Vec::new(),
                 secret_env_names: HashSet::new(),
@@ -491,7 +588,7 @@ impl Driver {
             },
         );
         let _ = record;
-        Ok(run_id)
+        Ok(())
     }
 
     fn plan_from_artifacts(&self, artifacts: &ArtifactPaths) -> network::NetPlan {
@@ -1086,10 +1183,10 @@ impl Driver {
             })
         };
         let result = SandboxResult {
-            protocol_version: PROTOCOL_VERSION,
             exit_code: outcome.exit_code,
             timed_out: outcome.timed_out,
             output: format!("{}{}", outcome.stdout, outcome.stderr),
+            output_truncated: outcome.output_truncated,
             usage: SandboxUsage {
                 wall_time_ms: outcome.wall_time_ms,
                 peak_memory_mib: outcome.peak_memory_mib,
@@ -1225,36 +1322,36 @@ impl Driver {
 // SandboxDriver trait
 // ---------------------------------------------------------------------------
 
+/// Map daemon errors onto the frozen [`SandboxError`]. The v1 contract is
+/// coarse by design: refused specs, trust failures, and run faults are all
+/// `RunFailed` with a descriptive message; `QuotaExceeded` is reserved for
+/// a run the daemon terminated for breaching its deadline/quotas; and
+/// `Unavailable` means the sandbox itself cannot serve right now (KVM or
+/// jailer down, concurrency gate, UID pool exhausted).
 fn to_sandbox_error(e: SandboxdError) -> SandboxError {
     match e {
-        SandboxdError::UnapprovedImage(m) => SandboxError::UnapprovedImage(m),
-        // Protocol-level faults (bad framing, bad handshake) surface as
-        // protocol errors; everything else is a driver fault.
-        SandboxdError::Protocol(m) | SandboxdError::GuestAgent(m) => SandboxError::Protocol(m),
-        other => SandboxError::Driver(other.to_string()),
+        SandboxdError::Terminated(m) => SandboxError::QuotaExceeded(m),
+        SandboxdError::Host(m) => SandboxError::Unavailable(m),
+        other => SandboxError::RunFailed(other.to_string()),
     }
 }
 
-#[async_trait]
-impl SandboxDriver for Driver {
-    async fn prepare(&self, spec: &SandboxRunSpec) -> Result<String, SandboxError> {
-        self.prepare_inner(spec).await.map_err(to_sandbox_error)
+/// Fail closed on a handle minted by a different driver version.
+fn check_handle(handle: &SandboxHandle) -> Result<(), SandboxError> {
+    if handle.version != SANDBOX_DRIVER_VERSION {
+        return Err(SandboxError::RunFailed(format!(
+            "handle version {} != {SANDBOX_DRIVER_VERSION}",
+            handle.version
+        )));
     }
+    Ok(())
+}
 
-    async fn start(&self, run_id: &str) -> Result<(), SandboxError> {
-        self.start_inner(run_id).await.map_err(to_sandbox_error)
-    }
-
-    async fn wait(&self, run_id: &str) -> Result<SandboxResult, SandboxError> {
-        self.wait_inner(run_id).await.map_err(to_sandbox_error)
-    }
-
-    async fn cancel(&self, run_id: &str) -> Result<(), SandboxError> {
-        self.cancel_inner(run_id).await.map_err(to_sandbox_error)
-    }
-
-    async fn export_manifest(&self, run_id: &str) -> Result<ExportManifest, SandboxError> {
-        // Prefer the live result; fall back to the durable outcome.
+impl Driver {
+    /// Shared by the trait's `export` and the local API: prefer the live
+    /// result, fall back to the durable outcome, fail if the run has no
+    /// outcome yet.
+    async fn export_manifest_inner(&self, run_id: &str) -> Result<ExportManifest, SandboxdError> {
         {
             let live = self.inner.live.lock().unwrap();
             if let Some(lr) = live.get(run_id)
@@ -1265,17 +1362,125 @@ impl SandboxDriver for Driver {
                 }));
             }
         }
-        let record = self.inner.store.load(run_id).map_err(to_sandbox_error)?;
+        let record = self.inner.store.load(run_id)?;
         match record.outcome {
             Some(o) => Ok(o.export_manifest.unwrap_or(ExportManifest {
                 changed: Vec::new(),
             })),
-            None => Err(SandboxError::Driver("run has no outcome yet".into())),
+            None => Err(SandboxdError::RunState("run has no outcome yet".into())),
         }
     }
 
-    async fn destroy(&self, run_id: &str) -> Result<(), SandboxError> {
-        self.destroy_inner(run_id).await.map_err(to_sandbox_error)
+    /// Collect a completed run's output as chunks plus [`StreamStats`].
+    ///
+    /// This is the [`SandboxDriver::stream`] logic minus the sink: the
+    /// frozen trait takes `sink: &mut dyn OutputSink`, and `dyn OutputSink`
+    /// has no `Send` bound, so any `async fn` holding that parameter —
+    /// including the trait impl — returns a `!Send` future. This inherent
+    /// method's future IS `Send`, so `Send`-requiring callers (the local
+    /// API's spawned connection tasks, and any kernel executor that
+    /// spawns) should use it instead of the trait method.
+    pub async fn stream_collect(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<(Vec<OutputChunk>, StreamStats), SandboxError> {
+        check_handle(handle)?;
+        let result = self
+            .wait_inner(&Self::run_key(handle))
+            .await
+            .map_err(to_sandbox_error)?;
+        // The supervisor captures bounded output; replay it as chunks. (v1
+        // delivers output at completion; the sink interface keeps the door
+        // open for incremental streaming later.)
+        let bytes = result.output.as_bytes();
+        let mut chunks = Vec::new();
+        let mut sent = 0u64;
+        for piece in bytes.chunks(64 * 1024) {
+            chunks.push(OutputChunk {
+                stream: "stdout".to_string(),
+                bytes: piece.to_vec(),
+            });
+            sent += piece.len() as u64;
+        }
+        Ok((
+            chunks,
+            StreamStats {
+                bytes: sent,
+                truncated: result.output_truncated,
+            },
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SandboxDriver trait (frozen v1)
+// ---------------------------------------------------------------------------
+
+impl SandboxDriver for Driver {
+    async fn prepare(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError> {
+        let runtime = Self::adapt_spec(spec, &self.inner.config).map_err(to_sandbox_error)?;
+        let handle = SandboxHandle {
+            version: SANDBOX_DRIVER_VERSION,
+            run_id: Uuid::new_v4(),
+        };
+        let key = Self::run_key(&handle);
+        self.prepare_inner(&key, &runtime)
+            .await
+            .map_err(to_sandbox_error)?;
+        Ok(handle)
+    }
+
+    async fn start(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
+        check_handle(handle)?;
+        self.start_inner(&Self::run_key(handle))
+            .await
+            .map_err(to_sandbox_error)
+    }
+
+    async fn stream(
+        &self,
+        handle: &SandboxHandle,
+        sink: &mut dyn OutputSink,
+    ) -> Result<StreamStats, SandboxError> {
+        // NOTE: this future is `!Send` — inherent to the frozen contract
+        // (`&mut dyn OutputSink` has no `Send` bound). `Send`-requiring
+        // callers should use `stream_collect`.
+        let (chunks, stats) = self.stream_collect(handle).await?;
+        for chunk in chunks {
+            sink.push(chunk);
+        }
+        Ok(stats)
+    }
+
+    async fn cancel(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
+        check_handle(handle)?;
+        self.cancel_inner(&Self::run_key(handle))
+            .await
+            .map_err(to_sandbox_error)
+    }
+
+    async fn export(&self, handle: &SandboxHandle) -> Result<Vec<ExportedFile>, SandboxError> {
+        check_handle(handle)?;
+        let manifest = self
+            .export_manifest_inner(&Self::run_key(handle))
+            .await
+            .map_err(to_sandbox_error)?;
+        Ok(manifest
+            .changed
+            .into_iter()
+            .map(|c| ExportedFile {
+                path: c.path,
+                content_hash: c.sha256,
+                size_bytes: c.size_bytes,
+            })
+            .collect())
+    }
+
+    async fn destroy(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
+        check_handle(handle)?;
+        self.destroy_inner(&Self::run_key(handle))
+            .await
+            .map_err(to_sandbox_error)
     }
 }
 
@@ -1894,7 +2099,7 @@ async fn mock_guest_main(mut stream: tokio::io::DuplexStream, script: Arc<Mutex<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{ResourceLimits, SandboxProfile};
+    use crate::contracts::SandboxQuotas;
     use crate::provenance::{ImageManifest, ToolchainManifest};
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeMap;
@@ -1904,8 +2109,8 @@ mod tests {
     }
 
     /// Build a signed fake image in a temp store. Returns
-    /// (store_dir, image_digest, kernel_digest).
-    fn fake_image() -> (tempfile::TempDir, String, String) {
+    /// (store_dir, image_digest).
+    fn fake_image() -> (tempfile::TempDir, String) {
         let store = tempfile::tempdir().unwrap();
         let key = test_key();
         // Fake artifacts with deterministic content.
@@ -1917,7 +2122,7 @@ mod tests {
         let template_digest = crate::provenance::digest_bytes(template);
         let mut manifest = ImageManifest {
             format_version: 1,
-            kernel_digest: kernel_digest.clone(),
+            kernel_digest,
             rootfs_digest,
             workspace_template_digest: template_digest,
             snapshot: None,
@@ -1952,7 +2157,7 @@ mod tests {
             key_path.display().to_string(),
         )
         .unwrap();
-        (store, image_digest, kernel_digest)
+        (store, image_digest)
     }
 
     fn test_config(store: &tempfile::TempDir, state: &tempfile::TempDir) -> DaemonConfig {
@@ -1965,29 +2170,20 @@ mod tests {
         cfg
     }
 
-    fn test_spec(image_digest: &str, kernel_digest: &str) -> SandboxRunSpec {
-        SandboxRunSpec {
-            protocol_version: SANDBOX_DRIVER_VERSION,
-            image_digest: image_digest.to_string(),
-            kernel_digest: kernel_digest.to_string(),
-            policy_version: "sandbox-policy-v1".into(),
+    /// A frozen v1 spec, as the kernel would send it.
+    fn test_spec(image_digest: &str) -> SandboxSpec {
+        SandboxSpec {
+            version: SANDBOX_DRIVER_VERSION,
             profile: SandboxProfile::Strict,
-            limits: ResourceLimits {
-                vcpu: 1,
-                memory_mib: 256,
-                wall_time_secs: 30,
-                max_processes: 32,
-                disk_mib: 512,
-                max_output_bytes: 65536,
-            },
-            network: NetworkPolicy {
-                allow_egress: vec![],
-                deny_metadata: true,
-                deny_private_ranges: true,
-            },
+            image_digest: image_digest.to_string(),
             command: vec!["echo".into(), "hi".into()],
-            env: vec![],
-            action_digest: "sha256:".to_string() + &"f".repeat(64),
+            quotas: SandboxQuotas {
+                memory_mb: 256,
+                vcpus: 1,
+                wall_time_ms: 30_000,
+                output_bytes: 65536,
+            },
+            egress_allowlist: vec![],
         }
     }
 
@@ -2004,48 +2200,126 @@ mod tests {
         (driver, tempfile::tempdir().unwrap())
     }
 
+    /// Collecting sink for `stream` tests.
+    #[derive(Default)]
+    struct VecSink {
+        chunks: Vec<OutputChunk>,
+    }
+
+    impl OutputSink for VecSink {
+        fn push(&mut self, chunk: OutputChunk) {
+            self.chunks.push(chunk);
+        }
+    }
+
+    #[test]
+    fn adapt_spec_maps_quotas_and_egress() {
+        let cfg = DaemonConfig::default();
+        let mut spec = test_spec(&("sha256:".to_string() + &"a".repeat(64)));
+        // 1500ms rounds UP to 2s so the kernel's deadline is never shortened.
+        spec.quotas.wall_time_ms = 1500;
+        spec.quotas.vcpus = 2;
+        spec.egress_allowlist = vec![crate::contracts::NetworkResource {
+            scheme: "https".into(),
+            host: "example.com".into(),
+            port: 443,
+        }];
+        let rt = Driver::adapt_spec(&spec, &cfg).unwrap();
+        assert_eq!(rt.limits.vcpu, 2);
+        assert_eq!(rt.limits.memory_mib, 256);
+        assert_eq!(rt.limits.wall_time_secs, 2);
+        assert_eq!(rt.limits.max_output_bytes, 65536);
+        assert_eq!(rt.limits.max_processes, cfg.limits.default_max_processes);
+        assert_eq!(rt.limits.disk_mib, cfg.limits.max_disk_mib);
+        assert_eq!(rt.policy_version, cfg.images.policy_version);
+        assert!(rt.env.is_empty());
+        assert_eq!(
+            rt.network.allow_egress,
+            vec!["https://example.com:443".to_string()]
+        );
+        assert!(rt.network.deny_metadata);
+        assert!(rt.network.deny_private_ranges);
+    }
+
     #[tokio::test]
     async fn prepare_rejects_bad_spec() {
-        let (img_store, image_digest, kernel_digest) = fake_image();
+        let (img_store, image_digest) = fake_image();
         let state = tempfile::tempdir().unwrap();
         let cfg = test_config(&img_store, &state);
         let script = Arc::new(Mutex::new(MockScript::default()));
         let (driver, _keep) = test_driver(cfg, script);
 
-        // Wrong protocol version.
-        let mut spec = test_spec(&image_digest, &kernel_digest);
-        spec.protocol_version = 999;
-        assert!(driver.prepare_inner(&spec).await.is_err());
-
-        // Non-strict profile.
-        let mut spec = test_spec(&image_digest, &kernel_digest);
-        spec.profile = SandboxProfile::Stateful;
-        assert!(driver.prepare_inner(&spec).await.is_err());
+        // Wrong contract version.
+        let mut spec = test_spec(&image_digest);
+        spec.version = 999;
+        assert!(driver.prepare(&spec).await.is_err());
 
         // Bad digest.
-        let mut spec = test_spec(&image_digest, &kernel_digest);
+        let mut spec = test_spec(&image_digest);
         spec.image_digest = "not-a-digest".into();
-        assert!(driver.prepare_inner(&spec).await.is_err());
+        assert!(driver.prepare(&spec).await.is_err());
 
-        // Secret-like env name.
-        let mut spec = test_spec(&image_digest, &kernel_digest);
-        spec.env = vec![("API_TOKEN".into(), "x".into())];
-        assert!(driver.prepare_inner(&spec).await.is_err());
+        // Empty command.
+        let mut spec = test_spec(&image_digest);
+        spec.command = vec![];
+        assert!(driver.prepare(&spec).await.is_err());
 
         // Over host limits.
-        let mut spec = test_spec(&image_digest, &kernel_digest);
-        spec.limits.memory_mib = u64::MAX;
-        assert!(driver.prepare_inner(&spec).await.is_err());
+        let mut spec = test_spec(&image_digest);
+        spec.quotas.memory_mb = u64::MAX;
+        assert!(driver.prepare(&spec).await.is_err());
 
-        // Kernel digest mismatch with manifest.
-        let mut spec = test_spec(&image_digest, &kernel_digest);
-        spec.kernel_digest = "sha256:".to_string() + &"e".repeat(64);
-        assert!(driver.prepare_inner(&spec).await.is_err());
+        // Zero wall time.
+        let mut spec = test_spec(&image_digest);
+        spec.quotas.wall_time_ms = 0;
+        assert!(driver.prepare(&spec).await.is_err());
+
+        // Malformed egress entry.
+        let mut spec = test_spec(&image_digest);
+        spec.egress_allowlist = vec![crate::contracts::NetworkResource {
+            scheme: "https".into(),
+            host: "".into(),
+            port: 443,
+        }];
+        assert!(driver.prepare(&spec).await.is_err());
+
+        // Unsupported scheme.
+        let mut spec = test_spec(&image_digest);
+        spec.egress_allowlist = vec![crate::contracts::NetworkResource {
+            scheme: "gopher".into(),
+            host: "example.com".into(),
+            port: 70,
+        }];
+        assert!(driver.prepare(&spec).await.is_err());
+
+        // Unknown image (not in the signed store).
+        let mut spec = test_spec(&image_digest);
+        spec.image_digest = "sha256:".to_string() + &"a".repeat(64);
+        assert!(driver.prepare(&spec).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn version_mismatched_handle_fails_closed() {
+        let (img_store, image_digest) = fake_image();
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_config(&img_store, &state);
+        let script = Arc::new(Mutex::new(MockScript::default()));
+        let (driver, _keep) = test_driver(cfg, script);
+
+        let spec = test_spec(&image_digest);
+        let mut handle = driver.prepare(&spec).await.unwrap();
+        handle.version = 999;
+        let mut sink = VecSink::default();
+        assert!(driver.start(&handle).await.is_err());
+        assert!(driver.stream(&handle, &mut sink).await.is_err());
+        assert!(driver.cancel(&handle).await.is_err());
+        assert!(driver.export(&handle).await.is_err());
+        assert!(driver.destroy(&handle).await.is_err());
     }
 
     #[tokio::test]
     async fn lifecycle_happy_path() {
-        let (img_store, image_digest, kernel_digest) = fake_image();
+        let (img_store, image_digest) = fake_image();
         let state = tempfile::tempdir().unwrap();
         let cfg = test_config(&img_store, &state);
         let script = Arc::new(Mutex::new(MockScript {
@@ -2059,38 +2333,46 @@ mod tests {
         }));
         let (driver, _keep) = test_driver(cfg, Arc::clone(&script));
 
-        let spec = test_spec(&image_digest, &kernel_digest);
-        let run_id = driver.prepare_inner(&spec).await.unwrap();
+        let spec = test_spec(&image_digest);
+        let handle = driver.prepare(&spec).await.unwrap();
+        assert_eq!(handle.version, SANDBOX_DRIVER_VERSION);
         // The mock guest must claim the right run id.
-        script.lock().unwrap().run_id = run_id.clone();
+        script.lock().unwrap().run_id = Driver::run_key(&handle);
 
-        driver.start_inner(&run_id).await.unwrap();
-        let result = driver.wait_inner(&run_id).await.unwrap();
+        driver.start(&handle).await.unwrap();
+
+        // Stream the output through the frozen sink interface.
+        let mut sink = VecSink::default();
+        let stats = driver.stream(&handle, &mut sink).await.unwrap();
+        assert!(stats.bytes > 0);
+        assert!(!stats.truncated);
+        let text: Vec<u8> = sink.chunks.iter().flat_map(|c| c.bytes.clone()).collect();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("hello stdout"));
+        assert!(text.contains("hello stderr"));
+
+        // The rich internal result is still available to the daemon.
+        let key = Driver::run_key(&handle);
+        let result = driver.wait_inner(&key).await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(!result.timed_out);
-        assert!(result.output.contains("hello stdout"));
-        assert!(result.output.contains("hello stderr"));
-        let manifest = result.export_manifest.clone().expect("export manifest");
-        assert_eq!(manifest.changed.len(), 1);
-        assert_eq!(manifest.changed[0].path, "/out/result.txt");
-        assert_eq!(manifest.changed[0].size_bytes, 12);
+        assert!(!result.output_truncated);
 
-        // Idempotent wait.
-        let again = driver.wait_inner(&run_id).await.unwrap();
-        assert_eq!(again, result);
+        // Export through the frozen trait.
+        let files = driver.export(&handle).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "/out/result.txt");
+        assert_eq!(files[0].size_bytes, 12);
+        assert_eq!(files[0].content_hash.len(), 64 + "sha256:".len());
 
-        // export_manifest via the trait.
-        let m = driver.export_manifest(&run_id).await.unwrap();
-        assert_eq!(m.changed.len(), 1);
-
-        driver.destroy_inner(&run_id).await.unwrap();
+        driver.destroy(&handle).await.unwrap();
         // Destroy is idempotent.
-        driver.destroy_inner(&run_id).await.unwrap();
+        driver.destroy(&handle).await.unwrap();
     }
 
     #[tokio::test]
     async fn cancel_terminates_run() {
-        let (img_store, image_digest, kernel_digest) = fake_image();
+        let (img_store, image_digest) = fake_image();
         let state = tempfile::tempdir().unwrap();
         let cfg = test_config(&img_store, &state);
         // Script that never exits on its own; the cancel must stop it.
@@ -2102,41 +2384,43 @@ mod tests {
         }));
         let (driver, _keep) = test_driver(cfg, Arc::clone(&script));
 
-        let spec = test_spec(&image_digest, &kernel_digest);
-        let run_id = driver.prepare_inner(&spec).await.unwrap();
-        script.lock().unwrap().run_id = run_id.clone();
+        let spec = test_spec(&image_digest);
+        let handle = driver.prepare(&spec).await.unwrap();
+        script.lock().unwrap().run_id = Driver::run_key(&handle);
 
         // Override the mock guest to block instead of exiting. We do this
         // by replacing accept_agent behavior: simpler to just start and
         // cancel quickly; the mock exits fast, so we test that cancel on a
         // completed run is still accepted (no supervisor).
-        driver.start_inner(&run_id).await.unwrap();
+        driver.start(&handle).await.unwrap();
         // Cancel while running (the mock exits quickly; this may race).
-        let _ = driver.cancel_inner(&run_id).await;
-        let result = driver.wait_inner(&run_id).await.unwrap();
+        let _ = driver.cancel(&handle).await;
+        let key = Driver::run_key(&handle);
+        let result = driver.wait_inner(&key).await.unwrap();
         // Either cancelled or completed; both are valid outcomes of the race.
         assert!(result.exit_code == 0 || result.timed_out || true);
-        driver.destroy_inner(&run_id).await.unwrap();
+        driver.destroy(&handle).await.unwrap();
     }
 
     #[tokio::test]
     async fn secret_env_names_rejected_without_grant() {
         // grant_secrets with no broker configured must fail closed.
-        let (img_store, image_digest, kernel_digest) = fake_image();
+        let (img_store, image_digest) = fake_image();
         let state = tempfile::tempdir().unwrap();
         let mut cfg = test_config(&img_store, &state);
         cfg.secrets.broker_socket = None;
         let script = Arc::new(Mutex::new(MockScript::default()));
         let (driver, _keep) = test_driver(cfg, script);
 
-        let spec = test_spec(&image_digest, &kernel_digest);
-        let run_id = driver.prepare_inner(&spec).await.unwrap();
+        let spec = test_spec(&image_digest);
+        let handle = driver.prepare(&spec).await.unwrap();
+        let key = Driver::run_key(&handle);
         let err = driver
-            .grant_secrets(&run_id, &[("MY_SECRET".into(), "handle-1".into())])
+            .grant_secrets(&key, &[("MY_SECRET".into(), "handle-1".into())])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("broker"));
-        driver.destroy_inner(&run_id).await.unwrap();
+        driver.destroy(&handle).await.unwrap();
     }
 
     #[test]

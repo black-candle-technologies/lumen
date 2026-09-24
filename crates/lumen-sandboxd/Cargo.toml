@@ -29,6 +29,7 @@ base64 = "0.22"
 ed25519-dalek = "2"
 hex = "0.4"
 libc = "0.2"
+lumen-protocol = { path = "../lumen-protocol" }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,6 +37,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.9"
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tempfile = "3"
