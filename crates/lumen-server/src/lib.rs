@@ -9,6 +9,7 @@ mod model_gateway;
 mod orchestration;
 pub mod pi_supervisor;
 mod routes;
+mod sandbox_driver;
 mod session;
 mod sse;
 mod state;
@@ -57,6 +58,7 @@ pub use orchestration::{
     OrchestrationFuture, OrchestrationService,
 };
 pub use routes::router;
+pub use sandbox_driver::{DriverSandboxRunner, DriverStagedExecution, SpecBuilder};
 pub use sse::{EventBroker, EventBrokerError, RunEvent};
 pub use state::{
     ApiState, ApiStateError, ApprovalConflict, ApprovalDecision, ApprovalDecisionCommand,

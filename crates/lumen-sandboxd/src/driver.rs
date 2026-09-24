@@ -1500,6 +1500,22 @@ impl Driver {
             },
         ))
     }
+
+    /// Load the completed run's [`SandboxResult`] (exit code, usage, export
+    /// manifest). [`stream_collect`] only returns the output stream; adapters
+    /// that need the exit code or usage (e.g. the host's `SandboxRunner`
+    /// seam) use this after the run completes.
+    pub fn run_result(&self, handle: &SandboxHandle) -> Result<SandboxResult, SandboxError> {
+        check_handle(handle)?;
+        let record = self
+            .inner
+            .store
+            .load(&Self::run_key(handle))
+            .map_err(to_sandbox_error)?;
+        record
+            .outcome
+            .ok_or_else(|| SandboxError::RunFailed("run has no outcome yet".into()))
+    }
 }
 
 // ---------------------------------------------------------------------------
