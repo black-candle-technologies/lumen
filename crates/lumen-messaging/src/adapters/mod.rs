@@ -15,14 +15,14 @@ pub use common::{
 pub use courier::{
     ADAPTER_VERSION as COURIER_ADAPTER_VERSION, CourierAdapter, CourierAddress, CourierConfig,
     CourierError, CourierStdioTransport, HandoffArtifact, HandoffSignature,
-    MAX_HANDOFF_PAYLOAD_BYTES, SessionIdentityBinding, VhlCourierCarriage, decode_vhl_message,
-    encode_vhl_message,
+    MAX_HANDOFF_PAYLOAD_BYTES, PollOutcome, PollRejection, SessionIdentityBinding,
+    VhlCourierCarriage, decode_vhl_message, encode_vhl_message,
 };
 #[cfg(feature = "discord")]
 pub use discord::{
     ADAPTER_VERSION as DISCORD_ADAPTER_VERSION, DiscordAdapter, DiscordBotConfig, DiscordError,
     DiscordEventKind, DiscordGatewayEvent, DiscordIntents, DiscordResource, DiscordRestCall,
-    verify_interaction_signature,
+    SignedInteractionOutcome, verify_interaction_signature,
 };
 pub use signal::{
     ADAPTER_VERSION as SIGNAL_ADAPTER_VERSION, SignalAdapter, SignalEligibility, SignalError,

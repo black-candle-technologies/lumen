@@ -20,7 +20,7 @@
 //! carry `message.send` and are distinguished by action kind.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -260,7 +260,7 @@ impl OutboundRequest {
                         reason: "edit requires target_message_id",
                     });
                 }
-                if self.text.as_ref().is_some_and(|t| t.trim().is_empty()) {
+                if !self.text.as_ref().is_some_and(|t| !t.trim().is_empty()) {
                     return Err(OutboundError::Validation {
                         reason: "edit requires non-empty text",
                     });
@@ -359,6 +359,31 @@ impl OutboundRequest {
             vec![capability],
         ))
     }
+
+    /// Stable fingerprint of the exact effect this request describes: verb,
+    /// provider, connection, target scope, and content. Stored in the
+    /// [`DeliveryReceipt`] so a replayed idempotency key for a *different*
+    /// request fails instead of returning a foreign receipt.
+    pub fn action_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        let mut field = |value: &str| {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        };
+        field(self.verb.as_str());
+        field(self.provider.as_str());
+        field(self.connection_id.as_str());
+        field(&self.target.scope_value(self.provider));
+        field(
+            self.target_message_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or(""),
+        );
+        field(self.reaction.as_deref().unwrap_or(""));
+        field(self.text.as_deref().unwrap_or(""));
+        format!("{:x}", hasher.finalize())
+    }
 }
 
 /// Kernel integration seam for outbound effects.
@@ -431,18 +456,59 @@ pub struct DeliveryReceipt {
     pub provider: Provider,
     pub provider_message_id: String,
     pub verb: OutboundVerb,
+    /// [`OutboundRequest::action_fingerprint`] of the request that produced
+    /// this receipt. A replayed key for a *different* request fails instead
+    /// of returning a foreign receipt.
+    pub action_fingerprint: String,
     pub sent_at_millis: i64,
 }
 
+/// Outcome of atomically reserving an idempotency key.
+#[derive(Clone, Debug)]
+pub enum KeyReservation {
+    /// A completed send already recorded this receipt: return it without
+    /// touching the provider.
+    Existing(DeliveryReceipt),
+    /// Another caller already holds the reservation: the provider must not be
+    /// called again for this key right now. Retry later with the same key.
+    InFlight,
+    /// This caller owns the send. It must [`ReceiptStore::complete`] on
+    /// success or [`ReceiptStore::abandon`] on failure so later retries can
+    /// proceed.
+    Reserved,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ReceiptError {
+    #[error("receipt store unavailable")]
+    Unavailable,
+}
+
 /// Idempotency-keyed receipt persistence.
+///
+/// Reservation is atomic: two concurrent `reserve` calls for the same key can
+/// never both return [`KeyReservation::Reserved`], so the provider is never
+/// called twice for one key. A poisoned lock maps to
+/// [`ReceiptError::Unavailable`] — fail closed, never treated as missing.
 pub trait ReceiptStore: Send + Sync {
-    fn get(&self, key: &IdempotencyKey) -> Option<DeliveryReceipt>;
-    fn put(&self, receipt: DeliveryReceipt);
+    fn reserve(&self, key: &IdempotencyKey) -> Result<KeyReservation, ReceiptError>;
+    fn complete(&self, receipt: DeliveryReceipt) -> Result<(), ReceiptError>;
+    /// Releases a reservation without recording a receipt (the send failed
+    /// or was blocked after reserving). Best-effort: on a poisoned lock the
+    /// reservation stays in-flight and later retries fail closed with
+    /// `InFlight` until the process restarts.
+    fn abandon(&self, key: &IdempotencyKey);
 }
 
 #[derive(Debug, Default)]
 pub struct MemoryReceiptStore {
-    inner: Mutex<HashMap<IdempotencyKey, DeliveryReceipt>>,
+    inner: Mutex<MemoryReceipts>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryReceipts {
+    completed: HashMap<IdempotencyKey, DeliveryReceipt>,
+    in_flight: HashSet<IdempotencyKey>,
 }
 
 impl MemoryReceiptStore {
@@ -452,13 +518,27 @@ impl MemoryReceiptStore {
 }
 
 impl ReceiptStore for MemoryReceiptStore {
-    fn get(&self, key: &IdempotencyKey) -> Option<DeliveryReceipt> {
-        self.inner.lock().ok()?.get(key).cloned()
+    fn reserve(&self, key: &IdempotencyKey) -> Result<KeyReservation, ReceiptError> {
+        let mut inner = self.inner.lock().map_err(|_| ReceiptError::Unavailable)?;
+        if let Some(receipt) = inner.completed.get(key) {
+            return Ok(KeyReservation::Existing(receipt.clone()));
+        }
+        if !inner.in_flight.insert(*key) {
+            return Ok(KeyReservation::InFlight);
+        }
+        Ok(KeyReservation::Reserved)
     }
 
-    fn put(&self, receipt: DeliveryReceipt) {
+    fn complete(&self, receipt: DeliveryReceipt) -> Result<(), ReceiptError> {
+        let mut inner = self.inner.lock().map_err(|_| ReceiptError::Unavailable)?;
+        inner.in_flight.remove(&receipt.idempotency_key);
+        inner.completed.insert(receipt.idempotency_key, receipt);
+        Ok(())
+    }
+
+    fn abandon(&self, key: &IdempotencyKey) {
         if let Ok(mut inner) = self.inner.lock() {
-            inner.insert(receipt.idempotency_key, receipt);
+            inner.in_flight.remove(key);
         }
     }
 }
@@ -478,14 +558,33 @@ impl<K: KernelPort, R: ReceiptStore> OutboundPipeline<K, R> {
     }
 
     /// Executes one outbound effect:
-    /// validate -> idempotency -> lease -> pre-send audit -> provider call ->
-    /// receipt -> post-send audit.
+    /// validate -> provider/connection binding -> capability -> idempotency
+    /// reservation -> lease -> pre-send audit -> provider call -> receipt ->
+    /// post-send audit.
     pub async fn execute<A: MessagingAdapter>(
         &self,
         adapter: &A,
         request: &OutboundRequest,
     ) -> Result<DeliveryReceipt, OutboundError> {
         request.validate()?;
+
+        // The adapter must be the one this request was authorized for: the
+        // provider and the bound connection are checked before the lease
+        // check, so a request authorized for one connection can never
+        // execute through an adapter bound to another.
+        if adapter.provider() != request.provider {
+            return Err(OutboundError::Validation {
+                reason: "adapter provider does not match request provider",
+            });
+        }
+        match adapter.bound_connection_id() {
+            Some(bound) if bound == &request.connection_id => {}
+            _ => {
+                return Err(OutboundError::ConnectionMismatch {
+                    reason: "adapter is not bound to the request connection",
+                });
+            }
+        }
 
         // Declared-capability check: the adapter must declare the verb it is
         // asked to execute.
@@ -499,12 +598,81 @@ impl<K: KernelPort, R: ReceiptStore> OutboundPipeline<K, R> {
             return Err(OutboundError::UnsupportedVerb { verb: request.verb });
         }
 
-        // Idempotency first: a replayed key returns the stored receipt without
-        // touching the provider.
-        if let Some(receipt) = self.receipts.get(&request.idempotency_key) {
-            return Ok(receipt);
+        // Idempotency reservation BEFORE the lease check. The reservation is
+        // atomic, so two concurrent sends for one key cannot both reach the
+        // provider: the second sees Existing or InFlight.
+        let fingerprint = request.action_fingerprint();
+        match self.receipts.reserve(&request.idempotency_key) {
+            Ok(KeyReservation::Reserved) => {}
+            Ok(KeyReservation::InFlight) => {
+                return Err(OutboundError::IdempotencyConflict {
+                    reason: "a send for this idempotency key is already in flight",
+                });
+            }
+            Ok(KeyReservation::Existing(receipt)) => {
+                // The key must identify the same effect: a reused key for a
+                // different request fails instead of returning a foreign
+                // receipt.
+                if receipt.action_fingerprint != fingerprint {
+                    return Err(OutboundError::Validation {
+                        reason: "idempotency key was already used for a different request",
+                    });
+                }
+                return Ok(receipt);
+            }
+            Err(unavailable) => {
+                return Err(OutboundError::ReceiptUnavailable {
+                    reason: unavailable.to_string(),
+                });
+            }
         }
 
+        // From here the reservation is ours: every exit path completes or
+        // abandons it, so a later retry of the same key can proceed.
+        let outcome = self.send_once(adapter, request, fingerprint).await;
+        match outcome {
+            Ok(receipt) => {
+                self.receipts
+                    .complete(receipt.clone())
+                    .map_err(|unavailable| OutboundError::ReceiptUnavailable {
+                        reason: unavailable.to_string(),
+                    })?;
+
+                // Post-send audit failure is surfaced with the receipt
+                // attached: the message already went out, so the caller must
+                // reconcile rather than retry (retrying would violate
+                // idempotency).
+                if let Err(unavailable) = self.kernel.record_audit(&OutboundAuditEvent {
+                    idempotency_key: request.idempotency_key,
+                    verb: request.verb,
+                    provider: request.provider,
+                    target_summary: request.target.summary(request.provider),
+                    phase: AuditPhase::PostSend,
+                    outcome: "sent".to_owned(),
+                }) {
+                    return Err(OutboundError::PostSendAuditFailed {
+                        receipt,
+                        reason: unavailable.reason,
+                    });
+                }
+
+                Ok(receipt)
+            }
+            Err(err) => {
+                self.receipts.abandon(&request.idempotency_key);
+                Err(err)
+            }
+        }
+    }
+
+    /// Lease -> pre-send audit -> provider call. Runs only after the caller
+    /// has reserved the idempotency key.
+    async fn send_once<A: MessagingAdapter>(
+        &self,
+        adapter: &A,
+        request: &OutboundRequest,
+        fingerprint: String,
+    ) -> Result<DeliveryReceipt, OutboundError> {
         let action = request.to_action_envelope()?;
 
         self.kernel
@@ -541,33 +709,14 @@ impl<K: KernelPort, R: ReceiptStore> OutboundPipeline<K, R> {
                     },
                 })?;
 
-        let receipt = DeliveryReceipt {
+        Ok(DeliveryReceipt {
             idempotency_key: request.idempotency_key,
             provider: request.provider,
             provider_message_id: provider_receipt.provider_message_id,
             verb: request.verb,
+            action_fingerprint: fingerprint,
             sent_at_millis: now_millis(),
-        };
-        self.receipts.put(receipt.clone());
-
-        // Post-send audit failure is surfaced with the receipt attached: the
-        // message already went out, so the caller must reconcile rather than
-        // retry (retrying would violate idempotency).
-        if let Err(unavailable) = self.kernel.record_audit(&OutboundAuditEvent {
-            idempotency_key: request.idempotency_key,
-            verb: request.verb,
-            provider: request.provider,
-            target_summary: request.target.summary(request.provider),
-            phase: AuditPhase::PostSend,
-            outcome: "sent".to_owned(),
-        }) {
-            return Err(OutboundError::PostSendAuditFailed {
-                receipt,
-                reason: unavailable.reason,
-            });
-        }
-
-        Ok(receipt)
+        })
     }
 }
 
@@ -592,6 +741,12 @@ pub enum OutboundError {
     Adapter { reason: String },
     #[error("adapter does not declare support for verb {verb:?}")]
     UnsupportedVerb { verb: OutboundVerb },
+    #[error("adapter is not bound to the request connection: {reason}")]
+    ConnectionMismatch { reason: &'static str },
+    #[error("idempotency key is already in flight; retry later with the same key: {reason}")]
+    IdempotencyConflict { reason: &'static str },
+    #[error("receipt store unavailable, send blocked: {reason}")]
+    ReceiptUnavailable { reason: String },
     #[error("post-send audit failed; receipt persisted, reconcile instead of retrying: {reason}")]
     PostSendAuditFailed {
         receipt: DeliveryReceipt,
@@ -703,6 +858,7 @@ mod tests {
         descriptor: AdapterDescriptor,
         calls: Arc<AtomicUsize>,
         bound: bool,
+        bound_connection: Option<ConnectionId>,
     }
 
     impl FakeAdapter {
@@ -718,6 +874,7 @@ mod tests {
                 ),
                 calls: Arc::new(AtomicUsize::new(0)),
                 bound: true,
+                bound_connection: Some(ConnectionId::new("conn-1").unwrap()),
             }
         }
     }
@@ -730,6 +887,14 @@ mod tests {
 
         fn descriptor_provider(&self) -> Provider {
             Provider::Courier
+        }
+
+        fn bound_connection_id(&self) -> Option<&ConnectionId> {
+            if self.bound {
+                self.bound_connection.as_ref()
+            } else {
+                None
+            }
         }
 
         fn state(&self) -> ConnectionState {
@@ -847,7 +1012,139 @@ mod tests {
         let pipeline = pipeline(TestKernelPort::allow());
         let request = test_request(OutboundVerb::Send);
         let err = pipeline.execute(&adapter, &request).await.unwrap_err();
-        assert!(matches!(err, OutboundError::AdapterBlocked { .. }));
+        // The binding check fires before the provider call: the adapter can
+        // never be reached through a connection it is not bound to.
+        assert!(matches!(err, OutboundError::ConnectionMismatch { .. }));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn adapter_bound_to_different_connection_blocks() {
+        let mut adapter = FakeAdapter::new();
+        adapter.bound_connection = Some(ConnectionId::new("conn-9").unwrap());
+        let pipeline = pipeline(TestKernelPort::allow());
+        let request = test_request(OutboundVerb::Send);
+        let err = pipeline.execute(&adapter, &request).await.unwrap_err();
+        assert!(matches!(err, OutboundError::ConnectionMismatch { .. }));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_mismatch_blocks() {
+        let adapter = FakeAdapter::new();
+        let pipeline = pipeline(TestKernelPort::allow());
+        let mut request = test_request(OutboundVerb::Send);
+        request.provider = Provider::Discord;
+        let err = pipeline.execute(&adapter, &request).await.unwrap_err();
+        assert!(matches!(err, OutboundError::Validation { .. }));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_for_one_key_send_once() {
+        let adapter = Arc::new(FakeAdapter::new());
+        let pipeline = Arc::new(pipeline(TestKernelPort::allow()));
+        let request = test_request(OutboundVerb::Send);
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let adapter = Arc::clone(&adapter);
+            let pipeline = Arc::clone(&pipeline);
+            let request = request.clone();
+            handles.push(tokio::spawn(async move {
+                pipeline.execute(adapter.as_ref(), &request).await
+            }));
+        }
+        let mut receipts = Vec::new();
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(receipt) => receipts.push(receipt),
+                // The reservation loser: retry later with the same key.
+                Err(OutboundError::IdempotencyConflict { .. }) => {}
+                Err(other) => panic!("expected receipt or IdempotencyConflict, got {other:?}"),
+            }
+        }
+        // Exactly one caller reached the provider; the rest either lost the
+        // reservation race or replayed the completed receipt.
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert!(!receipts.is_empty());
+        for receipt in &receipts {
+            assert_eq!(receipt, &receipts[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_reused_for_different_request_fails() {
+        let adapter = FakeAdapter::new();
+        let pipeline = pipeline(TestKernelPort::allow());
+        let request = test_request(OutboundVerb::Send);
+        let receipt = pipeline.execute(&adapter, &request).await.unwrap();
+
+        let mut other = test_request(OutboundVerb::Send);
+        other.idempotency_key = request.idempotency_key;
+        other.text = Some("different effect".to_owned());
+        let err = pipeline.execute(&adapter, &other).await.unwrap_err();
+        assert!(matches!(err, OutboundError::Validation { .. }));
+        // The provider was never called for the mismatched request.
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.action_fingerprint, request.action_fingerprint());
+    }
+
+    #[test]
+    fn fingerprints_distinguish_different_effects() {
+        let request = test_request(OutboundVerb::Send);
+        assert_eq!(
+            request.action_fingerprint(),
+            request.clone().action_fingerprint()
+        );
+        let mut other = test_request(OutboundVerb::Send);
+        other.text = Some("different effect".to_owned());
+        assert_ne!(request.action_fingerprint(), other.action_fingerprint());
+    }
+
+    #[test]
+    fn store_reservation_is_atomic() {
+        let store = MemoryReceiptStore::new();
+        let key = IdempotencyKey::new();
+        assert!(matches!(store.reserve(&key), Ok(KeyReservation::Reserved)));
+        assert!(matches!(store.reserve(&key), Ok(KeyReservation::InFlight)));
+        store.abandon(&key);
+        assert!(matches!(store.reserve(&key), Ok(KeyReservation::Reserved)));
+    }
+
+    #[tokio::test]
+    async fn failed_send_releases_reservation_for_retry() {
+        #[derive(Debug, Clone)]
+        struct SharedReceipts(Arc<MemoryReceiptStore>);
+
+        impl ReceiptStore for SharedReceipts {
+            fn reserve(&self, key: &IdempotencyKey) -> Result<KeyReservation, ReceiptError> {
+                self.0.reserve(key)
+            }
+            fn complete(&self, receipt: DeliveryReceipt) -> Result<(), ReceiptError> {
+                self.0.complete(receipt)
+            }
+            fn abandon(&self, key: &IdempotencyKey) {
+                self.0.abandon(key)
+            }
+        }
+
+        let adapter = FakeAdapter::new();
+        let receipts = SharedReceipts(Arc::new(MemoryReceiptStore::new()));
+
+        // The reservation is taken, then the lease denial abandons it.
+        let denied =
+            OutboundPipeline::new(TestKernelPort::deny_lease("no lease"), receipts.clone());
+        let request = test_request(OutboundVerb::Send);
+        let err = denied.execute(&adapter, &request).await.unwrap_err();
+        assert!(matches!(err, OutboundError::LeaseDenied(_)));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+
+        // The same key succeeds once the lease is granted: the reservation
+        // did not leak.
+        let allowed = OutboundPipeline::new(TestKernelPort::allow(), receipts);
+        let receipt = allowed.execute(&adapter, &request).await.unwrap();
+        assert_eq!(receipt.idempotency_key, request.idempotency_key);
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

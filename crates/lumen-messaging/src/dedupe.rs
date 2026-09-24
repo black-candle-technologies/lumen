@@ -57,7 +57,10 @@ impl MemoryDedupeStore {
     /// `retention_millis` bounds how long a key suppresses duplicates.
     pub fn new(retention_millis: u64) -> Self {
         Self {
-            retention_millis: retention_millis as i64,
+            // Clamp unrepresentable values instead of wrapping: a wrapped
+            // negative retention would make every redelivery look new and
+            // silently turn dedupe off.
+            retention_millis: i64::try_from(retention_millis).unwrap_or(i64::MAX),
             inner: Mutex::new(MemoryDedupeInner {
                 seen: HashMap::new(),
                 order: VecDeque::new(),
@@ -167,5 +170,19 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         store.evict_expired();
         assert_eq!(store.check_and_insert(&k), Ok(DedupeOutcome::New));
+    }
+
+    #[test]
+    fn huge_retention_clamps_instead_of_wrapping() {
+        // u64::MAX `as i64` wraps to -1, which would make every redelivery
+        // look new and silently disable dedupe. The constructor clamps to
+        // i64::MAX so "never expire" keeps suppressing duplicates.
+        let store = MemoryDedupeStore::new(u64::MAX);
+        let k = key(Provider::Courier, "m1");
+        assert_eq!(store.check_and_insert(&k), Ok(DedupeOutcome::New));
+        match store.check_and_insert(&k).unwrap() {
+            DedupeOutcome::Duplicate { .. } => {}
+            DedupeOutcome::New => panic!("second insert must still be a duplicate"),
+        }
     }
 }

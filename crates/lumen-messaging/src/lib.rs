@@ -47,9 +47,9 @@ pub use envelope::{
     ProviderMessageId, ReplyContext, SenderIdentity, SenderVerification, TransportTrust,
 };
 pub use outbound::{
-    AuditUnavailable, DeliveryReceipt, IdempotencyKey, KernelPort, LeaseDenial, MemoryReceiptStore,
-    OutboundAuditEvent, OutboundError, OutboundPipeline, OutboundRequest, OutboundTarget,
-    OutboundVerb, ReceiptStore, VhlApprovalCarriage,
+    AuditUnavailable, DeliveryReceipt, IdempotencyKey, KernelPort, KeyReservation, LeaseDenial,
+    MemoryReceiptStore, OutboundAuditEvent, OutboundError, OutboundPipeline, OutboundRequest,
+    OutboundTarget, OutboundVerb, ReceiptError, ReceiptStore, VhlApprovalCarriage,
 };
 pub use principals::{MappingError, PrincipalMappingRegistry, PrincipalResolution};
 

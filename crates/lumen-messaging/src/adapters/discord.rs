@@ -39,8 +39,8 @@ use crate::{
     },
     dedupe::DedupeStore,
     envelope::{
-        Conversation, DedupeKey, MessageEnvelope, Provenance, Provider, ProviderMessageId,
-        ReplyContext, SenderIdentity, TransportTrust,
+        ConnectionId, Conversation, DedupeKey, MessageEnvelope, Provenance, Provider,
+        ProviderMessageId, ReplyContext, SenderIdentity, TransportTrust,
     },
     outbound::{OutboundRequest, OutboundTarget, OutboundVerb},
     principals::{PrincipalMappingRegistry, PrincipalResolution},
@@ -207,6 +207,141 @@ pub enum DiscordEventKind {
     Interaction,
 }
 
+/// Outcome of [`DiscordAdapter::ingest_signed_interaction`].
+#[derive(Debug)]
+pub enum SignedInteractionOutcome {
+    /// Discord endpoint validation (`type: 1`): the host must answer
+    /// `{"type":1}`; there is nothing to ingest.
+    Ping,
+    /// Ingested interaction event (`None` when it was a known redelivery).
+    /// Boxed: the envelope is large and this enum crosses call boundaries.
+    Event(Option<Box<MessageEnvelope>>),
+}
+
+/// Wire shape of a Discord interaction webhook body
+/// (<https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-object>).
+/// Only the fields the adapter maps are modeled.
+#[derive(Clone, Debug, Deserialize)]
+struct DiscordInteraction {
+    #[serde(rename = "type")]
+    kind: u8,
+    id: String,
+    #[serde(default)]
+    guild_id: Option<String>,
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    channel: Option<InteractionChannel>,
+    #[serde(default)]
+    member: Option<InteractionMember>,
+    #[serde(default)]
+    user: Option<InteractionUser>,
+    #[serde(default)]
+    data: Option<InteractionData>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InteractionChannel {
+    id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InteractionMember {
+    #[serde(default)]
+    nick: Option<String>,
+    user: InteractionUser,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InteractionUser {
+    id: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    global_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InteractionData {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl DiscordInteraction {
+    /// Maps the webhook body onto the normalized gateway event shape:
+    /// interaction `id` becomes the message id, `member.user.id` (or
+    /// `user.id`) becomes the author.
+    fn into_gateway_event(self, timestamp_ms: i64) -> Result<DiscordGatewayEvent, IngestError> {
+        let malformed = |reason: &str| IngestError::MalformedEvent {
+            reason: reason.to_owned(),
+        };
+        let channel_id = self
+            .channel
+            .map(|c| c.id)
+            .or(self.channel_id)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| malformed("interaction has no channel"))?;
+        let (author_id, author_name) = match (self.member, self.user) {
+            (Some(member), _) => {
+                let name = member
+                    .nick
+                    .or(member.user.global_name)
+                    .or(member.user.username);
+                (member.user.id, name)
+            }
+            (None, Some(user)) => {
+                let name = user.global_name.or(user.username);
+                (user.id, name)
+            }
+            (None, None) => return Err(malformed("interaction has no author")),
+        };
+        if author_id.is_empty() {
+            return Err(malformed("interaction has no author"));
+        }
+        let command_name = self.data.as_ref().and_then(|d| d.name.clone());
+        let content = command_name
+            .as_deref()
+            .map(|name| format!("/{name}"))
+            .unwrap_or_default();
+        Ok(DiscordGatewayEvent {
+            kind: DiscordEventKind::Interaction,
+            guild_id: self.guild_id,
+            channel_id,
+            thread_id: None,
+            author_id,
+            author_name,
+            message_id: self.id,
+            content,
+            timestamp_ms,
+            command_name,
+            reply_to_message_id: None,
+        })
+    }
+}
+
+/// Maximum age of the authenticated `X-Signature-Timestamp` header, in
+/// seconds. The signature authenticates this header, so a captured webhook
+/// cannot be replayed outside the window (future timestamps are rejected
+/// too, which also bounds clock skew).
+const INTERACTION_TIMESTAMP_WINDOW_SECS: i64 = 300;
+
+/// Parses the authenticated interaction timestamp header as Unix seconds and
+/// enforces the freshness window against `now_millis`. Returns millis for
+/// the normalized event.
+fn parse_interaction_timestamp(timestamp: &str, now_millis: i64) -> Result<i64, IngestError> {
+    let malformed = |reason: &str| IngestError::MalformedEvent {
+        reason: reason.to_owned(),
+    };
+    let secs: i64 = timestamp
+        .parse()
+        .map_err(|_| malformed("interaction timestamp header is not unix seconds"))?;
+    let skew_secs = now_millis.div_euclid(1000) - secs;
+    if skew_secs.abs() > INTERACTION_TIMESTAMP_WINDOW_SECS {
+        return Err(malformed("interaction timestamp outside freshness window"));
+    }
+    Ok(secs.saturating_mul(1000))
+}
+
 /// Exact Discord REST call for an outbound effect. The host executes this
 /// with the kernel-brokered bot token (`Authorization: Bot <token>`); the
 /// adapter never sees the token.
@@ -269,13 +404,18 @@ impl DiscordAdapter {
     }
 
     /// Verifies an interaction webhook's Ed25519 signature and ingests it.
+    ///
+    /// Signed webhook bodies are Discord's *interaction* schema, not the
+    /// normalized [`DiscordGatewayEvent`] (that type is for host-authenticated
+    /// Gateway events). The body is parsed as [`DiscordInteraction`] and
+    /// mapped onto the normalized event before ingestion.
     pub fn ingest_signed_interaction(
         &self,
         signature_hex: &str,
         timestamp: &str,
         body: &[u8],
         now_millis: i64,
-    ) -> Result<Option<MessageEnvelope>, IngestError> {
+    ) -> Result<SignedInteractionOutcome, IngestError> {
         verify_interaction_signature(
             &self.bot_config.application_public_key_hex,
             signature_hex,
@@ -283,7 +423,27 @@ impl DiscordAdapter {
             body,
         )
         .map_err(|_| IngestError::SignatureVerificationFailed)?;
-        self.ingest(body, now_millis)
+        // The timestamp is authenticated by the signature above; enforce
+        // freshness so a captured webhook cannot be replayed after its
+        // dedupe key expires.
+        let timestamp_ms = parse_interaction_timestamp(timestamp, now_millis)?;
+        let interaction: DiscordInteraction =
+            serde_json::from_slice(body).map_err(|e| IngestError::MalformedEvent {
+                reason: format!("not a discord interaction: {e}"),
+            })?;
+        match interaction.kind {
+            // Discord endpoint validation: the host must answer `{"type":1}`;
+            // there is nothing to ingest.
+            1 => Ok(SignedInteractionOutcome::Ping),
+            2..=5 => {
+                let event = interaction.into_gateway_event(timestamp_ms)?;
+                self.ingest_event(body, &event, now_millis)
+                    .map(|envelope| SignedInteractionOutcome::Event(envelope.map(Box::new)))
+            }
+            other => Err(IngestError::MalformedEvent {
+                reason: format!("unsupported interaction type {other}"),
+            }),
+        }
     }
 
     /// Builds the exact Discord REST call for an outbound request. The host
@@ -296,7 +456,16 @@ impl DiscordAdapter {
             return Err(DiscordError::WrongProvider);
         }
         let channel_id = self.outbound_channel_id(&request.target)?;
-        let text = request.text.clone().unwrap_or_default();
+        // Discord rejects empty content (error 50006) after the host has
+        // already run authorization and audit: fail here instead.
+        let text = match request.verb {
+            OutboundVerb::Send | OutboundVerb::Edit => request
+                .text
+                .clone()
+                .filter(|t| !t.is_empty())
+                .ok_or(DiscordError::MissingText)?,
+            _ => String::new(),
+        };
         match request.verb {
             OutboundVerb::Send => Ok(DiscordRestCall::post_channel_message(&channel_id, &text)),
             OutboundVerb::Edit => {
@@ -304,11 +473,11 @@ impl DiscordAdapter {
                     .target_message_id
                     .as_ref()
                     .ok_or(DiscordError::MissingTargetMessage)?;
+                let message_id = snowflake(message_id.as_str())?;
                 Ok(DiscordRestCall {
                     method: "PATCH",
                     url: format!(
-                        "https://discord.com/api/v10/channels/{channel_id}/messages/{}",
-                        message_id.as_str()
+                        "https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
                     ),
                     body_json: serde_json::json!({ "content": text }).to_string(),
                 })
@@ -318,6 +487,7 @@ impl DiscordAdapter {
                     .target_message_id
                     .as_ref()
                     .ok_or(DiscordError::MissingTargetMessage)?;
+                let message_id = snowflake(message_id.as_str())?;
                 let reaction = request
                     .reaction
                     .as_deref()
@@ -326,8 +496,7 @@ impl DiscordAdapter {
                 Ok(DiscordRestCall {
                     method: "PUT",
                     url: format!(
-                        "https://discord.com/api/v10/channels/{channel_id}/messages/{}/reactions/{encoded}/@me",
-                        message_id.as_str()
+                        "https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me"
                     ),
                     body_json: String::new(),
                 })
@@ -337,11 +506,11 @@ impl DiscordAdapter {
                     .target_message_id
                     .as_ref()
                     .ok_or(DiscordError::MissingTargetMessage)?;
+                let message_id = snowflake(message_id.as_str())?;
                 Ok(DiscordRestCall {
                     method: "DELETE",
                     url: format!(
-                        "https://discord.com/api/v10/channels/{channel_id}/messages/{}",
-                        message_id.as_str()
+                        "https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
                     ),
                     body_json: String::new(),
                 })
@@ -352,7 +521,9 @@ impl DiscordAdapter {
 
     fn outbound_channel_id(&self, target: &OutboundTarget) -> Result<String, DiscordError> {
         match target {
-            OutboundTarget::Conversation(conversation) => Ok(conversation.channel_id.clone()),
+            OutboundTarget::Conversation(conversation) => {
+                Ok(snowflake(&conversation.channel_id)?.to_owned())
+            }
             OutboundTarget::DirectRecipient { .. } => Err(DiscordError::DmNeedsChannel),
         }
     }
@@ -412,18 +583,21 @@ impl DiscordAdapter {
         })?;
 
         let dedupe_key = DedupeKey::compute(Provider::Discord, &connection_id, &message_id);
-        match DedupeDecision::decide(self.dedupe.check_and_insert(&dedupe_key))? {
-            DedupeDecision::Proceed => {}
-            // Known redelivery: the first delivery already entered the
-            // pipeline. Skip without disturbing the batch.
-            DedupeDecision::Skip => return Ok(None),
-        }
-
+        // Explicit principal mapping; fail closed on ambiguity or absence.
+        // Pure lookup, so it runs BEFORE the dedupe insert: a message
+        // rejected here must not record a dedupe key, otherwise a redelivery
+        // after the operator maps the identity would collapse to Skip.
         let resolution = self.registry.resolve(Provider::Discord, &event.author_id);
         match resolution {
             PrincipalResolution::Ambiguous => return Err(IngestError::AmbiguousIdentity),
             PrincipalResolution::Unknown => return Err(IngestError::UnknownIdentity),
             PrincipalResolution::Mapped(_) => {}
+        }
+        match DedupeDecision::decide(self.dedupe.check_and_insert(&dedupe_key))? {
+            DedupeDecision::Proceed => {}
+            // Known redelivery: the first delivery already entered the
+            // pipeline. Skip without disturbing the batch.
+            DedupeDecision::Skip => return Ok(None),
         }
 
         let mut conversation = Conversation::channel(event.channel_id.clone()).map_err(|e| {
@@ -478,6 +652,19 @@ impl DiscordAdapter {
     }
 }
 
+/// Validates a Discord snowflake id before it is interpolated into a REST
+/// path. Discord ids are unsigned 64-bit integers in decimal; anything else
+/// (including `/` or `..` segments, which the envelope's generic identifier
+/// check permits) is rejected so a crafted id can never escape the intended
+/// channel/message path when a host executor normalizes dot segments.
+fn snowflake(id: &str) -> Result<&str, DiscordError> {
+    if !id.is_empty() && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(id)
+    } else {
+        Err(DiscordError::InvalidId)
+    }
+}
+
 fn url_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -502,6 +689,10 @@ impl MessagingAdapter for DiscordAdapter {
 
     fn state(&self) -> ConnectionState {
         self.state.clone()
+    }
+
+    fn bound_connection_id(&self) -> Option<&ConnectionId> {
+        self.binding.as_ref().map(|b| &b.connection_id)
     }
 
     async fn bind(
@@ -582,6 +773,10 @@ pub enum DiscordError {
     MissingReaction,
     #[error("DM sends need an open DM channel id; use a conversation target")]
     DmNeedsChannel,
+    #[error("invalid discord snowflake id")]
+    InvalidId,
+    #[error("send/edit requires non-empty text")]
+    MissingText,
 }
 
 #[cfg(test)]
@@ -717,6 +912,143 @@ mod tests {
         );
     }
 
+    fn sign_interaction(timestamp: &str, body: &[u8]) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+        let secret: [u8; 32] = hex::decode(TEST_SECRET_KEY).unwrap().try_into().unwrap();
+        let signing = SigningKey::from_bytes(&secret);
+        let mut msg = Vec::new();
+        msg.extend_from_slice(timestamp.as_bytes());
+        msg.extend_from_slice(body);
+        hex::encode(signing.sign(&msg).to_bytes())
+    }
+
+    fn interaction_test_adapter(author_id: &str) -> DiscordAdapter {
+        let mut registry = PrincipalMappingRegistry::new();
+        registry
+            .register(
+                Provider::Discord,
+                author_id,
+                lumen_core::identity::PrincipalId::new("bct", "user1").unwrap(),
+            )
+            .unwrap();
+        let mut adapter = DiscordAdapter::new(
+            test_config(),
+            Arc::new(registry),
+            Arc::new(MemoryDedupeStore::new(3_600_000)),
+        )
+        .unwrap();
+        adapter.state = ConnectionState::Bound;
+        adapter.binding = Some(
+            ConnectionBinding::new(
+                ConnectionId::new("conn-discord").unwrap(),
+                "bct-account",
+                CredentialHandle::new("handle-discord").unwrap(),
+            )
+            .unwrap(),
+        );
+        adapter
+    }
+
+    fn fresh_timestamp_secs() -> String {
+        (now_millis() / 1000).to_string()
+    }
+
+    #[test]
+    fn signed_interaction_ingests_real_payload() {
+        let author_id = "333333333333333333";
+        let adapter = interaction_test_adapter(author_id);
+        let timestamp = fresh_timestamp_secs();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": 2,
+            "id": "123456789012345679",
+            "application_id": "123456789012345670",
+            "guild_id": "111111111111111111",
+            "channel_id": "222222222222222222",
+            "member": {
+                "user": {
+                    "id": author_id,
+                    "username": "alice",
+                    "global_name": "Alice",
+                },
+                "nick": "Ali",
+            },
+            "data": {"name": "deploy", "type": 1},
+            "token": "interaction-token",
+            "version": 1,
+        }))
+        .unwrap();
+        let signature = sign_interaction(&timestamp, &body);
+
+        let outcome = adapter
+            .ingest_signed_interaction(&signature, &timestamp, &body, now_millis())
+            .expect("signed interaction ingests");
+        let envelope = match outcome {
+            SignedInteractionOutcome::Event(Some(envelope)) => envelope,
+            other => panic!("expected an ingested event, got {other:?}"),
+        };
+        assert_eq!(envelope.provider, Provider::Discord);
+        assert_eq!(envelope.message_id.as_str(), "123456789012345679");
+        assert_eq!(envelope.sender.external_id, author_id);
+        assert_eq!(envelope.sender.display_name.as_deref(), Some("Ali"));
+        assert_eq!(envelope.content, "/deploy");
+        assert_eq!(envelope.conversation.channel_id, "222222222222222222");
+        assert_eq!(
+            envelope.conversation.server_id.as_deref(),
+            Some("111111111111111111")
+        );
+        assert!(envelope.sender_is_verified());
+
+        // Redelivery of the same interaction collapses to None.
+        let outcome = adapter
+            .ingest_signed_interaction(&signature, &timestamp, &body, now_millis())
+            .expect("redelivery ingests");
+        assert!(matches!(outcome, SignedInteractionOutcome::Event(None)));
+    }
+
+    #[test]
+    fn signed_interaction_ping_returns_ping_outcome() {
+        let adapter = interaction_test_adapter("333333333333333333");
+        let timestamp = fresh_timestamp_secs();
+        let body = br#"{"type":1,"id":"1"}"#;
+        let signature = sign_interaction(&timestamp, body);
+
+        let outcome = adapter
+            .ingest_signed_interaction(&signature, &timestamp, body, now_millis())
+            .expect("ping ingests");
+        assert!(matches!(outcome, SignedInteractionOutcome::Ping));
+    }
+
+    #[test]
+    fn signed_interaction_rejects_stale_timestamp() {
+        let adapter = interaction_test_adapter("333333333333333333");
+        // An hour old: well outside the freshness window.
+        let timestamp = (now_millis() / 1000 - 3600).to_string();
+        let body = br#"{"type":1,"id":"1"}"#;
+        let signature = sign_interaction(&timestamp, body);
+
+        let err = adapter
+            .ingest_signed_interaction(&signature, &timestamp, body, now_millis())
+            .unwrap_err();
+        assert!(
+            matches!(err, IngestError::MalformedEvent { .. }),
+            "expected MalformedEvent, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn signed_interaction_rejects_tampered_body() {
+        let adapter = interaction_test_adapter("333333333333333333");
+        let timestamp = fresh_timestamp_secs();
+        let body = br#"{"type":2,"id":"123456789012345679"}"#;
+        let signature = sign_interaction(&timestamp, body);
+        let tampered = br#"{"type":2,"id":"999999999999999999"}"#;
+
+        let err = adapter
+            .ingest_signed_interaction(&signature, &timestamp, tampered, now_millis())
+            .unwrap_err();
+        assert_eq!(err, IngestError::SignatureVerificationFailed);
+    }
+
     #[test]
     fn bind_requires_the_runtime_flag() {
         let mut adapter = DiscordAdapter::new(
@@ -789,26 +1121,76 @@ mod tests {
         let adapter = test_adapter();
         let mut request = crate::outbound::test_support::test_request(OutboundVerb::Send);
         request.provider = Provider::Discord;
-        request.target = OutboundTarget::Conversation(Conversation::channel("chan-9").unwrap());
+        request.target =
+            OutboundTarget::Conversation(Conversation::channel("123456789012345678").unwrap());
         let call = adapter.build_rest_call(&request).unwrap();
         assert_eq!(call.method, "POST");
         assert_eq!(
             call.url,
-            "https://discord.com/api/v10/channels/chan-9/messages"
+            "https://discord.com/api/v10/channels/123456789012345678/messages"
         );
         assert!(call.body_json.contains("hello"));
 
         request.verb = OutboundVerb::Delete;
-        request.target_message_id = Some(ProviderMessageId::new("msg-7").unwrap());
+        request.target_message_id = Some(ProviderMessageId::new("987654321098765432").unwrap());
         let call = adapter.build_rest_call(&request).unwrap();
         assert_eq!(call.method, "DELETE");
-        assert!(call.url.ends_with("/channels/chan-9/messages/msg-7"));
+        assert!(
+            call.url
+                .ends_with("/channels/123456789012345678/messages/987654321098765432")
+        );
 
         request.verb = OutboundVerb::Upload;
         assert_eq!(
             adapter.build_rest_call(&request).unwrap_err(),
             DiscordError::VerbNotMapped
         );
+    }
+
+    #[test]
+    fn rest_call_rejects_non_snowflake_ids() {
+        let adapter = test_adapter();
+        let mut request = crate::outbound::test_support::test_request(OutboundVerb::Send);
+        request.provider = Provider::Discord;
+        // Path traversal in the channel id must not reach the URL.
+        request.target = OutboundTarget::Conversation(Conversation::channel("123/../456").unwrap());
+        assert_eq!(
+            adapter.build_rest_call(&request).unwrap_err(),
+            DiscordError::InvalidId
+        );
+
+        request.target =
+            OutboundTarget::Conversation(Conversation::channel("123456789012345678").unwrap());
+        request.verb = OutboundVerb::Delete;
+        request.target_message_id = Some(ProviderMessageId::new("../../x").unwrap());
+        assert_eq!(
+            adapter.build_rest_call(&request).unwrap_err(),
+            DiscordError::InvalidId
+        );
+    }
+
+    #[test]
+    fn rest_call_rejects_empty_text_for_send_and_edit() {
+        let adapter = test_adapter();
+        let mut request = crate::outbound::test_support::test_request(OutboundVerb::Send);
+        request.provider = Provider::Discord;
+        request.target =
+            OutboundTarget::Conversation(Conversation::channel("123456789012345678").unwrap());
+        request.text = None;
+        assert_eq!(
+            adapter.build_rest_call(&request).unwrap_err(),
+            DiscordError::MissingText
+        );
+        request.text = Some(String::new());
+        assert_eq!(
+            adapter.build_rest_call(&request).unwrap_err(),
+            DiscordError::MissingText
+        );
+
+        // Other verbs do not need text.
+        request.verb = OutboundVerb::Delete;
+        request.target_message_id = Some(ProviderMessageId::new("987654321098765432").unwrap());
+        assert!(adapter.build_rest_call(&request).is_ok());
     }
 
     #[test]

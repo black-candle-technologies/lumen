@@ -37,19 +37,36 @@ CLI surface used (from `courier --help` output, same source):
 
 - The adapter spawns `courier stdio` once at `bind`, multiplexes requests by
   `id` over oneshot channels, and enforces a per-request timeout (default 30s).
-- Reader/writer tasks detect child death; a dead child surfaces as
-  `ConnectionState::AuthLost` and blocks outbound effects.
+  Timed-out requests are evicted from the pending map so a late response
+  cannot resolve the wrong caller.
+- Reader/writer tasks detect child death; a dead child marks the transport
+  dead, fails all pending requests immediately, and surfaces as
+  `ConnectionState::AuthLost`, blocking outbound effects.
 - **Key material never enters the Pi process.** The kernel materializes the
   ephemeral per-session identity into a kernel-owned directory; the child
   runs with `HOME` pointed there so the CLI reads
   `<identity_dir>/.courier/config.json`. The adapter receives the directory
   path only — never key bytes. (Phase-4 owns identity materialization;
   see `TODO(PHASE4)`.)
-- The environment is otherwise inherited so proxy variables honored by the
-  courier client (`HTTPS_PROXY`, etc.) keep working.
-- Bind pins the reviewed binary: `courier version` must satisfy
-  `min_version`, and an optional expected SHA-256 (`expected_binary_sha256`)
-  fails closed on mismatch.
+- The child runs in a **scrubbed environment** (`env_clear`): only `HOME`
+  (the kernel-owned identity directory) and the ambient proxy variables the
+  courier client needs (`HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`,
+  `ALL_PROXY`/`all_proxy`, `NO_PROXY`/`no_proxy`) are installed. Ambient
+  secrets (API keys, tokens) never reach the helper.
+- **Bind pins the reviewed binary before anything executes it.** A SHA-256
+  digest pin (`expected_binary_sha256`) is **mandatory**, not optional:
+  `bind` hashes the binary at its absolute path first and fails closed on a
+  missing pin or mismatch (`BinaryPinRequired` / `BinaryHashMismatch`).
+  Only the digest-verified binary is executed, and `courier version` must
+  additionally satisfy `min_version`. Digest verification also runs before
+  the `version` probe so the probe itself cannot execute an unreviewed
+  binary.
+- **The binary's parent directory is part of the trust root.** The digest
+  check and the exec are separate syscalls, so `bind` requires the parent
+  directory to be root-owned and not writable by group/other
+  (`BinaryParentNotRootOwned` / `BinaryParentWritable`): a non-root actor
+  cannot rename a different file into the verified path between hash and
+  exec.
 
 ## Signature verification layering
 

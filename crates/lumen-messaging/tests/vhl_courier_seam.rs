@@ -76,7 +76,9 @@ fn real_request() -> VhlApprovalRequest {
         &action,
         &env,
         1,
-        NOW_MS + 300_000,
+        // Relative TTL, not an absolute timestamp: the constructor adds it
+        // to `now_ms` to compute expiry.
+        300_000,
         NOW_MS,
     )
     .expect("request builds")

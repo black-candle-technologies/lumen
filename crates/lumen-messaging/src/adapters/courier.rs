@@ -74,8 +74,8 @@ use crate::{
     },
     dedupe::DedupeStore,
     envelope::{
-        Conversation, DedupeKey, MessageEnvelope, Provenance, Provider, ProviderMessageId,
-        ReplyContext, SenderIdentity, TransportTrust,
+        ConnectionId, Conversation, DedupeKey, MessageEnvelope, Provenance, Provider,
+        ProviderMessageId, ReplyContext, SenderIdentity, TransportTrust,
     },
     outbound::OutboundRequest,
     principals::{PrincipalMappingRegistry, PrincipalResolution},
@@ -264,19 +264,7 @@ impl CourierStdioTransport {
     pub async fn spawn(config: &CourierConfig) -> Result<Self, CourierError> {
         // The pin is mandatory (validated at bind); re-verify here so a
         // direct spawn can never run an unpinned helper either.
-        let expected = config
-            .expected_binary_sha256
-            .as_ref()
-            .ok_or(CourierError::BinaryPinRequired)?;
-        let actual = sha256_file(&config.binary).map_err(|e| CourierError::Transport {
-            reason: format!("cannot hash courier binary: {e}"),
-        })?;
-        if actual != expected.to_ascii_lowercase() {
-            return Err(CourierError::BinaryHashMismatch {
-                expected: expected.clone(),
-                actual,
-            });
-        }
+        verify_binary_digest(config)?;
         if !config.binary.is_absolute() {
             return Err(CourierError::RelativeBinaryPath);
         }
@@ -368,14 +356,20 @@ impl CourierStdioTransport {
                 reason: "courier stdio writer task is gone".to_owned(),
             })?;
 
-        let response = tokio::time::timeout(self.timeout, rx)
-            .await
-            .map_err(|_| CourierError::Transport {
-                reason: format!("courier stdio request {id} timed out"),
-            })?
-            .map_err(|_| CourierError::Transport {
-                reason: "courier stdio response channel closed".to_owned(),
-            })?;
+        let response = match tokio::time::timeout(self.timeout, rx).await {
+            Ok(rx_result) => rx_result,
+            Err(_) => {
+                // Timeout: drop the registration so a late response cannot
+                // be misattributed and the map cannot grow without bound.
+                self.pending.inner.lock().await.remove(&id);
+                return Err(CourierError::Transport {
+                    reason: format!("courier stdio request {id} timed out"),
+                });
+            }
+        }
+        .map_err(|_| CourierError::Transport {
+            reason: "courier stdio response channel closed".to_owned(),
+        })?;
         if response.id != id {
             return Err(CourierError::Transport {
                 reason: format!("courier stdio id mismatch: sent {id}, got {}", response.id),
@@ -517,8 +511,13 @@ fn spawn_reader(
                     }
                 }
                 _ => {
-                    // EOF or read error: the child is gone.
+                    // EOF or read error: the child is gone. Fail every
+                    // in-flight caller at once instead of letting each wait
+                    // out the full request timeout: dropping the senders
+                    // makes each waiting `rx` return a closed-channel error
+                    // immediately.
                     dead.store(true, Ordering::SeqCst);
+                    pending.inner.lock().await.clear();
                     break;
                 }
             }
@@ -568,13 +567,37 @@ impl BridgeDeliveryLog {
     }
 }
 
+/// Verifies the configured helper binary against its mandatory SHA-256 pin.
+/// Runs before anything executes the binary: a substituted helper must never
+/// get a single execution, not even `courier version`.
+fn verify_binary_digest(config: &CourierConfig) -> Result<(), CourierError> {
+    let expected = config
+        .expected_binary_sha256
+        .as_ref()
+        .ok_or(CourierError::BinaryPinRequired)?;
+    let actual = sha256_file(&config.binary).map_err(|e| CourierError::Transport {
+        reason: format!("cannot hash courier binary: {e}"),
+    })?;
+    if actual != expected.to_ascii_lowercase() {
+        return Err(CourierError::BinaryHashMismatch {
+            expected: expected.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
 /// Validates the helper-binary trust root before anything executes it:
-/// absolute path (no PATH resolution) and a well-formed mandatory digest
-/// pin. Fail-closed: an unpinned or PATH-resolved helper must never run.
+/// absolute path (no PATH resolution), a well-formed mandatory digest pin,
+/// and a parent directory that a non-root actor cannot write to (so the
+/// digest verified at bind cannot be swapped for a different file between
+/// hash and exec). Fail-closed: an unpinned, PATH-resolved, or swappable
+/// helper must never run.
 fn validate_binary_config(config: &CourierConfig) -> Result<(), CourierError> {
     if !config.binary.is_absolute() {
         return Err(CourierError::RelativeBinaryPath);
     }
+    validate_binary_parent(&config.binary)?;
     match &config.expected_binary_sha256 {
         None => Err(CourierError::BinaryPinRequired),
         Some(pin) => {
@@ -586,6 +609,38 @@ fn validate_binary_config(config: &CourierConfig) -> Result<(), CourierError> {
             }
         }
     }
+}
+
+/// The digest check and the exec are two separate syscalls: without a
+/// trust-rooted parent, the file could be replaced between them (TOCTOU).
+/// The parent must not be writable by group/other (checked first, so the
+/// writable case is deterministic) and must be root-owned, so a non-root
+/// actor cannot rename a different file into the verified path.
+#[cfg(unix)]
+fn validate_binary_parent(binary: &std::path::Path) -> Result<(), CourierError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let parent = binary.parent().ok_or(CourierError::RelativeBinaryPath)?;
+    let meta = std::fs::metadata(parent).map_err(|e| CourierError::Transport {
+        reason: format!("cannot stat courier binary parent: {e}"),
+    })?;
+    if meta.permissions().mode() & 0o022 != 0 {
+        return Err(CourierError::BinaryParentWritable(
+            parent.display().to_string(),
+        ));
+    }
+    if meta.uid() != 0 {
+        return Err(CourierError::BinaryParentNotRootOwned(
+            parent.display().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Non-unix targets cannot express the root-owned-parent trust root; the
+/// digest pin is the only check there.
+#[cfg(not(unix))]
+fn validate_binary_parent(_binary: &std::path::Path) -> Result<(), CourierError> {
+    Ok(())
 }
 
 /// Environment for the supervised `courier` child: scrubbed, not inherited.
@@ -653,13 +708,23 @@ fn check_identity_dir(dir: &PathBuf) -> Result<(), CourierError> {
 }
 
 /// Checks `courier version` output against the minimum version.
-fn check_cli_version(binary: &PathBuf, min_version: &str) -> Result<String, CourierError> {
-    let output = std::process::Command::new(binary)
-        .arg("version")
-        .output()
-        .map_err(|e| CourierError::Transport {
-            reason: format!("failed to run courier version: {e}"),
-        })?;
+///
+/// Runs with the same scrubbed environment as the supervised child: even
+/// though the digest is verified before this executes, a substituted binary
+/// must never see ambient secrets.
+fn check_cli_version(
+    binary: &PathBuf,
+    min_version: &str,
+    identity_dir: Option<&PathBuf>,
+) -> Result<String, CourierError> {
+    let mut command = std::process::Command::new(binary);
+    command.arg("version").env_clear();
+    for (key, value) in child_env(identity_dir) {
+        command.env(key, value);
+    }
+    let output = command.output().map_err(|e| CourierError::Transport {
+        reason: format!("failed to run courier version: {e}"),
+    })?;
     if !output.status.success() {
         return Err(CourierError::Transport {
             reason: "courier version exited non-zero".to_owned(),
@@ -963,6 +1028,24 @@ impl HandoffArtifact {
 // The adapter
 // ---------------------------------------------------------------------------
 
+/// One message in a [`CourierAdapter::poll`] batch that failed to ingest.
+/// The batch continues past rejections; the caller must surface these to
+/// the operator/audit trail.
+#[derive(Debug)]
+pub struct PollRejection {
+    /// Provider message id of the rejected message.
+    pub message_id: i64,
+    pub error: IngestError,
+}
+
+/// Outcome of [`CourierAdapter::poll`]: the envelopes that ingested, plus
+/// the messages that were rejected without disturbing the batch.
+#[derive(Debug, Default)]
+pub struct PollOutcome {
+    pub envelopes: Vec<MessageEnvelope>,
+    pub rejected: Vec<PollRejection>,
+}
+
 /// Courier baseline adapter.
 pub struct CourierAdapter {
     descriptor: AdapterDescriptor,
@@ -1039,12 +1122,12 @@ impl CourierAdapter {
     }
 
     /// Polls the CLI inbox after the cursor and ingests each message.
-    /// Returns the envelopes for newly seen messages.
-    pub async fn poll(
-        &mut self,
-        limit: i32,
-        now_millis: i64,
-    ) -> Result<Vec<MessageEnvelope>, IngestError> {
+    ///
+    /// One bad message must not discard the batch: serialization and ingest
+    /// failures are recorded per message (with the message id) and the loop
+    /// continues. The caller must surface `rejected` to the operator/audit
+    /// trail — a rejection is terminal for that poll position.
+    pub async fn poll(&mut self, limit: i32, now_millis: i64) -> Result<PollOutcome, IngestError> {
         let transport = self.transport.as_ref().ok_or(IngestError::AuthLost {
             reason: "courier adapter not bound".to_owned(),
         })?;
@@ -1054,21 +1137,35 @@ impl CourierAdapter {
             .map_err(|e| IngestError::AuthLost {
                 reason: e.to_string(),
             })?;
-        let mut envelopes = Vec::new();
+        let mut outcome = PollOutcome::default();
         for message in messages {
             self.inbox_cursor = Some(message.id);
-            let raw = serde_json::to_vec(&message).map_err(|e| IngestError::MalformedEvent {
-                reason: e.to_string(),
-            })?;
+            let raw = match serde_json::to_vec(&message) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    outcome.rejected.push(PollRejection {
+                        message_id: message.id,
+                        error: IngestError::MalformedEvent {
+                            reason: e.to_string(),
+                        },
+                    });
+                    continue;
+                }
+            };
             // These bytes came from the supervised, digest-pinned bridge:
             // record them so the public ingest gate accepts exactly them.
             self.note_bridge_delivery(&raw);
             // Known redeliveries collapse to None and never disturb the batch.
-            if let Some(envelope) = self.ingest_message(&raw, &message, now_millis)? {
-                envelopes.push(envelope);
+            match self.ingest_message(&raw, &message, now_millis) {
+                Ok(Some(envelope)) => outcome.envelopes.push(envelope),
+                Ok(None) => {}
+                Err(error) => outcome.rejected.push(PollRejection {
+                    message_id: message.id,
+                    error,
+                }),
             }
         }
-        Ok(envelopes)
+        Ok(outcome)
     }
 
     /// Records raw bytes emitted by the supervised bridge. Only registered
@@ -1107,6 +1204,19 @@ impl CourierAdapter {
             }
         })?;
 
+        // Explicit principal mapping; fail closed on ambiguity or absence.
+        // This is a pure lookup with no side effects, so it runs BEFORE the
+        // dedupe insert: a message rejected here must not record a dedupe
+        // key, otherwise a redelivery after the operator maps the identity
+        // would collapse to Skip and the message would be lost.
+        let resolution = self.registry.resolve(Provider::Courier, from.as_str());
+        if matches!(resolution, PrincipalResolution::Ambiguous) {
+            return Err(IngestError::AmbiguousIdentity);
+        }
+        if matches!(resolution, PrincipalResolution::Unknown) {
+            return Err(IngestError::UnknownIdentity);
+        }
+
         // Deduplicate BEFORE the event may enter a Pi session.
         let connection_id = self
             .binding
@@ -1122,15 +1232,6 @@ impl CourierAdapter {
             // Known redelivery: the first delivery already entered the
             // pipeline. Skip without disturbing the batch.
             DedupeDecision::Skip => return Ok(None),
-        }
-
-        // Explicit principal mapping; fail closed on ambiguity or absence.
-        let resolution = self.registry.resolve(Provider::Courier, from.as_str());
-        if matches!(resolution, PrincipalResolution::Ambiguous) {
-            return Err(IngestError::AmbiguousIdentity);
-        }
-        if matches!(resolution, PrincipalResolution::Unknown) {
-            return Err(IngestError::UnknownIdentity);
         }
 
         // VHL carriage: split the body; the carriage is carried, not trusted.
@@ -1234,6 +1335,10 @@ impl MessagingAdapter for CourierAdapter {
         self.state.clone()
     }
 
+    fn bound_connection_id(&self) -> Option<&ConnectionId> {
+        self.binding.as_ref().map(|b| &b.connection_id)
+    }
+
     async fn bind(
         &mut self,
         binding: ConnectionBinding,
@@ -1243,25 +1348,35 @@ impl MessagingAdapter for CourierAdapter {
             return Err(AdapterError::Disabled);
         }
         // The helper binary is a trust root: validate it before executing
-        // anything. Absolute path (no PATH resolution) and a well-formed
+        // anything. Absolute path (no PATH resolution), a root-owned
+        // non-writable parent (no hash/exec swap), and a well-formed
         // mandatory digest pin, or bind fails closed here.
         validate_binary_config(&self.config).map_err(|e: CourierError| {
             AdapterError::Transport {
                 reason: e.to_string(),
             }
         })?;
+        // Verify the actual digest BEFORE the binary runs even once: the
+        // version check below executes the helper, so a substituted binary
+        // must be rejected here, not after its first execution.
+        verify_binary_digest(&self.config).map_err(|e: CourierError| AdapterError::Transport {
+            reason: e.to_string(),
+        })?;
         // Pin the reviewed CLI before trusting it with anything. This is a
         // blocking child process call; run it off the async executor.
         let binary = self.config.binary.clone();
         let min_version = self.config.min_version.clone();
-        let version = tokio::task::spawn_blocking(move || check_cli_version(&binary, &min_version))
-            .await
-            .map_err(|e| AdapterError::Transport {
-                reason: format!("courier version check panicked: {e}"),
-            })?
-            .map_err(|e: CourierError| AdapterError::Transport {
-                reason: e.to_string(),
-            })?;
+        let identity_dir = self.config.identity_dir.clone();
+        let version = tokio::task::spawn_blocking(move || {
+            check_cli_version(&binary, &min_version, identity_dir.as_ref())
+        })
+        .await
+        .map_err(|e| AdapterError::Transport {
+            reason: format!("courier version check panicked: {e}"),
+        })?
+        .map_err(|e: CourierError| AdapterError::Transport {
+            reason: e.to_string(),
+        })?;
         let _ = version;
 
         let transport =
@@ -1395,6 +1510,10 @@ pub enum CourierError {
     BinaryPinRequired,
     #[error("malformed courier binary digest pin: expected 64 hex characters")]
     MalformedBinaryPin,
+    #[error("courier binary parent directory is writable by group/other (swap risk): {0}")]
+    BinaryParentWritable(String),
+    #[error("courier binary parent directory is not root-owned (swap risk): {0}")]
+    BinaryParentNotRootOwned(String),
     #[error("courier identity dir must be a mode-0700 directory: {0}")]
     IdentityDirInsecure(String),
     #[error("unsupported courier CLI version: found {found}, minimum {min}")]
@@ -1753,6 +1872,26 @@ mod tests {
             std::env::remove_var("LUMEN_COURIER_TEST_SECRET");
             std::env::remove_var("https_proxy");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_parent_must_not_be_group_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("lumen-courier-parent-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+
+        // Writable by group/other: the verified file could be swapped
+        // between the digest check and exec.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            validate_binary_parent(&dir.join("courier")),
+            Err(CourierError::BinaryParentWritable(_))
+        ));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(unix)]

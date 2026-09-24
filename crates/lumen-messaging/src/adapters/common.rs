@@ -193,6 +193,14 @@ pub trait MessagingAdapter: Send + Sync {
         matches!(self.state(), ConnectionState::Bound)
     }
 
+    /// The connection this adapter is bound to, if any. The outbound
+    /// pipeline rejects requests for any other connection before the lease
+    /// check, so a request authorized for one connection can never execute
+    /// through an adapter bound to another.
+    fn bound_connection_id(&self) -> Option<&ConnectionId> {
+        None
+    }
+
     /// Step 1-2 of the lifecycle: authenticate, bind to the Black Candle
     /// account, and validate the reviewed version + enablement flags.
     /// Implementations must refuse to bind when disabled by config.

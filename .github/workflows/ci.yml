@@ -89,7 +89,14 @@ jobs:
           cargo test --workspace --exclude lumen-acceptance --exclude lumen-desktop --
           --skip fuel_deadline_and_cancellation_interrupt_guest_code
 
-  # NOTE: no discord-feature-tests job on pre-phase-5 branches.
-  # crates/lumen-messaging (and its `discord` feature) does not exist yet
-  # in this phase, so `cargo test -p lumen-messaging --features discord`
-  # can never run here. The job returns with the phase-5 tree.
+  discord-feature-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # The discord adapter lives behind a feature flag: the default
+      # workspace run never enables it, so it gets its own step.
+      - run: cargo test -p lumen-messaging --features discord

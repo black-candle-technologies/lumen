@@ -437,8 +437,10 @@ mod tests {
     #[test]
     fn rejects_future_and_stale_timestamps() {
         let now = now_millis();
-        assert!(envelope("hi", now + RECEIVED_SKEW_FUTURE_MILLIS + 1).is_err());
-        assert!(envelope("hi", now - RECEIVED_MAX_AGE_MILLIS - 1).is_err());
+        // Margin well beyond scheduling jitter: the test and the validator
+        // read the clock separately, so a 1ms boundary flakes under load.
+        assert!(envelope("hi", now + RECEIVED_SKEW_FUTURE_MILLIS + 60_000).is_err());
+        assert!(envelope("hi", now - RECEIVED_MAX_AGE_MILLIS - 60_000).is_err());
         assert!(envelope("hi", now).is_ok());
     }
 
