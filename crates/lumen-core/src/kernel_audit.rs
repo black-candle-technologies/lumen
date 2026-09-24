@@ -1,172 +1,111 @@
-//! Kernel audit foundation (Phase 1D): append-only hash-chained events,
-//! host-key checkpoints, secret-safe redaction, and provenance queries.
+//! Kernel audit log: append-only hash-chained audit events with host-key
+//! checkpoints.
 //!
-//! Events are [`lumen_protocol::AuditEvent`] v1 records: `seq`, `prev_hash`,
-//! `hash` form a tamper-evident chain (see the phase-0 contract). The kernel
-//! appends through [`KernelAuditLog`], which enforces redaction before an
-//! event is constructed — secrets must never reach the `details` field.
+//! The wire contract is the frozen [`lumen_core::pi_boundary::AuditEvent`]
+//! (v1): `version`, `event_id`, `sequence`, `timestamp_ms`, typed
+//! [`AuditActor`], typed [`AuditEventKind`], `session_id`, `action_digest`,
+//! optional `decision`, `detail` (a canonical JSON string), and the
+//! `prev_hash`/`hash` chain link. The kernel appends sealed events, seals
+//! checkpoints with the host key, and verifies the chain independently of
+//! any store.
 //!
-//! Periodically the kernel signs a checkpoint ([`lumen_protocol::AuditLink`])
-//! with the host key, bounding the damage window of a host compromise.
-//! Verification is independent: [`verify_chain_with_checkpoints`] replays the
-//! chain and checks every checkpoint signature from the host *verifying* key.
-//!
-//! Queries reconstruct provenance: action digest → session → lease ancestry →
-//! approval → run. Lease ancestry resolution needs the lease store; the query
-//! helpers take the pieces they need so they stay pure.
+//! [`AuditLink`] (checkpoint link records) is a kernel-internal runtime
+//! type, not a wire contract: checkpoints are local records, never sent
+//! across the trust boundary.
 
 use std::collections::HashMap;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use lumen_protocol::{
-    AUDIT_EVENT_VERSION, AuditError, AuditEvent, AuditLink,
-    audit::{append, verify_chain},
-    canonical,
+use crate::lease::KernelKeys;
+use crate::pi_boundary::{
+    AUDIT_EVENT_VERSION, AuditActor, AuditEvent, AuditEventKind, canonical_json,
 };
 
-use crate::lease::{KernelKeys, LeaseResolver, ms_to_rfc3339};
+/// Genesis `prev_hash`: the frozen contract uses `"0" * 64` for the first event.
+pub const GENESIS_PREV_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// Errors from the kernel audit log.
 #[derive(Debug, Error)]
 pub enum KernelAuditError {
-    #[error("audit contract error: {0}")]
-    Contract(#[from] AuditError),
-    #[error("canonicalization failed")]
-    Canonical,
-    #[error("bad checkpoint signature")]
-    BadCheckpointSignature,
-    #[error("checkpoint for seq {0} does not match chain hash {1}")]
-    CheckpointMismatch(u64, String),
-    #[error("checkpoint key {0} is not the host key")]
+    #[error("audit chain broken at seq {0}: {1}")]
+    ChainBreak(u64, String),
+    #[error("checkpoint signature invalid: {0}")]
+    BadCheckpoint(String),
+    #[error("checkpoint signed by unexpected key {0}")]
     WrongCheckpointKey(String),
-    #[error("no events to checkpoint")]
-    EmptyChain,
-    #[error("encoding error: {0}")]
-    Encoding(String),
+    #[error("event field invalid: {0}")]
+    BadEvent(String),
+    #[error("boundary error: {0}")]
+    Boundary(#[from] crate::pi_boundary::BoundaryError),
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic redaction
-// ---------------------------------------------------------------------------
+/// A host-key-signed checkpoint over a chain prefix.
+///
+/// Kernel-internal runtime record (not a wire contract): the signature binds
+/// `(key_id, through_seq, chain_hash)` so an independent verifier can confirm
+/// the chain prefix without trusting the store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLink {
+    pub key_id: String,
+    pub through_seq: u64,
+    pub chain_hash: String,
+    /// Hex-encoded Ed25519 signature over the canonical signing bytes.
+    pub signature: String,
+}
 
-/// Object keys whose values are always secrets. Matched case-insensitively.
-/// `secret_refs` is deliberately NOT in this list: references are opaque
-/// identifiers the kernel needs for queries; the secret material itself never
-/// appears in audit details.
-const SENSITIVE_KEYS: &[&str] = &[
-    "password",
-    "passwd",
-    "secret",
-    "api_key",
-    "apikey",
-    "token",
-    "auth_token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "bearer",
-    "authorization",
-    "private_key",
-    "privatekey",
-    "client_secret",
-    "signing_key",
-    "seed",
-    "seed_phrase",
-    "mnemonic",
-    "credentials",
-    "cookie",
-    "set_cookie",
-];
+impl AuditLink {
+    fn signing_bytes(&self) -> Result<Vec<u8>, KernelAuditError> {
+        let value = serde_json::json!({
+            "key_id": self.key_id,
+            "through_seq": self.through_seq,
+            "chain_hash": self.chain_hash,
+        });
+        canonical_json(&value).map_err(KernelAuditError::Boundary)
+    }
 
-/// Prefixes that mark a *value* as secret material regardless of its key.
-const SENSITIVE_VALUE_PREFIXES: &[&str] = &[
-    "sk-",
-    "sk-ant-",
-    "xoxb-",
-    "xoxp-",
-    "xoxa-",
-    "xoxr-",
-    "ghp_",
-    "gho_",
-    "ghu_",
-    "ghs_",
-    "ghr_",
-    "AKIA",
-    "-----BEGIN",
-];
+    pub fn sign(&mut self, keys: &KernelKeys) {
+        self.key_id = keys.host_key_id.clone();
+        // Sign over the final key_id so the signature covers it.
+        let bytes = self
+            .signing_bytes()
+            .expect("checkpoint signing bytes are infallible");
+        self.signature = hex::encode(keys.host_sign(&bytes).to_bytes());
+    }
 
-pub const REDACTED: &str = "[REDACTED]";
-
-/// Deterministically redact secrets from a JSON value, in place. Same input
-/// always produces the same output; redacted values carry no information
-/// about the original length or content.
-pub fn redact_details(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, val) in map.iter_mut() {
-                if SENSITIVE_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)) {
-                    *val = Value::String(REDACTED.to_string());
-                } else {
-                    redact_details(val);
-                }
-            }
+    pub fn verify(
+        &self,
+        key: &ed25519_dalek::VerifyingKey,
+        expected_key_id: &str,
+    ) -> Result<(), KernelAuditError> {
+        if self.key_id != expected_key_id {
+            return Err(KernelAuditError::WrongCheckpointKey(self.key_id.clone()));
         }
-        Value::Array(items) => {
-            for item in items {
-                redact_details(item);
-            }
-        }
-        Value::String(s) if SENSITIVE_VALUE_PREFIXES.iter().any(|p| s.starts_with(p)) => {
-            *s = REDACTED.to_string();
-        }
-        Value::String(_) => {}
-        _ => {}
+        let bytes = self.signing_bytes()?;
+        let sig = hex::decode(&self.signature)
+            .map_err(|e| KernelAuditError::BadCheckpoint(e.to_string()))?;
+        let sig = ed25519_dalek::Signature::from_slice(&sig)
+            .map_err(|e| KernelAuditError::BadCheckpoint(e.to_string()))?;
+        use ed25519_dalek::Verifier;
+        key.verify(&bytes, &sig)
+            .map_err(|e| KernelAuditError::BadCheckpoint(e.to_string()))?;
+        Ok(())
     }
 }
 
-/// A wrapper whose serialized and debug forms never reveal the inner value.
-/// Use for secret material that must cross a function boundary near audit
-/// code.
-pub struct Secret<T>(T);
-
-impl<T> Secret<T> {
-    pub fn new(value: T) -> Self {
-        Self(value)
-    }
-
-    pub fn expose(&self) -> &T {
-        &self.0
-    }
-}
-
-impl<T> std::fmt::Debug for Secret<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(REDACTED)
-    }
-}
-
-impl<T> Serialize for Secret<T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(REDACTED)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Append-only log
-// ---------------------------------------------------------------------------
-
-/// Where sealed events go. The in-memory implementation backs tests; the
-/// database implementation lives in `lumen-db`.
+/// Storage for audit events and checkpoints. The log owns sequencing and
+/// sealing; the store is a dumb append-only sink.
 pub trait AuditStore {
     fn append_event(&mut self, event: AuditEvent);
-    fn events(&self) -> &[AuditEvent];
     fn checkpoint(&mut self, link: AuditLink);
+    fn events(&self) -> &[AuditEvent];
     fn checkpoints(&self) -> &[AuditLink];
 }
 
+/// Shared in-memory store for tests and single-process kernels.
 #[derive(Default)]
 pub struct MemoryAuditStore {
     events: Vec<AuditEvent>,
@@ -178,12 +117,12 @@ impl AuditStore for MemoryAuditStore {
         self.events.push(event);
     }
 
-    fn events(&self) -> &[AuditEvent] {
-        &self.events
-    }
-
     fn checkpoint(&mut self, link: AuditLink) {
         self.checkpoints.push(link);
+    }
+
+    fn events(&self) -> &[AuditEvent] {
+        &self.events
     }
 
     fn checkpoints(&self) -> &[AuditLink] {
@@ -191,8 +130,8 @@ impl AuditStore for MemoryAuditStore {
     }
 }
 
-/// The kernel's audit log: seals events into the hash chain, redacts details,
-/// and issues host-key checkpoints.
+/// The kernel audit log: sequences, seals, and hash-chains frozen
+/// [`AuditEvent`]s, and anchors checkpoints with the host key.
 pub struct KernelAuditLog<S: AuditStore> {
     store: S,
 }
@@ -206,150 +145,179 @@ impl<S: AuditStore> KernelAuditLog<S> {
         &self.store
     }
 
-    /// Append an event. `details` are redacted deterministically *before*
-    /// the event is sealed, so no secret can enter the chain even if the
-    /// caller forgot.
+    fn prev_link(&self) -> (u64, String) {
+        match self.store.events().last() {
+            Some(e) => (e.sequence + 1, e.hash.clone()),
+            None => (0, GENESIS_PREV_HASH.to_string()),
+        }
+    }
+
+    /// Append one event: redacts secrets from `details`, assigns the next
+    /// sequence number, seals the hash chain, and stores the event.
+    ///
+    /// `decision` is the kernel's decision summary (`"allow"`, `"deny"`,
+    /// `"pending"`) or `None` when the event is not a policy decision.
+    /// `detail` is stored as a canonical JSON string per the frozen contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         actor: &str,
+        kind: AuditEventKind,
+        session_id: &str,
         action_digest: &str,
-        decision: &str,
+        decision: Option<&str>,
         now_ms: i64,
-        mut details: Value,
+        details: Value,
     ) -> Result<AuditEvent, KernelAuditError> {
-        redact_details(&mut details);
-        let prev = self.store.events().last();
-        let seq = prev.map(|e| e.seq + 1).unwrap_or(0);
-        let event = AuditEvent {
-            protocol_version: AUDIT_EVENT_VERSION,
-            seq,
-            ts: ms_to_rfc3339(now_ms),
-            actor: actor.to_string(),
+        // The frozen contract allows `"none"` for transport-level events; only
+        // an empty digest is rejected.
+        if action_digest.is_empty() {
+            return Err(KernelAuditError::BadEvent(
+                "action_digest must not be empty".to_string(),
+            ));
+        }
+        let actor_ty = parse_actor(actor)?;
+        let mut redacted = details;
+        redact_details(&mut redacted);
+        let detail_bytes = canonical_json(&redacted).map_err(KernelAuditError::Boundary)?;
+        let detail = String::from_utf8(detail_bytes)
+            .map_err(|e| KernelAuditError::BadEvent(format!("detail not UTF-8: {e}")))?;
+        let (sequence, prev_hash) = self.prev_link();
+        let mut event = AuditEvent {
+            version: AUDIT_EVENT_VERSION,
+            event_id: uuid::Uuid::new_v4(),
+            sequence,
+            timestamp_ms: now_ms,
+            actor: actor_ty,
+            kind,
+            session_id: session_id.to_string(),
             action_digest: action_digest.to_string(),
-            decision: decision.to_string(),
-            prev_hash: String::new(),
+            decision: decision.map(str::to_string),
+            detail,
+            prev_hash,
             hash: String::new(),
-            details,
         };
-        let sealed = append(prev, event)?;
-        self.store.append_event(sealed.clone());
-        Ok(sealed)
+        let hash = event
+            .compute_hash(&event.prev_hash)
+            .map_err(KernelAuditError::Boundary)?;
+        event.hash = hash;
+        self.store.append_event(event.clone());
+        Ok(event)
     }
 
-    /// Sign a checkpoint over the chain prefix ending at `upto_seq`
-    /// (inclusive) with the host key.
+    /// Checkpoint the chain through `through_seq` with the host key.
     pub fn checkpoint(
         &mut self,
-        upto_seq: u64,
+        through_seq: u64,
         keys: &KernelKeys,
     ) -> Result<AuditLink, KernelAuditError> {
         let event = self
             .store
             .events()
             .iter()
-            .find(|e| e.seq == upto_seq)
-            .ok_or(KernelAuditError::EmptyChain)?;
-        let bytes = checkpoint_signing_bytes(upto_seq, &event.hash, &keys.host_key_id)?;
-        let signature = hex::encode(keys.host_sign(&bytes).to_bytes());
-        let link = AuditLink {
-            seq: upto_seq,
-            hash: event.hash.clone(),
-            signature,
-            key_id: keys.host_key_id.clone(),
+            .find(|e| e.sequence == through_seq)
+            .ok_or_else(|| {
+                KernelAuditError::BadEvent(format!("no event at seq {through_seq}"))
+            })?;
+        let mut link = AuditLink {
+            key_id: String::new(),
+            through_seq,
+            chain_hash: event.hash.clone(),
+            signature: String::new(),
         };
+        link.sign(keys);
         self.store.checkpoint(link.clone());
         Ok(link)
     }
 
-    /// Verify the full chain plus every stored checkpoint against the host
-    /// *verifying* key. Reports the first break found: gaps are visible.
+    /// Verify the full chain plus every checkpoint, in order.
     pub fn verify(
         &self,
-        host_key: &VerifyingKey,
+        host_key: &ed25519_dalek::VerifyingKey,
         expected_key_id: &str,
     ) -> Result<(), KernelAuditError> {
-        let events = self.store.events();
-        verify_chain(events)?;
-        for link in self.store.checkpoints() {
-            if link.key_id != expected_key_id {
-                return Err(KernelAuditError::WrongCheckpointKey(link.key_id.clone()));
-            }
-            let event = events
+        verify_event_chain(self.store.events())?;
+        for cp in self.store.checkpoints() {
+            cp.verify(host_key, expected_key_id)?;
+            // The checkpoint must anchor a real chain prefix.
+            let anchored = self
+                .store
+                .events()
                 .iter()
-                .find(|e| e.seq == link.seq)
-                .ok_or_else(|| KernelAuditError::CheckpointMismatch(link.seq, link.hash.clone()))?;
-            if event.hash != link.hash {
-                return Err(KernelAuditError::CheckpointMismatch(
-                    link.seq,
-                    link.hash.clone(),
-                ));
+                .find(|e| e.sequence == cp.through_seq)
+                .is_some_and(|e| e.hash == cp.chain_hash);
+            if !anchored {
+                return Err(KernelAuditError::BadCheckpoint(format!(
+                    "checkpoint through seq {} does not match the chain",
+                    cp.through_seq
+                )));
             }
-            let bytes = checkpoint_signing_bytes(link.seq, &link.hash, &link.key_id)?;
-            let sig_bytes: [u8; 64] = hex::decode(&link.signature)
-                .map_err(|_| KernelAuditError::BadCheckpointSignature)?
-                .try_into()
-                .map_err(|_| KernelAuditError::BadCheckpointSignature)?;
-            host_key
-                .verify(&bytes, &Signature::from_bytes(&sig_bytes))
-                .map_err(|_| KernelAuditError::BadCheckpointSignature)?;
         }
         Ok(())
     }
 }
 
-/// Canonical bytes covered by a checkpoint signature. Public so the durable
-/// (SQL) audit store signs checkpoints over exactly the same bytes as the
-/// in-memory kernel log.
-pub fn checkpoint_signing_bytes(
-    seq: u64,
-    hash: &str,
-    key_id: &str,
-) -> Result<Vec<u8>, KernelAuditError> {
-    #[derive(Serialize)]
-    struct CheckpointView<'a> {
-        protocol: &'a str,
-        seq: u64,
-        hash: &'a str,
-        key_id: &'a str,
+/// Verify a slice of frozen audit events: version, gapless sequencing from
+/// 0, and every `prev_hash`/`hash` link recomputed independently.
+pub fn verify_event_chain(events: &[AuditEvent]) -> Result<(), KernelAuditError> {
+    let mut prev_hash = GENESIS_PREV_HASH.to_string();
+    for (i, e) in events.iter().enumerate() {
+        if e.version != AUDIT_EVENT_VERSION {
+            return Err(KernelAuditError::ChainBreak(
+                e.sequence,
+                format!("unsupported audit event version {}", e.version),
+            ));
+        }
+        if e.sequence != i as u64 {
+            return Err(KernelAuditError::ChainBreak(
+                e.sequence,
+                format!("sequence gap: expected {i}, found {}", e.sequence),
+            ));
+        }
+        if e.prev_hash != prev_hash {
+            return Err(KernelAuditError::ChainBreak(
+                e.sequence,
+                "prev_hash does not match previous event hash".to_string(),
+            ));
+        }
+        let recomputed = e
+            .compute_hash(&e.prev_hash)
+            .map_err(KernelAuditError::Boundary)?;
+        if recomputed != e.hash {
+            return Err(KernelAuditError::ChainBreak(
+                e.sequence,
+                "event hash does not recompute".to_string(),
+            ));
+        }
+        prev_hash = e.hash.clone();
     }
-    let view = CheckpointView {
-        protocol: "lumen-audit-checkpoint/v1",
-        seq,
-        hash,
-        key_id,
-    };
-    let value =
-        serde_json::to_value(view).map_err(|e| KernelAuditError::Encoding(e.to_string()))?;
-    canonical::canonical_json(&value)
-        .map(|s| s.into_bytes())
-        .map_err(|_| KernelAuditError::Canonical)
+    Ok(())
 }
 
-/// Verify an externally supplied chain and checkpoint set (independent
-/// verification path, e.g. for auditors holding only the host verifying key).
-pub fn verify_chain_with_checkpoints(
-    events: &[AuditEvent],
-    checkpoints: &[AuditLink],
-    host_key: &VerifyingKey,
-    expected_key_id: &str,
-) -> Result<(), KernelAuditError> {
-    let mut store = MemoryAuditStore::default();
-    for e in events {
-        store.append_event(e.clone());
+/// Parse a kernel actor string into the frozen [`AuditActor`].
+///
+/// `"kernel"` → [`AuditActor::Kernel`]; an `ed25519:`-prefixed subject →
+/// [`AuditActor::Session`]; anything else → [`AuditActor::Human`].
+fn parse_actor(actor: &str) -> Result<AuditActor, KernelAuditError> {
+    if actor.is_empty() {
+        return Err(KernelAuditError::BadEvent(
+            "actor must not be empty".to_string(),
+        ));
     }
-    for c in checkpoints {
-        store.checkpoint(c.clone());
-    }
-    KernelAuditLog::new(store).verify(host_key, expected_key_id)
+    Ok(if actor == "kernel" {
+        AuditActor::Kernel
+    } else if let Some(session_id) = actor.strip_prefix("ed25519:") {
+        AuditActor::Session {
+            session_id: session_id.to_string(),
+        }
+    } else {
+        AuditActor::Human {
+            subject: actor.to_string(),
+        }
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Provenance queries
-// ---------------------------------------------------------------------------
-
-/// Query helpers over a sealed event slice. Lease-ancestry queries resolve
-/// through the lease store: from any action digest we reach the lease, and
-/// from the lease we walk to the root.
+/// Provenance queries over a verified event slice.
 pub struct AuditQueries<'a> {
     events: &'a [AuditEvent],
 }
@@ -359,79 +327,65 @@ impl<'a> AuditQueries<'a> {
         Self { events }
     }
 
-    /// All events for one action digest, in chain order.
-    pub fn events_for_action(&self, action_digest: &str) -> Vec<&AuditEvent> {
+    /// All events mentioning an action digest.
+    pub fn events_for_action(&self, action_digest: &str) -> Vec<&'a AuditEvent> {
         self.events
             .iter()
             .filter(|e| e.action_digest == action_digest)
             .collect()
     }
 
-    /// All events by one actor (session address, `kernel`, or `host`).
-    pub fn events_for_actor(&self, actor: &str) -> Vec<&AuditEvent> {
-        self.events.iter().filter(|e| e.actor == actor).collect()
-    }
-
-    /// Events that reference a lease id in their details.
-    pub fn events_for_lease(&self, lease_id: &str) -> Vec<&AuditEvent> {
+    /// All events by an actor. The actor may be given as the kernel actor
+    /// string (`"kernel"`, `"ed25519:<id>"`, or a human subject).
+    pub fn events_for_actor(&self, actor: &str) -> Vec<&'a AuditEvent> {
+        let parsed = parse_actor(actor);
         self.events
             .iter()
             .filter(|e| {
-                e.details
-                    .get("lease_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id == lease_id)
+                parsed
+                    .as_ref()
+                    .is_ok_and(|want| &e.actor == want)
             })
             .collect()
     }
 
-    /// Events for a full lease ancestry, leaf → root.
+    /// All events whose detail mentions a lease id.
+    pub fn events_for_lease(&self, lease_id: &str) -> Vec<&'a AuditEvent> {
+        self.events
+            .iter()
+            .filter(|e| detail_field(&e.detail, "lease_id").as_deref() == Some(lease_id))
+            .collect()
+    }
+
+    /// All events for a lease plus every event for any ancestor lease named
+    /// in `ancestors` (leaf → root order).
     pub fn events_for_lease_ancestry(
         &self,
-        leaf_lease_id: &str,
-        leases: &dyn LeaseResolver,
-    ) -> Vec<&AuditEvent> {
-        let mut ids = vec![leaf_lease_id.to_string()];
-        let mut current = leaf_lease_id.to_string();
-        for _ in 0..128 {
-            match leases.lease(&current).and_then(|d| d.parent_id.clone()) {
-                Some(parent) => {
-                    ids.push(parent.clone());
-                    current = parent;
-                }
-                None => break,
-            }
-        }
-        let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        lease_id: &str,
+        ancestors: &[String],
+    ) -> Vec<&'a AuditEvent> {
         self.events
             .iter()
             .filter(|e| {
-                e.details
-                    .get("lease_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id_set.contains(id))
+                detail_field(&e.detail, "lease_id")
+                    .is_some_and(|id| id == lease_id || ancestors.iter().any(|a| a == &id))
             })
             .collect()
     }
 
-    /// Events for one approval request id.
-    pub fn events_for_approval(&self, approval_id: &str) -> Vec<&AuditEvent> {
+    /// All events tied to an approval request id.
+    pub fn events_for_approval(&self, approval_id: &str) -> Vec<&'a AuditEvent> {
         self.events
             .iter()
-            .filter(|e| {
-                e.details
-                    .get("approval_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id == approval_id)
-            })
+            .filter(|e| detail_field(&e.detail, "approval_id").as_deref() == Some(approval_id))
             .collect()
     }
 
     /// Chain-ordered window, for paged inspection.
-    pub fn events_in_range(&self, from_seq: u64, to_seq: u64) -> Vec<&AuditEvent> {
+    pub fn events_in_range(&self, from_seq: u64, to_seq: u64) -> Vec<&'a AuditEvent> {
         self.events
             .iter()
-            .filter(|e| e.seq >= from_seq && e.seq <= to_seq)
+            .filter(|e| e.sequence >= from_seq && e.sequence <= to_seq)
             .collect()
     }
 
@@ -440,17 +394,106 @@ impl<'a> AuditQueries<'a> {
         let mut index = HashMap::new();
         for e in self.events {
             if !e.action_digest.is_empty() {
-                index.entry(e.action_digest.as_str()).or_insert(e.seq);
+                index
+                    .entry(e.action_digest.as_str())
+                    .or_insert(e.sequence);
             }
         }
         index
     }
 }
 
+/// Extract a string field from an event's canonical-JSON detail.
+fn detail_field(detail: &str, field: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(detail).ok()?;
+    value.get(field)?.as_str().map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Redaction
+// ---------------------------------------------------------------------------
+
+/// Secret used exactly once; redacts on Debug/Serialize, exposes explicitly.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("[REDACTED]")
+    }
+}
+
+/// Redact secret-shaped values in place, deterministically: key names
+/// matching secret patterns, or string values that look like credentials,
+/// become `"[REDACTED]"`. Runs before canonicalization so redaction is part
+/// of the sealed bytes.
+pub fn redact_details(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if k == "secret_refs" {
+                    // References are opaque identifiers, not secrets.
+                    continue;
+                }
+                if is_secret_key(k) {
+                    *v = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_details(v);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) if looks_like_secret_value(s) => {
+                        *item = Value::String("[REDACTED]".to_string());
+                    }
+                    _ => redact_details(item),
+                }
+            }
+        }
+        Value::String(s) => {
+            if looks_like_secret_value(s) {
+                *s = "[REDACTED]".to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    ["secret", "password", "passwd", "token", "api_key", "apikey", "cookie", "credential"]
+        .iter()
+        .any(|pat| lower.contains(pat))
+}
+
+fn looks_like_secret_value(s: &str) -> bool {
+    // Heuristic: sk-… shaped bearer tokens. Key-name redaction covers the
+    // rest; values under innocent keys are left alone unless they look like
+    // credentials.
+    s.starts_with("sk-") && s.len() > 8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumen_protocol::audit::GENESIS_PREV_HASH;
     use serde_json::json;
 
     fn test_log() -> KernelAuditLog<MemoryAuditStore> {
@@ -463,21 +506,35 @@ mod tests {
         let e0 = log
             .append(
                 "kernel",
-                "digest-1",
-                "lease.allow",
+                AuditEventKind::PolicyAllowed,
+                "ed25519:session-1",
+                "ef12fc688bf209abc99880f536068f00b051c504230654cf3f69f5173b80ed07",
+                Some("allow"),
                 1000,
                 json!({"lease_id": "lease-1", "api_key": "sk-secret-value", "note": "ok"}),
             )
             .unwrap();
-        assert_eq!(e0.seq, 0);
+        assert_eq!(e0.sequence, 0);
         assert_eq!(e0.prev_hash, GENESIS_PREV_HASH);
-        // The secret never entered the chain.
-        assert_eq!(e0.details["api_key"], json!("[REDACTED]"));
-        assert_eq!(e0.details["note"], json!("ok"));
+        // The secret never entered the chain: detail is canonical JSON with
+        // the redaction marker sealed in.
+        let detail: Value = serde_json::from_str(&e0.detail).unwrap();
+        assert_eq!(detail["api_key"], json!("[REDACTED]"));
+        assert_eq!(detail["note"], json!("ok"));
+        assert_eq!(e0.actor, AuditActor::Kernel);
+        assert_eq!(e0.kind, AuditEventKind::PolicyAllowed);
         let e1 = log
-            .append("kernel", "digest-1", "lease.deny", 2000, json!({}))
+            .append(
+                "kernel",
+                AuditEventKind::PolicyDenied,
+                "ed25519:session-1",
+                "ef12fc688bf209abc99880f536068f00b051c504230654cf3f69f5173b80ed07",
+                Some("deny"),
+                2000,
+                json!({}),
+            )
             .unwrap();
-        assert_eq!(e1.seq, 1);
+        assert_eq!(e1.sequence, 1);
         assert_eq!(e1.prev_hash, e0.hash);
         // With no checkpoints, verification reduces to chain verification.
         let keys = KernelKeys::generate();
@@ -489,18 +546,23 @@ mod tests {
     fn checkpoint_and_verify() {
         let keys = KernelKeys::generate();
         let mut log = test_log();
+        let digest = "ef12fc688bf209abc99880f536068f00b051c504230654cf3f69f5173b80ed07";
         log.append(
             "kernel",
-            "d1",
-            "lease.allow",
+            AuditEventKind::PolicyAllowed,
+            "ed25519:session-1",
+            digest,
+            Some("allow"),
             1000,
             json!({"lease_id": "l1"}),
         )
         .unwrap();
         log.append(
             "kernel",
-            "d2",
-            "lease.deny",
+            AuditEventKind::PolicyDenied,
+            "ed25519:session-1",
+            digest,
+            Some("deny"),
             2000,
             json!({"lease_id": "l2"}),
         )
@@ -514,8 +576,8 @@ mod tests {
         let mut tampered = MemoryAuditStore::default();
         for e in log.store().events() {
             let mut e = e.clone();
-            if e.seq == 0 {
-                e.decision = "lease.allow.tampered".to_string();
+            if e.sequence == 0 {
+                e.decision = Some("tampered".to_string());
             }
             tampered.append_event(e);
         }
@@ -531,8 +593,16 @@ mod tests {
         // A checkpoint signed by a different key is rejected.
         let other = KernelKeys::generate();
         let mut log2 = test_log();
-        log2.append("kernel", "d1", "lease.allow", 1000, json!({}))
-            .unwrap();
+        log2.append(
+            "kernel",
+            AuditEventKind::PolicyAllowed,
+            "ed25519:session-1",
+            digest,
+            Some("allow"),
+            1000,
+            json!({}),
+        )
+        .unwrap();
         log2.checkpoint(0, &other).unwrap();
         assert!(matches!(
             log2.verify(&keys.host_verifying(), &keys.host_key_id),
@@ -571,22 +641,51 @@ mod tests {
     #[test]
     fn queries_find_provenance() {
         let mut log = test_log();
+        let digest = "ef12fc688bf209abc99880f536068f00b051c504230654cf3f69f5173b80ed07";
         log.append(
             "ed25519:session",
-            "digest-9",
-            "lease.allow",
+            AuditEventKind::PolicyAllowed,
+            "session",
+            digest,
+            Some("allow"),
             1000,
             json!({"lease_id": "lease-9", "approval_id": "appr-9"}),
         )
         .unwrap();
-        log.append("kernel", "", "checkpoint", 2000, json!({}))
-            .unwrap();
+        log.append(
+            "kernel",
+            AuditEventKind::PolicyDenied,
+            "session",
+            "none",
+            Some("deny"),
+            2000,
+            json!({}),
+        )
+        .unwrap();
         let q = AuditQueries::new(log.store().events());
-        assert_eq!(q.events_for_action("digest-9").len(), 1);
+        assert_eq!(q.events_for_action(digest).len(), 1);
         assert_eq!(q.events_for_actor("ed25519:session").len(), 1);
         assert_eq!(q.events_for_lease("lease-9").len(), 1);
         assert_eq!(q.events_for_approval("appr-9").len(), 1);
         assert_eq!(q.events_in_range(0, 0).len(), 1);
-        assert_eq!(q.action_index()["digest-9"], 0);
+        assert_eq!(q.action_index()[digest], 0);
+    }
+
+    #[test]
+    fn actor_parsing() {
+        assert_eq!(parse_actor("kernel").unwrap(), AuditActor::Kernel);
+        assert_eq!(
+            parse_actor("ed25519:abc").unwrap(),
+            AuditActor::Session {
+                session_id: "abc".to_string()
+            }
+        );
+        assert_eq!(
+            parse_actor("riley").unwrap(),
+            AuditActor::Human {
+                subject: "riley".to_string()
+            }
+        );
+        assert!(parse_actor("").is_err());
     }
 }
