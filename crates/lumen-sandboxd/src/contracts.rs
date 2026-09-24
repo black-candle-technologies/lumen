@@ -40,6 +40,15 @@ pub struct ResourceLimits {
     /// kernel's deadline is never shortened).
     pub wall_time_secs: u64,
     /// Max guest processes (daemon default; the v1 contract has no field).
+    /// NOT currently enforced for guest processes in this phase: the host
+    /// cgroup's `pids.max` counts Firecracker VMM threads, not guest
+    /// processes, so it is set from [`cgroups::vmm_pids_max`] (a VMM thread
+    /// bound), deliberately NOT from this value. Real guest-side
+    /// containment is future work — `RLIMIT_NPROC` is not an option as-is
+    /// because the guest workload runs as root and root/`CAP_SYS_RESOURCE`
+    /// is exempt from it, and the current guest image does not guarantee
+    /// the pids cgroup controller. The VM boundary is the isolation in
+    /// this phase.
     pub max_processes: u32,
     /// Writable workspace size cap in MiB (daemon host limit).
     pub disk_mib: u64,

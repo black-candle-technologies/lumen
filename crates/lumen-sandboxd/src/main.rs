@@ -7,15 +7,21 @@
 //! 4. Bind the API socket (0600) and serve.
 //! 5. Graceful shutdown on SIGTERM/SIGINT.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use lumen_sandboxd::{
     api,
+    cgroups::CGROUP_PARENT,
     config::DaemonConfig,
     driver::{Driver, FirecrackerBackend},
     error::SandboxdError,
-    state::{HostSystemView, RunStore, reconcile},
+    state::{HostSystemView, ReconcileConfig, RunStore, reconcile, retry_teardown_failed},
 };
+
+/// How often the background task retries `TeardownFailed` records while
+/// the daemon serves. The per-record backoff (5s doubling to 5min) still
+/// gates each attempt; this is just the poll cadence.
+const TEARDOWN_RETRY_INTERVAL_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> Result<(), SandboxdError> {
@@ -39,30 +45,78 @@ async fn main() -> Result<(), SandboxdError> {
     //    holding runs, netns, TAPs, or jailer chroots. Reclaim them now so we
     //    never serve with stale state.
     let mut sys = HostSystemView;
-    let report = reconcile(
-        driver.store(),
-        &mut sys,
-        &config.firecracker.chroot_base,
-        &config.firecracker.binary,
-        &config.net.netns_prefix,
-        &config.net.tap_prefix,
-        |_uid| {
-            // UID release is a no-op at startup; the Driver rebuilt its cursor
-            // past live UIDs already.
-        },
-    )?;
-    if !report.orphaned_runs.is_empty()
-        || !report.killed_pids.is_empty()
-        || !report.removed_netns.is_empty()
-    {
+    let rcfg = ReconcileConfig {
+        chroot_base: &config.firecracker.chroot_base,
+        firecracker_bin: &config.firecracker.binary,
+        cgroup_parent: std::path::Path::new(CGROUP_PARENT),
+        netns_prefix: &config.net.netns_prefix,
+        tap_prefix: &config.net.tap_prefix,
+    };
+    let report = reconcile(driver.store(), &mut sys, &rcfg, |_uid| {
+        // UID release is a no-op at startup; the Driver rebuilt its cursor
+        // past live UIDs already.
+    })?;
+    if !report.is_clean() {
         eprintln!(
-            "sandboxd: reconciled {} orphaned runs, {} pids, {} netns, {} taps, {} dirs",
+            "sandboxd: reconciled {} orphaned runs, {} pids, {} netns, {} taps, {} dirs, {} uids released; teardown_failed: {:?}",
             report.orphaned_runs.len(),
             report.killed_pids.len(),
             report.removed_netns.len(),
             report.removed_taps.len(),
             report.removed_dirs.len(),
+            report.released_uids.len(),
+            report.teardown_failed,
         );
+    }
+
+    // 3b. Periodic retry of TeardownFailed records WHILE serving. Startup
+    //     reconciliation runs exactly once; a teardown that cannot be
+    //     confirmed then would otherwise sit in TeardownFailed forever.
+    //     This task retries ONLY due TeardownFailed records — never the
+    //     full reconcile, which would misread live runs as orphaned.
+    //     The blocking work runs in spawn_blocking, off the async runtime.
+    {
+        let state_dir = config.state.dir.clone();
+        let netns_prefix = config.net.netns_prefix.clone();
+        let tap_prefix = config.net.tap_prefix.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(TEARDOWN_RETRY_INTERVAL_SECS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let dir = state_dir.clone();
+                let nsp = netns_prefix.clone();
+                let tpp = tap_prefix.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    let store = RunStore::open(&dir)?;
+                    let mut sys = HostSystemView;
+                    retry_teardown_failed(&store, &mut sys, &nsp, &tpp, |_uid| {
+                        // Same no-op rationale as the startup pass: the
+                        // Driver's UID cursor is monotonic within this
+                        // daemon, so a "released" UID is never reused.
+                    })
+                })
+                .await;
+                match res {
+                    Err(join_err) => {
+                        eprintln!("sandboxd: teardown-retry task panicked: {join_err}")
+                    }
+                    Ok(Err(e)) => eprintln!("sandboxd: teardown retry failed: {e}"),
+                    Ok(Ok(report)) => {
+                        if !report.is_clean() {
+                            eprintln!(
+                                "sandboxd: teardown retry: {} netns, {} taps, {} dirs removed, {} uids released; still failing: {:?}",
+                                report.removed_netns.len(),
+                                report.removed_taps.len(),
+                                report.removed_dirs.len(),
+                                report.released_uids.len(),
+                                report.teardown_failed,
+                            );
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // 4. Serve the API with graceful shutdown.

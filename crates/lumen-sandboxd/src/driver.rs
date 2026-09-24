@@ -70,7 +70,8 @@ where
 /// Supervised jailer/VMM process.
 #[async_trait]
 pub trait JailerHandle: Send {
-    /// SIGKILL the jailer process group (best effort, idempotent).
+    /// SIGKILL the Firecracker VMM (best effort, idempotent). The destroy
+    /// path's `cgroup.kill` is the hammer; this is the first attempt.
     async fn terminate(&mut self) -> Result<(), SandboxdError>;
     fn pid(&self) -> Option<u32>;
 }
@@ -911,6 +912,10 @@ async fn supervise(
                     break;
                 }
                 let elapsed = start.elapsed().as_secs();
+                // Host cgroup counters: pids.current counts VMM threads,
+                // not guest processes (max_processes is not enforced
+                // in-guest in this phase; see contracts). Compare against
+                // the VMM thread cap.
                 let pids = cgroups::read_pids_current(
                     Path::new("/sys/fs/cgroup"),
                     &artifacts.cgroup_path,
@@ -919,7 +924,7 @@ async fn supervise(
                 let disk_cap = spec.limits.disk_mib.saturating_mul(1024 * 1024);
                 match cgroups::check_quotas(
                     pids,
-                    spec.limits.max_processes,
+                    cgroups::vmm_pids_max(spec.limits.vcpu),
                     disk,
                     disk_cap,
                     elapsed,
@@ -1027,7 +1032,7 @@ impl Driver {
             firecracker_bin: self.inner.config.firecracker.binary.clone(),
             firecracker_version: self.inner.config.firecracker.version.clone(),
             limits: spec.limits.clone(),
-            cgroup_parent: PathBuf::from("/sys/fs/cgroup/lumen"),
+            cgroup_parent: PathBuf::from(cgroups::CGROUP_PARENT),
             snapshot: None,
         };
         // In-jail paths (Firecracker's view inside the chroot).
@@ -2217,11 +2222,19 @@ impl VmBackend for FirecrackerBackend {
         if let Some(pid) = pid {
             let _ = cgroups::add_process(cgroup_parent, cgroup_rel, pid);
         }
-        // Reap in the background; the handle kills by pid.
+        // Reap in the background. Termination goes through the
+        // firecracker.pid file (see ChildJailerHandle): with --new-pid-ns
+        // the jailer child exits as soon as the VMM is running.
         tokio::spawn(async move {
             let _ = child.wait().await;
         });
-        Ok(Box::new(ChildJailerHandle { pid }))
+        Ok(Box::new(ChildJailerHandle {
+            fc_pid_file: jailer::firecracker_pid_file(
+                &spec.chroot_base,
+                &spec.firecracker_bin,
+                &spec.id,
+            ),
+        }))
     }
 
     async fn boot_instance(&self, api_sock: &Path) -> Result<(), SandboxdError> {
@@ -2383,23 +2396,41 @@ async fn vm_state(api_sock: &Path) -> Option<String> {
 }
 
 struct ChildJailerHandle {
-    pid: Option<u32>,
+    /// Host-visible `<chroot>/firecracker.pid`: with `--new-pid-ns` the
+    /// jailer writes the Firecracker pid here and then EXITS, so the
+    /// supervised jailer child pid is dead by termination time. Kill the
+    /// pid from this file — never the jailer pid, and never its process
+    /// group (a dead group leader's id may be recycled by an unrelated
+    /// process).
+    fc_pid_file: PathBuf,
+}
+
+/// Read the VMM pid the jailer recorded. Missing/unparseable/dead is fine:
+/// callers treat terminate() as best-effort and the destroy path's
+/// `cgroup.kill` is the hammer.
+fn read_firecracker_pid(fc_pid_file: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(fc_pid_file).ok()?;
+    let pid: u32 = text.trim().parse().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    Some(pid)
 }
 
 #[async_trait]
 impl JailerHandle for ChildJailerHandle {
     async fn terminate(&mut self) -> Result<(), SandboxdError> {
-        if let Some(pid) = self.pid.take() {
+        if let Some(pid) = read_firecracker_pid(&self.fc_pid_file) {
             unsafe {
-                // SIGKILL the process group (jailer sets its own pgid).
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                // The single VMM pid, not -pid: no process-group kill.
+                let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
         }
         Ok(())
     }
 
     fn pid(&self) -> Option<u32> {
-        self.pid
+        read_firecracker_pid(&self.fc_pid_file)
     }
 }
 
