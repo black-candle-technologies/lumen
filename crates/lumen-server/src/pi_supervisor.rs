@@ -180,7 +180,9 @@ enum SupervisorCommand {
 impl SupervisorCommand {
     /// Parse a caller-supplied command name. Only the safe allowlist parses;
     /// everything else — including `bash` and `export_html` — is rejected.
-    /// `pub(crate)` so the boundary test can prove the rejection.
+    /// Test-only (`pub(crate)` + `cfg(test)`): the unit tests prove a hostile
+    /// caller string cannot be smuggled in.
+    #[cfg(test)]
     pub(crate) fn from_raw(name: &str) -> Result<Self, SupervisorError> {
         match name {
             "get_state" => Ok(SupervisorCommand::GetState),
@@ -426,10 +428,10 @@ impl PiSupervisor {
             }
             match self.events.recv().await {
                 Some(SupervisorEvent::Response(response)) => {
-                    if let Some(id) = response.id.clone() {
-                        if let Some(tx) = self.pending.remove(&id) {
-                            let _ = tx.send(response.clone());
-                        }
+                    if let Some(id) = response.id.clone()
+                        && let Some(tx) = self.pending.remove(&id)
+                    {
+                        let _ = tx.send(response.clone());
                     }
                     return Some(SupervisorEvent::Response(response));
                 }
@@ -489,14 +491,11 @@ impl PiSupervisor {
                 Some(event) => return Some(event),
                 None => {
                     // Event channel closed: reader task ended. Check the child.
-                    if let Some(handles) = self.child.as_mut() {
-                        match handles.child.try_wait() {
-                            Ok(Some(status)) => {
-                                let code = status.code();
-                                return Some(self.handle_exit(code).await);
-                            }
-                            _ => {}
-                        }
+                    if let Some(handles) = self.child.as_mut()
+                        && let Ok(Some(status)) = handles.child.try_wait()
+                    {
+                        let code = status.code();
+                        return Some(self.handle_exit(code).await);
                     }
                     if self.stopped {
                         return None;
@@ -847,8 +846,10 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_refuses_missing_binary() {
-        let mut config = PiSupervisorConfig::default();
-        config.pi_binary = PathBuf::from("/nonexistent/lumen-test-pi-binary");
+        let config = PiSupervisorConfig {
+            pi_binary: PathBuf::from("/nonexistent/lumen-test-pi-binary"),
+            ..Default::default()
+        };
         let err = match PiSupervisor::spawn(config).await {
             Ok(_) => panic!("must fail to spawn a missing binary"),
             Err(e) => e,
