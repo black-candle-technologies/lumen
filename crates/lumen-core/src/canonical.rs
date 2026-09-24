@@ -1,0 +1,1299 @@
+//! Canonical resources (Phase 1A): typed, canonicalized identifiers for every
+//! resource dimension a lease can name.
+//!
+//! The kernel never compares raw strings across the trust boundary. Every
+//! resource is parsed into a typed value, normalized into a canonical form,
+//! and only canonical forms are compared. Subset checks are structural
+//! (component-wise, range containment, set inclusion) — never string-prefix
+//! tests, which are trivially fooled (`/data` vs `/database`).
+//!
+//! # Fail-closed rules
+//!
+//! * Paths: must resolve through the [`PathResolver`] (symlinks, `.`/`..`,
+//!   mounts) to an absolute physical path. Unresolvable input is rejected,
+//!   not passed through.
+//! * Network: DNS names and IP ranges are distinct types and never compare
+//!   equal. Ambiguous wildcards (`*`, `*.*`, `*.tld`) are rejected.
+//! * If two scopes cannot be compared safely, the subset proof fails.
+
+#[cfg(test)]
+use std::collections::HashMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt, io,
+    net::IpAddr,
+    path::{Component, Path, PathBuf},
+};
+
+use ipnet::IpNet;
+use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use url::Url;
+
+use lumen_protocol::{EffectClass, canonical};
+
+/// Errors from resource canonicalization. Every variant fails closed: the
+/// caller must treat the resource as unusable, never as "close enough".
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CanonicalError {
+    #[error("empty resource")]
+    Empty,
+    #[error("resource too long")]
+    TooLong,
+    #[error("invalid characters in resource: {0}")]
+    BadChars(String),
+    #[error("path is not absolute: {0}")]
+    NotAbsolute(String),
+    #[error("path could not be resolved: {0}")]
+    Unresolvable(String),
+    #[error("path escapes its root via traversal: {0}")]
+    Traversal(String),
+    #[error("invalid tool name: {0}")]
+    BadToolName(String),
+    #[error("invalid version: {0}")]
+    BadVersion(String),
+    #[error("invalid network destination: {0}")]
+    BadDestination(String),
+    #[error("ambiguous wildcard rejected: {0}")]
+    AmbiguousWildcard(String),
+    #[error("DNS names and IP ranges are not comparable")]
+    DnsIpMix,
+    #[error("invalid port: {0}")]
+    BadPort(String),
+    #[error("invalid secret reference")]
+    BadSecretRef,
+    #[error("invalid account reference: {0}")]
+    BadAccountRef(String),
+    #[error("invalid model class: {0}")]
+    BadModelClass(String),
+    #[error("resource types are not comparable")]
+    Incomparable,
+    #[error("io error resolving path: {0}")]
+    Io(String),
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+/// A validated tool name: lowercase alphanumerics separated by single dots,
+/// e.g. `fs.read`. Versions are pinned separately (floating versions never
+/// cross the trust boundary).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolName(String);
+
+impl ToolName {
+    pub fn parse(value: &str) -> Result<Self, CanonicalError> {
+        if value.is_empty() {
+            return Err(CanonicalError::Empty);
+        }
+        if value.len() > 128 {
+            return Err(CanonicalError::TooLong);
+        }
+        let ok = value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
+            && !value.starts_with('.')
+            && !value.ends_with('.')
+            && !value.contains("..");
+        if !ok {
+            return Err(CanonicalError::BadToolName(value.to_string()));
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Canonical form: the validated name itself.
+    pub fn canonical_form(&self) -> String {
+        format!("tool:{}", self.0)
+    }
+}
+
+impl fmt::Display for ToolName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A scope entry for one tool: the parent lease's allowed version requirement.
+/// Children must pin an exact version that satisfies the parent requirement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolGrant {
+    pub name: ToolName,
+    pub allowed: VersionReq,
+}
+
+impl ToolGrant {
+    /// Structural subset: the child grant is narrower iff it names the same
+    /// tool and every version the child allows is also allowed by the parent.
+    ///
+    /// In practice children pin exact versions (`=1.2.3`), so this reduces to
+    /// "child's pinned version satisfies the parent requirement". The general
+    /// case is decided conservatively: child ⊆ parent iff the child's
+    /// requirement is syntactically at least as restrictive, verified by
+    /// probing — we require the child to be an exact pin and test it against
+    /// the parent requirement. Non-pinned child requirements fail closed.
+    pub fn is_subset_of(&self, parent: &ToolGrant) -> Result<(), CanonicalError> {
+        if self.name != parent.name {
+            return Err(CanonicalError::Incomparable);
+        }
+        // Extract the child's pinned version, if it is a single exact pin.
+        let pinned = exact_pin(&self.allowed).ok_or_else(|| {
+            CanonicalError::BadVersion(format!(
+                "child tool grant for {} must pin an exact version",
+                self.name
+            ))
+        })?;
+        if parent.allowed.matches(&pinned) {
+            Ok(())
+        } else {
+            Err(CanonicalError::BadVersion(format!(
+                "version {} not allowed by parent requirement {}",
+                pinned, parent.allowed
+            )))
+        }
+    }
+
+    pub fn allows(&self, version: &Version) -> bool {
+        self.allowed.matches(version)
+    }
+}
+
+/// If `req` is exactly `=x.y.z`, return the pinned version.
+fn exact_pin(req: &VersionReq) -> Option<Version> {
+    let s = req.to_string();
+    let pinned = s.strip_prefix('=')?;
+    // Reject compound requirements.
+    if pinned.contains(',') || pinned.contains(' ') || pinned.contains("||") {
+        return None;
+    }
+    Version::parse(pinned).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+/// How symlinks (and `.`/`..`) are resolved before comparison. The kernel
+/// uses [`RealFsResolver`] in production and a fake in tests.
+///
+/// Contract: `resolve` returns the fully canonical absolute path with all
+/// symlinks, `.`, and `..` resolved — `..` is processed *against* symlink
+/// resolution (component by component, as the OS does), not folded lexically
+/// afterwards. Lexical folding after resolution is wrong: if `/w/data` is a
+/// symlink to `/etc`, then `/w/data/../data` resolves to `/data`, not
+/// `/w/data`. [`CanonicalPath::parse`] rejects any result that still contains
+/// `.`/`..` or is not absolute (fail closed on resolver contract violation).
+pub trait PathResolver: Send + Sync {
+    fn resolve(&self, path: &Path) -> io::Result<PathBuf>;
+}
+
+/// Resolves against the real filesystem (`std::fs::canonicalize`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RealFsResolver;
+
+impl PathResolver for RealFsResolver {
+    fn resolve(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path)
+    }
+}
+
+/// A canonical filesystem path: absolute, symlink-resolved, `.`/`..`-free,
+/// stored as components. Comparison is component-wise — never a string
+/// prefix test.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CanonicalPath {
+    /// Resolved components below the root, e.g. `["workspace", "src"]`.
+    components: Vec<String>,
+    /// Whether comparison folded case (case-insensitive filesystem view).
+    case_folded: bool,
+}
+
+impl CanonicalPath {
+    /// Canonicalize `input` through `resolver`.
+    ///
+    /// * `case_insensitive`: the filesystem view folds case (macOS/Windows).
+    ///   Components are lowercased and `case_folded` is set, so equality and
+    ///   prefix tests are performed on the folded form.
+    pub fn parse(
+        input: &str,
+        resolver: &dyn PathResolver,
+        case_insensitive: bool,
+    ) -> Result<Self, CanonicalError> {
+        if input.is_empty() {
+            return Err(CanonicalError::Empty);
+        }
+        if input.len() > 4096 {
+            return Err(CanonicalError::TooLong);
+        }
+        if input.bytes().any(|b| b == 0 || (b < 0x20 && b != b'\t')) {
+            return Err(CanonicalError::BadChars(input.to_string()));
+        }
+        let raw = Path::new(input);
+        if !raw.is_absolute() {
+            return Err(CanonicalError::NotAbsolute(input.to_string()));
+        }
+        let resolved = resolver
+            .resolve(raw)
+            .map_err(|e| CanonicalError::Unresolvable(format!("{input}: {e}")))?;
+        if !resolved.is_absolute() {
+            return Err(CanonicalError::NotAbsolute(resolved.display().to_string()));
+        }
+        let mut components = Vec::new();
+        for comp in resolved.components() {
+            match comp {
+                Component::RootDir | Component::Prefix(_) => {}
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    // canonicalize() must never return `..`; a resolver that
+                    // does is broken — fail closed.
+                    return Err(CanonicalError::Traversal(resolved.display().to_string()));
+                }
+                Component::Normal(seg) => {
+                    let s = seg.to_string_lossy();
+                    if s.is_empty() {
+                        return Err(CanonicalError::BadChars(input.to_string()));
+                    }
+                    components.push(if case_insensitive {
+                        s.to_lowercase()
+                    } else {
+                        s.into_owned()
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            components,
+            case_folded: case_insensitive,
+        })
+    }
+
+    /// `true` iff `self` is at or below `root`, compared component-wise.
+    /// A path is within a root only on a strict component boundary, so
+    /// `/database` is never "within" `/data`.
+    pub fn is_within(&self, root: &CanonicalPath) -> bool {
+        if self.case_folded != root.case_folded {
+            // Different filesystem views cannot be compared safely.
+            return false;
+        }
+        if self.components.len() < root.components.len() {
+            return false;
+        }
+        self.components[..root.components.len()] == root.components[..]
+    }
+
+    /// Canonical encoding: `/`-joined components with a leading slash.
+    pub fn canonical_form(&self) -> String {
+        let mut s = String::from("/");
+        s.push_str(&self.components.join("/"));
+        if self.case_folded {
+            s.push_str("~fold");
+        }
+        s
+    }
+
+    pub fn components(&self) -> &[String] {
+        &self.components
+    }
+}
+
+/// Read/write rights on a path grant, as an explicit pair (not a bitmask
+/// string) so subset is structural.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PathRights {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl PathRights {
+    pub const READ: Self = Self {
+        read: true,
+        write: false,
+    };
+    pub const READ_WRITE: Self = Self {
+        read: true,
+        write: true,
+    };
+    pub const WRITE: Self = Self {
+        read: false,
+        write: true,
+    };
+
+    pub fn is_subset_of(self, parent: Self) -> bool {
+        (!self.read || parent.read) && (!self.write || parent.write)
+    }
+}
+
+/// One path grant: a canonical root plus rights. A child grant narrows a
+/// parent grant iff the child root is within the parent root (component-wise)
+/// and the child rights are a subset of the parent rights.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathGrant {
+    pub root: CanonicalPath,
+    pub rights: PathRights,
+}
+
+impl PathGrant {
+    /// Find a parent grant covering `child`, if any.
+    pub fn covering<'a>(
+        child: &PathGrant,
+        parents: &'a [PathGrant],
+    ) -> Result<&'a PathGrant, CanonicalError> {
+        parents
+            .iter()
+            .find(|p| child.root.is_within(&p.root) && child.rights.is_subset_of(p.rights))
+            .ok_or(CanonicalError::Incomparable)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network destinations
+// ---------------------------------------------------------------------------
+
+/// A normalized host: DNS names and IP ranges are distinct variants and
+/// never compare equal to each other.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum HostPattern {
+    /// Lowercased DNS name, no trailing dot, IDNA-encoded.
+    DnsName(String),
+    /// `*.example.com`, stored as the suffix `example.com`. Never matches the
+    /// apex itself.
+    DnsWildcard(String),
+    Ip(IpAddr),
+    IpRange(IpNet),
+}
+
+impl HostPattern {
+    pub fn parse(value: &str) -> Result<Self, CanonicalError> {
+        if value.is_empty() {
+            return Err(CanonicalError::Empty);
+        }
+        if value.len() > 253 {
+            return Err(CanonicalError::TooLong);
+        }
+        if let Some(suffix) = value.strip_prefix("*.") {
+            return Self::parse_wildcard(suffix);
+        }
+        if value.contains('*') {
+            return Err(CanonicalError::AmbiguousWildcard(value.to_string()));
+        }
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            return Ok(Self::Ip(ip));
+        }
+        if let Ok(net) = value.parse::<IpNet>() {
+            // A bare IP parses as a /32 or /128; keep the Ip variant for it so
+            // canonical forms stay distinct and stable.
+            if net.prefix_len() == net.max_prefix_len() {
+                return Ok(Self::Ip(net.addr()));
+            }
+            return Ok(Self::IpRange(net));
+        }
+        Self::parse_dns(value)
+    }
+
+    fn parse_dns(value: &str) -> Result<Self, CanonicalError> {
+        let lower = value.to_lowercase();
+        let trimmed = lower.strip_suffix('.').unwrap_or(&lower);
+        if trimmed.is_empty() || trimmed.len() > 253 {
+            return Err(CanonicalError::BadDestination(value.to_string()));
+        }
+        // Encode via the url crate for IDNA/punycode handling.
+        let probe = format!("http://{trimmed}/");
+        let url =
+            Url::parse(&probe).map_err(|_| CanonicalError::BadDestination(value.to_string()))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| CanonicalError::BadDestination(value.to_string()))?;
+        // url crate rejects IP-looking hosts here only if parse failed above;
+        // a successful DNS parse that yields an IP means the input was an IP.
+        if host.parse::<IpAddr>().is_ok() {
+            return Err(CanonicalError::BadDestination(value.to_string()));
+        }
+        Ok(Self::DnsName(host.to_string()))
+    }
+
+    fn parse_wildcard(suffix: &str) -> Result<Self, CanonicalError> {
+        if suffix.is_empty() || suffix == "*" || suffix.contains('*') {
+            return Err(CanonicalError::AmbiguousWildcard(format!("*.{suffix}")));
+        }
+        // The suffix must contain at least two labels: `*.example.com` is
+        // allowed, `*.com` is ambiguous and rejected.
+        let labels: Vec<&str> = suffix.split('.').collect();
+        if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+            return Err(CanonicalError::AmbiguousWildcard(format!("*.{suffix}")));
+        }
+        match Self::parse_dns(suffix)? {
+            Self::DnsName(name) => Ok(Self::DnsWildcard(name)),
+            _ => Err(CanonicalError::AmbiguousWildcard(format!("*.{suffix}"))),
+        }
+    }
+
+    /// Structural subset: is `self` (child) covered by `parent`?
+    pub fn is_subset_of(&self, parent: &HostPattern) -> Result<(), CanonicalError> {
+        match (self, parent) {
+            (Self::DnsName(c), Self::DnsName(p)) => {
+                if c == p {
+                    Ok(())
+                } else {
+                    Err(CanonicalError::Incomparable)
+                }
+            }
+            (Self::DnsName(c), Self::DnsWildcard(p)) => {
+                // `api.example.com` ⊆ `*.example.com`: exactly one label may
+                // precede the suffix. The apex `example.com` itself is NOT
+                // covered by its own wildcard.
+                let covered = c
+                    .strip_suffix(p.as_str())
+                    .and_then(|rest| rest.strip_suffix('.'))
+                    .is_some_and(|label| !label.is_empty() && !label.contains('.'));
+                if covered {
+                    Ok(())
+                } else {
+                    Err(CanonicalError::Incomparable)
+                }
+            }
+            (Self::DnsWildcard(c), Self::DnsWildcard(p)) => {
+                // Strict single-label semantics: `*.example.com` covers exactly
+                // the names with one label under `example.com`. A deeper
+                // pattern like `*.sub.example.com` covers `x.sub.example.com`,
+                // which `*.example.com` does NOT cover — so pattern ⊆ pattern
+                // only when the suffixes are identical. Fail closed.
+                if c == p {
+                    Ok(())
+                } else {
+                    Err(CanonicalError::Incomparable)
+                }
+            }
+            (Self::Ip(c), Self::Ip(p)) => {
+                if c == p {
+                    Ok(())
+                } else {
+                    Err(CanonicalError::Incomparable)
+                }
+            }
+            (Self::Ip(c), Self::IpRange(p)) => {
+                if p.contains(c) {
+                    Ok(())
+                } else {
+                    Err(CanonicalError::Incomparable)
+                }
+            }
+            (Self::IpRange(c), Self::IpRange(p)) => {
+                if p.contains(&c.network()) && p.prefix_len() <= c.prefix_len() {
+                    Ok(())
+                } else {
+                    Err(CanonicalError::Incomparable)
+                }
+            }
+            // DNS names never match IP ranges and vice versa: the kernel does
+            // not resolve DNS at comparison time (TOCTOU), so the two live in
+            // separate namespaces, fail closed.
+            _ => Err(CanonicalError::DnsIpMix),
+        }
+    }
+
+    /// Classify private/loopback/link-local networks. Used by policy, not by
+    /// the subset proof itself.
+    pub fn network_class(&self) -> NetworkClass {
+        match self {
+            Self::DnsName(_) | Self::DnsWildcard(_) => NetworkClass::Dns,
+            Self::Ip(ip) => classify_ip(*ip),
+            Self::IpRange(net) => classify_ip(net.addr()),
+        }
+    }
+
+    pub fn canonical_form(&self) -> String {
+        match self {
+            Self::DnsName(n) => format!("dns:{n}"),
+            Self::DnsWildcard(s) => format!("dnswild:*.{s}"),
+            Self::Ip(ip) => format!("ip:{ip}"),
+            Self::IpRange(net) => format!("iprange:{net}"),
+        }
+    }
+}
+
+/// Coarse network classification for policy decisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkClass {
+    Dns,
+    Public,
+    Private,
+    Loopback,
+    LinkLocal,
+    Multicast,
+}
+
+fn classify_ip(ip: IpAddr) -> NetworkClass {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if o[0] == 127 {
+                NetworkClass::Loopback
+            } else if o[0] == 10
+                || (o[0] == 172 && (16..32).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+            {
+                NetworkClass::Private
+            } else if o[0] == 169 && o[1] == 254 {
+                NetworkClass::LinkLocal
+            } else if o[0] >= 224 {
+                NetworkClass::Multicast
+            } else {
+                NetworkClass::Public
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                NetworkClass::Loopback
+            } else if v6.is_multicast() {
+                NetworkClass::Multicast
+            } else {
+                let seg = v6.segments();
+                if (seg[0] & 0xfe00) == 0xfc00 {
+                    NetworkClass::Private
+                } else if (seg[0] & 0xffc0) == 0xfe80 {
+                    NetworkClass::LinkLocal
+                } else {
+                    NetworkClass::Public
+                }
+            }
+        }
+    }
+}
+
+/// A set of ports, normalized to sorted non-overlapping ranges.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortSet {
+    /// Sorted, non-overlapping, non-adjacent ranges.
+    ranges: Vec<(u16, u16)>,
+    /// Explicit "any port" grant. Only ⊆ itself.
+    any: bool,
+}
+
+impl PortSet {
+    pub fn any() -> Self {
+        Self {
+            ranges: vec![],
+            any: true,
+        }
+    }
+
+    pub fn single(port: u16) -> Self {
+        Self {
+            ranges: vec![(port, port)],
+            any: false,
+        }
+    }
+
+    pub fn range(start: u16, end: u16) -> Result<Self, CanonicalError> {
+        if start > end {
+            return Err(CanonicalError::BadPort(format!("{start}-{end}")));
+        }
+        Ok(Self {
+            ranges: vec![(start, end)],
+            any: false,
+        })
+    }
+
+    pub fn from_ports(ports: &[u16]) -> Self {
+        let mut sorted: Vec<u16> = ports.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        for p in sorted {
+            match ranges.last_mut() {
+                Some(last) if last.1.wrapping_add(1) == p => last.1 = p,
+                _ => ranges.push((p, p)),
+            }
+        }
+        Self { ranges, any: false }
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        self.any || self.ranges.iter().any(|(s, e)| *s <= port && port <= *e)
+    }
+
+    /// Structural subset: every child range must be fully covered by parent
+    /// ranges. `any` is only a subset of `any`.
+    pub fn is_subset_of(&self, parent: &PortSet) -> bool {
+        if self.any {
+            return parent.any;
+        }
+        if parent.any {
+            return true;
+        }
+        self.ranges
+            .iter()
+            .all(|(cs, ce)| parent.ranges.iter().any(|(ps, pe)| ps <= cs && ce <= pe))
+    }
+
+    pub fn canonical_form(&self) -> String {
+        if self.any {
+            return "ports:*".to_string();
+        }
+        let parts: Vec<String> = self
+            .ranges
+            .iter()
+            .map(|(s, e)| {
+                if s == e {
+                    s.to_string()
+                } else {
+                    format!("{s}-{e}")
+                }
+            })
+            .collect();
+        format!("ports:{}", parts.join(","))
+    }
+}
+
+/// A network destination grant: scheme + host pattern + ports + (for
+/// HTTP-like schemes) methods.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkDestination {
+    /// Lowercased scheme, e.g. `https`. Empty means "any scheme" only when
+    /// constructed via [`NetworkDestination::any_scheme`] — parsing requires
+    /// an explicit scheme.
+    pub scheme: String,
+    pub host: HostPattern,
+    pub ports: PortSet,
+    /// Uppercased HTTP methods. Only meaningful for http/https/ws/wss;
+    /// ignored otherwise.
+    pub methods: BTreeSet<String>,
+}
+
+impl NetworkDestination {
+    /// Parse `scheme://host[:port][/...]` with optional method allowlist.
+    /// The default port for a known scheme may be omitted or given explicitly;
+    /// both canonicalize identically.
+    pub fn parse(input: &str, methods: &[&str]) -> Result<Self, CanonicalError> {
+        let url =
+            Url::parse(input).map_err(|_| CanonicalError::BadDestination(input.to_string()))?;
+        let scheme = url.scheme().to_lowercase();
+        if scheme.is_empty() {
+            return Err(CanonicalError::BadDestination(input.to_string()));
+        }
+        let host_str = url
+            .host_str()
+            .ok_or_else(|| CanonicalError::BadDestination(input.to_string()))?;
+        let host = HostPattern::parse(host_str)
+            .map_err(|_| CanonicalError::BadDestination(input.to_string()))?;
+        let port = url.port_or_known_default().ok_or_else(|| {
+            CanonicalError::BadDestination(format!(
+                "{input}: unknown scheme, explicit port required"
+            ))
+        })?;
+        let methods = methods
+            .iter()
+            .map(|m| m.to_uppercase())
+            .collect::<BTreeSet<_>>();
+        Ok(Self {
+            scheme,
+            host,
+            ports: PortSet::single(port),
+            methods,
+        })
+    }
+
+    fn methods_apply(&self) -> bool {
+        matches!(self.scheme.as_str(), "http" | "https" | "ws" | "wss")
+    }
+
+    /// Structural subset: same scheme (or parent any-scheme), host covered,
+    /// ports covered, methods covered (when applicable).
+    pub fn is_subset_of(&self, parent: &NetworkDestination) -> Result<(), CanonicalError> {
+        if !parent.scheme.is_empty() && self.scheme != parent.scheme {
+            return Err(CanonicalError::Incomparable);
+        }
+        self.host.is_subset_of(&parent.host)?;
+        if !self.ports.is_subset_of(&parent.ports) {
+            return Err(CanonicalError::Incomparable);
+        }
+        if self.methods_apply()
+            && parent.methods_apply()
+            && !self.methods.is_subset(&parent.methods)
+        {
+            return Err(CanonicalError::Incomparable);
+        }
+        Ok(())
+    }
+
+    pub fn canonical_form(&self) -> String {
+        let mut s = format!(
+            "net:{}://{}:{}",
+            self.scheme,
+            self.host.canonical_form(),
+            self.ports.canonical_form()
+        );
+        if self.methods_apply() && !self.methods.is_empty() {
+            let mut m: Vec<&String> = self.methods.iter().collect();
+            m.sort();
+            s.push_str(&format!(
+                ":{}",
+                m.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(",")
+            ));
+        }
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secrets, accounts, models
+// ---------------------------------------------------------------------------
+
+/// An opaque secret reference (never the secret itself). Validated charset;
+/// subset is set inclusion on the validated string.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretRef(String);
+
+impl SecretRef {
+    pub fn parse(value: &str) -> Result<Self, CanonicalError> {
+        if value.is_empty() {
+            return Err(CanonicalError::Empty);
+        }
+        if value.len() > 256 {
+            return Err(CanonicalError::TooLong);
+        }
+        let ok = value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b));
+        if !ok {
+            return Err(CanonicalError::BadSecretRef);
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn canonical_form(&self) -> String {
+        format!("secret:{}", self.0)
+    }
+}
+
+/// A typed external account: provider plus the provider's account identity.
+/// Distinct providers never compare equal.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct AccountRef {
+    pub provider: String,
+    pub account_id: String,
+}
+
+impl AccountRef {
+    pub fn parse(provider: &str, account_id: &str) -> Result<Self, CanonicalError> {
+        for (v, name) in [(provider, "provider"), (account_id, "account id")] {
+            if v.is_empty() {
+                return Err(CanonicalError::Empty);
+            }
+            if v.len() > 256 {
+                return Err(CanonicalError::TooLong);
+            }
+            let ok = v
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:-@".contains(&b));
+            if !ok {
+                return Err(CanonicalError::BadAccountRef(format!("{name}: {v}")));
+            }
+        }
+        Ok(Self {
+            provider: provider.to_lowercase(),
+            account_id: account_id.to_string(),
+        })
+    }
+
+    pub fn canonical_form(&self) -> String {
+        format!("account:{}:{}", self.provider, self.account_id)
+    }
+}
+
+/// A permitted model/provider class, e.g. provider `openai-compatible`,
+/// class `local`. Subset is per-provider set inclusion on classes.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ModelClass {
+    pub provider: String,
+    pub class: String,
+}
+
+impl ModelClass {
+    pub fn parse(provider: &str, class: &str) -> Result<Self, CanonicalError> {
+        for (v, what) in [(provider, "provider"), (class, "class")] {
+            if v.is_empty() {
+                return Err(CanonicalError::Empty);
+            }
+            if v.len() > 128 {
+                return Err(CanonicalError::TooLong);
+            }
+            let ok = v
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+            if !ok {
+                return Err(CanonicalError::BadModelClass(format!("{what}: {v}")));
+            }
+        }
+        Ok(Self {
+            provider: provider.to_string(),
+            class: class.to_string(),
+        })
+    }
+
+    pub fn canonical_form(&self) -> String {
+        format!("model:{}:{}", self.provider, self.class)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scope: the full typed resource set of a lease
+// ---------------------------------------------------------------------------
+
+/// The complete typed resource scope of a lease. Every dimension is a set of
+/// typed grants; the subset proof checks each dimension structurally.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceScope {
+    /// Tool name → allowed version requirement (children pin exact).
+    #[serde(default)]
+    pub tools: BTreeMap<String, VersionReq>,
+    #[serde(default)]
+    pub paths: Vec<PathGrant>,
+    #[serde(default)]
+    pub destinations: Vec<NetworkDestination>,
+    #[serde(default)]
+    pub secrets: BTreeSet<String>,
+    #[serde(default)]
+    pub accounts: BTreeSet<AccountRef>,
+    /// Provider → allowed classes.
+    #[serde(default)]
+    pub models: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    pub effects: Vec<EffectClass>,
+}
+
+impl ResourceScope {
+    /// The mechanical subset proof: `self` (child) ⊆ `parent`.
+    ///
+    /// * tools: every child tool pins an exact version allowed by the parent.
+    /// * paths: every child grant is covered by some parent grant
+    ///   (component-wise containment + rights subset).
+    /// * destinations: every child destination is covered by some parent
+    ///   destination (scheme/host/ports/methods).
+    /// * secrets/accounts/effects: set inclusion.
+    /// * models: per-provider class set inclusion.
+    ///
+    /// Any dimension that cannot be compared safely fails the whole proof.
+    pub fn is_subset_of(&self, parent: &ResourceScope) -> Result<(), ScopeSubsetError> {
+        for (name, child_req) in &self.tools {
+            let parent_req = parent
+                .tools
+                .get(name)
+                .ok_or_else(|| ScopeSubsetError::ToolNotGranted(name.clone()))?;
+            let child_name = ToolName::parse(name).map_err(ScopeSubsetError::Canonical)?;
+            let grant = ToolGrant {
+                name: child_name,
+                allowed: child_req.clone(),
+            };
+            let parent_grant = ToolGrant {
+                name: grant.name.clone(),
+                allowed: parent_req.clone(),
+            };
+            grant
+                .is_subset_of(&parent_grant)
+                .map_err(ScopeSubsetError::Canonical)?;
+        }
+        for child in &self.paths {
+            PathGrant::covering(child, &parent.paths)
+                .map_err(|_| ScopeSubsetError::PathNotCovered(child.root.canonical_form()))?;
+        }
+        for child in &self.destinations {
+            let covered = parent
+                .destinations
+                .iter()
+                .any(|p| child.is_subset_of(p).is_ok());
+            if !covered {
+                return Err(ScopeSubsetError::DestinationNotCovered(
+                    child.canonical_form(),
+                ));
+            }
+        }
+        for s in &self.secrets {
+            if !parent.secrets.contains(s) {
+                return Err(ScopeSubsetError::SecretNotGranted(s.clone()));
+            }
+        }
+        for a in &self.accounts {
+            if !parent.accounts.contains(a) {
+                return Err(ScopeSubsetError::AccountNotGranted(a.canonical_form()));
+            }
+        }
+        for (provider, child_classes) in &self.models {
+            match parent.models.get(provider) {
+                Some(parent_classes) if child_classes.is_subset(parent_classes) => {}
+                _ => {
+                    return Err(ScopeSubsetError::ModelClassNotGranted(format!(
+                        "{provider}:{}",
+                        child_classes.iter().cloned().collect::<Vec<_>>().join(",")
+                    )));
+                }
+            }
+        }
+        if !effects_subset(&self.effects, &parent.effects) {
+            return Err(ScopeSubsetError::EffectNotGranted);
+        }
+        Ok(())
+    }
+
+    /// Stable canonical encoding of the whole scope: sorted typed strings,
+    /// hashed for the action/lease digest.
+    pub fn canonical_digest(&self) -> Result<String, CanonicalError> {
+        let mut items: Vec<String> = Vec::new();
+        let mut tools: Vec<(&String, &VersionReq)> = self.tools.iter().collect();
+        tools.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, req) in tools {
+            items.push(format!("tool:{name}@{req}"));
+        }
+        let mut paths: Vec<String> = self
+            .paths
+            .iter()
+            .map(|p| {
+                format!(
+                    "path:{}:{}:{}",
+                    p.root.canonical_form(),
+                    p.rights.read,
+                    p.rights.write
+                )
+            })
+            .collect();
+        paths.sort();
+        items.extend(paths);
+        let mut dests: Vec<String> = self
+            .destinations
+            .iter()
+            .map(|d| d.canonical_form())
+            .collect();
+        dests.sort();
+        items.extend(dests);
+        for s in &self.secrets {
+            items.push(format!("secret:{s}"));
+        }
+        for a in &self.accounts {
+            items.push(a.canonical_form());
+        }
+        let mut providers: Vec<(&String, &BTreeSet<String>)> = self.models.iter().collect();
+        providers.sort_by(|a, b| a.0.cmp(b.0));
+        for (provider, classes) in providers {
+            let mut c: Vec<&String> = classes.iter().collect();
+            c.sort();
+            items.push(format!(
+                "model:{provider}:{}",
+                c.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(",")
+            ));
+        }
+        let mut effects: Vec<String> = self.effects.iter().map(|e| format!("{e:?}")).collect();
+        effects.sort();
+        effects.dedup();
+        for e in effects {
+            items.push(format!("effect:{e}"));
+        }
+        let value = serde_json::to_value(&items).map_err(|_| CanonicalError::TooLong)?;
+        canonical::digest_value(&value).map_err(|_| CanonicalError::TooLong)
+    }
+}
+
+/// `child` effects ⊆ `parent` effects, by equality (EffectClass has no
+/// ordering; the sets are tiny).
+fn effects_subset(child: &[EffectClass], parent: &[EffectClass]) -> bool {
+    child.iter().all(|c| parent.iter().any(|p| p == c))
+}
+
+/// Why a subset proof failed. Each variant names the offending resource so
+/// policy denials can explain themselves without leaking anything else.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ScopeSubsetError {
+    #[error("canonicalization failed: {0}")]
+    Canonical(#[source] CanonicalError),
+    #[error("tool not granted by parent: {0}")]
+    ToolNotGranted(String),
+    #[error("path not covered by any parent grant: {0}")]
+    PathNotCovered(String),
+    #[error("destination not covered by any parent grant: {0}")]
+    DestinationNotCovered(String),
+    #[error("secret not granted by parent: {0}")]
+    SecretNotGranted(String),
+    #[error("account not granted by parent: {0}")]
+    AccountNotGranted(String),
+    #[error("model class not granted by parent: {0}")]
+    ModelClassNotGranted(String),
+    #[error("effect class not granted by parent")]
+    EffectNotGranted,
+}
+
+#[cfg(test)]
+/// Fake path resolver for tests: maps inputs to outputs lexically.
+#[derive(Default)]
+pub struct FakeResolver {
+    map: HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl FakeResolver {
+    pub fn link(mut self, from: &str, to: &str) -> Self {
+        self.map.insert(from.to_string(), to.to_string());
+        self
+    }
+}
+
+#[cfg(test)]
+impl PathResolver for FakeResolver {
+    fn resolve(&self, path: &Path) -> io::Result<PathBuf> {
+        // Longest-prefix link matching on component boundaries, then `..`
+        // folding against the *resolved* path — the same order a real
+        // resolver uses. (`/w/data` -> `/etc` makes `/w/data/../data`
+        // resolve to `/data`, not `/w/data`.)
+        let mut cur = path.to_string_lossy().to_string();
+        for _ in 0..16 {
+            let mut hit: Option<(&str, &str)> = None;
+            for (from, to) in &self.map {
+                let matches = cur == *from
+                    || cur
+                        .strip_prefix(from.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'));
+                if matches && hit.is_none_or(|(f, _)| from.len() > f.len()) {
+                    hit = Some((from, to));
+                }
+            }
+            match hit {
+                Some((from, to)) => {
+                    let rest = cur.strip_prefix(from).unwrap_or("");
+                    cur = format!("{to}{rest}");
+                }
+                None => break,
+            }
+        }
+        let mut out = PathBuf::new();
+        for comp in Path::new(&cur).components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                _ => out.push(comp.as_os_str()),
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn canon(p: &str, r: &dyn PathResolver) -> CanonicalPath {
+        CanonicalPath::parse(p, r, false).unwrap()
+    }
+
+    #[test]
+    fn path_prefix_trick_rejected() {
+        let r = FakeResolver::default();
+        let root = canon("/data", &r);
+        let evil = canon("/database", &r);
+        assert!(!evil.is_within(&root));
+        let ok = canon("/data/sub/file", &r);
+        assert!(ok.is_within(&root));
+        assert!(root.is_within(&root));
+    }
+
+    #[test]
+    fn symlink_escape_defeated() {
+        let r = FakeResolver::default().link("/workspace/link", "/etc");
+        let root = canon("/workspace", &r);
+        let evil = canon("/workspace/link/passwd", &r);
+        assert!(!evil.is_within(&root));
+    }
+
+    #[test]
+    fn traversal_normalized() {
+        let r = FakeResolver::default();
+        let a = canon("/workspace/a/../b", &r);
+        let b = canon("/workspace/b", &r);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn case_folding_view() {
+        let r = FakeResolver::default();
+        let a = CanonicalPath::parse("/Workspace/SRC", &r, true).unwrap();
+        let b = CanonicalPath::parse("/workspace/src", &r, true).unwrap();
+        assert_eq!(a, b);
+        let c = CanonicalPath::parse("/workspace/src", &r, false).unwrap();
+        assert!(!a.is_within(&c)); // different views are incomparable
+    }
+
+    #[test]
+    fn dns_wildcard_rules() {
+        // `*.example.com` covers subdomains but not the apex.
+        let parent = HostPattern::parse("*.example.com").unwrap();
+        assert!(
+            HostPattern::parse("api.example.com")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_ok()
+        );
+        assert!(
+            HostPattern::parse("example.com")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_err()
+        );
+        // Strict single-label semantics: `*.example.com` does not cover
+        // deeper nesting or narrower wildcards.
+        assert!(
+            HostPattern::parse("a.b.example.com")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_err()
+        );
+        assert!(
+            HostPattern::parse("*.sub.example.com")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_err()
+        );
+        assert!(
+            HostPattern::parse("*.example.com")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_ok()
+        );
+        // Ambiguous wildcards rejected.
+        assert!(HostPattern::parse("*").is_err());
+        assert!(HostPattern::parse("*.com").is_err());
+        assert!(HostPattern::parse("*.*").is_err());
+        assert!(HostPattern::parse("*.example.*").is_err());
+    }
+
+    #[test]
+    fn dns_and_ip_never_mix() {
+        let dns = HostPattern::parse("example.com").unwrap();
+        let range = HostPattern::parse("93.184.216.0/24").unwrap();
+        assert!(matches!(
+            dns.is_subset_of(&range),
+            Err(CanonicalError::DnsIpMix)
+        ));
+        assert!(matches!(
+            range.is_subset_of(&dns),
+            Err(CanonicalError::DnsIpMix)
+        ));
+    }
+
+    #[test]
+    fn ip_range_containment() {
+        let parent = HostPattern::parse("10.0.0.0/8").unwrap();
+        assert!(
+            HostPattern::parse("10.1.2.3")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_ok()
+        );
+        assert!(
+            HostPattern::parse("10.0.0.0/16")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_ok()
+        );
+        assert!(
+            HostPattern::parse("11.0.0.1")
+                .unwrap()
+                .is_subset_of(&parent)
+                .is_err()
+        );
+        // A wider child range is not a subset of a narrower parent.
+        let narrow = HostPattern::parse("10.0.0.0/16").unwrap();
+        assert!(
+            HostPattern::parse("10.0.0.0/8")
+                .unwrap()
+                .is_subset_of(&narrow)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn default_port_normalization() {
+        let a = NetworkDestination::parse("https://example.com/x", &[]).unwrap();
+        let b = NetworkDestination::parse("https://example.com:443/x", &[]).unwrap();
+        assert_eq!(a.canonical_form(), b.canonical_form());
+        let c = NetworkDestination::parse("https://example.com:8443/x", &[]).unwrap();
+        assert_ne!(a.canonical_form(), c.canonical_form());
+    }
+
+    #[test]
+    fn port_subset() {
+        assert!(PortSet::single(443).is_subset_of(&PortSet::range(1, 1024).unwrap()));
+        assert!(!PortSet::single(8080).is_subset_of(&PortSet::range(1, 1024).unwrap()));
+        assert!(PortSet::any().is_subset_of(&PortSet::any()));
+        assert!(!PortSet::any().is_subset_of(&PortSet::range(1, 1024).unwrap()));
+        assert!(PortSet::single(80).is_subset_of(&PortSet::any()));
+    }
+
+    #[test]
+    fn tool_pin_subset() {
+        let parent = ToolGrant {
+            name: ToolName::parse("fs.read").unwrap(),
+            allowed: VersionReq::parse("^1.0").unwrap(),
+        };
+        let child = ToolGrant {
+            name: ToolName::parse("fs.read").unwrap(),
+            allowed: VersionReq::parse("=1.2.3").unwrap(),
+        };
+        assert!(child.is_subset_of(&parent).is_ok());
+        let bad = ToolGrant {
+            name: ToolName::parse("fs.read").unwrap(),
+            allowed: VersionReq::parse("=2.0.0").unwrap(),
+        };
+        assert!(bad.is_subset_of(&parent).is_err());
+        // Non-pinned child fails closed.
+        let float = ToolGrant {
+            name: ToolName::parse("fs.read").unwrap(),
+            allowed: VersionReq::parse("^1.2").unwrap(),
+        };
+        assert!(float.is_subset_of(&parent).is_err());
+    }
+
+    #[test]
+    fn scope_digest_stable() {
+        let r = FakeResolver::default();
+        let mut scope = ResourceScope::default();
+        scope.paths.push(PathGrant {
+            root: canon("/workspace", &r),
+            rights: PathRights::READ,
+        });
+        scope.secrets.insert("db-password".to_string());
+        let d1 = scope.canonical_digest().unwrap();
+        let d2 = scope.canonical_digest().unwrap();
+        assert_eq!(d1, d2);
+        assert_eq!(d1.len(), 64);
+    }
+
+    #[test]
+    fn network_class_private() {
+        assert_eq!(
+            HostPattern::parse("10.1.2.3").unwrap().network_class(),
+            NetworkClass::Private
+        );
+        assert_eq!(
+            HostPattern::parse("8.8.8.8").unwrap().network_class(),
+            NetworkClass::Public
+        );
+        assert_eq!(
+            HostPattern::parse("127.0.0.1").unwrap().network_class(),
+            NetworkClass::Loopback
+        );
+        assert_eq!(
+            HostPattern::parse("example.com").unwrap().network_class(),
+            NetworkClass::Dns
+        );
+    }
+}
