@@ -7,6 +7,7 @@ mod context;
 mod control;
 mod egress;
 mod extensions;
+pub mod lease;
 mod lifecycle;
 mod migrations;
 mod model_registry;
@@ -133,6 +134,16 @@ pub enum RepositoryError {
     InvalidAutomationState,
     #[error("skill version metadata conflicts with the pinned skill identity")]
     SkillMetadataConflict,
+    #[error("kernel lease state conflicts with repository constraints: {0}")]
+    InvalidKernelLeaseState(String),
+    #[error("kernel budget insufficient: {0}")]
+    KernelBudgetInsufficient(String),
+    #[error("kernel reservation conflicts with repository constraints")]
+    KernelReservationConflict,
+    #[error("kernel debit idempotency key was already used with different parameters")]
+    KernelDebitConflict,
+    #[error("kernel audit chain break: {0}")]
+    KernelAuditBreak(String),
 }
 
 pub(crate) fn timestamp_to_i64(
