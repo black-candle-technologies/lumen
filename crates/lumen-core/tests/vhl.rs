@@ -15,6 +15,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use lumen_core::budget::{Budget, BudgetDimension, BudgetLedger};
+use lumen_core::canonical::EffectClass;
 use lumen_core::canonical::PathResolver;
 use lumen_core::kernel_audit::{KernelAuditLog, MemoryAuditStore};
 use lumen_core::lease::{
@@ -22,14 +23,15 @@ use lumen_core::lease::{
     RevocationIndex, RootLeaseParams, SessionRegistry, mint_root_lease, validate_chain,
 };
 use lumen_core::nonce::NonceStore;
+use lumen_core::pi_boundary::ACTION_ENVELOPE_VERSION;
+use lumen_core::pi_boundary::{ActionEnvelope, ResourceSet, ToolRef};
 use lumen_core::session_identity::SessionIdentityVault;
 use lumen_core::vhl::{
     Attestation, AttestationProof, CourierVhlVerifier, Fido2Credential, Fido2RpConfig, ProofKind,
     SessionToken, VhlApprovalRequest, VhlAuditSink, VhlAuthority, VhlError, VhlRequestState,
     attestation_signing_bytes, body_hash,
 };
-use lumen_protocol::action_envelope::ACTION_ENVELOPE_VERSION;
-use lumen_protocol::{ActionEnvelope, EffectClass, ResourceSet, ToolRef};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -71,25 +73,43 @@ fn envelope(
     arguments: serde_json::Value,
     input_hashes: Vec<String>,
 ) -> ActionEnvelope {
+    use lumen_core::pi_boundary::{EffectClasses, InputRef, PathResource, PathRights};
+    let arguments: BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(arguments).unwrap_or_default();
     ActionEnvelope {
-        protocol_version: ACTION_ENVELOPE_VERSION,
-        action_id: Uuid::new_v4().to_string(),
+        version: ACTION_ENVELOPE_VERSION,
+        action_id: Uuid::new_v4(),
         session_id: session_subject.to_string(),
         tool: ToolRef {
             name: "fs.read".to_string(),
             version: "1.0.0".to_string(),
         },
         arguments,
-        input_hashes,
+        inputs: input_hashes
+            .into_iter()
+            .map(|content_hash| InputRef {
+                content_hash,
+                snapshot_id: None,
+            })
+            .collect(),
         resources: ResourceSet {
-            paths: vec!["/workspace/README.md".to_string()],
-            hosts: vec![],
-            secret_refs: vec![],
+            paths: vec![PathResource {
+                path: "/workspace/README.md".to_string(),
+                rights: PathRights::Read,
+            }],
+            network: vec![],
+            secrets: vec![],
+        },
+        expected_effects: EffectClasses {
+            file_read: true,
+            file_write: false,
+            network_egress: false,
+            network_ingress: false,
+            process_spawn: false,
         },
         lease_chain: vec![],
         nonce: format!("test-nonce-{}", Uuid::new_v4()),
-        expires_at: "2026-09-24T00:10:00Z".to_string(),
-        expected_effects: vec![EffectClass::Read],
+        expires_at_ms: NOW_MS + 600_000,
     }
 }
 
@@ -99,13 +119,14 @@ fn canonical_action(env: &ActionEnvelope) -> CanonicalAction {
 
 #[derive(Default)]
 struct RecordingAudit {
-    events: Vec<(String, String, String, serde_json::Value, i64)>,
+    events: Vec<(String, String, String, String, serde_json::Value, i64)>,
 }
 
 impl lumen_core::vhl::VhlAuditSink for RecordingAudit {
     fn record_vhl(
         &mut self,
         actor: &str,
+        session_id: &str,
         action_digest: &str,
         decision: &str,
         details: serde_json::Value,
@@ -113,6 +134,7 @@ impl lumen_core::vhl::VhlAuditSink for RecordingAudit {
     ) -> Result<(), VhlError> {
         self.events.push((
             actor.to_string(),
+            session_id.to_string(),
             action_digest.to_string(),
             decision.to_string(),
             details,
@@ -301,7 +323,7 @@ fn approve_once_mints_single_use_lease_for_exact_action() {
     assert!(matches!(again, Err(VhlError::IllegalTransition(_))));
 
     // The audit trail saw granted → minted → consumed, in order.
-    let decisions: Vec<&str> = h.audit.events.iter().map(|e| e.2.as_str()).collect();
+    let decisions: Vec<&str> = h.audit.events.iter().map(|e| e.3.as_str()).collect();
     assert_eq!(
         decisions,
         vec!["approval.granted", "approval.minted", "approval.consumed"]
@@ -1354,8 +1376,8 @@ fn parent_test_scope(action: &CanonicalAction) -> lumen_core::canonical::Resourc
 
 #[test]
 fn audit_event_removal_breaks_the_chain() {
-    use lumen_core::kernel_audit::AuditStore as _;
-    use lumen_protocol::audit::verify_chain;
+    use lumen_core::kernel_audit::{AuditStore as _, verify_event_chain};
+    use lumen_core::pi_boundary::AuditEventKind;
 
     let mut log = KernelAuditLog::new(MemoryAuditStore::default());
     for (i, decision) in ["approval.granted", "approval.minted", "approval.consumed"]
@@ -1364,29 +1386,31 @@ fn audit_event_removal_breaks_the_chain() {
     {
         log.append(
             "human",
+            AuditEventKind::ApprovalRequested,
+            "test-session",
             &"d".repeat(64),
-            decision,
+            Some(decision),
             NOW_MS + i as i64,
             json!({"seq": i}),
         )
         .expect("append");
     }
     let events = log.store().events().to_vec();
-    verify_chain(&events).expect("intact chain verifies");
+    verify_event_chain(&events).expect("intact chain verifies");
 
     // Removal of a decision event breaks sequence continuity: detectable.
     let mut tampered = events.clone();
     tampered.remove(1);
     assert!(
-        verify_chain(&tampered).is_err(),
+        verify_event_chain(&tampered).is_err(),
         "removed decision event must break the chain"
     );
 
     // Mutation of a decision event breaks the hash link: detectable.
     let mut tampered = events.clone();
-    tampered[0].decision = "approval.denied".to_string();
+    tampered[0].decision = Some("approval.denied".to_string());
     assert!(
-        verify_chain(&tampered).is_err(),
+        verify_event_chain(&tampered).is_err(),
         "mutated decision event must break the chain"
     );
 }
@@ -1489,6 +1513,7 @@ impl VhlAuditSink for FailingAudit {
     fn record_vhl(
         &mut self,
         _approver: &str,
+        _session_id: &str,
         _action_digest: &str,
         _decision: &str,
         _details: serde_json::Value,

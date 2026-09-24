@@ -53,8 +53,6 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
 
-use lumen_protocol::{ActionEnvelope, EffectClass, canonical};
-
 use crate::budget::{Budget, BudgetDimension, BudgetLedger};
 use crate::kernel_audit::{AuditStore, KernelAuditLog};
 use crate::lease::{
@@ -63,7 +61,8 @@ use crate::lease::{
 };
 use crate::nonce::NonceStore;
 use crate::{
-    canonical::ResourceScope,
+    canonical::{EffectClass, ResourceScope},
+    pi_boundary::{self, ActionEnvelope, canonical_digest, canonical_json},
     session_identity::{SessionEndReceipt, SessionIdentityError, SessionIdentityVault},
 };
 
@@ -503,8 +502,11 @@ impl ApprovalView {
                 "envelope digest does not match canonical action digest".to_string(),
             ));
         }
-        let arguments_digest = canonical::digest_value(&envelope.arguments)
-            .map_err(|e| VhlError::Encoding(e.to_string()))?;
+        let arguments_digest = canonical_digest(
+            &serde_json::to_value(&envelope.arguments)
+                .map_err(|e| VhlError::Encoding(e.to_string()))?,
+        )
+        .map_err(|e| VhlError::Encoding(e.to_string()))?;
         let tool = format!("{}@{}", action.tool_name.as_str(), action.tool_version);
         let paths: Vec<String> = action.paths.iter().map(|p| p.canonical_form()).collect();
         let destinations: Vec<String> = action
@@ -539,8 +541,8 @@ impl ApprovalView {
         }
         summary.push_str(&format!("effects: {}\n", effects.join(", ")));
         summary.push_str(&format!("arguments digest: {arguments_digest}\n"));
-        for input in &envelope.input_hashes {
-            summary.push_str(&format!("input hash: {input}\n"));
+        for input in &envelope.inputs {
+            summary.push_str(&format!("input hash: {}\n", input.content_hash));
         }
         summary.push_str(&format!(
             "session: {}\nbudget: {budget_executions} execution(s)\nexpires: {expires_at_ms}\n",
@@ -556,7 +558,11 @@ impl ApprovalView {
             secrets,
             effects,
             arguments_digest,
-            input_hashes: envelope.input_hashes.clone(),
+            input_hashes: envelope
+                .inputs
+                .iter()
+                .map(|i| i.content_hash.clone())
+                .collect(),
             budget_executions,
             expires_at_ms,
             summary,
@@ -567,9 +573,7 @@ impl ApprovalView {
     /// exactly these bytes.
     pub fn render_body(&self) -> Result<Vec<u8>, VhlError> {
         let value = serde_json::to_value(self).map_err(|e| VhlError::Encoding(e.to_string()))?;
-        canonical::canonical_json(&value)
-            .map(|s| s.into_bytes())
-            .map_err(|e| VhlError::Encoding(e.to_string()))
+        canonical_json(&value).map_err(|e| VhlError::Encoding(e.to_string()))
     }
 
     /// SHA-256 of the rendered body (hex); the attestation carries the same
@@ -678,7 +682,11 @@ impl VhlApprovalRequest {
         Ok(Self {
             request_id: Uuid::new_v4().to_string(),
             action_digest: action.digest.clone(),
-            input_hashes: envelope.input_hashes.clone(),
+            input_hashes: envelope
+                .inputs
+                .iter()
+                .map(|i| i.content_hash.clone())
+                .collect(),
             session_subject: envelope.session_id.clone(),
             nonce: hex::encode(nonce_bytes),
             created_at_ms: now_ms,
@@ -1533,6 +1541,7 @@ pub trait VhlAuditSink {
     fn record_vhl(
         &mut self,
         actor: &str,
+        session_id: &str,
         action_digest: &str,
         decision: &str,
         details: serde_json::Value,
@@ -1540,18 +1549,36 @@ pub trait VhlAuditSink {
     ) -> Result<(), VhlError>;
 }
 
+/// Map the VHL decision string to the frozen [`pi_boundary::AuditEventKind`].
+/// The frozen contract has a single approval bucket
+/// ([`ApprovalRequested`](pi_boundary::AuditEventKind::ApprovalRequested));
+/// the VHL decision string itself is preserved verbatim in the event's
+/// `decision` field, so no information is lost.
+fn vhl_decision_kind(_decision: &str) -> pi_boundary::AuditEventKind {
+    pi_boundary::AuditEventKind::ApprovalRequested
+}
+
 impl<S: AuditStore> VhlAuditSink for KernelAuditLog<S> {
     fn record_vhl(
         &mut self,
         actor: &str,
+        session_id: &str,
         action_digest: &str,
         decision: &str,
         details: serde_json::Value,
         now_ms: i64,
     ) -> Result<(), VhlError> {
-        self.append(actor, action_digest, decision, now_ms, details)
-            .map(|_| ())
-            .map_err(|e| VhlError::Audit(e.to_string()))
+        self.append(
+            actor,
+            vhl_decision_kind(decision),
+            session_id,
+            action_digest,
+            Some(decision),
+            now_ms,
+            details,
+        )
+        .map(|_| ())
+        .map_err(|e| VhlError::Audit(e.to_string()))
     }
 }
 
@@ -1654,6 +1681,7 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         // instead of leaving state and audit diverged.
         audit.record_vhl(
             &verified.approver,
+            &request.session_subject,
             &request.action_digest,
             "approval.granted",
             serde_json::json!({
@@ -1684,6 +1712,7 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         // Audit before mutating request state (see decide()).
         audit.record_vhl(
             approver,
+            &request.session_subject,
             &request.action_digest,
             "approval.denied",
             serde_json::json!({
@@ -1756,6 +1785,7 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         request.note_minted(&lease.lease_id, now_ms)?;
         audit.record_vhl(
             &approver,
+            &request.session_subject,
             &request.action_digest,
             "approval.minted",
             serde_json::json!({
@@ -1789,6 +1819,7 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         request.note_consumed(now_ms)?;
         audit.record_vhl(
             "kernel",
+            &request.session_subject,
             &request.action_digest,
             "approval.consumed",
             serde_json::json!({
@@ -1865,6 +1896,7 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         // Audit before mutating request state (see decide()).
         audit.record_vhl(
             &verified.approver,
+            &request.session_subject,
             &request.action_digest,
             "standing-lease.confirmed",
             serde_json::json!({
@@ -1964,6 +1996,7 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         request.note_minted(&lease.lease_id, now_ms)?;
         audit.record_vhl(
             &confirmation.approver,
+            &request.session_subject,
             &request.action_digest,
             "standing-lease.minted",
             serde_json::json!({
@@ -2111,9 +2144,7 @@ impl VhlCourierMessage {
     /// Canonical JSON bytes for the wire.
     pub fn encode(&self) -> Result<Vec<u8>, VhlError> {
         let value = serde_json::to_value(self).map_err(|e| VhlError::Encoding(e.to_string()))?;
-        canonical::canonical_json(&value)
-            .map(|s| s.into_bytes())
-            .map_err(|e| VhlError::Encoding(e.to_string()))
+        canonical_json(&value).map_err(|e| VhlError::Encoding(e.to_string()))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, VhlError> {
