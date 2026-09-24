@@ -11,6 +11,7 @@ members = [
     "crates/lumen-control-plane",
     "crates/lumen-acceptance",
     "crates/lumen-protocol",
+    "crates/lumen-sandboxd",
 ]
 resolver = "3"
 

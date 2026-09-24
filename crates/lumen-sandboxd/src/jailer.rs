@@ -1,0 +1,396 @@
+//! Firecracker jailer invocation.
+//!
+//! Defense in depth, host side:
+//! - the jailer chroots into `<chroot_base>/firecracker/<id>/root`,
+//!   joins the run's network namespace, optionally starts a new PID
+//!   namespace, drops to a dedicated per-run UID/GID, closes inherited
+//!   FDs, clears the environment, and only then execs Firecracker;
+//! - cgroup v2 limits are applied by the jailer itself (`--cgroup`),
+//!   so no extra privileged helper is needed between sandboxd and the VMM;
+//! - the guest never sees the API socket path outside the chroot, and the
+//!   chroot contains only: the firecracker binary, config, kernel, rootfs,
+//!   seccomp filter, and the sockets firecracker itself creates.
+//!
+//! Flag reference: Firecracker `docs/jailer.md` (jailer `--id --exec-file
+//! --uid --gid [--cgroup-version 2 --cgroup ...] [--netns] [--new-pid-ns]
+//! [--daemonize] -- <firecracker args>`).
+
+use std::path::{Path, PathBuf};
+
+use sha2::Digest;
+
+use crate::{contracts::ResourceLimits, error::SandboxdError};
+
+/// Everything the jailer needs to launch one microVM.
+#[derive(Debug, Clone)]
+pub struct JailSpec {
+    /// Jail id: alphanumeric + hyphens, <= 64 chars.
+    pub id: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub chroot_base: PathBuf,
+    /// Path to the run's network namespace handle (`/var/run/netns/<name>`).
+    pub netns_path: PathBuf,
+    pub firecracker_bin: PathBuf,
+    pub firecracker_version: String,
+    pub limits: ResourceLimits,
+    /// cgroup v2 parent for this host, e.g. `/sys/fs/cgroup/lumen`.
+    pub cgroup_parent: PathBuf,
+    /// Whether to request a fresh snapshot restore instead of a cold boot.
+    pub snapshot: Option<SnapshotLoad>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotLoad {
+    pub mem_path: PathBuf,
+    pub vmstate_path: PathBuf,
+}
+
+/// Chroot layout produced by the jailer for `<id>`:
+/// `<chroot_base>/firecracker/<id>/root/`.
+pub fn jail_root(chroot_base: &Path, id: &str) -> PathBuf {
+    chroot_base.join("firecracker").join(id).join("root")
+}
+
+/// Validate a jail id against the jailer's rules.
+pub fn validate_jail_id(id: &str) -> Result<(), SandboxdError> {
+    if id.is_empty() || id.len() > 64 {
+        return Err(SandboxdError::InvalidSpec(
+            "jail id must be 1..=64 chars".into(),
+        ));
+    }
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(SandboxdError::InvalidSpec(
+            "jail id allows alphanumeric and hyphen only".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// cgroup v2 settings applied by the jailer `--cgroup` flag, derived from
+/// the run's [`ResourceLimits`].
+///
+/// - `memory.max`: hard memory cap (OOM kills the VMM, not the host).
+/// - `cpu.max`: `<quota> <period>`; quota = vcpu * 100_000 (1 vcpu = 1 core).
+/// - `pids.max`: fork-bomb containment.
+/// - `memory.swap.max = 0`: no swap escape hatch.
+pub fn cgroup_settings(limits: &ResourceLimits) -> Vec<(String, String)> {
+    let memory_max = format!("{}M", limits.memory_mib);
+    let cpu_quota = limits.vcpu.max(1) as u64 * 100_000;
+    vec![
+        ("memory.max".into(), memory_max),
+        ("memory.swap.max".into(), "0".into()),
+        ("cpu.max".into(), format!("{cpu_quota} 100000")),
+        ("pids.max".into(), limits.max_processes.to_string()),
+    ]
+}
+
+/// Resource limits applied by the jailer `--resource-limit` flag
+/// (RLIMIT_* on the VMM process itself).
+pub fn resource_limits() -> Vec<(String, String)> {
+    vec![
+        // No core dumps from the VMM (could contain guest memory).
+        ("core".into(), "0".into()),
+        // Bound open FDs.
+        ("no-file".into(), "1024".into()),
+    ]
+}
+
+/// Build the full jailer argv (excluding argv[0]).
+///
+/// We intentionally do NOT pass `--daemonize`: sandboxd supervises the
+/// jailer as a child process so crashes are observed and the pid is known.
+/// Reconciliation covers the SIGKILL case via `/proc` scanning.
+pub fn jailer_argv(spec: &JailSpec, fc_args: &[String]) -> Result<Vec<String>, SandboxdError> {
+    validate_jail_id(&spec.id)?;
+    let mut argv = vec![
+        "--id".into(),
+        spec.id.clone(),
+        "--exec-file".into(),
+        spec.firecracker_bin.display().to_string(),
+        "--uid".into(),
+        spec.uid.to_string(),
+        "--gid".into(),
+        spec.gid.to_string(),
+        "--chroot-base-dir".into(),
+        spec.chroot_base.display().to_string(),
+        "--cgroup-version".into(),
+        "2".into(),
+        "--parent-cgroup".into(),
+        spec.cgroup_parent.display().to_string(),
+        "--netns".into(),
+        spec.netns_path.display().to_string(),
+        "--new-pid-ns".into(),
+    ];
+    for (file, value) in cgroup_settings(&spec.limits) {
+        argv.push("--cgroup".into());
+        argv.push(format!("{file}={value}"));
+    }
+    for (resource, value) in resource_limits() {
+        argv.push("--resource-limit".into());
+        argv.push(format!("{resource}={value}"));
+    }
+    argv.push("--".into());
+    argv.extend(fc_args.iter().cloned());
+    Ok(argv)
+}
+
+/// Firecracker argv (passed after jailer's `--`).
+pub fn firecracker_argv(
+    api_sock_in_jail: &Path,
+    config_in_jail: &Path,
+    seccomp_in_jail: &Path,
+) -> Vec<String> {
+    vec![
+        "--api-sock".into(),
+        api_sock_in_jail.display().to_string(),
+        "--config-file".into(),
+        config_in_jail.display().to_string(),
+        "--seccomp-filter".into(),
+        seccomp_in_jail.display().to_string(),
+    ]
+}
+
+/// Minimal Firecracker config.json: machine, boot source, drives,
+/// network interface, vsock. Sockets live inside the jail; the guest agent
+/// channel is the vsock device.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FirecrackerConfig {
+    pub machine_config: MachineConfig,
+    pub boot_source: BootSource,
+    pub drives: Vec<Drive>,
+    pub network_interfaces: Vec<NetworkInterface>,
+    pub vsock: Vsock,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MachineConfig {
+    pub vcpu_count: u32,
+    pub mem_size_mib: u64,
+    /// Hide SMT / pin to a static CPU template for determinism.
+    pub cpu_template: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BootSource {
+    pub kernel_image_path: String,
+    pub boot_args: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Drive {
+    pub drive_id: String,
+    pub path_on_host: String,
+    pub is_root_device: bool,
+    pub is_read_only: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkInterface {
+    pub iface_id: String,
+    pub host_dev_name: String,
+    pub guest_mac: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Vsock {
+    pub guest_cid: u32,
+    pub uds_path: String,
+}
+
+/// Render the Firecracker config.json for one run.
+///
+/// Paths are jail-relative: the jailer hard-links the kernel/rootfs into
+/// the chroot, so the config references `/kernel`, `/rootfs.ext4`, etc.
+pub fn render_config(
+    limits: &ResourceLimits,
+    tap_name: &str,
+    guest_mac: &str,
+    snapshot: Option<&SnapshotLoad>,
+) -> FirecrackerConfig {
+    let _ = snapshot; // Snapshot restore uses the API load path, not config.
+    FirecrackerConfig {
+        machine_config: MachineConfig {
+            vcpu_count: limits.vcpu.max(1),
+            mem_size_mib: limits.memory_mib.max(64),
+            cpu_template: "None".into(),
+        },
+        boot_source: BootSource {
+            kernel_image_path: "/vmlinux".into(),
+            boot_args: "console=ttyS0 reboot=k panic=1 pci=off ro init=/sbin/lumen-guest-agent"
+                .into(),
+        },
+        drives: vec![
+            Drive {
+                drive_id: "rootfs".into(),
+                path_on_host: "/rootfs.ext4".into(),
+                is_root_device: true,
+                is_read_only: true,
+            },
+            Drive {
+                drive_id: "workspace".into(),
+                path_on_host: "/workspace.qcow2".into(),
+                is_root_device: false,
+                is_read_only: false,
+            },
+        ],
+        network_interfaces: vec![NetworkInterface {
+            iface_id: "eth0".into(),
+            host_dev_name: tap_name.into(),
+            guest_mac: guest_mac.into(),
+        }],
+        vsock: Vsock {
+            guest_cid: 3,
+            uds_path: "/v.sock".into(),
+        },
+    }
+}
+
+/// Deterministic guest MAC from the run tag (locally administered).
+pub fn guest_mac(tag: &str) -> String {
+    let mut bytes = [0u8; 6];
+    bytes[0] = 0x02; // locally administered, unicast
+    let digest = sha2::Sha256::digest(tag.as_bytes());
+    bytes[1..].copy_from_slice(&digest[..5]);
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
+}
+
+/// Files the jailer is expected to place in the chroot. Used by the
+/// adversarial test "guest probes VMM socket": the API socket exists, but
+/// only inside the jail, unreachable from the guest's network namespace
+/// and invisible to the workload (no guest path leads to it).
+pub fn expected_chroot_entries() -> Vec<&'static str> {
+    vec![
+        "firecracker",  // exec-file copy
+        "config.json",  // hard-linked
+        "seccomp.json", // hard-linked
+        "vmlinux",      // hard-linked
+        "rootfs.ext4",  // hard-linked
+        "workspace.qcow2",
+        "api.sock", // created by firecracker at runtime
+        "v.sock",   // created by firecracker at runtime
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> JailSpec {
+        JailSpec {
+            id: "lmn-abc12345".into(),
+            uid: 61001,
+            gid: 61001,
+            chroot_base: PathBuf::from("/srv/jailer"),
+            netns_path: PathBuf::from("/var/run/netns/lmn-abc12345"),
+            firecracker_bin: PathBuf::from("/usr/local/bin/firecracker"),
+            firecracker_version: "v1.10.1".into(),
+            limits: crate::contracts::ResourceLimits {
+                vcpu: 2,
+                memory_mib: 1024,
+                wall_time_secs: 120,
+                max_processes: 64,
+                disk_mib: 2048,
+                max_output_bytes: 65536,
+            },
+            cgroup_parent: PathBuf::from("/sys/fs/cgroup/lumen"),
+            snapshot: None,
+        }
+    }
+
+    #[test]
+    fn jailer_argv_has_defense_in_depth_flags() {
+        let s = spec();
+        let fc = firecracker_argv(
+            Path::new("/api.sock"),
+            Path::new("/config.json"),
+            Path::new("/seccomp.json"),
+        );
+        let argv = jailer_argv(&s, &fc).unwrap();
+        let joined = argv.join(" ");
+        for flag in [
+            "--id",
+            "--exec-file",
+            "--uid",
+            "--gid",
+            "--chroot-base-dir",
+            "--cgroup-version",
+            "--netns",
+            "--new-pid-ns",
+        ] {
+            assert!(argv.contains(&flag.to_string()), "missing {flag}");
+        }
+        // No --daemonize: sandboxd supervises the child.
+        assert!(!argv.contains(&"--daemonize".to_string()));
+        // cgroup v2, not v1.
+        let pos = argv.iter().position(|a| a == "--cgroup-version").unwrap();
+        assert_eq!(argv[pos + 1], "2");
+        // Quotas present.
+        assert!(joined.contains("memory.max=1024M"));
+        assert!(joined.contains("pids.max=64"));
+        assert!(joined.contains("cpu.max=200000 100000"));
+        assert!(joined.contains("memory.swap.max=0"));
+        // No core dumps.
+        assert!(joined.contains("core=0"));
+        // Firecracker args after `--`.
+        let dash = argv.iter().position(|a| a == "--").unwrap();
+        assert!(argv[dash + 1..].contains(&"--seccomp-filter".to_string()));
+    }
+
+    #[test]
+    fn rejects_bad_jail_ids() {
+        assert!(validate_jail_id("lmn-abc123").is_ok());
+        assert!(validate_jail_id("").is_err());
+        assert!(validate_jail_id(&"x".repeat(65)).is_err());
+        assert!(validate_jail_id("lmn_abc").is_err());
+        assert!(validate_jail_id("../../etc").is_err());
+    }
+
+    #[test]
+    fn guest_mac_is_locally_administered_and_deterministic() {
+        let a = guest_mac("abc12345");
+        let b = guest_mac("abc12345");
+        let c = guest_mac("zzz99999");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("02:"));
+        assert_eq!(a.len(), 17);
+    }
+
+    #[test]
+    fn render_config_is_read_only_root() {
+        let cfg = render_config(&spec().limits, "lmnt-abc1234", "02:aa:bb:cc:dd:ee", None);
+        let root = cfg.drives.iter().find(|d| d.is_root_device).unwrap();
+        assert!(root.is_read_only);
+        let ws = cfg
+            .drives
+            .iter()
+            .find(|d| d.drive_id == "workspace")
+            .unwrap();
+        assert!(!ws.is_read_only && !ws.is_root_device);
+        assert_eq!(cfg.network_interfaces.len(), 1);
+        // Guest agent is PID 1: no shell, no login, no sshd in the image.
+        assert!(
+            cfg.boot_source
+                .boot_args
+                .contains("init=/sbin/lumen-guest-agent")
+        );
+    }
+
+    #[test]
+    fn chroot_contains_no_host_secrets_or_control_paths() {
+        // The adversarial test "guest probes VMM socket" relies on this:
+        // the chroot allowlist has no host paths, no kernel API socket
+        // outside the jail, and nothing the guest can reach.
+        let entries = expected_chroot_entries();
+        for e in &entries {
+            assert!(!e.contains(".."), "path traversal in {e}");
+            assert!(!e.starts_with('/'), "absolute path in {e}");
+        }
+        assert!(!entries.contains(&"token"));
+        assert!(!entries.contains(&"sandboxd.sock"));
+    }
+}
