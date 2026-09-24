@@ -8,14 +8,18 @@
 //! a crashed or buggy host cannot overspend through this layer.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use lumen_core::{
     budget::{Budget, DebitReceipt, Reservation, ReservationState},
     identity::WorkspaceId,
-    kernel_audit::{checkpoint_signing_bytes, redact_details, verify_chain_with_checkpoints},
+    kernel_audit::{
+        AuditLink, GENESIS_PREV_HASH, actor_to_string, parse_actor, render_detail, seal_event,
+        verify_event_chain,
+    },
     lease::LeaseDocument,
+    pi_boundary::{AUDIT_EVENT_VERSION, AuditEvent, AuditEventKind},
 };
-use lumen_protocol::audit::{AuditEvent, AuditLink, verify_chain};
 use serde_json::Value;
 use sqlx::Row;
 use uuid::Uuid;
@@ -51,42 +55,54 @@ impl Database {
         workspace_id: &WorkspaceId,
         doc: &LeaseDocument,
     ) -> Result<(), RepositoryError> {
-        let scope_digest = doc
-            .scope
-            .canonical_digest()
-            .map_err(|e| RepositoryError::InvalidKernelLeaseState(e.to_string()))?;
-        let scope_json =
-            serde_json::to_string(&doc.scope).map_err(RepositoryError::Serialization)?;
-        let limits_json =
-            serde_json::to_string(&doc.limits).map_err(RepositoryError::Serialization)?;
-        let document_digest = doc
-            .digest()
-            .map_err(|e| RepositoryError::InvalidKernelLeaseState(e.to_string()))?;
-        sqlx::query(
-            "INSERT INTO kernel_leases(lease_id,workspace_id,parent_id,subject,issuer_key_id,
-             issued_at_ms,protocol_version,scope_digest,scope_json,limits_json,depth,depth_limit,
-             lease_nonce,signature,document_digest,created_at)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(&doc.lease_id)
-        .bind(ws(workspace_id))
-        .bind(doc.parent_id.as_deref())
-        .bind(&doc.subject)
-        .bind(&doc.issuer_key_id)
-        .bind(doc.issued_at_ms)
-        .bind(doc.protocol_version as i64)
-        .bind(&scope_digest)
-        .bind(&scope_json)
-        .bind(&limits_json)
-        .bind(doc.depth as i64)
-        .bind(doc.depth_limit as i64)
-        .bind(&doc.lease_nonce)
-        .bind(&doc.signature)
-        .bind(&document_digest)
-        .bind(doc.issued_at_ms)
-        .execute(self.pool())
-        .await?;
+        let mut tx = self.pool().begin().await?;
+        insert_lease_tx(&mut tx, workspace_id, doc).await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// Mint a child lease durably in a single transaction: the child lease
+    /// row, the parent's budget reservation, and the child's budget account
+    /// commit together. A crash can never leave a child lease without its
+    /// reservation (an unbacked budget) or a reservation without its lease.
+    ///
+    /// The child's budget caps are its declared limits; the reservation
+    /// holds exactly those limits against the parent. Fails closed when the
+    /// parent cannot cover the limits, when the document is not a child
+    /// (no parent id), or when any digest check fails. Returns the
+    /// reservation id.
+    pub async fn mint_kernel_child_lease(
+        &self,
+        workspace_id: &WorkspaceId,
+        doc: &LeaseDocument,
+        now_ms: i64,
+    ) -> Result<String, RepositoryError> {
+        let parent_id = doc.parent_id.clone().ok_or_else(|| {
+            RepositoryError::InvalidKernelLeaseState(
+                "mint_kernel_child_lease requires a child document with a parent id".to_string(),
+            )
+        })?;
+        let mut tx = self.pool().begin().await?;
+        insert_lease_tx(&mut tx, workspace_id, doc).await?;
+        let reservation_id = reserve_budget_tx(
+            &mut tx,
+            workspace_id,
+            &parent_id,
+            &doc.lease_id,
+            &doc.limits.budget,
+            now_ms,
+        )
+        .await?;
+        register_budget_tx(
+            &mut tx,
+            workspace_id,
+            &doc.lease_id,
+            &doc.limits.budget,
+            now_ms,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(reservation_id)
     }
 
     pub async fn kernel_lease(
@@ -262,6 +278,57 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Consume a one-shot lease and durably record the authorization outcome
+    /// in a single transaction: the consumption row and the audit event
+    /// commit together, so a crash can never leave a consumed lease without
+    /// its audit trail, nor an audit "allow" for a lease that was not
+    /// consumed.
+    ///
+    /// Returns `(consumed, event)`: `consumed` is true when this call
+    /// performed the consumption, false on replay. The `on_consumed` audit
+    /// parameters describe the allow event; `on_replay` the deny event, so
+    /// every authorization attempt is audited exactly once, atomically tied
+    /// to its outcome. A bounded retry loop resolves audit-sequence races
+    /// with concurrent writers.
+    pub async fn consume_kernel_one_shot_and_audit(
+        &self,
+        workspace_id: &WorkspaceId,
+        lease_id: &str,
+        on_consumed: &KernelAuditAppend<'_>,
+        on_replay: &KernelAuditAppend<'_>,
+    ) -> Result<(bool, AuditEvent), RepositoryError> {
+        for attempt in 0..AUDIT_APPEND_RETRIES {
+            let mut tx = self.pool().begin().await?;
+            let res = sqlx::query(
+                "INSERT OR IGNORE INTO kernel_one_shot_uses(lease_id,workspace_id,consumed_at_ms)
+                 VALUES(?,?,?)",
+            )
+            .bind(lease_id)
+            .bind(ws(workspace_id))
+            .bind(on_consumed.timestamp_ms)
+            .execute(&mut *tx)
+            .await?;
+            // The consumption row is idempotent, so retrying a rolled-back
+            // attempt is safe: a rolled-back INSERT OR IGNORE left no row.
+            let consumed = res.rows_affected() == 1;
+            let params = if consumed { on_consumed } else { on_replay };
+            match append_audit_attempt(&mut tx, workspace_id, params).await {
+                Ok(event) => {
+                    tx.commit().await?;
+                    return Ok((consumed, event));
+                }
+                Err(e) if is_retryable(&e) => {
+                    audit_retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(RepositoryError::KernelAuditBreak(
+            "one-shot consume lost too many audit sequence races".to_string(),
+        ))
+    }
+
     // ------------------------------------------------------------------
     // Budget ledger (transactional)
     // ------------------------------------------------------------------
@@ -275,22 +342,9 @@ impl Database {
         caps: &Budget,
         now_ms: i64,
     ) -> Result<(), RepositoryError> {
-        let zero = budget_json(&Budget::new())?;
-        let res = sqlx::query(
-            "INSERT OR IGNORE INTO kernel_budget_accounts(lease_id,workspace_id,caps_json,
-             reserved_out_json,consumed_json,updated_at) VALUES(?,?,?,?,?,?)",
-        )
-        .bind(lease_id)
-        .bind(ws(workspace_id))
-        .bind(budget_json(caps)?)
-        .bind(&zero)
-        .bind(&zero)
-        .bind(now_ms)
-        .execute(self.pool())
-        .await?;
-        if res.rows_affected() == 0 {
-            return Err(RepositoryError::KernelReservationConflict);
-        }
+        let mut tx = self.pool().begin().await?;
+        register_budget_tx(&mut tx, workspace_id, lease_id, caps, now_ms).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -304,58 +358,18 @@ impl Database {
         requested: &Budget,
         now_ms: i64,
     ) -> Result<String, RepositoryError> {
-        let pool = self.pool();
-        let mut tx = pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT caps_json,reserved_out_json,consumed_json FROM kernel_budget_accounts
-             WHERE workspace_id=? AND lease_id=?",
+        let mut tx = self.pool().begin().await?;
+        let id = reserve_budget_tx(
+            &mut tx,
+            workspace_id,
+            parent_lease_id,
+            child_lease_id,
+            requested,
+            now_ms,
         )
-        .bind(ws(workspace_id))
-        .bind(parent_lease_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| insufficient(&format!("unknown parent lease {parent_lease_id}")))?;
-        let caps = parse_budget(row.get::<String, _>("caps_json").as_str())?;
-        let reserved_out = parse_budget(row.get::<String, _>("reserved_out_json").as_str())?;
-        let consumed = parse_budget(row.get::<String, _>("consumed_json").as_str())?;
-        let remaining = caps.saturating_sub(&reserved_out).saturating_sub(&consumed);
-        if !remaining.covers(requested) {
-            return Err(insufficient(&format!(
-                "parent {parent_lease_id} cannot cover reservation for {child_lease_id}"
-            )));
-        }
-        let reservation_id = format!("res_{}", Uuid::new_v4().simple());
-        let held_json = budget_json(requested)?;
-        let zero = budget_json(&Budget::new())?;
-        sqlx::query(
-            "INSERT INTO kernel_reservations(reservation_id,workspace_id,parent_lease_id,
-             child_lease_id,held_json,consumed_json,state,created_at_ms,released_at_ms)
-             VALUES(?,?,?,?,?,?,'active',?,NULL)",
-        )
-        .bind(&reservation_id)
-        .bind(ws(workspace_id))
-        .bind(parent_lease_id)
-        .bind(child_lease_id)
-        .bind(&held_json)
-        .bind(&zero)
-        .bind(now_ms)
-        .execute(&mut *tx)
-        .await?;
-        let new_reserved = reserved_out
-            .checked_add(requested)
-            .ok_or_else(|| insufficient("reserved_out overflow"))?;
-        sqlx::query(
-            "UPDATE kernel_budget_accounts SET reserved_out_json=?,updated_at=?
-             WHERE workspace_id=? AND lease_id=?",
-        )
-        .bind(budget_json(&new_reserved)?)
-        .bind(now_ms)
-        .bind(ws(workspace_id))
-        .bind(parent_lease_id)
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(reservation_id)
+        Ok(id)
     }
 
     /// Debit actual usage against a reservation, atomically and idempotently.
@@ -664,105 +678,74 @@ impl Database {
     // Audit log
     // ------------------------------------------------------------------
 
-    /// Append an event to the workspace's hash-chained audit log. Details are
-    /// redacted deterministically before sealing. The chain link is computed
-    /// in the same transaction that inserts the row, so concurrent appends
-    /// cannot fork the chain.
+    /// Append an event to the workspace's hash-chained audit log, sealed
+    /// against the frozen v1 [`AuditEvent`] contract. Details are redacted
+    /// deterministically before sealing, and the chain link is computed in
+    /// the same transaction that inserts the row.
+    ///
+    /// Concurrent writers are handled by a bounded retry loop: when two
+    /// writers race, the loser fails the gapless-sequence trigger, rolls
+    /// back, re-reads the tip, and appends after it. Concurrent appends
+    /// from multiple connections therefore never fork the chain.
     pub async fn append_kernel_audit_event(
         &self,
         workspace_id: &WorkspaceId,
-        actor: &str,
-        action_digest: &str,
-        decision: &str,
-        recorded_at_ms: i64,
-        mut details: Value,
+        params: &KernelAuditAppend<'_>,
     ) -> Result<AuditEvent, RepositoryError> {
-        use lumen_protocol::audit::AUDIT_EVENT_VERSION;
-        redact_details(&mut details);
-        let pool = self.pool();
-        let mut tx = pool.begin().await?;
-        let prev: Option<AuditEvent> = sqlx::query(
-            "SELECT seq,prev_hash,hash,action_digest,decision,actor,details_json,recorded_at
-             FROM kernel_audit_events WHERE workspace_id=? ORDER BY seq DESC LIMIT 1",
-        )
-        .bind(ws(workspace_id))
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(|r| audit_event_from_row(&r))
-        .transpose()?;
-        let event = AuditEvent {
-            protocol_version: AUDIT_EVENT_VERSION,
-            seq: prev.as_ref().map(|e| e.seq + 1).unwrap_or(0),
-            ts: ms_to_rfc3339(recorded_at_ms),
-            actor: actor.to_string(),
-            action_digest: action_digest.to_string(),
-            decision: decision.to_string(),
-            prev_hash: String::new(),
-            hash: String::new(),
-            details,
-        };
-        let sealed = lumen_protocol::audit::append(prev.as_ref(), event)
-            .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
-        sqlx::query(
-            "INSERT INTO kernel_audit_events(seq,workspace_id,prev_hash,hash,action_digest,
-             decision,actor,details_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(sealed.seq as i64)
-        .bind(ws(workspace_id))
-        .bind(&sealed.prev_hash)
-        .bind(&sealed.hash)
-        .bind(&sealed.action_digest)
-        .bind(&sealed.decision)
-        .bind(&sealed.actor)
-        .bind(serde_json::to_string(&sealed.details).map_err(RepositoryError::Serialization)?)
-        .bind(recorded_at_ms)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(sealed)
+        for attempt in 0..AUDIT_APPEND_RETRIES {
+            let mut tx = self.pool().begin().await?;
+            match append_audit_attempt(&mut tx, workspace_id, params).await {
+                Ok(event) => {
+                    tx.commit().await?;
+                    return Ok(event);
+                }
+                Err(e) if is_retryable(&e) => {
+                    audit_retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(RepositoryError::KernelAuditBreak(
+            "audit append lost too many sequence races".to_string(),
+        ))
     }
 
-    /// Store a host-key checkpoint. The signature is computed by the kernel
-    /// over [`checkpoint_signing_bytes`]; the db verifies the checkpoint
-    /// references a real event with the matching hash before storing.
+    /// Store a host-key checkpoint. The checkpoint is anchored to a real
+    /// event: the db refuses a link whose hash does not match the event at
+    /// `through_seq` in this workspace. Signature verification happens in
+    /// [`Database::verify_kernel_audit`], which holds the host key.
     pub async fn checkpoint_kernel_audit(
         &self,
         workspace_id: &WorkspaceId,
-        seq: u64,
-        hash: &str,
-        signature_hex: &str,
-        key_id: &str,
+        link: &AuditLink,
         created_at_ms: i64,
     ) -> Result<(), RepositoryError> {
         let event_hash: Option<String> = sqlx::query_scalar(
             "SELECT hash FROM kernel_audit_events WHERE workspace_id=? AND seq=?",
         )
         .bind(ws(workspace_id))
-        .bind(seq as i64)
+        .bind(link.through_seq as i64)
         .fetch_optional(self.pool())
         .await?;
         match event_hash {
-            Some(h) if h == hash => {}
+            Some(h) if h == link.chain_hash => {}
             _ => {
                 return Err(RepositoryError::KernelAuditBreak(format!(
-                    "checkpoint references unknown event seq {seq}"
+                    "checkpoint references unknown event seq {}",
+                    link.through_seq
                 )));
             }
         }
-        // Recompute the signing bytes so a caller cannot store a checkpoint
-        // whose signature was computed over different bytes unnoticed: the
-        // signature itself is verified by readers via verify_kernel_audit.
-        let _ = checkpoint_signing_bytes(seq, hash, key_id)
-            .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
         sqlx::query(
             "INSERT INTO kernel_audit_checkpoints(workspace_id,seq,hash,signature,key_id,created_at)
              VALUES(?,?,?,?,?,?)",
         )
         .bind(ws(workspace_id))
-        .bind(seq as i64)
-        .bind(hash)
-        .bind(signature_hex)
-        .bind(key_id)
+        .bind(link.through_seq as i64)
+        .bind(&link.chain_hash)
+        .bind(&link.signature)
+        .bind(&link.key_id)
         .bind(created_at_ms)
         .execute(self.pool())
         .await?;
@@ -778,7 +761,8 @@ impl Database {
     ) -> Result<Vec<AuditEvent>, RepositoryError> {
         use sqlx::QueryBuilder;
         let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
-            "SELECT seq,prev_hash,hash,action_digest,decision,actor,details_json,recorded_at
+            "SELECT workspace_id,seq,version,event_id,kind,actor,session_id,action_digest,
+             decision,detail,prev_hash,hash,timestamp_ms
              FROM kernel_audit_events WHERE workspace_id=",
         );
         qb.push_bind(ws(workspace_id));
@@ -819,17 +803,19 @@ impl Database {
         rows.iter()
             .map(|r| {
                 Ok(AuditLink {
-                    seq: r.get::<i64, _>("seq") as u64,
-                    hash: r.get("hash"),
-                    signature: r.get("signature"),
                     key_id: r.get("key_id"),
+                    through_seq: r.get::<i64, _>("seq") as u64,
+                    chain_hash: r.get("hash"),
+                    signature: r.get("signature"),
                 })
             })
             .collect()
     }
 
     /// Verify the workspace's audit chain and every checkpoint against the
-    /// host verifying key. Reports the first break found.
+    /// host verifying key. Each checkpoint must be anchored to a real event
+    /// (matching sequence and hash) and carry a valid host-key signature.
+    /// Reports the first break found.
     pub async fn verify_kernel_audit(
         &self,
         workspace_id: &WorkspaceId,
@@ -839,12 +825,38 @@ impl Database {
         let events = self
             .kernel_audit_events(workspace_id, &KernelAuditQuery::default())
             .await?;
-        verify_chain(&events).map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
-        let checkpoints = self.kernel_audit_checkpoints(workspace_id).await?;
-        verify_chain_with_checkpoints(&events, &checkpoints, host_key, expected_key_id)
+        verify_event_chain(&events)
             .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
+        let checkpoints = self.kernel_audit_checkpoints(workspace_id).await?;
+        for link in &checkpoints {
+            let anchored = events
+                .iter()
+                .any(|e| e.sequence == link.through_seq && e.hash == link.chain_hash);
+            if !anchored {
+                return Err(RepositoryError::KernelAuditBreak(format!(
+                    "checkpoint at seq {} is not anchored to the chain",
+                    link.through_seq
+                )));
+            }
+            link.verify(host_key, expected_key_id)
+                .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
+        }
         Ok(())
     }
+}
+
+/// Parameters for one audit event append, mirroring the frozen v1
+/// [`AuditEvent`]: `actor` is the kernel actor string (`"kernel"`,
+/// `"ed25519:<session-id>"`, or a human subject); `decision` is `"allow"` |
+/// `"deny"` | `"pending"`, or `None` when the event records no decision.
+pub struct KernelAuditAppend<'a> {
+    pub actor: &'a str,
+    pub kind: AuditEventKind,
+    pub session_id: &'a str,
+    pub action_digest: &'a str,
+    pub decision: Option<&'a str>,
+    pub timestamp_ms: i64,
+    pub details: Value,
 }
 
 /// Provenance query filters for the kernel audit log.
@@ -856,6 +868,238 @@ pub struct KernelAuditQuery {
     pub min_seq: Option<u64>,
     pub max_seq: Option<u64>,
     pub limit: Option<u64>,
+}
+
+/// Attempts for [`Database::append_kernel_audit_event`]: with jittered
+/// backoff between attempts, this is far beyond any plausible burst of
+/// concurrent writers.
+const AUDIT_APPEND_RETRIES: u32 = 32;
+
+/// Backoff between audit-append retries: exponential with full jitter, so
+/// colliding writers decorrelate instead of retrying in lockstep.
+async fn audit_retry_backoff(attempt: u32) {
+    use rand::Rng;
+    let cap_ms = 5u64.saturating_mul(1 << attempt.min(6));
+    let delay_ms = rand::thread_rng().gen_range(0..cap_ms.max(1));
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+/// One append attempt inside an already-open transaction: read the tip,
+/// seal the event, insert it. On a sequence race with a concurrent writer
+/// the gapless-sequence trigger aborts the insert and the caller retries.
+async fn append_audit_attempt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    params: &KernelAuditAppend<'_>,
+) -> Result<AuditEvent, RepositoryError> {
+    if params.action_digest.is_empty() {
+        return Err(RepositoryError::KernelAuditBreak(
+            "action_digest must not be empty".to_string(),
+        ));
+    }
+    let actor =
+        parse_actor(params.actor).map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
+    let detail = render_detail(&params.details)
+        .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
+    let tip: Option<(i64, String)> = sqlx::query_as(
+        "SELECT seq,hash FROM kernel_audit_events WHERE workspace_id=? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(ws(workspace_id))
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (sequence, prev_hash) = match tip {
+        Some((seq, hash)) => (seq as u64 + 1, hash),
+        None => (0, GENESIS_PREV_HASH.to_string()),
+    };
+    let event = AuditEvent {
+        version: AUDIT_EVENT_VERSION,
+        event_id: Uuid::new_v4(),
+        sequence,
+        timestamp_ms: params.timestamp_ms,
+        actor,
+        kind: params.kind,
+        session_id: params.session_id.to_string(),
+        action_digest: params.action_digest.to_string(),
+        decision: params.decision.map(str::to_string),
+        detail,
+        prev_hash: String::new(),
+        hash: String::new(),
+    };
+    let sealed = seal_event(event, &prev_hash)
+        .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
+    sqlx::query(
+        "INSERT INTO kernel_audit_events(workspace_id,seq,version,event_id,kind,actor,
+         session_id,action_digest,decision,detail,prev_hash,hash,timestamp_ms)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(ws(workspace_id))
+    .bind(sealed.sequence as i64)
+    .bind(sealed.version as i64)
+    .bind(sealed.event_id.to_string())
+    .bind(sealed.kind.as_str())
+    .bind(actor_to_string(&sealed.actor))
+    .bind(&sealed.session_id)
+    .bind(&sealed.action_digest)
+    .bind(sealed.decision.as_deref())
+    .bind(&sealed.detail)
+    .bind(&sealed.prev_hash)
+    .bind(&sealed.hash)
+    .bind(sealed.timestamp_ms)
+    .execute(&mut **tx)
+    .await?;
+    Ok(sealed)
+}
+
+/// True when `e` is a transient write conflict the caller should retry:
+/// the gapless-sequence trigger aborting a lost sequence race, or SQLite
+/// reporting the database locked/busy under WAL concurrency (including
+/// `SQLITE_BUSY_SNAPSHOT`, which the busy timeout does not cover). The
+/// transaction rolled back; the retry re-reads the tip and appends after it.
+fn is_retryable(e: &RepositoryError) -> bool {
+    match e {
+        RepositoryError::Sqlx(sqlx::Error::Database(d)) => {
+            let msg = d.message();
+            msg.contains("audit seq must be gapless") || msg.contains("database is locked")
+        }
+        _ => false,
+    }
+}
+
+/// Insert one lease row inside `tx`, recomputing and comparing the scope and
+/// document digests first. Shared by [`Database::insert_kernel_lease`] and
+/// [`Database::mint_kernel_child_lease`].
+async fn insert_lease_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    doc: &LeaseDocument,
+) -> Result<(), RepositoryError> {
+    let scope_digest = doc
+        .scope
+        .canonical_digest()
+        .map_err(|e| RepositoryError::InvalidKernelLeaseState(e.to_string()))?;
+    let scope_json = serde_json::to_string(&doc.scope).map_err(RepositoryError::Serialization)?;
+    let limits_json = serde_json::to_string(&doc.limits).map_err(RepositoryError::Serialization)?;
+    let document_digest = doc
+        .digest()
+        .map_err(|e| RepositoryError::InvalidKernelLeaseState(e.to_string()))?;
+    sqlx::query(
+        "INSERT INTO kernel_leases(lease_id,workspace_id,parent_id,subject,issuer_key_id,
+         issued_at_ms,protocol_version,scope_digest,scope_json,limits_json,depth,depth_limit,
+         lease_nonce,signature,document_digest,created_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&doc.lease_id)
+    .bind(ws(workspace_id))
+    .bind(doc.parent_id.as_deref())
+    .bind(&doc.subject)
+    .bind(&doc.issuer_key_id)
+    .bind(doc.issued_at_ms)
+    .bind(doc.protocol_version as i64)
+    .bind(&scope_digest)
+    .bind(&scope_json)
+    .bind(&limits_json)
+    .bind(doc.depth as i64)
+    .bind(doc.depth_limit as i64)
+    .bind(&doc.lease_nonce)
+    .bind(&doc.signature)
+    .bind(&document_digest)
+    .bind(doc.issued_at_ms)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Carve a reservation for `child_lease_id` out of the parent's account
+/// inside `tx`, returning the reservation id. The parent's remaining balance
+/// is re-checked in SQL-visible state, so concurrent reservations against
+/// the same parent cannot overspend. Shared by
+/// [`Database::reserve_kernel_budget`] and [`Database::mint_kernel_child_lease`].
+async fn reserve_budget_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    parent_lease_id: &str,
+    child_lease_id: &str,
+    requested: &Budget,
+    now_ms: i64,
+) -> Result<String, RepositoryError> {
+    let row = sqlx::query(
+        "SELECT caps_json,reserved_out_json,consumed_json FROM kernel_budget_accounts
+         WHERE workspace_id=? AND lease_id=?",
+    )
+    .bind(ws(workspace_id))
+    .bind(parent_lease_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| insufficient(&format!("unknown parent lease {parent_lease_id}")))?;
+    let caps = parse_budget(row.get::<String, _>("caps_json").as_str())?;
+    let reserved_out = parse_budget(row.get::<String, _>("reserved_out_json").as_str())?;
+    let consumed = parse_budget(row.get::<String, _>("consumed_json").as_str())?;
+    let remaining = caps.saturating_sub(&reserved_out).saturating_sub(&consumed);
+    if !remaining.covers(requested) {
+        return Err(insufficient(&format!(
+            "parent {parent_lease_id} cannot cover reservation for {child_lease_id}"
+        )));
+    }
+    let reservation_id = format!("res_{}", Uuid::new_v4().simple());
+    let held_json = budget_json(requested)?;
+    let zero = budget_json(&Budget::new())?;
+    sqlx::query(
+        "INSERT INTO kernel_reservations(reservation_id,workspace_id,parent_lease_id,
+         child_lease_id,held_json,consumed_json,state,created_at_ms,released_at_ms)
+         VALUES(?,?,?,?,?,?,'active',?,NULL)",
+    )
+    .bind(&reservation_id)
+    .bind(ws(workspace_id))
+    .bind(parent_lease_id)
+    .bind(child_lease_id)
+    .bind(&held_json)
+    .bind(&zero)
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await?;
+    let new_reserved = reserved_out
+        .checked_add(requested)
+        .ok_or_else(|| insufficient("reserved_out overflow"))?;
+    sqlx::query(
+        "UPDATE kernel_budget_accounts SET reserved_out_json=?,updated_at=?
+         WHERE workspace_id=? AND lease_id=?",
+    )
+    .bind(budget_json(&new_reserved)?)
+    .bind(now_ms)
+    .bind(ws(workspace_id))
+    .bind(parent_lease_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(reservation_id)
+}
+
+/// Register a lease's budget caps inside `tx`. Re-registering the same
+/// lease is a conflict (fail closed). Shared by
+/// [`Database::register_kernel_budget`] and [`Database::mint_kernel_child_lease`].
+async fn register_budget_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    lease_id: &str,
+    caps: &Budget,
+    now_ms: i64,
+) -> Result<(), RepositoryError> {
+    let zero = budget_json(&Budget::new())?;
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO kernel_budget_accounts(lease_id,workspace_id,caps_json,
+         reserved_out_json,consumed_json,updated_at) VALUES(?,?,?,?,?,?)",
+    )
+    .bind(lease_id)
+    .bind(ws(workspace_id))
+    .bind(budget_json(caps)?)
+    .bind(&zero)
+    .bind(&zero)
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(RepositoryError::KernelReservationConflict);
+    }
+    Ok(())
 }
 
 fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseDocument, RepositoryError> {
@@ -878,25 +1122,41 @@ fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseDocument, Reposito
 }
 
 fn audit_event_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, RepositoryError> {
-    use lumen_protocol::audit::AUDIT_EVENT_VERSION;
+    let version = r.get::<i64, _>("version") as u32;
+    if version != AUDIT_EVENT_VERSION {
+        return Err(RepositoryError::KernelAuditBreak(format!(
+            "unsupported audit event version {version}"
+        )));
+    }
+    let kind = match r.get::<String, _>("kind").as_str() {
+        "action_proposed" => AuditEventKind::ActionProposed,
+        "policy_allowed" => AuditEventKind::PolicyAllowed,
+        "policy_denied" => AuditEventKind::PolicyDenied,
+        "approval_requested" => AuditEventKind::ApprovalRequested,
+        "transport_rejected" => AuditEventKind::TransportRejected,
+        "tool_executed" => AuditEventKind::ToolExecuted,
+        other => {
+            return Err(RepositoryError::KernelAuditBreak(format!(
+                "unknown audit event kind {other}"
+            )));
+        }
+    };
+    let event_id = Uuid::parse_str(r.get::<String, _>("event_id").as_str())
+        .map_err(|e| RepositoryError::KernelAuditBreak(format!("bad audit event_id: {e}")))?;
+    let actor = parse_actor(r.get::<String, _>("actor").as_str())
+        .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
     Ok(AuditEvent {
-        protocol_version: AUDIT_EVENT_VERSION,
-        seq: r.get::<i64, _>("seq") as u64,
-        ts: ms_to_rfc3339(r.get::<i64, _>("recorded_at")),
-        actor: r.get("actor"),
+        version,
+        event_id,
+        sequence: r.get::<i64, _>("seq") as u64,
+        timestamp_ms: r.get("timestamp_ms"),
+        actor,
+        kind,
+        session_id: r.get("session_id"),
         action_digest: r.get("action_digest"),
         decision: r.get("decision"),
+        detail: r.get("detail"),
         prev_hash: r.get("prev_hash"),
         hash: r.get("hash"),
-        details: serde_json::from_str(r.get::<String, _>("details_json").as_str())
-            .map_err(RepositoryError::Serialization)?,
     })
-}
-
-fn ms_to_rfc3339(ms: i64) -> String {
-    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-    let dt = OffsetDateTime::from_unix_timestamp_nanos((ms.max(0) as i128) * 1_000_000)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    dt.format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
