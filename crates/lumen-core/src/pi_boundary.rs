@@ -817,6 +817,16 @@ pub enum SandboxError {
 }
 
 /// Frozen driver surface: prepare → start → stream → cancel / export → destroy.
+///
+/// NOTE: `async fn` in this trait is intentional and exempted from
+/// `async_fn_in_trait` below. This is the frozen v1 `SandboxDriver`
+/// contract (`SANDBOX_DRIVER_VERSION = 1`); desugaring to
+/// `fn() -> impl Future` would change the public API and force a `Send`
+/// decision that the contract deliberately does not make — notably
+/// `stream()` takes `&mut dyn OutputSink`, which is `!Send` by construction,
+/// so a `Send` auto-trait bound would be wrong. The allow is a lint-only
+/// suppression: zero runtime/behavior change.
+#[allow(async_fn_in_trait)]
 pub trait SandboxDriver: Send + Sync {
     async fn prepare(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError>;
     async fn start(&self, handle: &SandboxHandle) -> Result<(), SandboxError>;
@@ -1153,9 +1163,9 @@ impl LocalKernel {
             } else {
                 // First entry is the leaf: it must be bound to this session.
                 if record.subject != envelope.session_id {
-                    return Err(DenyReason::subject_mismatch(format!(
-                        "leaf lease subject does not match session"
-                    )));
+                    return Err(DenyReason::subject_mismatch(
+                        "leaf lease subject does not match session".to_string(),
+                    ));
                 }
                 leaf = Some(record);
             }
@@ -1214,12 +1224,11 @@ impl LocalKernel {
             .map(|p| canonical_path(&p.path).unwrap_or_default())
             .collect();
         // Also derive the path from arguments for the canonical read tool.
-        if let Some(Value::String(arg_path)) = envelope.arguments.get("path") {
-            if let Ok(canon) = canonical_path(arg_path) {
-                if !action_paths.contains(&canon) {
-                    action_paths.push(canon);
-                }
-            }
+        if let Some(Value::String(arg_path)) = envelope.arguments.get("path")
+            && let Ok(canon) = canonical_path(arg_path)
+            && !action_paths.contains(&canon)
+        {
+            action_paths.push(canon);
         }
         if action_paths.is_empty() {
             return Err(DenyReason::invalid_envelope("read action names no path"));
@@ -1465,11 +1474,11 @@ impl KernelListener {
             std::fs::remove_file(&socket_path)
                 .map_err(|e| KernelError::Transport(format!("remove stale socket: {e}")))?;
         }
-        if let Some(parent) = socket_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| KernelError::Transport(format!("create socket dir: {e}")))?;
-            }
+        if let Some(parent) = socket_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| KernelError::Transport(format!("create socket dir: {e}")))?;
         }
         let listener = tokio::net::UnixListener::bind(&socket_path)
             .map_err(|e| KernelError::Transport(format!("bind unix socket: {e}")))?;
