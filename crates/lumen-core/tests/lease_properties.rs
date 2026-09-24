@@ -299,6 +299,25 @@ fn arb_widen() -> impl Strategy<Value = Widen> {
     ])
 }
 
+/// The path grant that `Widen::ParentPath` adds: the parent directory of the
+/// parent scope's first path grant, with read rights. `None` when the parent
+/// has no path grants (the widening is then a no-op).
+fn parent_path_widen_grant(pair: &ScopePair) -> Option<PathGrant> {
+    let r = FakeResolver::default();
+    let g = pair.parent.paths.first()?;
+    let comps = g.root.components();
+    let up = if comps.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", comps[..comps.len() - 1].join("/"))
+    };
+    let root = CanonicalPath::parse(&up, &r, false).unwrap();
+    Some(PathGrant {
+        root,
+        rights: PathRights::READ,
+    })
+}
+
 fn apply_widen(pair: &ScopePair, widen: Widen) -> ResourceScope {
     let mut child = pair.child.clone();
     let r = FakeResolver::default();
@@ -316,18 +335,8 @@ fn apply_widen(pair: &ScopePair, widen: Widen) -> ResourceScope {
             });
         }
         Widen::ParentPath => {
-            if let Some(g) = pair.parent.paths.first() {
-                let comps = g.root.components();
-                let up = if comps.is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("/{}", comps[..comps.len() - 1].join("/"))
-                };
-                let root = CanonicalPath::parse(&up, &r, false).unwrap();
-                child.paths.push(PathGrant {
-                    root,
-                    rights: PathRights::READ,
-                });
+            if let Some(grant) = parent_path_widen_grant(pair) {
+                child.paths.push(grant);
             }
         }
         Widen::ExtraWrite => {
@@ -416,6 +425,12 @@ fn widen_covers_parent(pair: &ScopePair, widen: Widen) -> bool {
             .paths
             .iter()
             .any(|g| g.root.canonical_form() == "/data2"),
+        // ParentPath only widens when the parent directory isn't already
+        // covered by the parent's own grants (e.g. parent grants `/d/a` and
+        // `/d`: pushing `/d` read is a no-op, not a widening).
+        Widen::ParentPath => parent_path_widen_grant(pair)
+            .map(|grant| PathGrant::covering(&grant, &pair.parent.paths).is_ok())
+            .unwrap_or(true),
         _ => false,
     }
 }
