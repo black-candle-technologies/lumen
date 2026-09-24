@@ -316,13 +316,13 @@ async fn inspect_returns_full_staged_identity_without_mutating_state() {
 
 /// Run the submit → test → approve admission flow and return the stage id.
 async fn admit_fixture(
-    config: &std::path::PathBuf,
+    config: &std::path::Path,
     package: &std::path::Path,
     store: &Arc<InMemorySecretStore>,
 ) -> uuid::Uuid {
     let submitted = execute_with_secret_store(
         Cli {
-            config: config.clone(),
+            config: config.to_path_buf(),
             command: Command::Plugin {
                 command: PluginCommand::Submit {
                     directory: package.to_path_buf(),
@@ -341,7 +341,7 @@ async fn admit_fixture(
     };
     let tested = execute_with_secret_store(
         Cli {
-            config: config.clone(),
+            config: config.to_path_buf(),
             command: Command::Plugin {
                 command: PluginCommand::Test {
                     stage_id: submitted.stage_id,
@@ -361,7 +361,7 @@ async fn admit_fixture(
     // Approval requires an explicit reason and confirmation.
     let approved = execute_with_secret_store(
         Cli {
-            config: config.clone(),
+            config: config.to_path_buf(),
             command: Command::Plugin {
                 command: PluginCommand::Approve {
                     stage_id: submitted.stage_id,

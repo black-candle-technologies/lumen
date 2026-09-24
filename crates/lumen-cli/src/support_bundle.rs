@@ -466,10 +466,11 @@ fn scan_text(file: &str, text: &str, hits: &mut Vec<SecretHit>, bearer_value: Op
             }
         }
     }
-    if let Some(value) = bearer_value {
-        if !value.is_empty() && text.contains(value) {
-            push("bearer-token-value");
-        }
+    if let Some(value) = bearer_value
+        && !value.is_empty()
+        && text.contains(value)
+    {
+        push("bearer-token-value");
     }
     if has_high_entropy_token(text) {
         push("high-entropy-token");

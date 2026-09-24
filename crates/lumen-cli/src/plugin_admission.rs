@@ -167,18 +167,11 @@ pub struct Submission {
     pub status: String,
 }
 
-fn load_staged(
-    database: &Database,
-    stage_id: Uuid,
-) -> impl std::future::Future<Output = Result<StagedPluginPackage>> + '_ {
-    async move {
-        database
-            .staged_plugin_package(stage_id)
-            .await?
-            .ok_or_else(|| {
-                AdmissionCommandError::Refused("staged plugin package was not found".into())
-            })
-    }
+async fn load_staged(database: &Database, stage_id: Uuid) -> Result<StagedPluginPackage> {
+    database
+        .staged_plugin_package(stage_id)
+        .await?
+        .ok_or_else(|| AdmissionCommandError::Refused("staged plugin package was not found".into()))
 }
 
 fn load_admission(config: &Config, staged: &StagedPluginPackage) -> Result<AdmissionRecord> {
@@ -266,7 +259,7 @@ fn run_test_legs(config: &Config, staged: &StagedPluginPackage) -> Result<Vec<Ad
     let restaged = PackageStager::default()
         .stage(
             &quarantine_dir,
-            &config.runtime.data_directory.join("plugins/quarantine"),
+            config.runtime.data_directory.join("plugins/quarantine"),
         )
         .map_err(|error| {
             AdmissionCommandError::Refused(format!("quarantined bytes failed re-staging: {error}"))
