@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 736be6e9e5317476517fdbbee1c143be25b0421f1d9563f530d21513bf66234f # shrinks to count = 2, tamper = FlipDecision, redact_note = ""
+cc 0e48e10fb20e8ce493f021e3690f33ecc841b76966fb752810e2c2f5134655c6 # shrinks to count = 2, tamper = DeleteOne, redact_note = "a"
