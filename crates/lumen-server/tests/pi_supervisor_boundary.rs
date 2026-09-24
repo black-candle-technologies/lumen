@@ -59,17 +59,20 @@ fn config_with_mode(mode: &str) -> (PiSupervisorConfig, PathBuf, tempfile::TempD
     let dir = tempfile::tempdir().expect("tempdir");
     let script = dir.path().join("fake_child.py");
     std::fs::write(&script, FAKE_CHILD).expect("write fake child");
-    let mut config = PiSupervisorConfig::default();
-    config.pi_binary = PathBuf::from("/usr/bin/python3");
+    let base = PiSupervisorConfig::default();
     let mut args = vec![script.to_string_lossy().to_string()];
-    args.extend(config.args.clone());
-    config.args = args;
-    config
-        .env
-        .push(("LUMEN_FAKE_CHILD_MODE".to_string(), mode.to_string()));
-    config.restart = RestartPolicy {
-        max_restarts: 1,
-        base_backoff: Duration::from_millis(10),
+    args.extend(base.args.clone());
+    let mut env = base.env.clone();
+    env.push(("LUMEN_FAKE_CHILD_MODE".to_string(), mode.to_string()));
+    let config = PiSupervisorConfig {
+        pi_binary: PathBuf::from("/usr/bin/python3"),
+        args,
+        env,
+        restart: RestartPolicy {
+            max_restarts: 1,
+            base_backoff: Duration::from_millis(10),
+        },
+        ..base
     };
     (config, script, dir)
 }
