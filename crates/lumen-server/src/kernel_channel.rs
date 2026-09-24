@@ -441,5 +441,68 @@ fn map_outcome(outcome: ToolOutcome, digest: Option<String>) -> ChannelResponse 
         ToolOutcome::Fault { reason } => {
             ChannelResponse::error("fault", reason, base.action_digest)
         }
+        // The effect committed but its completion record is not
+        // durable. This is a distinct reconciliation error, not a
+        // fault (the effect may have landed) and not a success: the
+        // response carries no result and no completed audit ref. The
+        // action digest plus the staged audit ref locate the audit gap
+        // for recovery.
+        ToolOutcome::Uncertain {
+            reason,
+            action_digest,
+            staged_audit_ref,
+            ..
+        } => {
+            let mut response = ChannelResponse::error(
+                "effect_uncertain",
+                format!(
+                    "{reason}; reconcile with action_digest={action_digest} staged_audit_ref={staged_audit_ref:?}"
+                ),
+                base.action_digest,
+            );
+            response.audit_ref = Some(staged_audit_ref);
+            response
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uncertain_outcome_maps_to_reconciliation_error() {
+        let staged_ref = AuditRef {
+            event_id: "evt-staged-1".to_string(),
+            chain_hash: "chain-abc".to_string(),
+        };
+        let response = map_outcome(
+            ToolOutcome::Uncertain {
+                result: serde_json::json!({"exit_code": 0}),
+                usage: ResourceUsage {
+                    cpu_ms: 12,
+                    memory_bytes_max: 1024,
+                    egress_bytes: 0,
+                },
+                reason: "tool_committed audit write failed".to_string(),
+                action_digest: "digest-1".to_string(),
+                staged_audit_ref: staged_ref.clone(),
+            },
+            Some("digest-1".to_string()),
+        );
+        // Not a decision: no Allow/Deny, and no result payload that
+        // could be mistaken for a successful completion.
+        assert!(response.decision.is_none());
+        assert!(response.result.is_none());
+        assert!(response.usage.is_none());
+        let error = response
+            .error
+            .expect("uncertain outcome must render a channel error");
+        assert_eq!(error.code, "effect_uncertain");
+        assert!(error.detail.contains("tool_committed"));
+        assert!(error.detail.contains("digest-1"));
+        // The staged audit ref is attached for reconciliation.
+        assert_eq!(response.audit_ref, Some(staged_ref));
+        assert_eq!(response.action_digest.as_deref(), Some("digest-1"));
     }
 }

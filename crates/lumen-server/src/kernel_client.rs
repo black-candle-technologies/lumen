@@ -19,7 +19,7 @@
 //!   must not be treated as committed (fail closed).
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     pin::Pin,
     sync::Mutex,
@@ -420,6 +420,12 @@ struct MockKernelState {
     revoked_leases: BTreeSet<String>,
     audit_log: Vec<(AuditEvent, AuditRef)>,
     fail_audit: bool,
+    /// Fail every append after the first `n` succeed (see
+    /// `fail_audit_after_appends`).
+    fail_audit_after: Option<u64>,
+    /// Per-kind transient failure injection (see
+    /// `fail_next_audit_appends_for_kind`).
+    fail_kinds: HashMap<String, u64>,
     fail_revoke: bool,
     decisions_made: u64,
 }
@@ -451,6 +457,26 @@ impl MockKernelClient {
     /// Arm the next (and subsequent) audit appends to fail.
     pub fn fail_audit(&self, fail: bool) {
         self.inner.lock().unwrap().fail_audit = fail;
+    }
+
+    /// Fail every audit append after the first `n` succeed. `n = 1`
+    /// fails the second append onward (e.g. the post-commit
+    /// `tool_committed` record while the pre-commit `tool_staged`
+    /// intention lands durably).
+    pub fn fail_audit_after_appends(&self, n: u64) {
+        self.inner.lock().unwrap().fail_audit_after = Some(n);
+    }
+
+    /// Fail the next `n` appends of events with this `kind`, then
+    /// succeed again. Models a transient store hiccup the pipeline's
+    /// bounded post-commit retry can ride out, without disturbing the
+    /// pre-commit `tool_staged` write (which is not retried).
+    pub fn fail_next_audit_appends_for_kind(&self, kind: &str, n: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_kinds
+            .insert(kind.to_string(), n);
     }
 
     /// Arm the next (and subsequent) session revocations to fail.
@@ -603,6 +629,21 @@ impl KernelClient for MockKernelClient {
         Box::pin(async move {
             let mut state = self.inner.lock().unwrap();
             if state.fail_audit {
+                return Err(KernelError::AuditFailed(
+                    "mock audit store down".to_string(),
+                ));
+            }
+            if let Some(remaining) = state.fail_kinds.get_mut(&event.kind)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(KernelError::AuditFailed(
+                    "mock audit store down".to_string(),
+                ));
+            }
+            if let Some(limit) = state.fail_audit_after
+                && state.audit_log.len() as u64 >= limit
+            {
                 return Err(KernelError::AuditFailed(
                     "mock audit store down".to_string(),
                 ));

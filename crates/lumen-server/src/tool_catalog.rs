@@ -23,6 +23,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,14 @@ use crate::kernel_client::{
     KernelClient, Obligation, ResourceSet, ToolRef, deadline_rfc3339, now_ms, rfc3339_to_ms,
     sha256_hex,
 };
+
+/// Bounded retries for the post-commit `tool_committed` audit write.
+/// If all attempts fail the pipeline returns [`ToolOutcome::Uncertain`]
+/// instead of `Completed`: a completion that is not durably recorded
+/// must never be reported as success.
+const COMMIT_AUDIT_RETRIES: u32 = 3;
+/// Delay between post-commit audit retries (transient store hiccups).
+const COMMIT_AUDIT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// A typed tool request as emitted by Pi (mirrors the PiBridge v1
 /// `PiToolRequest` shape; arguments are raw until [`Catalog::decode`]).
@@ -722,6 +731,21 @@ pub enum ToolOutcome {
     Fault {
         reason: String,
     },
+    /// The effect committed but the `tool_committed` completion record
+    /// could not be written durably. This is NOT success: the hash
+    /// chain holds the `tool_staged` intention but no completion, so
+    /// the caller must not treat the action as audited-complete.
+    /// Recover via the `action_digest`: the durable intention record
+    /// plus `staged_audit_ref` identify the gap for reconciliation
+    /// (re-append the completion record), after which the action may
+    /// be acknowledged as complete.
+    Uncertain {
+        result: serde_json::Value,
+        usage: ResourceUsage,
+        reason: String,
+        action_digest: String,
+        staged_audit_ref: AuditRef,
+    },
 }
 
 /// The vertical slice: Pi typed tool request -> kernel lease check ->
@@ -995,38 +1019,71 @@ async fn decide_execute_audit<K: KernelClient + ?Sized, S: SandboxRunner + ?Size
                     reason: format!("sandbox commit failed: {e}"),
                 };
             }
-            // Commit landed: record completion. If this write fails the
-            // effect is still committed (returning Fault would be the
-            // lie); the durable `tool_staged` intention remains as the
-            // audit trail and the staged ref is returned so the action
-            // is never unaudited.
-            let audit_ref = match pipeline
-                .kernel
-                .append_audit(&AuditEvent {
-                    kind: "tool_committed".to_string(),
-                    session_id: session_subject.to_string(),
-                    action_digest: Some(digest.to_string()),
-                    payload: serde_json::json!({
-                        "tool": envelope.tool.name,
-                        "tool_version": envelope.tool.version,
-                        "lease_id": lease_id,
-                        "exit_code": outcome.exit_code,
-                        "output_digest": outcome.output_digest,
-                        "usage": outcome.usage,
-                    }),
-                })
-                .await
-            {
-                Ok(audit_ref) => audit_ref,
-                Err(_) => staged_ref,
-            };
-            ToolOutcome::Completed {
-                result: serde_json::json!({
+            // Commit landed: completion must be durably recorded before
+            // the action is reported as complete. The audit write is
+            // retried a bounded number of times (transient store
+            // hiccups); readers dedupe `tool_committed` by action
+            // digest, so a retry that follows a lost acknowledgement is
+            // detectable, not silently double-counted.
+            let committed_event = AuditEvent {
+                kind: "tool_committed".to_string(),
+                session_id: session_subject.to_string(),
+                action_digest: Some(digest.to_string()),
+                payload: serde_json::json!({
+                    "tool": envelope.tool.name,
+                    "tool_version": envelope.tool.version,
+                    "lease_id": lease_id,
                     "exit_code": outcome.exit_code,
-                    "output_tail": outcome.output_tail,
+                    "output_digest": outcome.output_digest,
+                    "usage": outcome.usage,
                 }),
-                usage: outcome.usage,
-                audit_ref,
+            };
+            let mut append_err = String::new();
+            let mut audit_ref = None;
+            for attempt in 0..COMMIT_AUDIT_RETRIES {
+                match pipeline.kernel.append_audit(&committed_event).await {
+                    Ok(r) => {
+                        audit_ref = Some(r);
+                        break;
+                    }
+                    Err(e) => {
+                        append_err = e.to_string();
+                        if attempt + 1 < COMMIT_AUDIT_RETRIES {
+                            tokio::time::sleep(COMMIT_AUDIT_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            }
+            match audit_ref {
+                Some(audit_ref) => ToolOutcome::Completed {
+                    result: serde_json::json!({
+                        "exit_code": outcome.exit_code,
+                        "output_tail": outcome.output_tail,
+                    }),
+                    usage: outcome.usage,
+                    audit_ref,
+                },
+                None => {
+                    // The effect is committed but the completion record
+                    // is not durable. This is NOT success: return the
+                    // recoverable uncertain state instead. The durable
+                    // `tool_staged` intention (staged_ref) plus the
+                    // action digest identify the audit gap for
+                    // reconciliation; only after the completion record
+                    // lands may the action be acknowledged as complete.
+                    ToolOutcome::Uncertain {
+                        result: serde_json::json!({
+                            "exit_code": outcome.exit_code,
+                            "output_tail": outcome.output_tail,
+                        }),
+                        usage: outcome.usage,
+                        reason: format!(
+                            "tool_committed audit write failed after {COMMIT_AUDIT_RETRIES} attempts: {append_err}; effect may have landed but is not audit-confirmed"
+                        ),
+                        action_digest: digest.to_string(),
+                        staged_audit_ref: staged_ref,
+                    }
+                }
             }
         }
     }
@@ -1239,6 +1296,85 @@ mod tests {
         assert_eq!(sandbox.staged_count(), 1);
         assert_eq!(sandbox.committed_count(), 0);
         assert_eq!(sandbox.aborted_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn commit_audit_failure_returns_uncertain_not_completed() {
+        let catalog = Arc::new(default_catalog());
+        let kernel = Arc::new(MockKernelClient::new().with_verdict(MockVerdict::Allow));
+        // The pre-commit `tool_staged` intention lands durably; the
+        // post-commit `tool_committed` record fails on every attempt.
+        kernel.fail_audit_after_appends(1);
+        let sandbox = Arc::new(MockSandboxRunner::new());
+        let pipeline = ToolPipeline::new(catalog, kernel.clone(), sandbox.clone());
+
+        let outcome = pipeline
+            .handle(
+                &request("bct.fs.read", serde_json::json!({"path": "/tmp/x"})),
+                "ed25519:subject",
+                &[],
+            )
+            .await;
+        // Stage succeeded, the intention was durably recorded, and the
+        // commit happened.
+        assert_eq!(sandbox.staged_count(), 1);
+        assert_eq!(sandbox.committed_count(), 1);
+        assert_eq!(sandbox.aborted_count(), 0);
+        let log = kernel.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0.kind, "tool_staged");
+        // But the completion record is missing, so the outcome is
+        // Uncertain — never Completed (a lie) and never Fault (the
+        // effect was committed, so "not committed" would be the lie).
+        match outcome {
+            ToolOutcome::Uncertain {
+                reason,
+                action_digest,
+                staged_audit_ref,
+                result,
+                usage,
+            } => {
+                assert!(
+                    reason.contains("tool_committed"),
+                    "reason must name the missing record: {reason}"
+                );
+                assert!(!action_digest.is_empty());
+                // The staged audit ref survives for reconciliation.
+                assert_eq!(staged_audit_ref, log[0].1);
+                // No claim of completion travels with the outcome.
+                assert_eq!(result["exit_code"], 0);
+                assert_eq!(usage.cpu_ms, 12);
+            }
+            other => panic!("expected Uncertain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_audit_retry_recovers_before_uncertain() {
+        let catalog = Arc::new(default_catalog());
+        let kernel = Arc::new(MockKernelClient::new().with_verdict(MockVerdict::Allow));
+        // Two transient failures, then the store recovers: the bounded
+        // retry lands the completion record, so the outcome is honestly
+        // Completed.
+        kernel.fail_next_audit_appends_for_kind("tool_committed", 2);
+        let sandbox = Arc::new(MockSandboxRunner::new());
+        let pipeline = ToolPipeline::new(catalog, kernel.clone(), sandbox.clone());
+
+        let outcome = pipeline
+            .handle(
+                &request("bct.fs.read", serde_json::json!({"path": "/tmp/x"})),
+                "ed25519:subject",
+                &[],
+            )
+            .await;
+        // tool_staged, then the retried tool_committed.
+        let log = kernel.audit_log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[1].0.kind, "tool_committed");
+        assert!(
+            matches!(outcome, ToolOutcome::Completed { .. }),
+            "expected Completed after retry recovery, got {outcome:?}"
+        );
     }
 
     #[test]
