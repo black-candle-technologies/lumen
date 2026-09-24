@@ -9,7 +9,7 @@
 //!   so no extra privileged helper is needed between sandboxd and the VMM;
 //! - the guest never sees the API socket path outside the chroot, and the
 //!   chroot contains only: the firecracker binary, config, kernel, rootfs,
-//!   seccomp filter, and the sockets firecracker itself creates.
+//!   workspace image, and the sockets firecracker itself creates.
 //!
 //! Flag reference: Firecracker `docs/jailer.md` (jailer `--id --exec-file
 //! --uid --gid [--cgroup-version 2 --cgroup ...] [--netns] [--new-pid-ns]
@@ -46,10 +46,37 @@ pub struct SnapshotLoad {
     pub vmstate_path: PathBuf,
 }
 
+/// File-name component of the `--exec-file` path. The jailer builds its
+/// chroot as `<chroot_base>/<exec_file_name>/<id>/root` (jailer v1.10.1
+/// `env.rs`: it pushes the exec file *name*, not a fixed component), so
+/// every host-side path into the jail must use the same element.
+///
+/// Mirrors `validate_exec_file`: the jailer `canonicalize`s `--exec-file`
+/// first, so a symlinked binary contributes its *target's* file name. We
+/// do the same; if canonicalization fails (e.g. in unit tests with fake
+/// paths) we fall back to the literal file name.
+pub fn exec_file_name(exec_file: &Path) -> String {
+    let canonical = std::fs::canonicalize(exec_file).unwrap_or_else(|_| exec_file.to_path_buf());
+    canonical
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("firecracker")
+        .to_string()
+}
+
 /// Chroot layout produced by the jailer for `<id>`:
-/// `<chroot_base>/firecracker/<id>/root/`.
-pub fn jail_root(chroot_base: &Path, id: &str) -> PathBuf {
-    chroot_base.join("firecracker").join(id).join("root")
+/// `<chroot_base>/<exec_file_name>/<id>/root/`.
+pub fn jail_root(chroot_base: &Path, exec_file: &Path, id: &str) -> PathBuf {
+    chroot_base
+        .join(exec_file_name(exec_file))
+        .join(id)
+        .join("root")
+}
+
+/// The `<chroot_base>/<exec_file_name>` directory that holds the per-id
+/// jails; the unit the reconcile sweep scans for strays.
+pub fn jail_parent(chroot_base: &Path, exec_file: &Path) -> PathBuf {
+    chroot_base.join(exec_file_name(exec_file))
 }
 
 /// Validate a jail id against the jailer's rules.
@@ -89,9 +116,8 @@ pub fn cgroup_settings(limits: &ResourceLimits) -> Vec<(String, String)> {
 /// (RLIMIT_* on the VMM process itself).
 pub fn resource_limits() -> Vec<(String, String)> {
     vec![
-        // No core dumps from the VMM (could contain guest memory).
-        ("core".into(), "0".into()),
-        // Bound open FDs.
+        // Bound open FDs. (jailer v1.10.1 only supports fsize and no-file;
+        // core dumps are disabled via the guest kernel cmdline instead.)
         ("no-file".into(), "1024".into()),
     ]
 }
@@ -103,6 +129,15 @@ pub fn resource_limits() -> Vec<(String, String)> {
 /// Reconciliation covers the SIGKILL case via `/proc` scanning.
 pub fn jailer_argv(spec: &JailSpec, fc_args: &[String]) -> Result<Vec<String>, SandboxdError> {
     validate_jail_id(&spec.id)?;
+    // The jailer requires --parent-cgroup to be a relative path (relative
+    // to the cgroup v2 mount). The JailSpec stores the absolute host path;
+    // strip the /sys/fs/cgroup prefix here.
+    let parent_cgroup_rel = spec
+        .cgroup_parent
+        .strip_prefix("/sys/fs/cgroup")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| spec.cgroup_parent.display().to_string());
+    let parent_cgroup_rel = parent_cgroup_rel.trim_start_matches('/').to_string();
     let mut argv = vec![
         "--id".into(),
         spec.id.clone(),
@@ -117,7 +152,7 @@ pub fn jailer_argv(spec: &JailSpec, fc_args: &[String]) -> Result<Vec<String>, S
         "--cgroup-version".into(),
         "2".into(),
         "--parent-cgroup".into(),
-        spec.cgroup_parent.display().to_string(),
+        parent_cgroup_rel,
         "--netns".into(),
         spec.netns_path.display().to_string(),
         "--new-pid-ns".into(),
@@ -136,25 +171,32 @@ pub fn jailer_argv(spec: &JailSpec, fc_args: &[String]) -> Result<Vec<String>, S
 }
 
 /// Firecracker argv (passed after jailer's `--`).
-pub fn firecracker_argv(
-    api_sock_in_jail: &Path,
-    config_in_jail: &Path,
-    seccomp_in_jail: &Path,
-) -> Vec<String> {
+///
+/// No `--seccomp-filter`: Firecracker's flag accepts only bincode-serialized
+/// binary filters, not JSON, so a custom JSON filter can never load. With
+/// neither `--seccomp-filter` nor `--no-seccomp`, Firecracker installs its
+/// default compiled-in filters for the pinned release (default action trap,
+/// fail-closed), which is exactly the posture a hand-rolled filter would
+/// try to replicate -- vetted by the Firecracker team instead of us.
+pub fn firecracker_argv(api_sock_in_jail: &Path, config_in_jail: &Path) -> Vec<String> {
     vec![
         "--api-sock".into(),
         api_sock_in_jail.display().to_string(),
         "--config-file".into(),
         config_in_jail.display().to_string(),
-        "--seccomp-filter".into(),
-        seccomp_in_jail.display().to_string(),
     ]
 }
 
 /// Minimal Firecracker config.json: machine, boot source, drives,
 /// network interface, vsock. Sockets live inside the jail; the guest agent
 /// channel is the vsock device.
+///
+/// Top-level keys are kebab-case (`machine-config`, `boot-source`,
+/// `network-interfaces`) as Firecracker expects; the inner structs keep
+/// snake_case fields (`vcpu_count`, `kernel_image_path`, ...), matching the
+/// Firecracker API.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct FirecrackerConfig {
     pub machine_config: MachineConfig,
     pub boot_source: BootSource,
@@ -198,17 +240,47 @@ pub struct Vsock {
     pub uds_path: String,
 }
 
+/// Guest boot parameters baked into the kernel command line.
+///
+/// The guest's `/init` and the guest agent read these from `/proc/cmdline`
+/// (`lumen.run_id=`, `lumen.guest_ip=`, ...). They are the only channel
+/// that carries per-run addressing into the VM before the vsock handshake.
+#[derive(Debug, Clone)]
+pub struct GuestBootParams {
+    pub run_id: String,
+    pub guest_ip: String,
+    pub host_ip: String,
+    pub proxy_port: u16,
+    pub vsock_port: u32,
+}
+
 /// Render the Firecracker config.json for one run.
 ///
 /// Paths are jail-relative: the jailer hard-links the kernel/rootfs into
-/// the chroot, so the config references `/kernel`, `/rootfs.ext4`, etc.
+/// the chroot, so the config references `/vmlinux`, `/rootfs.ext4`, etc.
+///
+/// The workspace drive is a raw image: Firecracker's virtio-blk does not
+/// understand qcow2, so the backend copies the (raw ext4) template to
+/// `/workspace.raw` per run.
 pub fn render_config(
     limits: &ResourceLimits,
     tap_name: &str,
     guest_mac: &str,
+    boot: &GuestBootParams,
     snapshot: Option<&SnapshotLoad>,
 ) -> FirecrackerConfig {
     let _ = snapshot; // Snapshot restore uses the API load path, not config.
+    let boot_args = format!(
+        "console=ttyS0 reboot=k panic=1 pci=off ro init=/init \
+         lumen.run_id={run_id} lumen.vsock_port={vsock_port} \
+         lumen.guest_ip={guest_ip} lumen.host_ip={host_ip} \
+         lumen.proxy_port={proxy_port}",
+        run_id = boot.run_id,
+        vsock_port = boot.vsock_port,
+        guest_ip = boot.guest_ip,
+        host_ip = boot.host_ip,
+        proxy_port = boot.proxy_port,
+    );
     FirecrackerConfig {
         machine_config: MachineConfig {
             vcpu_count: limits.vcpu.max(1),
@@ -217,8 +289,7 @@ pub fn render_config(
         },
         boot_source: BootSource {
             kernel_image_path: "/vmlinux".into(),
-            boot_args: "console=ttyS0 reboot=k panic=1 pci=off ro init=/sbin/lumen-guest-agent"
-                .into(),
+            boot_args,
         },
         drives: vec![
             Drive {
@@ -229,7 +300,7 @@ pub fn render_config(
             },
             Drive {
                 drive_id: "workspace".into(),
-                path_on_host: "/workspace.qcow2".into(),
+                path_on_host: "/workspace.raw".into(),
                 is_root_device: false,
                 is_read_only: false,
             },
@@ -264,14 +335,14 @@ pub fn guest_mac(tag: &str) -> String {
 /// and invisible to the workload (no guest path leads to it).
 pub fn expected_chroot_entries() -> Vec<&'static str> {
     vec![
-        "firecracker",  // exec-file copy
-        "config.json",  // hard-linked
-        "seccomp.json", // hard-linked
-        "vmlinux",      // hard-linked
-        "rootfs.ext4",  // hard-linked
-        "workspace.qcow2",
-        "api.sock", // created by firecracker at runtime
-        "v.sock",   // created by firecracker at runtime
+        "firecracker",      // exec-file copy
+        "firecracker.json", // written by the backend (matches --config-file)
+        "vmlinux",          // hard-linked
+        "rootfs.ext4",      // hard-linked
+        "workspace-template.raw",
+        "workspace.raw", // per-run sparse copy of the template
+        "fc-api.sock",   // created by firecracker at runtime (--api-sock)
+        "v.sock",        // created by firecracker at runtime
     ]
 }
 
@@ -304,11 +375,7 @@ mod tests {
     #[test]
     fn jailer_argv_has_defense_in_depth_flags() {
         let s = spec();
-        let fc = firecracker_argv(
-            Path::new("/api.sock"),
-            Path::new("/config.json"),
-            Path::new("/seccomp.json"),
-        );
+        let fc = firecracker_argv(Path::new("/api.sock"), Path::new("/config.json"));
         let argv = jailer_argv(&s, &fc).unwrap();
         let joined = argv.join(" ");
         for flag in [
@@ -333,11 +400,17 @@ mod tests {
         assert!(joined.contains("pids.max=64"));
         assert!(joined.contains("cpu.max=200000 100000"));
         assert!(joined.contains("memory.swap.max=0"));
-        // No core dumps.
-        assert!(joined.contains("core=0"));
-        // Firecracker args after `--`.
+        // No `core` resource limit: jailer v1.10.1 only accepts fsize and
+        // no-file (`jailer --help`); passing core=0 makes the jailer exit
+        // with an argument error.
+        assert!(!joined.contains("core="));
+        // Firecracker args after `--`: no --seccomp-filter (Firecracker
+        // only accepts binary filters; it uses its default trap-by-default
+        // filters when the flag is absent).
         let dash = argv.iter().position(|a| a == "--").unwrap();
-        assert!(argv[dash + 1..].contains(&"--seccomp-filter".to_string()));
+        assert!(!argv[dash + 1..].contains(&"--seccomp-filter".to_string()));
+        assert!(argv[dash + 1..].contains(&"--api-sock".to_string()));
+        assert!(argv[dash + 1..].contains(&"--config-file".to_string()));
     }
 
     #[test]
@@ -362,7 +435,20 @@ mod tests {
 
     #[test]
     fn render_config_is_read_only_root() {
-        let cfg = render_config(&spec().limits, "lmnt-abc1234", "02:aa:bb:cc:dd:ee", None);
+        let boot = GuestBootParams {
+            run_id: "lmn-abc12345".into(),
+            guest_ip: "10.244.0.2".into(),
+            host_ip: "10.244.0.1".into(),
+            proxy_port: 18080,
+            vsock_port: 1234,
+        };
+        let cfg = render_config(
+            &spec().limits,
+            "lmnt-abc1234",
+            "02:aa:bb:cc:dd:ee",
+            &boot,
+            None,
+        );
         let root = cfg.drives.iter().find(|d| d.is_root_device).unwrap();
         assert!(root.is_read_only);
         let ws = cfg
@@ -371,13 +457,27 @@ mod tests {
             .find(|d| d.drive_id == "workspace")
             .unwrap();
         assert!(!ws.is_read_only && !ws.is_root_device);
+        // Raw image: Firecracker's virtio-blk cannot read qcow2.
+        assert_eq!(ws.path_on_host, "/workspace.raw");
         assert_eq!(cfg.network_interfaces.len(), 1);
-        // Guest agent is PID 1: no shell, no login, no sshd in the image.
+        // The guest boots into /init (mounts, network setup), which execs
+        // the agent; the run identity travels on the kernel command line.
+        let args = &cfg.boot_source.boot_args;
+        assert!(args.contains("init=/init"), "boot_args: {args}");
         assert!(
-            cfg.boot_source
-                .boot_args
-                .contains("init=/sbin/lumen-guest-agent")
+            args.contains("lumen.run_id=lmn-abc12345"),
+            "boot_args: {args}"
         );
+        assert!(
+            args.contains("lumen.guest_ip=10.244.0.2"),
+            "boot_args: {args}"
+        );
+        assert!(
+            args.contains("lumen.host_ip=10.244.0.1"),
+            "boot_args: {args}"
+        );
+        assert!(args.contains("lumen.proxy_port=18080"), "boot_args: {args}");
+        assert!(args.contains("lumen.vsock_port=1234"), "boot_args: {args}");
     }
 
     #[test]

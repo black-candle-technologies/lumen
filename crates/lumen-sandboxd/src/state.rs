@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     contracts::{SandboxResult, SandboxRunSpec},
     error::SandboxdError,
+    jailer,
     provenance::ProvenanceRecord,
 };
 
@@ -78,11 +79,11 @@ impl RunState {
 pub struct ArtifactPaths {
     /// Jailer id (also the chroot leaf name).
     pub jail_id: String,
-    /// Jailer chroot: `<chroot_base>/firecracker/<jail_id>/root`.
+    /// Jailer chroot: `<chroot_base>/<exec_file_name>/<jail_id>/root`
+    /// (see `jailer::jail_root`).
     pub chroot_dir: PathBuf,
-    /// Firecracker config + seccomp filter inside the chroot staging area.
+    /// Firecracker config inside the chroot staging area.
     pub config_path: PathBuf,
-    pub seccomp_path: PathBuf,
     /// UID/GID the jailer drops to.
     pub uid: u32,
     pub gid: u32,
@@ -403,18 +404,22 @@ fn destroy_artifacts<S: SystemView>(run: &RunRecord, sys: &mut S, report: &mut R
     }
 
     // 3. Filesystem: chroot, cgroup dir, workspace disk, staging.
-    //    The chroot dir removal covers config/seccomp/api.sock/vsock.
-    for dir in [
-        a.chroot_dir.clone(),
-        a.cgroup_path.clone(),
-        a.staging_dir.clone(),
-    ] {
+    //    The chroot dir removal covers config/api.sock/vsock.
+    //    The cgroup path is relative to /sys/fs/cgroup (see kill_cgroup);
+    //    resolve it the same way here (tolerating an absolute path from
+    //    older records).
+    let cgroup_dir = if a.cgroup_path.is_absolute() {
+        a.cgroup_path.clone()
+    } else {
+        Path::new("/sys/fs/cgroup").join(&a.cgroup_path)
+    };
+    for dir in [a.chroot_dir.clone(), cgroup_dir, a.staging_dir.clone()] {
         if sys.remove_dir(&dir).is_ok() {
             report.removed_dirs.push(dir.display().to_string());
         }
     }
-    // The qcow2 delta lives next to the chroot staging area's parent run
-    // dir; remove the file explicitly.
+    // The per-run workspace copy lives inside the chroot; remove the file
+    // explicitly in case the chroot dir itself is already gone.
     let _ = std::fs::remove_file(&a.workspace_disk);
 }
 
@@ -428,6 +433,7 @@ pub fn reconcile<S: SystemView>(
     store: &RunStore,
     sys: &mut S,
     chroot_base: &Path,
+    firecracker_bin: &Path,
     netns_prefix: &str,
     tap_prefix: &str,
     mut release_uid: impl FnMut(u32),
@@ -474,7 +480,9 @@ pub fn reconcile<S: SystemView>(
             report.removed_taps.push(tap);
         }
     }
-    let jail_root = chroot_base.join("firecracker");
+    // The jailer nests per-id jails under <chroot_base>/<exec_file_name>;
+    // scan that directory, not a hardcoded `firecracker` component.
+    let jail_root = jailer::jail_parent(chroot_base, firecracker_bin);
     for jail_id in sys.jail_dirs(&jail_root) {
         let dir = jail_root.join(&jail_id);
         if sys.remove_dir(&dir).is_ok() {
@@ -745,9 +753,6 @@ mod tests {
             config_path: PathBuf::from(format!(
                 "/srv/jailer/firecracker/lmn-{tag}/root/config.json"
             )),
-            seccomp_path: PathBuf::from(format!(
-                "/srv/jailer/firecracker/lmn-{tag}/root/seccomp.json"
-            )),
             uid: 61000,
             gid: 61000,
             netns_name: format!("lmn-{tag}"),
@@ -857,6 +862,7 @@ mod tests {
             &store,
             &mut sys,
             Path::new("/srv/jailer"),
+            Path::new("/usr/bin/firecracker"),
             "lmn-",
             "lmnt-",
             |uid| released.push(uid),
@@ -890,6 +896,7 @@ mod tests {
             &store,
             &mut sys,
             Path::new("/srv/jailer"),
+            Path::new("/usr/bin/firecracker"),
             "lmn-",
             "lmnt-",
             |_| {},
@@ -914,6 +921,7 @@ mod tests {
             &store,
             &mut sys,
             Path::new("/srv/jailer"),
+            Path::new("/usr/bin/firecracker"),
             "lmn-",
             "lmnt-",
             |_| {},
@@ -941,6 +949,7 @@ mod tests {
             &store,
             &mut sys,
             Path::new("/srv/jailer"),
+            Path::new("/usr/bin/firecracker"),
             "lmn-",
             "lmnt-",
             |_| {},
@@ -951,6 +960,7 @@ mod tests {
             &store,
             &mut sys,
             Path::new("/srv/jailer"),
+            Path::new("/usr/bin/firecracker"),
             "lmn-",
             "lmnt-",
             |_| {},

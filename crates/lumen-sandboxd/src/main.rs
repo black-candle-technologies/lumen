@@ -43,6 +43,7 @@ async fn main() -> Result<(), SandboxdError> {
         driver.store(),
         &mut sys,
         &config.firecracker.chroot_base,
+        &config.firecracker.binary,
         &config.net.netns_prefix,
         &config.net.tap_prefix,
         |_uid| {

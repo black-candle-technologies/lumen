@@ -17,7 +17,7 @@
 //! - [`api`]: authenticated local (Unix socket) API used by the kernel; its
 //!   method set mirrors the frozen trait 1:1.
 //! - [`state`]: crash-safe run state machine + startup reconciliation.
-//! - `jailer`, [`seccomp`], [`cgroups`]: host policy perimeter.
+//! - `jailer`, [`cgroups`]: host policy perimeter (Firecracker runs with its default seccomp filters).
 //! - [`network`], [`dns`], [`proxy`]: default-deny egress.
 //! - [`storage`], [`export`]: copy-on-write workspace + controlled export.
 //! - [`guest_agent`]: vsock guest-agent protocol (host side). The guest-side
@@ -46,7 +46,6 @@ pub mod jailer;
 pub mod network;
 pub mod provenance;
 pub mod proxy;
-pub mod seccomp;
 pub mod secrets;
 pub mod state;
 pub mod storage;

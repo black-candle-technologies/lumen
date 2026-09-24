@@ -1,12 +1,17 @@
 //! lumen-guest-agent: the in-VM agent.
 //!
 //! Runs inside the Firecracker microVM. Responsibilities:
-//! - Connect to the host via vsock (CID 2, port from env).
+//! - Listen on AF_VSOCK; the host dials in through Firecracker's vsock
+//!   UDS (`CONNECT <port>` preamble).
 //! - Handshake: Hello -> Welcome (or Deny).
 //! - Spawn the workload with the provided argv/env (secrets in env).
 //! - Relay stdout/stderr with secret redaction and byte caps.
 //! - Heartbeat; enforce deadline; handle Cancel.
 //! - Stream exports from the workspace.
+//!
+//! Run identity and addressing come from the kernel command line
+//! (`lumen.run_id=`, `lumen.vsock_port=`, ...), set by the host in the
+//! Firecracker boot args and read from `/proc/cmdline`.
 //!
 //! The agent is untrusted from the host's perspective: the host validates
 //! every message (bounded framing, path validation, hash verification).
@@ -19,7 +24,7 @@ use std::{
 
 use lumen_sandboxd::{
     error::SandboxdError,
-    guest_agent::{AgentMsg, HostMsg, PROTOCOL_VERSION, read_msg, write_msg},
+    guest_agent::{AgentMsg, HostMsg, PROTOCOL_VERSION, VSOCK_PORT, read_msg, write_msg},
     secrets::Redactor,
 };
 use tokio::{
@@ -28,14 +33,11 @@ use tokio::{
     process::{Child, Command},
 };
 
-// vsock: host is always CID 2. (Used in the KVM path; the TCP fallback is for
-// dev-machine testing.)
-#[allow(dead_code)]
-const HOST_CID: u32 = 2;
 // Max single stdio chunk we relay (the host also caps).
 const STDIO_CHUNK: usize = 64 * 1024;
 
-/// Config from the environment (set by the VM init).
+/// Config from the kernel command line (set by the host in the Firecracker
+/// boot args; the guest's `/init` mounts `/proc` before exec'ing us).
 struct AgentConfig {
     run_id: String,
     vsock_port: u32,
@@ -43,77 +45,183 @@ struct AgentConfig {
 }
 
 fn load_config() -> Result<AgentConfig, SandboxdError> {
-    let run_id = std::env::var("LUMEN_RUN_ID")
-        .map_err(|_| SandboxdError::Host("LUMEN_RUN_ID not set".into()))?;
-    let vsock_port = std::env::var("LUMEN_VSOCK_PORT")
-        .map_err(|_| SandboxdError::Host("LUMEN_VSOCK_PORT not set".into()))?
-        .parse::<u32>()
-        .map_err(|e| SandboxdError::Host(format!("bad LUMEN_VSOCK_PORT: {e}")))?;
-    let workspace = std::env::var("LUMEN_WORKSPACE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/workspace"));
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let value = |key: &str| {
+        cmdline
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key))
+            .map(|v| v.to_owned())
+    };
+    let run_id = value("lumen.run_id=").ok_or_else(|| {
+        SandboxdError::Host(format!(
+            "lumen.run_id= missing from kernel cmdline: {cmdline}"
+        ))
+    })?;
+    let vsock_port = match value("lumen.vsock_port=") {
+        Some(v) => v
+            .parse::<u32>()
+            .map_err(|e| SandboxdError::Host(format!("bad lumen.vsock_port=: {e}")))?,
+        None => VSOCK_PORT,
+    };
     Ok(AgentConfig {
         run_id,
         vsock_port,
-        workspace,
+        workspace: PathBuf::from("/workspace"),
     })
 }
 
-/// Connect to the host via vsock. Uses AF_VSOCK if available, else falls back
-/// to TCP (for testing on the dev machine).
-async fn connect_host(port: u32) -> Result<tokio::net::TcpStream, SandboxdError> {
-    // Try vsock via libc (AF_VSOCK = 40 on Linux).
-    // For now, use TCP to 127.0.0.1 as the test hook; the real vsock path
-    // is wired in the KVM-gated integration test.
-    let addr = format!("127.0.0.1:{port}");
-    TcpStream::connect(&addr)
+/// Bind the AF_VSOCK listen socket. Returns the listen fd.
+///
+/// Host-initiated flow (see Firecracker docs/vsock.md): the host connects to
+/// the vsock UDS, sends `CONNECT <port>\n`, reads `OK <host-port>\n`, and the
+/// UDS connection becomes the data stream. From the guest's perspective this
+/// is a plain vsock listen + accept.
+fn vsock_bind(port: u32) -> Result<i32, SandboxdError> {
+    let os_err =
+        |op: &str| SandboxdError::Host(format!("vsock {op}: {}", std::io::Error::last_os_error()));
+    // SAFETY: straightforward libc socket setup; the fd is closed on error.
+    unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(os_err("socket"));
+        }
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = libc::VMADDR_CID_ANY;
+        addr.svm_port = port;
+        let rc = libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        );
+        if rc != 0 {
+            libc::close(fd);
+            return Err(os_err("bind"));
+        }
+        if libc::listen(fd, 8) != 0 {
+            libc::close(fd);
+            return Err(os_err("listen"));
+        }
+        Ok(fd)
+    }
+}
+
+/// Accept one host connection on a bound vsock listen fd. Retries on
+/// transient accept errors. Blocking accept runs in `spawn_blocking`.
+async fn vsock_accept(listen_fd: i32) -> Result<TcpStream, SandboxdError> {
+    use std::os::unix::io::FromRawFd;
+
+    loop {
+        let cfd: i32 = tokio::task::spawn_blocking(move || unsafe {
+            libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut())
+        })
         .await
-        .map_err(|e| SandboxdError::Host(format!("host connect failed: {e}")))
+        .map_err(|e| SandboxdError::Host(format!("vsock accept task: {e}")))?;
+        if cfd < 0 {
+            eprintln!(
+                "lumen-guest-agent: accept failed ({}); retrying",
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        // SAFETY: cfd is an accepted vsock stream we own; set non-blocking
+        // for Tokio.
+        let std_stream = unsafe {
+            let flags = libc::fcntl(cfd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(cfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            std::net::TcpStream::from_raw_fd(cfd)
+        };
+        match TcpStream::from_std(std_stream) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                eprintln!("lumen-guest-agent: vsock from_std failed ({e}); retrying");
+            }
+        }
+    }
+}
+
+/// Nonce that does not need kernel entropy: a freshly booted VM may block
+/// in `getrandom` until the CRNG initializes, which would stall the
+/// handshake while the host times out and retries. Uniqueness per boot is
+/// all the handshake needs.
+fn make_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        CTR.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[tokio::main]
 async fn main() -> Result<(), SandboxdError> {
     let cfg = load_config()?;
-    let mut stream = connect_host(cfg.vsock_port).await?;
+    let listen_fd = vsock_bind(cfg.vsock_port)?;
+    eprintln!(
+        "lumen-guest-agent: listening on vsock port {}",
+        cfg.vsock_port
+    );
 
-    // Hello.
-    let nonce: String = (0..16)
-        .map(|_| format!("{:02x}", rand::random::<u8>()))
-        .collect();
-    write_msg(
-        &mut stream,
-        &AgentMsg::Hello {
+    // Handshake loop. The host may retry its CONNECT; if a handshake
+    // attempt fails partway (the host went away), drop the connection and
+    // go back to accept.
+    let (mut stream, argv, env, secrets, deadline_ms) = loop {
+        let mut stream = vsock_accept(listen_fd).await?;
+
+        // Hello.
+        let hello = AgentMsg::Hello {
             version: PROTOCOL_VERSION,
             run_id: cfg.run_id.clone(),
-            nonce,
-        },
-    )
-    .await?;
+            nonce: make_nonce(),
+        };
+        if let Err(e) = write_msg(&mut stream, &hello).await {
+            eprintln!("lumen-guest-agent: hello send failed ({e}); re-accepting");
+            continue;
+        }
 
-    // Welcome or Deny.
-    let welcome = read_msg::<_, HostMsg>(&mut stream).await?;
-    let (argv, env, secrets, deadline_ms) = match welcome {
-        Some(HostMsg::Welcome {
-            run_id,
-            argv,
-            env,
-            secrets,
-            deadline_ms,
-        }) => {
-            if run_id != cfg.run_id {
-                return Err(SandboxdError::Protocol("run_id mismatch".into()));
+        // Welcome or Deny, with a timeout so a dead peer cannot wedge us.
+        let welcome: Option<HostMsg> =
+            match tokio::time::timeout(Duration::from_secs(30), read_msg(&mut stream)).await {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => {
+                    eprintln!("lumen-guest-agent: welcome read failed ({e}); re-accepting");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("lumen-guest-agent: welcome timeout; re-accepting");
+                    continue;
+                }
+            };
+        match welcome {
+            Some(HostMsg::Welcome {
+                run_id,
+                argv,
+                env,
+                secrets,
+                deadline_ms,
+            }) => {
+                if run_id != cfg.run_id {
+                    eprintln!("lumen-guest-agent: run_id mismatch; re-accepting");
+                    continue;
+                }
+                if argv.is_empty() {
+                    eprintln!("lumen-guest-agent: empty argv; re-accepting");
+                    continue;
+                }
+                break (stream, argv, env, secrets, deadline_ms);
             }
-            (argv, env, secrets, deadline_ms)
+            Some(HostMsg::Deny { reason }) => {
+                return Err(SandboxdError::Host(format!("denied: {reason}")));
+            }
+            _ => {
+                eprintln!("lumen-guest-agent: expected Welcome; re-accepting");
+                continue;
+            }
         }
-        Some(HostMsg::Deny { reason }) => {
-            return Err(SandboxdError::Host(format!("denied: {reason}")));
-        }
-        _ => return Err(SandboxdError::Protocol("expected Welcome".into())),
     };
-
-    if argv.is_empty() {
-        return Err(SandboxdError::Protocol("empty argv".into()));
-    }
 
     // Build the redactor from secret values.
     let secret_vals: Vec<lumen_sandboxd::secrets::Secret> = secrets

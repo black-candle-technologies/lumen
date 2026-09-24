@@ -36,6 +36,9 @@ use crate::error::SandboxdError;
 
 /// Protocol version. The host rejects any other version at handshake.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// AF_VSOCK port the guest agent listens on. The host dials it through
+/// Firecracker's vsock UDS with a `CONNECT <port>` preamble.
+pub const VSOCK_PORT: u32 = 1234;
 /// Largest single frame (length prefix + JSON). Bounds memory per message.
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// Largest base64 payload inside one frame (keeps JSON parse bounded).

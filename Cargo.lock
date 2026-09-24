@@ -3281,6 +3281,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "libc",
+ "lumen-core",
  "lumen-protocol",
  "rand 0.9.5",
  "serde",

@@ -26,7 +26,9 @@ use crate::contracts::{
 use crate::dns::{DnsForwarder, HostPolicyResolver, SystemUpstream};
 use crate::error::SandboxdError;
 use crate::export::{ExportLimits, ExportValidator, StagedFile};
-use crate::guest_agent::{AgentMsg, HostMsg, PROTOCOL_VERSION, check_hello, read_msg, write_msg};
+use crate::guest_agent::{
+    AgentMsg, HostMsg, PROTOCOL_VERSION, VSOCK_PORT, check_hello, read_msg, write_msg,
+};
 use crate::jailer::{self, JailSpec};
 use crate::network;
 use crate::provenance::{self, ProvenanceRecord};
@@ -93,6 +95,9 @@ pub trait VmBackend: Send + Sync {
     ) -> Result<Box<dyn NetnsHandle>, SandboxdError>;
     async fn spawn_jailer(&self, setup: &JailSetup)
     -> Result<Box<dyn JailerHandle>, SandboxdError>;
+    /// Ask a freshly spawned Firecracker to boot: it loads `--config-file`
+    /// but waits for the `InstanceStart` action on its API socket.
+    async fn boot_instance(&self, api_sock: &Path) -> Result<(), SandboxdError>;
     async fn connect_agent(
         &self,
         uds_path: &Path,
@@ -102,7 +107,6 @@ pub trait VmBackend: Send + Sync {
 
 /// Context for the per-run netns services (DNS + egress proxy).
 pub struct NetnsCtx {
-    pub netns_path: PathBuf,
     pub host_ip: String,
     pub proxy_port: u16,
     pub proxy_cfg: crate::proxy::ProxyConfig,
@@ -119,13 +123,13 @@ pub trait NetnsHandle: Send {
 /// Everything the backend needs to build the chroot and launch the jailer.
 pub struct JailSetup {
     pub spec: JailSpec,
+    /// Path to the jailer binary (from DaemonConfig).
+    pub jailer_bin: PathBuf,
     /// Verified image directory (vmlinux, rootfs.ext4,
     /// workspace-template.qcow2).
     pub image_dir: PathBuf,
     /// Rendered Firecracker config JSON (also written to the run dir).
     pub fc_config_json: String,
-    /// Rendered seccomp JSON (also written to the run dir).
-    pub seccomp_json: String,
     /// In-jail Firecracker argv (paths are jail-relative).
     pub fc_args: Vec<String>,
 }
@@ -428,12 +432,15 @@ impl Driver {
             &config.net.netns_prefix,
         )?;
         let run_dir = store.run_dir(run_id);
-        let chroot_dir = jailer::jail_root(&config.firecracker.chroot_base, run_id);
+        let chroot_dir = jailer::jail_root(
+            &config.firecracker.chroot_base,
+            &config.firecracker.binary,
+            run_id,
+        );
         Ok(ArtifactPaths {
             jail_id: run_id.to_string(),
             chroot_dir: chroot_dir.clone(),
             config_path: run_dir.join("firecracker.json"),
-            seccomp_path: run_dir.join("seccomp.json"),
             uid,
             gid: uid,
             netns_name: plan.netns_name,
@@ -442,12 +449,17 @@ impl Driver {
             veth_guest: plan.veth_guest,
             host_ip: plan.host_ip,
             guest_ip: plan.guest_ip,
-            // Cgroup path must match what the backend creates (see
-            // FirecrackerBackend::start: `lumen/<run_id>`). Interface names
+            // Cgroup path (relative to /sys/fs/cgroup) must match what the
+            // jailer creates: `--parent-cgroup lumen --id <run_id>` =>
+            // `/sys/fs/cgroup/lumen/<run_id>` (the jailer requires a path
+            // relative to the cgroup v2 mount). Interface names
             // use the short tag (15-char limit), but cgroups have no such
             // limit, so we use the full run ID for uniqueness and clarity.
             cgroup_path: PathBuf::from(format!("lumen/{run_id}")),
-            workspace_disk: run_dir.join("workspace.qcow2"),
+            // The per-run workspace copy lives inside the jail chroot
+            // (Firecracker is chrooted and can only open paths under it).
+            // The quota monitor watches this file's allocated blocks.
+            workspace_disk: chroot_dir.join("workspace.raw"),
             vsock_path: chroot_dir.join("v.sock"),
             api_sock: chroot_dir.join("fc-api.sock"),
             staging_dir: run_dir.join("staging"),
@@ -986,15 +998,23 @@ impl Driver {
         let spec = record.spec.clone();
         let plan = self.plan_from_artifacts(&artifacts);
 
-        // Render Firecracker config + seccomp into the run dir (the
-        // backend hard-links/copies them into the chroot).
+        // Render the Firecracker config into the run dir (the backend
+        // copies it into the chroot).
         let guest_mac = jailer::guest_mac(run_id);
-        let fc_config = jailer::render_config(&spec.limits, &plan.tap_name, &guest_mac, None);
+        // Guest boot parameters: run identity + addressing on the kernel
+        // command line, read by /init and the guest agent from /proc/cmdline.
+        let boot_params = jailer::GuestBootParams {
+            run_id: run_id.to_string(),
+            guest_ip: plan.guest_ip.clone(),
+            host_ip: plan.host_ip.clone(),
+            proxy_port: plan.proxy_port,
+            vsock_port: VSOCK_PORT,
+        };
+        let fc_config =
+            jailer::render_config(&spec.limits, &plan.tap_name, &guest_mac, &boot_params, None);
         let fc_json = serde_json::to_string_pretty(&fc_config)
             .map_err(|e| SandboxdError::Host(format!("fc config render: {e}")))?;
-        let seccomp_json = crate::seccomp::render_filter_pretty()?;
         std::fs::write(&artifacts.config_path, &fc_json).map_err(SandboxdError::Io)?;
-        std::fs::write(&artifacts.seccomp_path, &seccomp_json).map_err(SandboxdError::Io)?;
 
         let jail_spec = JailSpec {
             id: run_id.to_string(),
@@ -1009,11 +1029,8 @@ impl Driver {
             snapshot: None,
         };
         // In-jail paths (Firecracker's view inside the chroot).
-        let fc_args = jailer::firecracker_argv(
-            Path::new("/fc-api.sock"),
-            Path::new("/firecracker.json"),
-            Path::new("/seccomp.json"),
-        );
+        let fc_args =
+            jailer::firecracker_argv(Path::new("/fc-api.sock"), Path::new("/firecracker.json"));
 
         // Image dir for the backend to hard-link into the chroot.
         let image_dir = self.inner.config.images.store.join(&spec.image_digest);
@@ -1026,9 +1043,12 @@ impl Driver {
             let _ = self.inner.store.transition(run_id, RunState::Failed);
             return Err(e);
         }
-        // 2. Per-run DNS forwarder + egress proxy (join the netns).
+        // 2. Per-run DNS forwarder + egress proxy. These bind the run's
+        //    host-side address in the HOST netns (that address is local
+        //    only there; the run netns has no route to the host resolver
+        //    or upstream targets). The guest reaches them over the veth
+        //    pair; guest isolation is unchanged.
         let netns_ctx = NetnsCtx {
-            netns_path: jail_spec.netns_path.clone(),
             host_ip: plan.host_ip.clone(),
             proxy_port: plan.proxy_port,
             proxy_cfg: crate::proxy::ProxyConfig {
@@ -1051,9 +1071,9 @@ impl Driver {
         // 3. Jailer (builds chroot, drops privs, execs Firecracker).
         let setup = JailSetup {
             spec: jail_spec,
+            jailer_bin: self.inner.config.firecracker.jailer.clone(),
             image_dir,
             fc_config_json: fc_json,
-            seccomp_json,
             fc_args,
         };
         let jailer_handle = match self.inner.backend.spawn_jailer(&setup).await {
@@ -1066,31 +1086,66 @@ impl Driver {
                 return Err(e);
             }
         };
-        // 4. Agent handshake. The host connects to Firecracker's vsock UDS;
-        //    the guest agent listens on AF_VSOCK inside the VM.
-        let mut agent = match self
-            .inner
-            .backend
-            .connect_agent(&artifacts.vsock_path, Duration::from_secs(30))
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
+        // 4. Boot the VM. Firecracker loads --config-file but waits for the
+        //    InstanceStart action on its API socket; without this the guest
+        //    never boots and the vsock handshake below would time out.
+        if let Err(e) = self.inner.backend.boot_instance(&artifacts.api_sock).await {
+            let mut jh = jailer_handle;
+            let _ = jh.terminate().await;
+            let mut ns = netns_services;
+            let _ = ns.shutdown().await;
+            let _ = self.inner.backend.teardown_network(&plan).await;
+            let _ = self.inner.store.transition(run_id, RunState::Failed);
+            return Err(e);
+        }
+        // 5. Agent handshake, with retries. The guest agent starts
+        //    listening on AF_VSOCK partway through boot; if our CONNECT
+        //    arrives before it is listening, Firecracker closes the UDS, so
+        //    we retry the whole dial + hello sequence until the deadline.
+        let mut agent: Option<Box<dyn AgentIo>> = None;
+        let mut last_err = String::from("no attempts");
+        let hs_start = Instant::now();
+        while hs_start.elapsed() < Duration::from_secs(60) && agent.is_none() {
+            match self
+                .inner
+                .backend
+                .connect_agent(&artifacts.vsock_path, Duration::from_secs(5))
+                .await
+            {
+                Ok(mut a) => {
+                    let hello_r = tokio::time::timeout(Duration::from_secs(5), a.next_msg()).await;
+                    match hello_r {
+                        Ok(Ok(Some(hello))) => match check_hello(&hello, run_id) {
+                            Ok(_) => agent = Some(a),
+                            Err(e) => last_err = format!("bad hello: {e}"),
+                        },
+                        Ok(Ok(None)) => last_err = "agent closed before hello".to_string(),
+                        Ok(Err(e)) => last_err = format!("hello read failed: {e}"),
+                        Err(_) => last_err = "hello timeout".to_string(),
+                    }
+                }
+                Err(e) => last_err = format!("vsock dial failed: {e}"),
+            }
+            if agent.is_none() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        let mut agent = match agent {
+            Some(a) => a,
+            None => {
                 let mut jh = jailer_handle;
                 let _ = jh.terminate().await;
                 let mut ns = netns_services;
                 let _ = ns.shutdown().await;
                 let _ = self.inner.backend.teardown_network(&plan).await;
                 let _ = self.inner.store.transition(run_id, RunState::Failed);
-                return Err(e);
+                return Err(SandboxdError::GuestAgent(format!(
+                    "agent handshake failed after 60s: {last_err}"
+                )));
             }
         };
-        let hello: Option<AgentMsg> = agent.next_msg().await?;
-        let hello =
-            hello.ok_or_else(|| SandboxdError::GuestAgent("agent closed before hello".into()))?;
-        check_hello(&hello, run_id)?;
 
-        // 5. Welcome: argv, env, secrets, deadline.
+        // 6. Welcome: argv, env, secrets, deadline.
         let (secret_pairs, secret_vals): (Vec<(String, String)>, Vec<Secret>) = {
             let live = self.inner.live.lock().unwrap();
             let lr = live.get(run_id).expect("live run checked above");
@@ -1122,7 +1177,7 @@ impl Driver {
             return Err(e);
         }
 
-        // 6. Supervisor task owns the agent stream + jailer from here.
+        // 7. Supervisor task owns the agent stream + jailer from here.
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let store = self.inner.store.clone();
         let run_id_owned = run_id.to_string();
@@ -1506,31 +1561,6 @@ async fn run_cmd(prog: &str, args: &[&str]) -> Result<String, SandboxdError> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn join_netns(path: &Path) -> Result<(), SandboxdError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let cpath = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| SandboxdError::Host("bad netns path".into()))?;
-    unsafe {
-        let fd = libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return Err(SandboxdError::Host(format!(
-                "open netns: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let rc = libc::setns(fd, libc::CLONE_NEWNET);
-        libc::close(fd);
-        if rc != 0 {
-            return Err(SandboxdError::Host(format!(
-                "setns: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-}
-
 struct NetnsTask {
     thread: Option<std::thread::JoinHandle<()>>,
     shutdown_tx: std::sync::mpsc::Sender<()>,
@@ -1548,10 +1578,13 @@ impl NetnsHandle for NetnsTask {
 }
 
 fn netns_services_main(ctx: NetnsCtx, shutdown_rx: std::sync::mpsc::Receiver<()>) {
-    if let Err(e) = join_netns(&ctx.netns_path) {
-        eprintln!("sandboxd: netns join failed: {e}");
-        return;
-    }
+    // NOTE: these services intentionally run in the HOST network namespace.
+    // The run's host-side address (host_ip) is assigned to the veth's host
+    // leg in the root namespace, so it is only bindable here; inside the
+    // run netns the bind fails with EADDRNOTAVAIL, and the run netns has no
+    // route to the host resolver or upstream targets. The guest still lives
+    // in total isolation: it reaches these services over the veth pair,
+    // subject to the nftables default-deny policy, and has no other path.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1624,7 +1657,29 @@ fn netns_services_main(ctx: NetnsCtx, shutdown_rx: std::sync::mpsc::Receiver<()>
     });
 }
 
-/// Real backend: jailer, netns, vsock, qemu-img. Requires root + /dev/kvm.
+/// Ensure the cgroup parent exists with the controllers the run needs
+/// enabled. Without `+memory +pids +cpu` in `cgroup.subtree_control`,
+/// neither our `apply_limits` nor the jailer's `--cgroup` writes take
+/// effect (writes fail and limits silently don't apply).
+fn ensure_cgroup_parent(parent: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(parent)?;
+    let ctl = parent.join("cgroup.subtree_control");
+    let current = std::fs::read_to_string(&ctl).unwrap_or_default();
+    let mut want = String::new();
+    for c in ["memory", "pids", "cpu"] {
+        if !current.split_whitespace().any(|x| x == c) {
+            want.push('+');
+            want.push_str(c);
+            want.push(' ');
+        }
+    }
+    if !want.is_empty() {
+        std::fs::write(&ctl, want.trim_end())?;
+    }
+    Ok(())
+}
+
+/// Real backend: jailer, netns, vsock, Firecracker. Requires root + /dev/kvm.
 pub struct FirecrackerBackend;
 
 #[async_trait]
@@ -1677,20 +1732,19 @@ impl VmBackend for FirecrackerBackend {
         let nn = |args: Vec<String>| {
             let netns_name = netns_name.clone();
             async move {
-                let mut full = vec!["netns".to_string(), "exec".to_string(), netns_name];
+                // ip netns exec <ns> <cmd>: the <cmd> must be a full command,
+                // e.g. `ip link set ...`, not just the ip subcommand.
+                let mut full = vec![
+                    "netns".to_string(),
+                    "exec".to_string(),
+                    netns_name,
+                    "ip".to_string(),
+                ];
                 full.extend(args);
                 let refs: Vec<&str> = full.iter().map(String::as_str).collect();
                 run_cmd("ip", &refs).await
             }
         };
-        nn(vec![
-            "addr".into(),
-            "add".into(),
-            format!("{}/{}", plan.guest_ip, plan.prefix_len),
-            "dev".into(),
-            plan.veth_guest.clone(),
-        ])
-        .await?;
         nn(vec![
             "link".into(),
             "set".into(),
@@ -1714,8 +1768,11 @@ impl VmBackend for FirecrackerBackend {
             "up".into(),
         ])
         .await?;
-        // Bridge the TAP (guest) and veth_guest (host leg) so the guest can
-        // reach the host's DNS/proxy. The bridge lives in the netns.
+        // Bridge the TAP (guest) and veth_guest (host leg) at L2 so the
+        // guest can reach the host's DNS/proxy on the host leg. The bridge
+        // carries no IP address: the guest configures `guest_ip` on its own
+        // interface inside the VM (from the `lumen.guest_ip=` kernel
+        // command-line parameter).
         let br_name = format!("br-{}", &plan.netns_name[..8.min(plan.netns_name.len())]);
         nn(vec![
             "link".into(),
@@ -1748,24 +1805,12 @@ impl VmBackend for FirecrackerBackend {
             br_name.clone(),
         ])
         .await?;
-        // Move the guest IP to the bridge (the veth and TAP are now L2).
-        nn(vec![
-            "addr".into(),
-            "del".into(),
-            format!("{}/{}", plan.guest_ip, plan.prefix_len),
-            "dev".into(),
-            plan.veth_guest.clone(),
-        ])
-        .await?;
-        nn(vec![
-            "addr".into(),
-            "add".into(),
-            format!("{}/{}", plan.guest_ip, plan.prefix_len),
-            "dev".into(),
-            br_name.clone(),
-        ])
-        .await?;
-        // nftables (default-deny; see network::render_nftables)
+        // nftables (default-deny; see network::render_nftables). Bridged
+        // guest traffic traverses the inet forward chain via br_netfilter;
+        // make sure the module is loaded so the policy actually applies.
+        // Best-effort: even without it the topology (no route, no NAT)
+        // denies egress; the nftables layer is defense in depth.
+        let _ = run_cmd("modprobe", &["br_netfilter"]).await;
         let nft_path = format!("/run/lumen-{}.nft", plan.netns_name);
         std::fs::write(&nft_path, nftables_rules).map_err(SandboxdError::Io)?;
         let nft_cmd = format!("ip netns exec {} nft -f {}", plan.netns_name, nft_path);
@@ -1787,7 +1832,6 @@ impl VmBackend for FirecrackerBackend {
     ) -> Result<Box<dyn NetnsHandle>, SandboxdError> {
         // Move the ctx into the thread.
         let ctx = NetnsCtx {
-            netns_path: ctx.netns_path.clone(),
             host_ip: ctx.host_ip.clone(),
             proxy_port: ctx.proxy_port,
             proxy_cfg: crate::proxy::ProxyConfig {
@@ -1813,54 +1857,80 @@ impl VmBackend for FirecrackerBackend {
     ) -> Result<Box<dyn JailerHandle>, SandboxdError> {
         let spec = &setup.spec;
         // 1. Chroot skeleton.
-        let root = jailer::jail_root(&spec.chroot_base, &spec.id);
+        let root = jailer::jail_root(&spec.chroot_base, &spec.firecracker_bin, &spec.id);
         std::fs::create_dir_all(&root).map_err(SandboxdError::Io)?;
-        // 2. Hard-link verified artifacts. The template is hard-linked so the
-        //    CoW delta can use a RELATIVE backing path (resolves inside the
-        //    chroot at Firecracker open time).
-        for name in ["vmlinux", "rootfs.ext4", "workspace-template.qcow2"] {
+        // 2. Hard-link verified read-only artifacts. The workspace template
+        //    is hard-linked too, but the per-run workspace is a COPY (never
+        //    a hard link): guest block writes through a hard link would
+        //    dirty the shared template for every later run.
+        for name in ["vmlinux", "rootfs.ext4", "workspace-template.raw"] {
             let src = setup.image_dir.join(name);
             let dst = root.join(name);
             let _ = std::fs::remove_file(&dst);
             std::fs::hard_link(&src, &dst)
                 .map_err(|e| SandboxdError::Host(format!("hard-link {name}: {e}")))?;
         }
-        // 3. CoW delta with a relative backing path.
-        let delta = root.join("workspace.qcow2");
+        // 3. Per-run workspace: sparse (reflink-preferring) copy of the
+        //    template. Firecracker's virtio-blk is raw-only, so this is a
+        //    raw ext4 image, not qcow2.
+        let delta = root.join("workspace.raw");
         let _ = std::fs::remove_file(&delta);
-        let qemu_img = Path::new("qemu-img");
-        let args =
-            crate::storage::qemu_img_create_args(Path::new("workspace-template.qcow2"), &delta);
-        let out = tokio::process::Command::new(qemu_img)
-            .args(&args)
-            .current_dir(&root)
-            .output()
-            .await
-            .map_err(|e| SandboxdError::Host(format!("qemu-img: {e}")))?;
-        if !out.status.success() {
+        crate::storage::create_workspace_copy(&root.join("workspace-template.raw"), &delta)
+            .map_err(|e| SandboxdError::Host(format!("workspace copy: {e}")))?;
+        // Firecracker runs as the jailer's uid/gid and opens the workspace
+        // O_RDWR; the copy inherits root ownership (0644) from the template,
+        // so chown it to the jailer identity.
+        let c_path = std::ffi::CString::new(delta.as_os_str().as_encoded_bytes())
+            .map_err(|e| SandboxdError::Host(format!("workspace path contains NUL: {e}")))?;
+        // SAFETY: c_path is a valid NUL-terminated path; chown has no other
+        // preconditions.
+        let rc = unsafe { libc::chown(c_path.as_ptr(), spec.uid, spec.gid) };
+        if rc != 0 {
             return Err(SandboxdError::Host(format!(
-                "qemu-img create: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "chown workspace.raw to {}:{}: {}",
+                spec.uid,
+                spec.gid,
+                std::io::Error::last_os_error()
             )));
         }
-        // 4. Config + seccomp into the chroot.
+        // 4. Config into the chroot.
         std::fs::write(root.join("firecracker.json"), &setup.fc_config_json)
             .map_err(SandboxdError::Io)?;
-        std::fs::write(root.join("seccomp.json"), &setup.seccomp_json)
-            .map_err(SandboxdError::Io)?;
-        // 5. cgroup for the run.
+        // 5. cgroup for the run. This MUST be the same cgroup the jailer
+        //    creates (`--parent-cgroup <parent> --id <id>` => `<parent>/<id>`),
+        //    otherwise limits, kill, and metering act on an empty cgroup
+        //    while the VMM runs unconstrained next to it.
         let cgroup_parent = &spec.cgroup_parent;
-        let cgroup_rel = Path::new("lumen").join(&spec.id);
-        if let Err(e) = cgroups::apply_limits(cgroup_parent, &cgroup_rel, &spec.limits) {
+        let cgroup_rel = Path::new(&spec.id);
+        // The parent needs the controllers enabled before either we or the
+        // jailer (as root) write limit files in the leaf.
+        if let Err(e) = ensure_cgroup_parent(cgroup_parent) {
+            return Err(SandboxdError::Host(format!("cgroup parent: {e}")));
+        }
+        if let Err(e) = cgroups::apply_limits(cgroup_parent, cgroup_rel, &spec.limits) {
             return Err(SandboxdError::Host(format!("cgroup apply: {e}")));
         }
         // 6. Launch via the jailer binary.
         let argv = jailer::jailer_argv(spec, &setup.fc_args)?;
-        let mut child = tokio::process::Command::new(&argv[0])
-            .args(&argv[1..])
+        // jailer_argv returns the jailer arguments (starting with --id);
+        // the binary path comes from the JailSetup.
+        // Capture jailer stderr: the only post-mortem when firecracker dies before the API socket exists.
+        let jailer_log = spec.chroot_base.join(format!("jailer-{}.log", spec.id));
+        let log_file = std::fs::File::create(&jailer_log).ok();
+        let stderr_cfg = log_file
+            .map(std::process::Stdio::from)
+            .unwrap_or(std::process::Stdio::null());
+        // Log the full jailer command alongside, for post-mortem.
+        let cmd_log = spec.chroot_base.join(format!("jailer-cmd-{}.log", spec.id));
+        let _ = std::fs::write(
+            &cmd_log,
+            format!("BIN: {}\nARGS: {:?}\n", setup.jailer_bin.display(), argv),
+        );
+        let mut child = tokio::process::Command::new(&setup.jailer_bin)
+            .args(&argv)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr_cfg)
             .spawn()
             .map_err(|e| SandboxdError::Host(format!("spawn jailer: {e}")))?;
         let pid = child.id();
@@ -1877,25 +1947,116 @@ impl VmBackend for FirecrackerBackend {
         Ok(Box::new(ChildJailerHandle { pid }))
     }
 
+    async fn boot_instance(&self, api_sock: &Path) -> Result<(), SandboxdError> {
+        // Firecracker applies --config-file at startup but does NOT boot;
+        // the VM waits for the InstanceStart action on its API socket.
+        // Minimal HTTP/1.1 client over the unix socket (no extra deps).
+        let body = r#"{"action_type":"InstanceStart"}"#;
+        let req = format!(
+            "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let start = Instant::now();
+        loop {
+            match tokio::net::UnixStream::connect(api_sock).await {
+                Ok(mut s) => {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    s.write_all(req.as_bytes())
+                        .await
+                        .map_err(|e| SandboxdError::Host(format!("InstanceStart write: {e}")))?;
+                    let mut buf = vec![0u8; 4096];
+                    let mut len = 0;
+                    // Read until the end of the status line.
+                    while len < buf.len() {
+                        let n = s
+                            .read(&mut buf[len..])
+                            .await
+                            .map_err(|e| SandboxdError::Host(format!("InstanceStart read: {e}")))?;
+                        if n == 0 {
+                            break;
+                        }
+                        len += n;
+                        if buf[..len].windows(2).any(|w| w == b"\r\n") {
+                            break;
+                        }
+                    }
+                    let status = String::from_utf8_lossy(&buf[..len]);
+                    let status_line = status.lines().next().unwrap_or("");
+                    // Firecracker answers 204 on success (e.g. "HTTP/1.1 204 "
+                    // with no reason phrase). Parse the status code robustly.
+                    let is_204 = status_line
+                        .split_whitespace()
+                        .nth(1)
+                        .map(|code| code == "204")
+                        .unwrap_or(false);
+                    if is_204 {
+                        return Ok(());
+                    }
+                    // A 400 with "not supported after starting" means the VM
+                    // is already Running (e.g. a retried request). Verify.
+                    drop(s);
+                    if vm_state(api_sock).await.as_deref() == Some("Running") {
+                        return Ok(());
+                    }
+                    return Err(SandboxdError::Host(format!(
+                        "InstanceStart rejected: {status_line}"
+                    )));
+                }
+                Err(e) => {
+                    if start.elapsed() > Duration::from_secs(30) {
+                        return Err(SandboxdError::Host(format!(
+                            "firecracker API {}: {e}",
+                            api_sock.display()
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     async fn connect_agent(
         &self,
         uds_path: &Path,
         timeout: Duration,
     ) -> Result<Box<dyn AgentIo>, SandboxdError> {
         // Firecracker creates the vsock UDS when the VMM starts; poll for
-        // it, then connect. The Firecracker vsock protocol requires a
-        // `CONNECT <port>\n` preamble: the UDS connection is forwarded to
-        // the guest's AF_VSOCK listener on that port.
-        // See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md
+        // it, then connect. Host-initiated vsock (see docs/vsock.md): send
+        // `CONNECT <port>\n`, read the `OK <host-port>\n` ack; the UDS
+        // connection is then the data stream to the guest's AF_VSOCK
+        // listener on that port.
         let start = Instant::now();
         loop {
             match tokio::net::UnixStream::connect(uds_path).await {
                 Ok(mut s) => {
                     // Send the CONNECT preamble. The guest agent listens on
-                    // port 1234 (LUMEN_VSOCK_PORT).
-                    let preamble = b"CONNECT 1234\n";
-                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut s, preamble).await {
+                    // AF_VSOCK VSOCK_PORT (see guest_agent::VSOCK_PORT).
+                    let preamble = format!("CONNECT {VSOCK_PORT}\n");
+                    if let Err(e) =
+                        tokio::io::AsyncWriteExt::write_all(&mut s, preamble.as_bytes()).await
+                    {
                         return Err(SandboxdError::Host(format!("vsock CONNECT failed: {e}")));
+                    }
+                    // Read the `OK <host-port>\n` ack. Without this the ack
+                    // bytes would be parsed as the first message frame.
+                    let mut ack = Vec::new();
+                    let ack_read = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tokio::io::AsyncBufReadExt::read_until(
+                            &mut tokio::io::BufReader::new(&mut s),
+                            b'\n',
+                            &mut ack,
+                        ),
+                    )
+                    .await;
+                    match ack_read {
+                        Ok(Ok(_)) if ack.starts_with(b"OK ") => {}
+                        _ => {
+                            return Err(SandboxdError::Host(format!(
+                                "vsock CONNECT: no OK ack ({})",
+                                String::from_utf8_lossy(&ack)
+                            )));
+                        }
                     }
                     return Ok(Box::new(s));
                 }
@@ -1911,6 +2072,37 @@ impl VmBackend for FirecrackerBackend {
             }
         }
     }
+}
+
+/// Query the VM state via GET /. Returns None on any error.
+async fn vm_state(api_sock: &Path) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::UnixStream::connect(api_sock).await.ok()?;
+    let req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    s.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = vec![0u8; 4096];
+    let mut len = 0;
+    while len < buf.len() {
+        let n = s.read(&mut buf[len..]).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        // End of headers.
+        if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let resp = String::from_utf8_lossy(&buf[..len]);
+    // Body is JSON like {"state":"Running",...}; extract the state value.
+    let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    let body = &resp[body_start..];
+    let key = "\"state\":\"";
+    body.find(key).map(|i| {
+        let start = i + key.len();
+        let end = body[start..].find('"').map(|j| start + j).unwrap_or(start);
+        body[start..end].to_string()
+    })
 }
 
 struct ChildJailerHandle {
@@ -2005,6 +2197,10 @@ impl VmBackend for MockBackend {
         _setup: &JailSetup,
     ) -> Result<Box<dyn JailerHandle>, SandboxdError> {
         Ok(Box::new(MockJailerHandle))
+    }
+
+    async fn boot_instance(&self, _api_sock: &Path) -> Result<(), SandboxdError> {
+        Ok(())
     }
 
     async fn connect_agent(
@@ -2144,7 +2340,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("vmlinux"), vmlinux).unwrap();
         std::fs::write(dir.join("rootfs.ext4"), rootfs).unwrap();
-        std::fs::write(dir.join("workspace-template.qcow2"), template).unwrap();
+        std::fs::write(dir.join("workspace-template.raw"), template).unwrap();
         let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
         std::fs::write(dir.join("manifest.json"), manifest_json).unwrap();
         // Trusted key file.
