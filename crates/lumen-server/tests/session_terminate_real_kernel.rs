@@ -8,14 +8,17 @@
 //! - the termination report claims leases revoked + identity destroyed;
 //! - the kernel really revoked the lease: a subsequent `decide` with the
 //!   same lease chain is denied as revoked;
+//! - a descendant lease chained to the revoked parent is denied as
+//!   revoked too (kernel-layer descendant protection — the kernel's
+//!   chain check rejects any chain containing a revoked lease);
 //! - the kernel audit chain still verifies.
 //!
-//! Descendant sessions: the phase-4 `SessionIdentityVault::end_session`
-//! destroys descendant keys, but phase-3's supervisor does not hold a vault
-//! or session registry — connecting them is a coordinator design decision
-//! (documented in the integration report). At the authority layer the
-//! kernel's lease-chain check already denies any child lease chained to a
-//! revoked parent lease.
+//! What this does NOT prove (coordinator design decision, not wired):
+//! phase-3's supervisor owns its own `SessionIdentity`, not phase-4's
+//! `SessionIdentityVault` / `SessionRegistry`, so supervisor-side
+//! descendant *identity* destruction on parent termination is unwired.
+//! The authority layer (lease revocation) is covered above; the identity
+//! layer needs the supervisor/vault ownership design.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -108,6 +111,22 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
         )
         .expect("issue real lease");
 
+    // A descendant lease chained to the parent (leaf first, then parent).
+    // The supervisor does not model descendants — this exercises the
+    // kernel layer directly, which is the part that is wired.
+    let child_subject = format!("{subject}::child");
+    let child_lease = kernel
+        .issue_session_child_lease(
+            lease,
+            &child_subject,
+            vec!["/tmp".into()],
+            vec!["read".into()],
+            now_ms() + 3_600_000,
+        )
+        .expect("issue real child lease");
+    let mut child_env = read_envelope(&child_subject, &child_lease.to_string());
+    child_env.lease_chain = vec![child_lease.to_string(), lease.to_string()];
+
     // Sanity: the lease authorizes before termination.
     let decision = kernel
         .decide(&read_envelope(&subject, &lease.to_string()))
@@ -116,6 +135,11 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
     assert!(
         matches!(decision.decision, Decision::Allow { .. }),
         "lease must authorize before termination"
+    );
+    let child_decision = kernel.decide(&child_env).await.expect("decide");
+    assert!(
+        matches!(child_decision.decision, Decision::Allow { .. }),
+        "child lease must authorize before parent termination"
     );
 
     // Terminate: the supervisor must revoke kernel-side and destroy the identity.
@@ -137,6 +161,22 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
     assert!(
         reason.contains("revoked"),
         "deny reason must name revocation: {reason}"
+    );
+
+    // The descendant lease is dead too: the kernel's chain check denies
+    // any lease chained to a revoked parent, even though the supervisor
+    // never saw the descendant. (Supervisor-side descendant identity
+    // destruction — phase-4 vault wiring — remains a coordinator design
+    // decision; the authority layer is covered here.)
+    child_env.nonce = format!("seam-c-child-{}", Uuid::new_v4());
+    let child_decision = kernel.decide(&child_env).await.expect("decide");
+    let reason = match &child_decision.decision {
+        Decision::Deny { reason } => reason.clone(),
+        other => panic!("expected Deny for child of revoked parent, got {other:?}"),
+    };
+    assert!(
+        reason.contains("revoked"),
+        "child deny reason must name revocation: {reason}"
     );
 
     kernel.audit_log().verify().expect("audit chain verifies");
