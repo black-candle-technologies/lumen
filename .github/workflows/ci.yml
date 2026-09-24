@@ -46,10 +46,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Bubblewrap is required by the sandbox test suites
       # (lumen-cli readiness, lumen-integrations extension_process/local_executors).
-      # GitHub-hosted ubuntu runners are full VMs, so unprivileged user
-      # namespaces work there, unlike in locked-down containers.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
       - run: bwrap --version
+      # Ubuntu 24.04 (what ubuntu-latest runs) restricts unprivileged user
+      # namespaces via AppArmor (kernel.apparmor_restrict_unprivileged_userns=1
+      # by default). Bubblewrap's --unshare-user then fails with
+      # "setting up uid map: Permission denied", the sandbox probe reports
+      # unavailable, and the readiness tests fail. The sandbox profile under
+      # test requires a user namespace by design, so relax the restriction
+      # for this ephemeral runner (it is discarded after the job). On
+      # persistent hosts, prefer a narrow AppArmor profile granting `userns`
+      # to /usr/bin/bwrap instead of the blanket sysctl.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # Fail fast with a clear signal if the sandbox probe's prerequisites
+      # are not met, instead of surfacing it as readiness test failures.
+      # NOTE: bwrap pivot_roots into an empty tmpfs, so the probe binary
+      # must be reachable via explicit --ro-bind mounts: a bare
+      # `bwrap --unshare-user /bin/true` fails with ENOENT even when user
+      # namespaces work fine. /lib and /lib64 carry the dynamic loader
+      # (symlinks into /usr on merged-/usr systems).
+      - run: bwrap --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 --unshare-user /usr/bin/true && echo "bwrap userns probe OK"
       # lumen-acceptance is excluded: it is a 10m+ end-to-end suite that has
       # not been stabilized for CI yet. Do not re-add it until it is run and
       # green on its own.
