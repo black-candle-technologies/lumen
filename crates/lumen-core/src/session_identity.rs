@@ -171,7 +171,7 @@ impl SessionIdentityVault {
             // Astronomically unlikely; fail closed rather than overwrite.
             return Err(SessionIdentityError::SubjectCollision);
         }
-        registry.register(subject.clone(), parent_subject.clone(), verifying);
+        registry.register(subject.clone(), parent_subject.clone(), verifying, now_ms);
         if let Some(parent) = &parent_subject {
             self.children
                 .entry(parent.clone())

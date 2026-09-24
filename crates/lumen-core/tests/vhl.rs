@@ -5,11 +5,11 @@
 //! asserts the action stays blocked: no lease minted, no second effect, no
 //! silent widening.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -20,8 +20,9 @@ use lumen_core::canonical::PathResolver;
 use lumen_core::canonical::{HostPattern, PathRights as CanonicalPathRights};
 use lumen_core::kernel_audit::{KernelAuditLog, MemoryAuditStore};
 use lumen_core::lease::{
-    CanonicalAction, KernelKeys, LeaseDocument, LeaseError, LeaseLimits, OneShotGrant,
-    RevocationIndex, RootLeaseParams, SessionRegistry, mint_root_lease, validate_chain,
+    CanonicalAction, IssuerKeyResolver, KernelKeys, LeaseDocument, LeaseError, LeaseLimits,
+    OneShotGrant, RevocationIndex, RootLeaseParams, SessionRegistry, mint_root_lease,
+    validate_chain,
 };
 use lumen_core::nonce::NonceStore;
 use lumen_core::pi_boundary::ACTION_ENVELOPE_VERSION;
@@ -728,17 +729,46 @@ fn session_end_during_action_revokes_lease_and_denies_commit() {
         .into_iter()
         .collect();
     let chain = vec![lease.lease_id.clone()];
+    let resolver = TestIssuerResolver::for_keys(&h.keys);
     let err = validate_chain(
         &store,
         &chain,
         &h.revocations,
         &h.sessions,
-        &h.keys,
+        &resolver,
         &NoopOneShot,
         NOW_MS,
     )
     .expect_err("revoked lease must not validate");
     assert!(matches!(err, LeaseError::Revoked(_)), "got {err:?}");
+}
+
+/// Test issuer-key resolver pre-loaded with the harness generation.
+struct TestIssuerResolver {
+    keys: HashMap<String, VerifyingKey>,
+    killed: HashSet<String>,
+}
+
+impl TestIssuerResolver {
+    fn for_keys(keys: &KernelKeys) -> Self {
+        let mut r = Self {
+            keys: HashMap::new(),
+            killed: HashSet::new(),
+        };
+        r.keys
+            .insert(keys.issuer_key_id.clone(), keys.issuer_verifying());
+        r
+    }
+}
+
+impl IssuerKeyResolver for TestIssuerResolver {
+    fn issuer_verifying_key(&self, key_id: &str) -> Option<VerifyingKey> {
+        self.keys.get(key_id).copied()
+    }
+
+    fn is_generation_killed(&self, key_id: &str) -> bool {
+        self.killed.contains(key_id)
+    }
 }
 
 struct NoopOneShot;
@@ -1363,12 +1393,13 @@ fn standing_lease_mint_needs_confirmation_and_matches_approved_scope() {
     ]
     .into_iter()
     .collect();
+    let resolver = TestIssuerResolver::for_keys(&h.keys);
     validate_chain(
         &store,
         &[lease.lease_id.clone(), "root-parent-1".to_string()],
         &h.revocations,
         &h.sessions,
-        &h.keys,
+        &resolver,
         &NoopOneShot,
         NOW_MS,
     )

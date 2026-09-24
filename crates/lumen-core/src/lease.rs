@@ -50,6 +50,11 @@ use crate::{
 /// contract is v2; v1 documents are rejected, fail closed.
 pub const LEASE_PROTOCOL_VERSION: u32 = 2;
 
+/// Maximum root-lease lifetime: 30 days (spec §6.4 retention bound).
+pub const MAX_ROOT_LEASE_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Default session max lifetime: 24h (spec §6.3).
+pub const DEFAULT_SESSION_MAX_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// Limits carried by a lease: time bounds, budget caps, execution caps.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +217,12 @@ pub enum LeaseError {
     ChainCycle,
     #[error("issuer {0} does not match parent subject {1}")]
     IssuerMismatch(String, String),
+    #[error("unknown issuer key generation {0}")]
+    UnknownIssuerGeneration(String),
+    #[error("issuer key generation {0} was killed")]
+    KilledIssuerGeneration(String),
+    #[error("root lease lifetime {0}ms exceeds maximum {1}ms")]
+    ExceedsMaxLifetime(i64, i64),
     #[error("one-shot lease {0} already consumed")]
     AlreadyConsumed(String),
     #[error("lease {0} is not single-use")]
@@ -238,8 +249,11 @@ pub enum LeaseError {
 /// `zeroize` feature in `lumen-core/Cargo.toml`; the
 /// `kernel_keys_zeroize_on_drop` test pins the feature so it cannot be
 /// silently removed). They are never written to disk or logs. A kernel
-/// restart generates fresh keys, which the host must treat as a key
-/// rotation: leases signed by the previous issuer key no longer verify.
+/// restart generates fresh keys, which the host treats as a key rotation:
+/// retired generations' verifying keys are retained durably and leases
+/// signed under them keep verifying, resolved through
+/// [`IssuerKeyResolver`]. Private keys are still never persisted — minting
+/// always uses the current generation's private key.
 pub struct KernelKeys {
     pub issuer_key_id: String,
     issuer: SigningKey,
@@ -282,6 +296,10 @@ pub struct SessionRecord {
     pub parent_subject: Option<String>,
     pub verifying_key: VerifyingKey,
     pub active: bool,
+    /// Boot-relative wall clock when the session was created. Used with
+    /// [`SessionRegistry::max_lifetime_ms`] to bound the post-restart
+    /// stolen-key window (spec §6.3).
+    pub created_at_ms: i64,
 }
 
 /// Kernel-side session registry. The kernel holds session *signing* keys
@@ -290,6 +308,12 @@ pub struct SessionRecord {
 #[derive(Default)]
 pub struct SessionRegistry {
     sessions: HashMap<String, SessionRecord>,
+    /// Session max lifetime, if configured (spec §6.3; default 24h via
+    /// [`DEFAULT_SESSION_MAX_LIFETIME_MS`]). Records older than this are
+    /// dead for the TTL-checked descendant predicates. `None` disables the
+    /// TTL; only the host's durable `kernel_sessions` hydration decides
+    /// which records exist at all.
+    max_lifetime_ms: Option<i64>,
 }
 
 impl SessionRegistry {
@@ -302,6 +326,7 @@ impl SessionRegistry {
         subject: String,
         parent_subject: Option<String>,
         verifying_key: VerifyingKey,
+        created_at_ms: i64,
     ) {
         self.sessions.insert(
             subject.clone(),
@@ -310,8 +335,14 @@ impl SessionRegistry {
                 parent_subject,
                 verifying_key,
                 active: true,
+                created_at_ms,
             },
         );
+    }
+
+    /// Configure the session max lifetime (`None` disables the TTL).
+    pub fn set_max_lifetime(&mut self, max_lifetime_ms: Option<i64>) {
+        self.max_lifetime_ms = max_lifetime_ms;
     }
 
     pub fn deactivate(&mut self, subject: &str) {
@@ -324,13 +355,25 @@ impl SessionRegistry {
         self.sessions.get(subject)
     }
 
-    /// `subject` is an active descendant of `ancestor` (or the same active
-    /// session — self-narrowing is safe delegation).
-    pub fn is_active_descendant(&self, subject: &str, ancestor: &str) -> bool {
+    /// Active **and** within the session TTL at `now_ms`.
+    fn record_live_at(&self, record: &SessionRecord, now_ms: i64) -> bool {
+        if !record.active {
+            return false;
+        }
+        match self.max_lifetime_ms {
+            Some(ttl) => now_ms.saturating_sub(record.created_at_ms) < ttl,
+            None => true,
+        }
+    }
+
+    /// `subject` is a live descendant of `ancestor` (or the same live
+    /// session — self-narrowing is safe delegation), with the TTL checked at
+    /// every hop so a TTL-expired ancestor kills the whole subtree.
+    pub fn is_active_descendant(&self, subject: &str, ancestor: &str, now_ms: i64) -> bool {
         let mut current = subject;
         for _ in 0..256 {
             let record = match self.sessions.get(current) {
-                Some(r) if r.active => r,
+                Some(r) if self.record_live_at(r, now_ms) => r,
                 _ => return false,
             };
             if current == ancestor {
@@ -342,6 +385,20 @@ impl SessionRegistry {
             }
         }
         false
+    }
+
+    /// Active descendant subjects of `subject`, inclusive, TTL-checked.
+    /// Used for post-restart destroy: everything named here loses authority
+    /// when `subject` ends.
+    pub fn active_descendants_inclusive(&self, subject: &str, now_ms: i64) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .sessions
+            .keys()
+            .filter(|s| self.is_active_descendant(s, subject, now_ms))
+            .cloned()
+            .collect();
+        out.sort();
+        out
     }
 }
 
@@ -405,6 +462,18 @@ impl OneShotTracker for HashSet<String> {
     }
 }
 
+/// Resolves verifying keys for kernel issuer generations, current or
+/// retired. The host implements this over the current [`KernelKeys`], the
+/// durable `kernel_key_generations` map hydrated at open, and the
+/// generation kill set (spec §4.1). `lumen-core` stays IO-free: it never
+/// sees the database, only this trait.
+pub trait IssuerKeyResolver {
+    /// Verifying key for an issuer generation, current or retired.
+    fn issuer_verifying_key(&self, key_id: &str) -> Option<VerifyingKey>;
+    /// True if the generation was killed (§6.4).
+    fn is_generation_killed(&self, key_id: &str) -> bool;
+}
+
 // ---------------------------------------------------------------------------
 // Issuance
 // ---------------------------------------------------------------------------
@@ -452,6 +521,18 @@ pub fn mint_root_lease(
     now_ms: i64,
 ) -> Result<LeaseDocument, LeaseError> {
     check_time_bounds(&params.limits, now_ms)?;
+    // Retention bound (spec §6.4): cap how long a compromised old issuer
+    // key stays a live signing capability.
+    let lifetime = params
+        .limits
+        .expires_at_ms
+        .saturating_sub(params.issued_at_ms);
+    if lifetime > MAX_ROOT_LEASE_LIFETIME_MS {
+        return Err(LeaseError::ExceedsMaxLifetime(
+            lifetime,
+            MAX_ROOT_LEASE_LIFETIME_MS,
+        ));
+    }
     if !sessions.get(&params.subject).is_some_and(|r| r.active) {
         return Err(LeaseError::SubjectInactive(params.subject.clone()));
     }
@@ -512,7 +593,7 @@ pub fn mint_child_lease(
     if parent.limits.single_use {
         return Err(LeaseError::SingleUseDelegation);
     }
-    if !sessions.is_active_descendant(&params.subject, &parent.subject) {
+    if !sessions.is_active_descendant(&params.subject, &parent.subject, now_ms) {
         return Err(LeaseError::SubjectNotDescendant(
             params.subject.clone(),
             parent.subject.clone(),
@@ -602,7 +683,7 @@ pub fn validate_chain(
     presented_chain: &[String],
     revocations: &RevocationIndex,
     sessions: &SessionRegistry,
-    keys: &KernelKeys,
+    issuer_resolver: &dyn IssuerKeyResolver,
     one_shot: &dyn OneShotTracker,
     now_ms: i64,
 ) -> Result<ValidatedChain, LeaseError> {
@@ -690,14 +771,18 @@ pub fn validate_chain(
             // Re-prove narrowing: a tampered store cannot widen a child.
             doc.scope.is_subset_of(&parent.scope)?;
         } else {
-            // Root: signed by the kernel issuer.
-            if doc.issuer_key_id != keys.issuer_key_id {
-                return Err(LeaseError::IssuerMismatch(
+            // Root: signed by the kernel issuer generation named in
+            // issuer_key_id (current or retired). Revocation and expiry
+            // were checked above (D4: liveness precedes crypto).
+            if issuer_resolver.is_generation_killed(&doc.issuer_key_id) {
+                return Err(LeaseError::KilledIssuerGeneration(
                     doc.issuer_key_id.clone(),
-                    keys.issuer_key_id.clone(),
                 ));
             }
-            doc.verify_signature(&keys.issuer_verifying())?;
+            let key = issuer_resolver
+                .issuer_verifying_key(&doc.issuer_key_id)
+                .ok_or_else(|| LeaseError::UnknownIssuerGeneration(doc.issuer_key_id.clone()))?;
+            doc.verify_signature(&key)?;
             if doc.depth != 0 {
                 return Err(LeaseError::DepthViolation(doc.depth, doc.depth_limit));
             }
@@ -1118,6 +1203,16 @@ fn deny_reason_for_chain_error(e: &LeaseError) -> DenyReason {
         LeaseError::UnknownKey(subject) => {
             DenyReason::subject_mismatch(format!("unknown session key for {subject}"))
         }
+        LeaseError::UnknownIssuerGeneration(id) => {
+            DenyReason::subject_mismatch(format!("unknown issuer generation {id}"))
+        }
+        LeaseError::KilledIssuerGeneration(id) => {
+            DenyReason::invalid_envelope(format!("issuer generation {id} killed"))
+        }
+        LeaseError::ExceedsMaxLifetime(..) => {
+            DenyReason::invalid_envelope(format!("lease invalid: {e}"))
+        }
+
         _ => DenyReason::invalid_envelope(format!("lease chain invalid: {e}")),
     }
 }
@@ -1144,7 +1239,7 @@ pub fn authorize_envelope(
     lease_resolver: &dyn LeaseResolver,
     revocations: &RevocationIndex,
     sessions: &SessionRegistry,
-    keys: &KernelKeys,
+    issuer_resolver: &dyn IssuerKeyResolver,
     one_shot: &mut dyn OneShotTracker,
     nonces: &NonceStore,
     ledger: &BudgetLedger,
@@ -1186,7 +1281,7 @@ pub fn authorize_envelope(
         &presented,
         revocations,
         sessions,
-        keys,
+        issuer_resolver,
         one_shot,
         now_ms,
     ) {
@@ -1341,13 +1436,48 @@ mod tests {
 
     fn test_sessions(session_vk: VerifyingKey, child_vk: VerifyingKey) -> SessionRegistry {
         let mut s = SessionRegistry::new();
-        s.register("ed25519:parent-session".to_string(), None, session_vk);
+        s.register("ed25519:parent-session".to_string(), None, session_vk, 0);
         s.register(
             "ed25519:child-session".to_string(),
             Some("ed25519:parent-session".to_string()),
             child_vk,
+            0,
         );
         s
+    }
+
+    /// Test issuer-key resolver: HashMap-backed generations plus a kill set.
+    #[derive(Default)]
+    struct TestIssuerResolver {
+        keys: HashMap<String, VerifyingKey>,
+        killed: HashSet<String>,
+    }
+
+    impl TestIssuerResolver {
+        fn record(&mut self, keys: &KernelKeys) {
+            self.keys
+                .insert(keys.issuer_key_id.clone(), keys.issuer_verifying());
+        }
+
+        fn kill(&mut self, key_id: &str) {
+            self.killed.insert(key_id.to_string());
+        }
+    }
+
+    impl IssuerKeyResolver for TestIssuerResolver {
+        fn issuer_verifying_key(&self, key_id: &str) -> Option<VerifyingKey> {
+            self.keys.get(key_id).copied()
+        }
+
+        fn is_generation_killed(&self, key_id: &str) -> bool {
+            self.killed.contains(key_id)
+        }
+    }
+
+    fn issuer_resolver(keys: &KernelKeys) -> TestIssuerResolver {
+        let mut r = TestIssuerResolver::default();
+        r.record(keys);
+        r
     }
 
     fn parent_scope() -> ResourceScope {
@@ -1389,7 +1519,7 @@ mod tests {
     fn root_mint_sign_verify() {
         let (keys, _, session_vk) = test_keys();
         let mut sessions = SessionRegistry::new();
-        sessions.register("ed25519:parent-session".to_string(), None, session_vk);
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
         let ledger = BudgetLedger::new();
         let nonces = NonceStore::new();
         let doc = mint_root_lease(
@@ -1570,7 +1700,7 @@ mod tests {
             &chain_ids,
             &revocations,
             &sessions,
-            &keys,
+            &issuer_resolver(&keys),
             &one_shot,
             300,
         )
@@ -1585,7 +1715,7 @@ mod tests {
             &chain_ids,
             &revocations,
             &sessions,
-            &keys,
+            &issuer_resolver(&keys),
             &one_shot,
             300,
         );
@@ -1599,7 +1729,7 @@ mod tests {
         let vhl_key = SigningKey::generate(&mut OsRng);
         let vhl_vk = vhl_key.verifying_key();
         let mut sessions = SessionRegistry::new();
-        sessions.register("ed25519:parent-session".to_string(), None, session_vk);
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
         let ledger = BudgetLedger::new();
         let nonces = NonceStore::new();
         let r = FakeResolver::default();
@@ -1677,7 +1807,7 @@ mod tests {
             &map,
             &RevocationIndex::new(),
             &sessions,
-            &keys,
+            &issuer_resolver(&keys),
             &mut tracker,
             &nonces,
             &ledger,
@@ -1706,7 +1836,7 @@ mod tests {
             &map,
             &RevocationIndex::new(),
             &sessions,
-            &keys,
+            &issuer_resolver(&keys),
             &mut tracker,
             &nonces,
             &ledger,
@@ -2338,5 +2468,229 @@ mod tests {
         );
         assert!(!d.is_allow());
         assert_deny_code(&d, "scope_exceeded");
+    /// A root lease minted under a retired generation validates through the
+    /// resolver (spec §4.1: retirement no longer invalidates outstanding
+    /// leases).
+    #[test]
+    fn root_validates_via_retired_generation() {
+        let (old_keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let doc = mint_root_lease(
+            root_params(parent_scope()),
+            &old_keys,
+            &sessions,
+            &ledger,
+            &nonces,
+            100,
+        )
+        .unwrap();
+        // Simulates post-restart: the resolver carries the retired
+        // generation's recorded verifying key.
+        let resolver = issuer_resolver(&old_keys);
+        let mut map = HashMap::new();
+        map.insert(doc.lease_id.clone(), doc.clone());
+        let validated = validate_chain(
+            &map,
+            std::slice::from_ref(&doc.lease_id),
+            &RevocationIndex::new(),
+            &sessions,
+            &resolver,
+            &HashSet::new(),
+            300,
+        )
+        .unwrap();
+        assert_eq!(validated.leaf.lease_id, doc.lease_id);
+    }
+
+    /// A root lease naming an unrecorded generation fails closed with
+    /// `UnknownIssuerGeneration` (distinct from `IssuerMismatch`).
+    #[test]
+    fn unknown_generation_fails_closed() {
+        let (old_keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let doc = mint_root_lease(
+            root_params(parent_scope()),
+            &old_keys,
+            &sessions,
+            &ledger,
+            &nonces,
+            100,
+        )
+        .unwrap();
+        // Resolver knows only a different (fresh) generation.
+        let (new_keys, _, _) = test_keys();
+        let resolver = issuer_resolver(&new_keys);
+        let mut map = HashMap::new();
+        map.insert(doc.lease_id.clone(), doc.clone());
+        let err = validate_chain(
+            &map,
+            std::slice::from_ref(&doc.lease_id),
+            &RevocationIndex::new(),
+            &sessions,
+            &resolver,
+            &HashSet::new(),
+            300,
+        )
+        .expect_err("unknown generation must fail closed");
+        assert!(
+            matches!(err, LeaseError::UnknownIssuerGeneration(ref id) if id == &old_keys.issuer_key_id),
+            "got {err:?}"
+        );
+    }
+
+    /// A killed generation fails closed with `KilledIssuerGeneration`,
+    /// checked before key resolution.
+    #[test]
+    fn killed_generation_fails_closed() {
+        let (old_keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let doc = mint_root_lease(
+            root_params(parent_scope()),
+            &old_keys,
+            &sessions,
+            &ledger,
+            &nonces,
+            100,
+        )
+        .unwrap();
+        let mut resolver = issuer_resolver(&old_keys);
+        resolver.kill(&old_keys.issuer_key_id);
+        let mut map = HashMap::new();
+        map.insert(doc.lease_id.clone(), doc.clone());
+        let err = validate_chain(
+            &map,
+            std::slice::from_ref(&doc.lease_id),
+            &RevocationIndex::new(),
+            &sessions,
+            &resolver,
+            &HashSet::new(),
+            300,
+        )
+        .expect_err("killed generation must fail closed");
+        assert!(
+            matches!(err, LeaseError::KilledIssuerGeneration(ref id) if id == &old_keys.issuer_key_id),
+            "got {err:?}"
+        );
+    }
+
+    /// Root leases longer than 30 days are refused at mint time.
+    #[test]
+    fn root_mint_rejects_overlong_lifetime() {
+        let (keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let mut params = root_params(parent_scope());
+        params.lease_nonce = "overlong-nonce".to_string();
+        params.issued_at_ms = 100;
+        params.limits.not_before_ms = 100;
+        params.limits.expires_at_ms = 100 + MAX_ROOT_LEASE_LIFETIME_MS + 1;
+        let err = mint_root_lease(params, &keys, &sessions, &ledger, &nonces, 100)
+            .expect_err("over-30-day root lease must be refused");
+        assert!(
+            matches!(err, LeaseError::ExceedsMaxLifetime(l, m) if l == MAX_ROOT_LEASE_LIFETIME_MS + 1 && m == MAX_ROOT_LEASE_LIFETIME_MS),
+            "got {err:?}"
+        );
+        // Exactly at the cap still mints.
+        let mut params = root_params(parent_scope());
+        params.lease_nonce = "at-cap-nonce".to_string();
+        params.issued_at_ms = 100;
+        params.limits.not_before_ms = 100;
+        params.limits.expires_at_ms = 100 + MAX_ROOT_LEASE_LIFETIME_MS;
+        mint_root_lease(params, &keys, &sessions, &ledger, &nonces, 100)
+            .expect("30-day root lease mints");
+    }
+
+    /// Session TTL: a record past `max_lifetime_ms` is not a live
+    /// descendant, at every hop of the walk.
+    #[test]
+    fn session_ttl_bounds_descendant_check() {
+        use rand::rngs::OsRng;
+        let parent_vk = SigningKey::generate(&mut OsRng).verifying_key();
+        let child_vk = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut sessions = SessionRegistry::new();
+        sessions.set_max_lifetime(Some(DEFAULT_SESSION_MAX_LIFETIME_MS));
+        sessions.register("ed25519:parent-session".to_string(), None, parent_vk, 0);
+        sessions.register(
+            "ed25519:child-session".to_string(),
+            Some("ed25519:parent-session".to_string()),
+            child_vk,
+            0,
+        );
+        // Within the TTL both walk.
+        assert!(sessions.is_active_descendant(
+            "ed25519:child-session",
+            "ed25519:parent-session",
+            DEFAULT_SESSION_MAX_LIFETIME_MS - 1
+        ));
+        // Past the TTL the child is dead at every hop (parent is expired
+        // too, so the walk fails even if the child's own record were fresh).
+        assert!(!sessions.is_active_descendant(
+            "ed25519:child-session",
+            "ed25519:parent-session",
+            DEFAULT_SESSION_MAX_LIFETIME_MS + 1
+        ));
+        assert!(!sessions.is_active_descendant(
+            "ed25519:parent-session",
+            "ed25519:parent-session",
+            DEFAULT_SESSION_MAX_LIFETIME_MS + 1
+        ));
+        // Re-registered fresh, the child walks again.
+        sessions.register(
+            "ed25519:child-session".to_string(),
+            Some("ed25519:parent-session".to_string()),
+            child_vk,
+            DEFAULT_SESSION_MAX_LIFETIME_MS,
+        );
+        assert!(sessions.is_active_descendant(
+            "ed25519:child-session",
+            "ed25519:child-session",
+            DEFAULT_SESSION_MAX_LIFETIME_MS + 1
+        ));
+    }
+
+    /// `active_descendants_inclusive` returns the TTL-checked subtree,
+    /// inclusive of the root, excluding inactive records.
+    #[test]
+    fn active_descendants_inclusive_correctness() {
+        use rand::rngs::OsRng;
+        let vks: Vec<VerifyingKey> = (0..4)
+            .map(|_| SigningKey::generate(&mut OsRng).verifying_key())
+            .collect();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("root".to_string(), None, vks[0], 0);
+        sessions.register("a".to_string(), Some("root".to_string()), vks[1], 0);
+        sessions.register("b".to_string(), Some("a".to_string()), vks[2], 0);
+        sessions.register("sibling".to_string(), None, vks[3], 0);
+        assert_eq!(
+            sessions.active_descendants_inclusive("root", 1_000),
+            vec!["a".to_string(), "b".to_string(), "root".to_string()]
+        );
+        // Deactivating `a` prunes its subtree but not the root.
+        sessions.deactivate("a");
+        assert_eq!(
+            sessions.active_descendants_inclusive("root", 1_000),
+            vec!["root".to_string()]
+        );
+        // TTL expiry prunes everything.
+        sessions.set_max_lifetime(Some(500));
+        assert!(
+            sessions
+                .active_descendants_inclusive("root", 1_000)
+                .is_empty()
+        );
+        // `get()` keeps its no-TTL-filter semantics: the host decides
+        // hydration.
+        assert!(sessions.get("root").is_some());
     }
 }

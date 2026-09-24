@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use proptest::prelude::*;
 use rand::rngs::OsRng;
 use semver::{Version, VersionReq};
@@ -33,10 +33,10 @@ use lumen_core::{
     },
     kernel_audit::{AuditStore, KernelAuditLog, MemoryAuditStore},
     lease::{
-        AuthorizeParams, CanonicalAction, ChildLeaseParams, KernelKeys, LeaseDocument, LeaseError,
-        LeaseLimits, OneShotGrant, RevocationIndex, RootLeaseParams, SessionRegistry,
-        authorize_envelope, consume_single_use, mint_child_lease, mint_one_shot_lease,
-        mint_root_lease, validate_chain,
+        AuthorizeParams, CanonicalAction, ChildLeaseParams, IssuerKeyResolver, KernelKeys,
+        LeaseDocument, LeaseError, LeaseLimits, OneShotGrant, RevocationIndex, RootLeaseParams,
+        SessionRegistry, authorize_envelope, consume_single_use, mint_child_lease,
+        mint_one_shot_lease, mint_root_lease, validate_chain,
     },
     nonce::NonceStore,
 };
@@ -112,9 +112,35 @@ fn test_sessions(sks: &[SigningKey]) -> SessionRegistry {
         } else {
             Some(format!("ed25519:session-{}", i - 1))
         };
-        reg.register(subject, parent, sk.verifying_key());
+        reg.register(subject, parent, sk.verifying_key(), 0);
     }
     reg
+}
+
+/// Test issuer-key resolver pre-loaded with the current generation.
+#[derive(Default)]
+struct TestIssuerResolver {
+    keys: std::collections::HashMap<String, VerifyingKey>,
+    killed: std::collections::HashSet<String>,
+}
+
+impl TestIssuerResolver {
+    fn for_keys(keys: &KernelKeys) -> Self {
+        let mut r = Self::default();
+        r.keys
+            .insert(keys.issuer_key_id.clone(), keys.issuer_verifying());
+        r
+    }
+}
+
+impl IssuerKeyResolver for TestIssuerResolver {
+    fn issuer_verifying_key(&self, key_id: &str) -> Option<VerifyingKey> {
+        self.keys.get(key_id).copied()
+    }
+
+    fn is_generation_killed(&self, key_id: &str) -> bool {
+        self.killed.contains(key_id)
+    }
 }
 
 fn exec_budget(n: u64) -> Budget {
@@ -613,7 +639,8 @@ proptest! {
                 cur = p;
             }
             let one_shot = HashSet::new();
-            let result = validate_chain(&map, &chain_ids, &revocations, &sessions, &keys, &one_shot, 10);
+            let resolver = TestIssuerResolver::for_keys(&keys);
+            let result = validate_chain(&map, &chain_ids, &revocations, &sessions, &resolver, &one_shot, 10);
             let mut cur_idx = i;
             let mut is_descendant = false;
             loop {
@@ -723,7 +750,7 @@ proptest! {
     ) {
         let (keys, sks) = test_keys(1);
         let mut sessions = SessionRegistry::new();
-        sessions.register("ed25519:session-0".to_string(), None, sks[0].verifying_key());
+        sessions.register("ed25519:session-0".to_string(), None, sks[0].verifying_key(), 0);
         let ledger = BudgetLedger::new();
         let nonces = NonceStore::new();
         let r = FakeResolver::default();
@@ -793,13 +820,14 @@ proptest! {
             allow_approval_fallback: false, approval_ttl_ms: 60_000,
         };
         let mut outbox: Vec<lumen_core::lease::VhlRequest> = vec![];
+        let resolver = TestIssuerResolver::for_keys(&keys);
         let d1 = authorize_envelope(
-            &env2, &r, &map, &RevocationIndex::new(), &sessions, &keys,
+            &env2, &r, &map, &RevocationIndex::new(), &sessions, &resolver,
             &mut tracker2, &nonces, &ledger, &mut outbox, &params,
         );
         prop_assert!(d1.is_allow(), "first use denied: {:?}", d1);
         let d2 = authorize_envelope(
-            &env2, &r, &map, &RevocationIndex::new(), &sessions, &keys,
+            &env2, &r, &map, &RevocationIndex::new(), &sessions, &resolver,
             &mut tracker2, &nonces, &ledger, &mut outbox, &params,
         );
         prop_assert!(!d2.is_allow(), "replay allowed!");
