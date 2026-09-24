@@ -284,7 +284,7 @@ pub fn resolve_image(
         ("vmlinux", manifest.kernel_digest.as_str()),
         ("rootfs.ext4", manifest.rootfs_digest.as_str()),
         (
-            "workspace-template.qcow2",
+            "workspace-template.raw",
             manifest.workspace_template_digest.as_str(),
         ),
     ] {
@@ -422,7 +422,7 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
         std::fs::write(dir.join("vmlinux"), kernel).unwrap();
         std::fs::write(dir.join("rootfs.ext4"), rootfs).unwrap();
-        std::fs::write(dir.join("workspace-template.qcow2"), ws).unwrap();
+        std::fs::write(dir.join("workspace-template.raw"), ws).unwrap();
 
         let resolved = resolve_image(tmp.path(), &digest, &[key.verifying_key()]).unwrap();
         assert_eq!(resolved.image_digest, digest);

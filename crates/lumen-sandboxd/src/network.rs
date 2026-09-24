@@ -285,6 +285,13 @@ pub fn render_nftables(plan: &NetPlan) -> String {
     }}
     chain forward {{
         type filter hook forward priority 0; policy drop;
+        # Guest -> host DNS/proxy. The TAP and the host leg are bridged,
+        # so guest traffic traverses this chain (via br_netfilter); only
+        # the allowlisted flows pass.
+        ip daddr {host} udp dport 53 accept
+        ip daddr {host} tcp dport 53 accept
+        ip daddr {host} tcp dport {proxy} accept
+        ct state established,related accept
     }}
 }}
 "#,
