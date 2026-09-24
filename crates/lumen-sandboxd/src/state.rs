@@ -451,8 +451,12 @@ impl RunStore {
 /// Abstraction over the host for reconciliation. The real implementation
 /// shells out to `/proc` and `ip`; tests inject [`FakeSystemView`].
 pub trait SystemView {
-    /// PIDs of firecracker processes tied to our chroot base.
-    fn firecracker_pids(&self) -> Vec<(u32, String)>;
+    /// PIDs of firecracker processes that belong to THIS sandboxd: the
+    /// process's cgroup (from `/proc/<pid>/cgroup`) must be at or under
+    /// `cgroup_parent`, or its root (from `/proc/<pid>/root`) under
+    /// `chroot_base`. The stray sweep SIGKILLs these, so an unscoped match
+    /// would kill other tenants' VMMs on a shared host.
+    fn firecracker_pids(&self, cgroup_parent: &Path, chroot_base: &Path) -> Vec<(u32, String)>;
     fn pid_alive(&self, pid: u32) -> bool;
     /// Kill every process in the run's cgroup (preferred) or the pid.
     fn kill_cgroup(&mut self, cgroup_path: &Path) -> io::Result<()>;
@@ -462,6 +466,12 @@ pub trait SystemView {
     fn tap_names(&self, prefix: &str) -> Vec<String>;
     fn delete_tap(&mut self, name: &str) -> io::Result<()>;
     fn remove_dir(&mut self, path: &Path) -> io::Result<()>;
+    /// Remove a cgroup directory with rmdir semantics (NOT recursive).
+    /// cgroupfs control files cannot be unlinked, so `remove_dir_all` always
+    /// fails on cgroupfs; callers must [`kill_cgroup`] first — cgroupfs
+    /// refuses to rmdir a non-empty cgroup. `NotFound` (already gone) is
+    /// success.
+    fn remove_cgroup(&mut self, path: &Path) -> io::Result<()>;
     /// Remove a single file. `NotFound` (already gone) is success.
     fn remove_file(&mut self, path: &Path) -> io::Result<()>;
     /// PIDs currently in the run's cgroup. Empty when the cgroup is gone
@@ -549,6 +559,41 @@ fn already_gone(result: io::Result<()>) -> Result<(), String> {
     }
 }
 
+/// True when a candidate firecracker pid belongs to this sandboxd: its
+/// cgroup (the `/proc/<pid>/cgroup` text) is at or under `cgroup_parent`,
+/// or its root (the `/proc/<pid>/root` target) is under `chroot_base`.
+///
+/// Pure so the stray sweep's scoping rule is unit-testable; the `/proc`
+/// reads stay in the [`HostSystemView`] impl.
+fn pid_in_scope(
+    proc_cgroup: &str,
+    proc_root: Option<&Path>,
+    cgroup_parent: &Path,
+    chroot_base: &Path,
+) -> bool {
+    // cgroup v2 lines look like `0::/lumen/lmn-abc`: the path is relative
+    // to the cgroupfs mount. Reduce the configured parent to the same frame
+    // before comparing.
+    let rel_parent = cgroup_parent
+        .strip_prefix("/sys/fs/cgroup")
+        .unwrap_or(cgroup_parent)
+        .to_string_lossy();
+    let rel_parent = rel_parent.trim_start_matches('/');
+    for line in proc_cgroup.lines() {
+        let member = line.split(':').nth(2).unwrap_or("").trim();
+        let member = member.strip_prefix('/').unwrap_or(member);
+        if !rel_parent.is_empty()
+            && (member == rel_parent || member.starts_with(&format!("{rel_parent}/")))
+        {
+            return true;
+        }
+    }
+    match proc_root {
+        Some(root) => root.starts_with(chroot_base),
+        None => false,
+    }
+}
+
 /// Tear down every artifact belonging to one run, VERIFYING each step's
 /// postcondition instead of assuming the operation worked.
 ///
@@ -625,11 +670,13 @@ fn teardown_run<S: SystemView>(
         failures.push(format!("processes unconfirmed ({})", detail.join(", ")));
     }
 
-    // 2. Cgroup dir: remove, then confirm gone. (cgroupfs refuses to rmdir
-    //    a non-empty cgroup, so a removal failure here usually means step 1
-    //    is also unconfirmed — both are reported.)
+    // 2. Cgroup dir: rmdir (NOT recursive — cgroupfs control files cannot
+    //    be unlinked, so remove_dir_all always fails on cgroupfs), then
+    //    confirm gone. (cgroupfs refuses to rmdir a non-empty cgroup, so a
+    //    removal failure here usually means step 1 is also unconfirmed —
+    //    both are reported.)
     let cgroup_existed = sys.path_exists(&cgroup_dir);
-    let cgroup_rm_err = already_gone(sys.remove_dir(&cgroup_dir)).err();
+    let cgroup_rm_err = already_gone(sys.remove_cgroup(&cgroup_dir)).err();
     if sys.path_exists(&cgroup_dir) {
         let mut detail = format!("cgroup dir {} still exists", cgroup_dir.display());
         if let Some(e) = cgroup_rm_err {
@@ -701,6 +748,133 @@ fn teardown_run<S: SystemView>(
     }
 }
 
+/// One teardown attempt for a single run, shared by [`reconcile`] and
+/// [`retry_teardown_failed`].
+///
+/// Runs `teardown_run`, attributes ONLY this run's removed artifacts to its
+/// journal entry (the report is shared across runs, so the per-run slice is
+/// cut by snapshotting the report lengths first), and moves the record to
+/// `Destroyed` (releasing the UID) or to the nonterminal `TeardownFailed`
+/// state (retaining the record, the UID, and the alert).
+fn attempt_teardown<S: SystemView>(
+    store: &RunStore,
+    run: &RunRecord,
+    sys: &mut S,
+    netns_prefix: &str,
+    tap_prefix: &str,
+    report: &mut ReconcileReport,
+    release_uid: &mut impl FnMut(u32),
+) -> Result<(), SandboxdError> {
+    let run_id = run.run_id.clone();
+    // Snapshot the report lengths: teardown_run appends to the SHARED
+    // report, so without this the Nth run's ArtifactsRemoved entry would
+    // also list runs 1..N-1's artifacts.
+    let base_dirs = report.removed_dirs.len();
+    let base_netns = report.removed_netns.len();
+    let base_taps = report.removed_taps.len();
+    match teardown_run(run, sys, netns_prefix, tap_prefix, report) {
+        Ok(()) => {
+            let removed: Vec<String> = report.removed_dirs[base_dirs..]
+                .iter()
+                .chain(&report.removed_netns[base_netns..])
+                .chain(&report.removed_taps[base_taps..])
+                .cloned()
+                .collect();
+            store.record_artifacts_removed(&run_id, removed)?;
+            release_uid(run.artifacts.uid);
+            report.released_uids.push(run.artifacts.uid);
+            store.transition(&run_id, RunState::Destroying)?;
+            store.transition(&run_id, RunState::Destroyed)?;
+        }
+        Err(failures) => {
+            // Fail closed per design invariant (7): the alert is
+            // journaled BEFORE the run enters the nonterminal state.
+            // If the journal write fails, this returns Err and the run
+            // stays Orphaned/Destroying — retried by the next pass —
+            // instead of being silently dropped.
+            let attempt = run.teardown_attempts.saturating_add(1);
+            let detail = failures.join("; ");
+            eprintln!(
+                "sandboxd: ERROR teardown of run {run_id} unconfirmed \
+                 (attempt {attempt}): {detail}. Record retained in \
+                 TeardownFailed; retrying with backoff."
+            );
+            store.teardown_attempt(&run_id, attempt, failures)?;
+            if run.state != RunState::TeardownFailed {
+                store.transition(&run_id, RunState::TeardownFailed)?;
+            }
+            report.teardown_failed.push(run_id.clone());
+            // NOTE: the UID is deliberately NOT released here: the run
+            // may still hold live processes, netns, or files.
+        }
+    }
+    Ok(())
+}
+
+/// Retry teardown for runs stuck in [`RunState::TeardownFailed`] whose
+/// backoff has elapsed. Unlike [`reconcile`], this NEVER touches runs in
+/// any other state: an active (`Running`, `Prepared`, ...) run belongs to
+/// the live daemon and must not be disturbed. Backoff and persistence are
+/// the same as the startup path: attempts are journaled, the backoff
+/// doubles per consecutive failure, and a verified teardown marks the run
+/// `Destroyed` and releases its UID.
+///
+/// This is the workhorse behind the daemon's periodic teardown-retry task
+/// (see `main.rs`): blocking, so run it in `spawn_blocking`.
+pub fn retry_teardown_failed<S: SystemView>(
+    store: &RunStore,
+    sys: &mut S,
+    netns_prefix: &str,
+    tap_prefix: &str,
+    mut release_uid: impl FnMut(u32),
+) -> Result<ReconcileReport, SandboxdError> {
+    let mut report = ReconcileReport::default();
+    for run in store.all_runs()? {
+        // ONLY TeardownFailed records. Anything else is live daemon state.
+        if run.state != RunState::TeardownFailed {
+            continue;
+        }
+        let run_id = run.run_id.clone();
+        if !teardown_retry_due(&run) {
+            // Backoff has not elapsed: keep the record for a later pass.
+            report.teardown_failed.push(run_id);
+            continue;
+        }
+        store.note(
+            &run_id,
+            format!("teardown retry (attempt {})", run.teardown_attempts + 1),
+        )?;
+        let reloaded = store.load(&run_id)?;
+        attempt_teardown(
+            store,
+            &reloaded,
+            sys,
+            netns_prefix,
+            tap_prefix,
+            &mut report,
+            &mut release_uid,
+        )?;
+    }
+    Ok(report)
+}
+
+/// Parameters for [`reconcile`], grouped so the call sites stay readable.
+/// See the function docs for what each field does.
+#[derive(Debug, Clone, Copy)]
+pub struct ReconcileConfig<'a> {
+    /// Chroot base for jail dirs and the stray-pid root-ownership check.
+    pub chroot_base: &'a Path,
+    /// Firecracker binary path (used to locate the jail parent dir).
+    pub firecracker_bin: &'a Path,
+    /// Cgroup parent under which this daemon's VMMs run; scopes the
+    /// stray-pid sweep so other tenants' VMMs are never touched.
+    pub cgroup_parent: &'a Path,
+    /// Netns name prefix (e.g. `"lmn-"`).
+    pub netns_prefix: &'a str,
+    /// TAP name prefix (e.g. `"lmnt-"`).
+    pub tap_prefix: &'a str,
+}
+
 /// Daemon-startup crash recovery. For every run that is not `Destroyed`:
 /// mark `Orphaned`, reclaim all artifacts with a postcondition-verified
 /// teardown, release its UID, mark `Destroyed`. A teardown that leaves any
@@ -716,10 +890,7 @@ fn teardown_run<S: SystemView>(
 pub fn reconcile<S: SystemView>(
     store: &RunStore,
     sys: &mut S,
-    chroot_base: &Path,
-    firecracker_bin: &Path,
-    netns_prefix: &str,
-    tap_prefix: &str,
+    cfg: &ReconcileConfig<'_>,
     mut release_uid: impl FnMut(u32),
 ) -> Result<ReconcileReport, SandboxdError> {
     let mut report = ReconcileReport::default();
@@ -758,66 +929,40 @@ pub fn reconcile<S: SystemView>(
         report.orphaned_runs.push(run_id.clone());
 
         let reloaded = store.load(&run_id)?;
-        match teardown_run(&reloaded, sys, netns_prefix, tap_prefix, &mut report) {
-            Ok(()) => {
-                let removed: Vec<String> = report
-                    .removed_dirs
-                    .iter()
-                    .chain(report.removed_netns.iter())
-                    .chain(report.removed_taps.iter())
-                    .cloned()
-                    .collect();
-                store.record_artifacts_removed(&run_id, removed)?;
-                release_uid(reloaded.artifacts.uid);
-                report.released_uids.push(reloaded.artifacts.uid);
-                store.transition(&run_id, RunState::Destroying)?;
-                store.transition(&run_id, RunState::Destroyed)?;
-            }
-            Err(failures) => {
-                // Fail closed per design invariant (7): the alert is
-                // journaled BEFORE the run enters the nonterminal state.
-                // If the journal write fails, this returns Err and the run
-                // stays Orphaned/Destroying — retried by the next reconcile
-                // — instead of being silently dropped.
-                let attempt = reloaded.teardown_attempts.saturating_add(1);
-                let detail = failures.join("; ");
-                eprintln!(
-                    "sandboxd: ERROR teardown of run {run_id} unconfirmed \
-                     (attempt {attempt}): {detail}. Record retained in \
-                     TeardownFailed; retrying with backoff."
-                );
-                store.teardown_attempt(&run_id, attempt, failures)?;
-                if reloaded.state != RunState::TeardownFailed {
-                    store.transition(&run_id, RunState::TeardownFailed)?;
-                }
-                report.teardown_failed.push(run_id.clone());
-                // NOTE: the UID is deliberately NOT released here: the run
-                // may still hold live processes, netns, or files.
-            }
-        }
+        attempt_teardown(
+            store,
+            &reloaded,
+            sys,
+            cfg.netns_prefix,
+            cfg.tap_prefix,
+            &mut report,
+            &mut release_uid,
+        )?;
     }
 
     // Recompute live sets (only Destroyed runs remain, which hold nothing).
     let _ = (live_jail_ids, live_netns, live_taps);
 
     // Sweep strays: firecracker pids, netns, TAPs, jail dirs with no run.
-    for (pid, _cmdline) in sys.firecracker_pids() {
+    // The pid sweep is scoped to OUR cgroup parent / chroot base so other
+    // tenants' VMMs on a shared host are never touched.
+    for (pid, _cmdline) in sys.firecracker_pids(cfg.cgroup_parent, cfg.chroot_base) {
         let _ = sys.kill_pid(pid);
         report.killed_pids.push(pid);
     }
-    for ns in sys.netns_names(netns_prefix) {
+    for ns in sys.netns_names(cfg.netns_prefix) {
         if sys.delete_netns(&ns).is_ok() {
             report.removed_netns.push(ns);
         }
     }
-    for tap in sys.tap_names(tap_prefix) {
+    for tap in sys.tap_names(cfg.tap_prefix) {
         if sys.delete_tap(&tap).is_ok() {
             report.removed_taps.push(tap);
         }
     }
     // The jailer nests per-id jails under <chroot_base>/<exec_file_name>;
     // scan that directory, not a hardcoded `firecracker` component.
-    let jail_root = jailer::jail_parent(chroot_base, firecracker_bin);
+    let jail_root = jailer::jail_parent(cfg.chroot_base, cfg.firecracker_bin);
     for jail_id in sys.jail_dirs(&jail_root) {
         let dir = jail_root.join(&jail_id);
         if sys.remove_dir(&dir).is_ok() {
@@ -851,7 +996,10 @@ pub struct FakeSystemView {
 }
 
 impl SystemView for FakeSystemView {
-    fn firecracker_pids(&self) -> Vec<(u32, String)> {
+    fn firecracker_pids(&self, _cgroup_parent: &Path, _chroot_base: &Path) -> Vec<(u32, String)> {
+        // Hermetic: tests plant only the pids they want swept, so the
+        // scoping rule (a HostSystemView concern) is not modelled here —
+        // see the `pid_in_scope` unit tests.
         self.pids
             .iter()
             .filter(|(pid, _)| self.alive.contains(pid))
@@ -938,6 +1086,19 @@ impl SystemView for FakeSystemView {
         }
     }
 
+    fn remove_cgroup(&mut self, path: &Path) -> io::Result<()> {
+        // Hermetic: dirs are a set, so rmdir-vs-recursive is not modelled;
+        // the distinction only matters on real cgroupfs.
+        if self.remove_fail {
+            return Err(io::Error::other("remove cgroup failed"));
+        }
+        if self.dirs.remove(path) {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        }
+    }
+
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
         if self.remove_fail {
             return Err(io::Error::other("remove file failed"));
@@ -997,7 +1158,7 @@ impl HostSystemView {
 }
 
 impl SystemView for HostSystemView {
-    fn firecracker_pids(&self) -> Vec<(u32, String)> {
+    fn firecracker_pids(&self, cgroup_parent: &Path, chroot_base: &Path) -> Vec<(u32, String)> {
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return out;
@@ -1020,7 +1181,15 @@ impl SystemView for HostSystemView {
                 .next()
                 .map(|s| String::from_utf8_lossy(s).into_owned())
                 .unwrap_or_default();
-            if prog.contains("firecracker") {
+            if !prog.contains("firecracker") {
+                continue;
+            }
+            // Scope the sweep to OUR VMMs: the cgroup must be under our
+            // parent, or the process root under our chroot base. Never
+            // SIGKILL another tenant's Firecracker on a shared host.
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+            let root = std::fs::read_link(format!("/proc/{pid}/root")).ok();
+            if pid_in_scope(&cgroup, root.as_deref(), cgroup_parent, chroot_base) {
                 out.push((pid, prog));
             }
         }
@@ -1085,6 +1254,16 @@ impl SystemView for HostSystemView {
 
     fn remove_dir(&mut self, path: &Path) -> io::Result<()> {
         match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn remove_cgroup(&mut self, path: &Path) -> io::Result<()> {
+        // rmdir, NOT remove_dir_all: cgroupfs control files cannot be
+        // unlinked, so a recursive removal always fails on cgroupfs.
+        match std::fs::remove_dir(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -1280,16 +1459,7 @@ mod tests {
         sys.dirs.insert(artifacts.staging_dir.clone());
 
         let mut released = Vec::new();
-        let report = reconcile(
-            &store,
-            &mut sys,
-            Path::new("/srv/jailer"),
-            Path::new("/usr/bin/firecracker"),
-            "lmn-",
-            "lmnt-",
-            |uid| released.push(uid),
-        )
-        .unwrap();
+        let report = reconcile(&store, &mut sys, &test_cfg(), |uid| released.push(uid)).unwrap();
 
         assert_eq!(report.orphaned_runs, vec!["lmn-dead01".to_string()]);
         assert!(report.killed_pids.contains(&4242));
@@ -1314,16 +1484,7 @@ mod tests {
         sys.dirs
             .insert(PathBuf::from("/srv/jailer/firecracker/lmn-stray01"));
 
-        let report = reconcile(
-            &store,
-            &mut sys,
-            Path::new("/srv/jailer"),
-            Path::new("/usr/bin/firecracker"),
-            "lmn-",
-            "lmnt-",
-            |_| {},
-        )
-        .unwrap();
+        let report = reconcile(&store, &mut sys, &test_cfg(), |_| {}).unwrap();
 
         assert!(report.orphaned_runs.is_empty());
         assert!(report.killed_pids.contains(&9999));
@@ -1339,16 +1500,7 @@ mod tests {
         sys.netns.insert("other-ns".into());
         sys.taps.insert("eth0".into());
 
-        let report = reconcile(
-            &store,
-            &mut sys,
-            Path::new("/srv/jailer"),
-            Path::new("/usr/bin/firecracker"),
-            "lmn-",
-            "lmnt-",
-            |_| {},
-        )
-        .unwrap();
+        let report = reconcile(&store, &mut sys, &test_cfg(), |_| {}).unwrap();
 
         assert!(report.is_clean());
         assert!(sys.netns.contains("other-ns"));
@@ -1367,27 +1519,9 @@ mod tests {
             )
             .unwrap();
         let mut sys = FakeSystemView::default();
-        let r1 = reconcile(
-            &store,
-            &mut sys,
-            Path::new("/srv/jailer"),
-            Path::new("/usr/bin/firecracker"),
-            "lmn-",
-            "lmnt-",
-            |_| {},
-        )
-        .unwrap();
+        let r1 = reconcile(&store, &mut sys, &test_cfg(), |_| {}).unwrap();
         assert_eq!(r1.orphaned_runs.len(), 1);
-        let r2 = reconcile(
-            &store,
-            &mut sys,
-            Path::new("/srv/jailer"),
-            Path::new("/usr/bin/firecracker"),
-            "lmn-",
-            "lmnt-",
-            |_| {},
-        )
-        .unwrap();
+        let r2 = reconcile(&store, &mut sys, &test_cfg(), |_| {}).unwrap();
         assert!(r2.is_clean());
     }
 
@@ -1417,21 +1551,22 @@ mod tests {
             .collect()
     }
 
+    fn test_cfg() -> ReconcileConfig<'static> {
+        ReconcileConfig {
+            chroot_base: Path::new("/srv/jailer"),
+            firecracker_bin: Path::new("/usr/bin/firecracker"),
+            cgroup_parent: Path::new("/sys/fs/cgroup/lumen"),
+            netns_prefix: "lmn-",
+            tap_prefix: "lmnt-",
+        }
+    }
+
     fn reconcile_all(
         store: &RunStore,
         sys: &mut FakeSystemView,
         released: &mut Vec<u32>,
     ) -> ReconcileReport {
-        reconcile(
-            store,
-            sys,
-            Path::new("/srv/jailer"),
-            Path::new("/usr/bin/firecracker"),
-            "lmn-",
-            "lmnt-",
-            |uid| released.push(uid),
-        )
-        .unwrap()
+        reconcile(store, sys, &test_cfg(), |uid| released.push(uid)).unwrap()
     }
 
     #[test]
@@ -1572,6 +1707,172 @@ mod tests {
         fn record_attempts(store: &RunStore) -> u32 {
             store.load("lmn-tbo01").unwrap().teardown_attempts
         }
+    }
+
+    #[test]
+    fn retry_teardown_failed_leaves_other_states_alone() {
+        // The periodic retry must NEVER touch active runs: only
+        // TeardownFailed records are eligible. A Running run keeps its
+        // artifacts and its state.
+        let (_tmp, store) = test_store();
+        let artifacts = test_artifacts("live01");
+        store
+            .create(
+                "lmn-live01",
+                test_spec(),
+                "sha256:s".into(),
+                artifacts.clone(),
+            )
+            .unwrap();
+        store.transition("lmn-live01", RunState::Running).unwrap();
+
+        let mut sys = dirty_sys(&artifacts);
+        let mut released = Vec::new();
+        let report =
+            retry_teardown_failed(&store, &mut sys, "lmn-", "lmnt-", |uid| released.push(uid))
+                .unwrap();
+
+        assert!(report.is_clean());
+        assert_eq!(store.load("lmn-live01").unwrap().state, RunState::Running);
+        assert!(released.is_empty());
+        // Nothing was reclaimed: the "dead daemon left it" host view is
+        // untouched.
+        assert!(sys.pid_alive(4242));
+        assert!(sys.netns.contains(&artifacts.netns_name));
+        assert!(sys.dirs.contains(&artifacts.chroot_dir));
+    }
+
+    #[test]
+    fn retry_teardown_failed_retries_due_records() {
+        let (_tmp, store) = test_store();
+        let artifacts = test_artifacts("rtf01");
+        store
+            .create(
+                "lmn-rtf01",
+                test_spec(),
+                "sha256:s".into(),
+                artifacts.clone(),
+            )
+            .unwrap();
+        store.transition("lmn-rtf01", RunState::Running).unwrap();
+
+        // First pass via reconcile: kill fails, run lands in TeardownFailed.
+        let mut sys = dirty_sys(&artifacts);
+        sys.kill_fail = true;
+        let mut released = Vec::new();
+        reconcile_all(&store, &mut sys, &mut released);
+        assert_eq!(
+            store.load("lmn-rtf01").unwrap().state,
+            RunState::TeardownFailed
+        );
+
+        // Retry while the backoff has not elapsed: left alone, no new alert.
+        sys.kill_fail = false;
+        let report =
+            retry_teardown_failed(&store, &mut sys, "lmn-", "lmnt-", |uid| released.push(uid))
+                .unwrap();
+        assert_eq!(report.teardown_failed, vec!["lmn-rtf01".to_string()]);
+        assert_eq!(
+            store.load("lmn-rtf01").unwrap().state,
+            RunState::TeardownFailed
+        );
+
+        // Backoff elapsed and the host is healthy: the retry reclaims the
+        // run and releases its UID.
+        let past = now_unix().saturating_sub(TEARDOWN_RETRY_MAX_SECS + 1);
+        store.set_updated_at_for_test("lmn-rtf01", past).unwrap();
+        let report =
+            retry_teardown_failed(&store, &mut sys, "lmn-", "lmnt-", |uid| released.push(uid))
+                .unwrap();
+        assert!(report.teardown_failed.is_empty());
+        assert_eq!(store.load("lmn-rtf01").unwrap().state, RunState::Destroyed);
+        assert_eq!(released, vec![61000]);
+        assert!(!sys.pid_alive(4242));
+    }
+
+    #[test]
+    fn artifacts_removed_lists_only_this_runs_artifacts() {
+        // Two orphaned runs reclaimed by one reconcile: each run's
+        // ArtifactsRemoved journal entry must name only its own artifacts.
+        let (_tmp, store) = test_store();
+        let a1 = test_artifacts("att01");
+        let a2 = test_artifacts("att02");
+        for (id, a) in [("lmn-att01", &a1), ("lmn-att02", &a2)] {
+            store
+                .create(id, test_spec(), "sha256:s".into(), a.clone())
+                .unwrap();
+            store.transition(id, RunState::Running).unwrap();
+        }
+
+        let mut sys = FakeSystemView::default();
+        for a in [&a1, &a2] {
+            sys.netns.insert(a.netns_name.clone());
+            sys.taps.insert(a.tap_name.clone());
+            sys.dirs.insert(a.chroot_dir.clone());
+            sys.dirs.insert(a.cgroup_path.clone());
+            sys.dirs.insert(a.staging_dir.clone());
+            sys.files.insert(a.workspace_disk.clone());
+        }
+
+        let mut released = Vec::new();
+        reconcile_all(&store, &mut sys, &mut released);
+
+        for (id, own, other) in [
+            ("lmn-att01", "att01", "att02"),
+            ("lmn-att02", "att02", "att01"),
+        ] {
+            let events = journal_events(&store, id);
+            let removed: Vec<_> = events
+                .iter()
+                .filter(|v| v["event"] == "artifacts_removed")
+                .collect();
+            assert_eq!(removed.len(), 1, "one entry for {id}");
+            let listed: Vec<&str> = removed[0]["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            // Its own artifacts are listed...
+            assert!(
+                listed.iter().any(|s| s.contains(own)),
+                "{id} missing its own artifacts: {listed:?}"
+            );
+            // ...and the OTHER run's artifacts are not.
+            assert!(
+                !listed.iter().any(|s| s.contains(other)),
+                "{id} must not list {other}'s artifacts: {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_in_scope_matches_own_cgroup_or_chroot() {
+        let parent = Path::new("/sys/fs/cgroup/lumen");
+        let chroot = Path::new("/srv/jailer");
+
+        // Our cgroup, nested: in scope.
+        assert!(pid_in_scope("0::/lumen/lmn-abc123\n", None, parent, chroot));
+        // Our cgroup parent itself: in scope.
+        assert!(pid_in_scope("0::/lumen\n", None, parent, chroot));
+        // Another tenant's cgroup, unrelated root: OUT of scope.
+        assert!(!pid_in_scope(
+            "0::/kubepods/besteffort/pod123\n",
+            Some(Path::new("/")),
+            parent,
+            chroot
+        ));
+        // Prefix-sibling cgroup (/lumen2) must not match /lumen.
+        assert!(!pid_in_scope("0::/lumen2/lmn-xyz\n", None, parent, chroot));
+        // Chrooted under our base even with an unrelated cgroup: in scope.
+        assert!(pid_in_scope(
+            "0::/\n",
+            Some(Path::new("/srv/jailer/firecracker/lmn-abc123/root")),
+            parent,
+            chroot
+        ));
+        // Neither: out of scope.
+        assert!(!pid_in_scope("0::/\n", None, parent, chroot));
     }
 
     #[test]

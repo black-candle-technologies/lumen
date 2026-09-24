@@ -19,7 +19,11 @@ use std::path::{Path, PathBuf};
 
 use sha2::Digest;
 
-use crate::{contracts::ResourceLimits, error::SandboxdError};
+use crate::{
+    cgroups::{guest_mem_mib, host_memory_max_mib, vmm_pids_max},
+    contracts::ResourceLimits,
+    error::SandboxdError,
+};
 
 /// Everything the jailer needs to launch one microVM.
 #[derive(Debug, Clone)]
@@ -97,18 +101,22 @@ pub fn validate_jail_id(id: &str) -> Result<(), SandboxdError> {
 /// cgroup v2 settings applied by the jailer `--cgroup` flag, derived from
 /// the run's [`ResourceLimits`].
 ///
-/// - `memory.max`: hard memory cap (OOM kills the VMM, not the host).
+/// - `memory.max`: guest RAM plus VMM overhead (OOM kills the VMM, not the
+///   host) — see [`host_memory_max_mib`];
 /// - `cpu.max`: `<quota> <period>`; quota = vcpu * 100_000 (1 vcpu = 1 core).
-/// - `pids.max`: fork-bomb containment.
+/// - `pids.max`: host-side VMM thread cap (see [`vmm_pids_max`]) — this does
+///   NOT count guest processes, so it is never set from
+///   `ResourceLimits::max_processes` (which is not currently enforced for
+///   guest processes in this phase; see that field's docs).
 /// - `memory.swap.max = 0`: no swap escape hatch.
 pub fn cgroup_settings(limits: &ResourceLimits) -> Vec<(String, String)> {
-    let memory_max = format!("{}M", limits.memory_mib);
+    let memory_max = format!("{}M", host_memory_max_mib(limits));
     let cpu_quota = limits.vcpu.max(1) as u64 * 100_000;
     vec![
         ("memory.max".into(), memory_max),
         ("memory.swap.max".into(), "0".into()),
         ("cpu.max".into(), format!("{cpu_quota} 100000")),
-        ("pids.max".into(), limits.max_processes.to_string()),
+        ("pids.max".into(), vmm_pids_max(limits.vcpu).to_string()),
     ]
 }
 
@@ -131,12 +139,21 @@ pub fn jailer_argv(spec: &JailSpec, fc_args: &[String]) -> Result<Vec<String>, S
     validate_jail_id(&spec.id)?;
     // The jailer requires --parent-cgroup to be a relative path (relative
     // to the cgroup v2 mount). The JailSpec stores the absolute host path;
-    // strip the /sys/fs/cgroup prefix here.
+    // strip the /sys/fs/cgroup prefix here. A parent OUTSIDE /sys/fs/cgroup
+    // is rejected: silently reinterpreting it (e.g. `/custom/lumen` ->
+    // `custom/lumen`, which the jailer resolves under /sys/fs/cgroup) would
+    // put the VMM and our limit files in different cgroups, so kill and
+    // metering would act on the wrong cgroup.
     let parent_cgroup_rel = spec
         .cgroup_parent
         .strip_prefix("/sys/fs/cgroup")
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| spec.cgroup_parent.display().to_string());
+        .map_err(|_| {
+            SandboxdError::InvalidSpec(format!(
+                "cgroup_parent must be under /sys/fs/cgroup, got {}",
+                spec.cgroup_parent.display()
+            ))
+        })?;
+    let parent_cgroup_rel = parent_cgroup_rel.display().to_string();
     let parent_cgroup_rel = parent_cgroup_rel.trim_start_matches('/').to_string();
     let mut argv = vec![
         "--id".into(),
@@ -284,7 +301,7 @@ pub fn render_config(
     FirecrackerConfig {
         machine_config: MachineConfig {
             vcpu_count: limits.vcpu.max(1),
-            mem_size_mib: limits.memory_mib.max(64),
+            mem_size_mib: guest_mem_mib(limits),
             cpu_template: "None".into(),
         },
         boot_source: BootSource {
@@ -329,6 +346,18 @@ pub fn guest_mac(tag: &str) -> String {
     )
 }
 
+/// Host-visible path of the pid file the jailer writes with `--new-pid-ns`:
+/// `<chroot>/firecracker.pid`.
+///
+/// With `--new-pid-ns` the jailer clones into a new PID namespace, writes
+/// the Firecracker child's (host-namespace) pid to this file, and then
+/// EXITS (`exec_into_new_pid_ns` in the jailer source). The supervised
+/// jailer child pid is therefore dead by the time anyone would signal it —
+/// terminate the VMM via this file, never via the jailer pid.
+pub fn firecracker_pid_file(chroot_base: &Path, exec_file: &Path, id: &str) -> PathBuf {
+    jail_root(chroot_base, exec_file, id).join("firecracker.pid")
+}
+
 /// Files the jailer is expected to place in the chroot. Used by the
 /// adversarial test "guest probes VMM socket": the API socket exists, but
 /// only inside the jail, unreachable from the guest's network namespace
@@ -343,6 +372,9 @@ pub fn expected_chroot_entries() -> Vec<&'static str> {
         "workspace.raw", // per-run sparse copy of the template
         "fc-api.sock",   // created by firecracker at runtime (--api-sock)
         "v.sock",        // created by firecracker at runtime
+        // Written by the jailer with --new-pid-ns (host-namespace pid of
+        // the Firecracker child); the VMM termination path reads it.
+        "firecracker.pid",
     ]
 }
 
@@ -395,9 +427,11 @@ mod tests {
         // cgroup v2, not v1.
         let pos = argv.iter().position(|a| a == "--cgroup-version").unwrap();
         assert_eq!(argv[pos + 1], "2");
-        // Quotas present.
-        assert!(joined.contains("memory.max=1024M"));
-        assert!(joined.contains("pids.max=64"));
+        // Quotas present: memory.max = guest RAM (1024) + VMM overhead (128).
+        assert!(joined.contains("memory.max=1152M"));
+        // pids.max is the host-side VMM thread cap (32 + 8*vcpu), not the
+        // guest process limit.
+        assert!(joined.contains("pids.max=48"));
         assert!(joined.contains("cpu.max=200000 100000"));
         assert!(joined.contains("memory.swap.max=0"));
         // No `core` resource limit: jailer v1.10.1 only accepts fsize and
@@ -420,6 +454,42 @@ mod tests {
         assert!(validate_jail_id(&"x".repeat(65)).is_err());
         assert!(validate_jail_id("lmn_abc").is_err());
         assert!(validate_jail_id("../../etc").is_err());
+    }
+
+    #[test]
+    fn rejects_cgroup_parent_outside_sys_fs_cgroup() {
+        let s = spec();
+        let fc = firecracker_argv(Path::new("/api.sock"), Path::new("/config.json"));
+        // /sys/fs/cgroup/lumen -> "lumen".
+        let argv = jailer_argv(&s, &fc).unwrap();
+        let pos = argv.iter().position(|a| a == "--parent-cgroup").unwrap();
+        assert_eq!(argv[pos + 1], "lumen");
+
+        // Outside /sys/fs/cgroup: reject instead of silently reinterpreting
+        // (the old fallback passed `custom/lumen` to the jailer, which
+        // resolves it under /sys/fs/cgroup while we applied limits to
+        // /custom/lumen/<id> — VMM and limits in different cgroups).
+        let mut bad = s.clone();
+        bad.cgroup_parent = PathBuf::from("/custom/lumen");
+        assert!(jailer_argv(&bad, &fc).is_err());
+        bad.cgroup_parent = PathBuf::from("lumen");
+        assert!(jailer_argv(&bad, &fc).is_err());
+    }
+
+    #[test]
+    fn firecracker_pid_file_lives_in_the_jail_root() {
+        let p = firecracker_pid_file(
+            Path::new("/srv/jailer"),
+            Path::new("/usr/local/bin/firecracker"),
+            "lmn-abc12345",
+        );
+        // exec_file_name falls back to the literal file name when the path
+        // does not exist on this machine.
+        assert_eq!(
+            p,
+            PathBuf::from("/srv/jailer/firecracker/lmn-abc12345/root/firecracker.pid")
+        );
+        assert!(expected_chroot_entries().contains(&"firecracker.pid"));
     }
 
     #[test]
@@ -478,6 +548,8 @@ mod tests {
         );
         assert!(args.contains("lumen.proxy_port=18080"), "boot_args: {args}");
         assert!(args.contains("lumen.vsock_port=1234"), "boot_args: {args}");
+        // Guest RAM is clamped to Firecracker's 64 MiB minimum.
+        assert_eq!(cfg.machine_config.mem_size_mib, 1024);
     }
 
     #[test]
