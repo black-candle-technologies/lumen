@@ -1,0 +1,25 @@
+[package]
+name = "lumen-messaging"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lumen-core = { path = "../lumen-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
+async-trait = "0.1"
+ed25519-dalek = { version = "2", optional = true }
+hex = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+default = []
+# Discord beta: double-gated — this Cargo feature must be enabled AND the
+# runtime `discord_enabled` flag set before the adapter will bind.
+discord = ["ed25519-dalek", "hex"]

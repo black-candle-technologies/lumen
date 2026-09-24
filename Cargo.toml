@@ -12,6 +12,7 @@ members = [
     "crates/lumen-acceptance",
     "crates/lumen-protocol",
     "crates/lumen-sandboxd",
+    "crates/lumen-messaging",
 ]
 resolver = "3"
 
