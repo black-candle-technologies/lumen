@@ -483,13 +483,14 @@ proptest! {
 
         // The parent cap holds atomically, in every dimension.
         ledger.check_invariants().unwrap();
-        let (cap_b, reserved_out, consumed) = ledger.account_summary("parent").unwrap();
+        let (cap_b, reserved_out, exec_held, consumed) = ledger.account_summary("parent").unwrap();
         let remaining = ledger.remaining("parent").unwrap();
         for dim in [BudgetDimension::SpendMicros, BudgetDimension::Tokens] {
             prop_assert_eq!(cap_b.get(dim), cap);
             // Conservation: every micro is accounted for.
             let total = remaining.get(dim)
                 .checked_add(reserved_out.get(dim)).unwrap()
+                .checked_add(exec_held.get(dim)).unwrap()
                 .checked_add(consumed.get(dim)).unwrap();
             prop_assert_eq!(total, cap, "budget not conserved");
         }

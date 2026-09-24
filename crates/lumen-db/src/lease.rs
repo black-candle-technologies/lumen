@@ -11,7 +11,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use lumen_core::{
-    budget::{Budget, DebitReceipt, Reservation, ReservationState},
+    budget::{
+        Budget, DebitReceipt, ExecutionReservation, ExecutionState, Reservation, ReservationState,
+    },
     identity::WorkspaceId,
     kernel_audit::{
         AuditLink, GENESIS_PREV_HASH, actor_to_string, parse_actor, render_detail, seal_event,
@@ -40,6 +42,42 @@ fn parse_budget(s: &str) -> Result<Budget, RepositoryError> {
 
 fn insufficient(what: &str) -> RepositoryError {
     RepositoryError::KernelBudgetInsufficient(what.to_string())
+}
+
+fn execution_state_str(state: ExecutionState) -> &'static str {
+    match state {
+        ExecutionState::Held => "held",
+        ExecutionState::Settled => "settled",
+        ExecutionState::Released => "released",
+    }
+}
+
+fn parse_execution_state(s: &str) -> Result<ExecutionState, RepositoryError> {
+    match s {
+        "held" => Ok(ExecutionState::Held),
+        "settled" => Ok(ExecutionState::Settled),
+        "released" => Ok(ExecutionState::Released),
+        other => Err(RepositoryError::InvalidKernelLeaseState(format!(
+            "unknown execution state {other}"
+        ))),
+    }
+}
+
+fn parse_execution_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ExecutionReservation, RepositoryError> {
+    let actual_json: Option<String> = row.get("actual_json");
+    Ok(ExecutionReservation {
+        id: row.get("id"),
+        lease_id: row.get("lease_id"),
+        action_id: row.get("action_id"),
+        held: parse_budget(row.get::<String, _>("held_json").as_str())?,
+        state: parse_execution_state(row.get::<String, _>("state").as_str())?,
+        idempotency_key: row.get("idempotency_key"),
+        created_at_ms: row.get("created_at_ms"),
+        completed_at_ms: row.get("completed_at_ms"),
+        actual: actual_json.as_deref().map(parse_budget).transpose()?,
+    })
 }
 
 impl Database {
@@ -672,6 +710,157 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // Execution reservations (dispatch-side budget lifecycle)
+    // ------------------------------------------------------------------
+
+    /// Record a lease's budget caps. First write wins; re-recording is a
+    /// no-op so mint retries stay idempotent.
+    pub async fn record_kernel_lease_caps(
+        &self,
+        workspace_id: &WorkspaceId,
+        lease_id: &str,
+        caps: &Budget,
+        now_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO kernel_lease_caps(lease_id,workspace_id,caps_json,recorded_at_ms)
+             VALUES(?,?,?,?)",
+        )
+        .bind(lease_id)
+        .bind(ws(workspace_id))
+        .bind(budget_json(caps)?)
+        .bind(now_ms)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The caps recorded for a lease, if any (boot rehydration).
+    pub async fn kernel_lease_caps(
+        &self,
+        workspace_id: &WorkspaceId,
+        lease_id: &str,
+    ) -> Result<Option<Budget>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT caps_json FROM kernel_lease_caps WHERE workspace_id=? AND lease_id=?",
+        )
+        .bind(ws(workspace_id))
+        .bind(lease_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|r| parse_budget(r.get::<String, _>("caps_json").as_str()))
+            .transpose()
+    }
+
+    /// Persist an execution reservation taken at authorize time. The
+    /// reservation id and idempotency key are unique: a duplicate insert is
+    /// a conflict (fail closed).
+    pub async fn insert_kernel_execution(
+        &self,
+        workspace_id: &WorkspaceId,
+        exec: &ExecutionReservation,
+    ) -> Result<(), RepositoryError> {
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO kernel_executions(id,workspace_id,lease_id,action_id,
+             held_json,state,idempotency_key,created_at_ms,completed_at_ms,actual_json)
+             VALUES(?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&exec.id)
+        .bind(ws(workspace_id))
+        .bind(&exec.lease_id)
+        .bind(&exec.action_id)
+        .bind(budget_json(&exec.held)?)
+        .bind(execution_state_str(exec.state))
+        .bind(&exec.idempotency_key)
+        .bind(exec.created_at_ms)
+        .bind(exec.completed_at_ms)
+        .bind(
+            exec.actual
+                .as_ref()
+                .map(budget_json)
+                .transpose()?
+                .as_deref(),
+        )
+        .execute(self.pool())
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::KernelReservationConflict);
+        }
+        Ok(())
+    }
+
+    /// Fetch an execution reservation by id.
+    pub async fn get_kernel_execution(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+    ) -> Result<Option<ExecutionReservation>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT id,lease_id,action_id,held_json,state,idempotency_key,
+             created_at_ms,completed_at_ms,actual_json
+             FROM kernel_executions WHERE workspace_id=? AND id=?",
+        )
+        .bind(ws(workspace_id))
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|r| parse_execution_row(&r)).transpose()
+    }
+
+    /// Apply the terminal transition of an execution reservation:
+    /// held → settled (with measured actuals) or held → released. The SQL
+    /// guard trigger rejects any other mutation; a zero-row update means the
+    /// row is missing or already terminal (fail closed).
+    pub async fn update_kernel_execution(
+        &self,
+        workspace_id: &WorkspaceId,
+        exec: &ExecutionReservation,
+    ) -> Result<(), RepositoryError> {
+        let res = sqlx::query(
+            "UPDATE kernel_executions
+             SET state=?,completed_at_ms=?,actual_json=?
+             WHERE workspace_id=? AND id=?",
+        )
+        .bind(execution_state_str(exec.state))
+        .bind(exec.completed_at_ms)
+        .bind(
+            exec.actual
+                .as_ref()
+                .map(budget_json)
+                .transpose()?
+                .as_deref(),
+        )
+        .bind(ws(workspace_id))
+        .bind(&exec.id)
+        .execute(self.pool())
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::InvalidKernelLeaseState(format!(
+                "unknown or terminal execution reservation {}",
+                exec.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Every execution reservation in the workspace, held or terminal, for
+    /// boot rehydration.
+    pub async fn all_kernel_executions(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<ExecutionReservation>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id,lease_id,action_id,held_json,state,idempotency_key,
+             created_at_ms,completed_at_ms,actual_json
+             FROM kernel_executions WHERE workspace_id=? ORDER BY created_at_ms",
+        )
+        .bind(ws(workspace_id))
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(parse_execution_row).collect()
     }
 
     // ------------------------------------------------------------------

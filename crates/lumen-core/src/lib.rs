@@ -2,8 +2,8 @@
 //!
 //! Phase 1 of the rebuild adds the authority kernel alongside the existing
 //! modules: [`canonical`] (typed canonical resources), [`lease`] (signed
-//! lease engine), [`budget`] (reservation accounting), [`nonce`] (replay
-//! protection), [`kernel_audit`] (append-only audit + checkpoints), and
+//! lease engine), [`budget`] (reservation accounting), [`execution`]
+//! (execution lifecycle driver), [`nonce`] (replay protection), [`kernel_audit`] (append-only audit + checkpoints), and
 //! [`store`] (repository traits).
 
 pub mod action;
@@ -16,6 +16,7 @@ pub mod canonical;
 pub mod capability;
 pub mod context;
 pub mod egress;
+pub mod execution;
 pub mod executor;
 pub mod extension;
 pub mod identity;

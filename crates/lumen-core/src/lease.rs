@@ -31,13 +31,16 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    budget::{Budget, BudgetDimension, BudgetError, BudgetLedger},
+    budget::{Budget, BudgetDimension, BudgetError, BudgetLedger, ExecutionReservation},
     canonical::{
         CanonicalPath, EffectClass, NetworkDestination, PathGrant, PathResolver, PathRights,
         ResourceScope, ScopeSubsetError, SecretRef, ToolName,
     },
     nonce::{NonceError, NonceStore},
-    pi_boundary::{ActionEnvelope, BoundaryError, DenyReason, PolicyDecision, canonical_json},
+    pi_boundary::{
+        ActionEnvelope, BoundaryError, DecisionOutcome, DenyReason, Obligation, PolicyDecision,
+        canonical_json,
+    },
 };
 
 /// Contract version for [`LeaseDocument`].
@@ -965,6 +968,33 @@ impl ApprovalOutbox for Vec<VhlRequest> {
     }
 }
 
+/// Build the [`Obligation`] binding an allowed action to its execution
+/// budget reservation. The dispatcher settles the reservation after
+/// dispatch (converting the hold into measured consumption) or releases it
+/// when dispatch never happened or failed before any effect.
+pub fn execution_settlement_obligation(
+    reservation: &ExecutionReservation,
+    lease_id: &str,
+) -> Obligation {
+    Obligation::SettleBudget {
+        reservation_id: reservation.id.clone(),
+        lease_id: lease_id.to_string(),
+        action_id: reservation.action_id.clone(),
+    }
+}
+
+/// Extract the execution reservation id from an `Allow` decision's
+/// obligations, if the decision carries one.
+pub fn execution_reservation_id(decision: &PolicyDecision) -> Option<&str> {
+    match &decision.outcome {
+        DecisionOutcome::Allow { obligations } => obligations.iter().find_map(|o| match o {
+            Obligation::SettleBudget { reservation_id, .. } => Some(reservation_id.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 /// Parameters for [`authorize_envelope`].
 pub struct AuthorizeParams {
     pub now_ms: i64,
@@ -1078,15 +1108,33 @@ pub fn authorize_envelope(
             "action not covered by lease: {e}"
         )));
     }
-    // Fail fast when the lease has no execution budget left.
+    // Atomically reserve one execution against the leaf lease's remaining
+    // balance. The admission check and the hold are a single ledger
+    // mutation, so concurrent authorizations cannot both pass on the last
+    // execution — a standing lease with a finite budget actually depletes.
+    // The reservation id travels in the Allow obligations: the dispatcher
+    // must settle it after execution, or release it when dispatch never
+    // happened or failed before any effect. This is the last fallible step,
+    // so a denied authorization can never leak a hold.
     let need = Budget::new().set(BudgetDimension::Executions, 1);
-    match ledger.remaining(&leaf.lease_id) {
-        Ok(remaining) if remaining.covers(&need) => {}
-        _ => {
-            return PolicyDecision::deny(DenyReason::scope_exceeded("lease budget exhausted"));
+    let reservation = match ledger.reserve_execution(
+        &leaf.lease_id,
+        &env.action_id.to_string(),
+        &need,
+        &envelope_nonce,
+        now_ms,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return PolicyDecision::deny(DenyReason::scope_exceeded(format!(
+                "lease budget exhausted: {e}"
+            )));
         }
-    }
-    PolicyDecision::allow(vec![])
+    };
+    PolicyDecision::allow(vec![execution_settlement_obligation(
+        &reservation,
+        &leaf.lease_id,
+    )])
 }
 
 fn no_covering_lease(
@@ -1498,5 +1546,151 @@ mod tests {
             &params,
         );
         assert!(!d2.is_allow());
+    }
+
+    #[test]
+    fn finite_execution_budget_depletes() {
+        let (keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let r = FakeResolver::default();
+
+        // Standing lease with exactly one execution.
+        let mut lp = root_params(parent_scope());
+        lp.limits.budget = Budget::new().set(BudgetDimension::Executions, 1);
+        // The frozen envelope carries lease ids as UUIDs.
+        lp.lease_id = Uuid::new_v4().to_string();
+        let root = mint_root_lease(lp, &keys, &sessions, &ledger, &nonces, 100).unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(root.lease_id.clone(), root.clone());
+        let params = AuthorizeParams {
+            now_ms: 200,
+            case_insensitive_fs: false,
+            allow_approval_fallback: false,
+            approval_ttl_ms: 60_000,
+        };
+        let mut env = ActionEnvelope {
+            version: crate::pi_boundary::ACTION_ENVELOPE_VERSION,
+            action_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").unwrap(),
+            session_id: "ed25519:parent-session".to_string(),
+            tool: crate::pi_boundary::ToolRef {
+                name: "fs.read".to_string(),
+                version: "1.2.3".to_string(),
+            },
+            // The frozen contract requires integer-only arguments.
+            arguments: [("n".to_string(), serde_json::json!(1))]
+                .into_iter()
+                .collect(),
+            inputs: vec![],
+            resources: crate::pi_boundary::ResourceSet {
+                paths: vec![crate::pi_boundary::PathResource {
+                    path: "/workspace/README.md".to_string(),
+                    rights: crate::pi_boundary::PathRights::Read,
+                }],
+                network: vec![],
+                secrets: vec![],
+            },
+            expected_effects: crate::pi_boundary::EffectClasses {
+                file_read: true,
+                file_write: false,
+                network_egress: false,
+                network_ingress: false,
+                process_spawn: false,
+            },
+            lease_chain: vec![crate::pi_boundary::LeaseId::from_uuid(
+                root.lease_id.parse().expect("root id is a UUID"),
+            )],
+            nonce: "env-nonce-a".to_string(),
+            expires_at_ms: 1_000_000,
+        };
+
+        // First authorization: allowed, and the Allow carries the execution
+        // reservation the dispatcher must settle or release.
+        let mut tracker = HashSet::new();
+        let outbox: &mut Vec<VhlRequest> = &mut vec![];
+        let d1 = authorize_envelope(
+            &env,
+            &r,
+            &map,
+            &RevocationIndex::new(),
+            &sessions,
+            &keys,
+            &mut tracker,
+            &nonces,
+            &ledger,
+            outbox,
+            &params,
+        );
+        assert!(d1.is_allow());
+        let res_id = execution_reservation_id(&d1)
+            .expect("allow carries the settle_budget obligation")
+            .to_string();
+        assert!(res_id.starts_with("exec_"));
+        assert_eq!(
+            ledger
+                .remaining(&root.lease_id)
+                .unwrap()
+                .get(BudgetDimension::Executions),
+            0,
+            "the hold is visible the moment the action is authorized"
+        );
+
+        // Second action: the finite budget is exhausted, denied.
+        env.action_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").unwrap();
+        env.nonce = "env-nonce-b".to_string();
+        let d2 = authorize_envelope(
+            &env,
+            &r,
+            &map,
+            &RevocationIndex::new(),
+            &sessions,
+            &keys,
+            &mut tracker,
+            &nonces,
+            &ledger,
+            outbox,
+            &params,
+        );
+        assert!(!d2.is_allow());
+        match &d2.outcome {
+            crate::pi_boundary::DecisionOutcome::Deny { reason } => {
+                assert!(
+                    reason.detail.contains("budget"),
+                    "unexpected reason: {reason:?}"
+                )
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+
+        // Settling the first reservation converts the hold to consumption;
+        // the budget stays spent, never leaks back.
+        ledger
+            .settle_execution(
+                &res_id,
+                &Budget::new().set(BudgetDimension::Executions, 1),
+                "settle-a",
+                300,
+            )
+            .unwrap();
+        env.action_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440003").unwrap();
+        env.nonce = "env-nonce-c".to_string();
+        let d3 = authorize_envelope(
+            &env,
+            &r,
+            &map,
+            &RevocationIndex::new(),
+            &sessions,
+            &keys,
+            &mut tracker,
+            &nonces,
+            &ledger,
+            outbox,
+            &params,
+        );
+        assert!(!d3.is_allow());
+        ledger.check_invariants().unwrap();
     }
 }

@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use lumen_core::{
-    budget::{Budget, BudgetDimension, BudgetLedger},
+    budget::{Budget, BudgetDimension, BudgetLedger, ExecutionReservation, ExecutionState},
     canonical::{CanonicalPath, EffectClass, PathGrant, PathResolver, PathRights, ResourceScope},
     identity::WorkspaceId,
     kernel_audit::AuditLink,
@@ -215,6 +215,8 @@ async fn migration_0022_tables_exist() {
         "kernel_audit_events",
         "kernel_budget_accounts",
         "kernel_debits",
+        "kernel_executions",
+        "kernel_lease_caps",
         "kernel_lease_debits",
         "kernel_leases",
         "kernel_nonces",
@@ -1036,4 +1038,112 @@ async fn cross_workspace_references_fail_closed() {
         .unwrap();
     assert_eq!(ea.sequence, 0);
     assert_eq!(eb.sequence, 0);
+}
+
+#[tokio::test]
+async fn execution_reservation_durable_lifecycle() {
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    db.insert_kernel_lease(&ws, &root).await.unwrap();
+
+    // Caps: first write wins, re-recording is a no-op.
+    let caps = Budget::new().set(BudgetDimension::Executions, 100);
+    db.record_kernel_lease_caps(&ws, "lease-root-1", &caps, 100)
+        .await
+        .unwrap();
+    db.record_kernel_lease_caps(&ws, "lease-root-1", &Budget::new(), 101)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.kernel_lease_caps(&ws, "lease-root-1").await.unwrap(),
+        Some(caps)
+    );
+    assert_eq!(
+        db.kernel_lease_caps(&ws, "lease-missing").await.unwrap(),
+        None
+    );
+
+    // Insert a held reservation.
+    let exec = ExecutionReservation {
+        id: "exec_test_1".to_string(),
+        lease_id: "lease-root-1".to_string(),
+        action_id: "action-1".to_string(),
+        held: Budget::new().set(BudgetDimension::Executions, 1),
+        state: ExecutionState::Held,
+        idempotency_key: "nonce-1".to_string(),
+        created_at_ms: 200,
+        completed_at_ms: None,
+        actual: None,
+    };
+    db.insert_kernel_execution(&ws, &exec).await.unwrap();
+    // Duplicate insert is a conflict (fail closed).
+    assert!(db.insert_kernel_execution(&ws, &exec).await.is_err());
+
+    let got = db
+        .get_kernel_execution(&ws, "exec_test_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, exec);
+    assert!(
+        db.get_kernel_execution(&ws, "exec_missing")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Held -> settled, with measured actuals as the durable receipt.
+    let mut settled = exec.clone();
+    settled.state = ExecutionState::Settled;
+    settled.completed_at_ms = Some(300);
+    settled.actual = Some(Budget::new().set(BudgetDimension::Executions, 1));
+    db.update_kernel_execution(&ws, &settled).await.unwrap();
+    let got = db
+        .get_kernel_execution(&ws, "exec_test_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.state, ExecutionState::Settled);
+    assert_eq!(got.actual, settled.actual);
+
+    // Settled is terminal: settled -> released is rejected by the guard trigger.
+    let mut bad = settled.clone();
+    bad.state = ExecutionState::Released;
+    assert!(db.update_kernel_execution(&ws, &bad).await.is_err());
+    // Settling without actuals is rejected too.
+    let mut bad2 = exec.clone();
+    bad2.completed_at_ms = Some(300);
+    bad2.state = ExecutionState::Settled;
+    assert!(db.update_kernel_execution(&ws, &bad2).await.is_err());
+    // Updating a missing row fails closed.
+    let mut missing = exec.clone();
+    missing.id = "exec_missing".to_string();
+    missing.state = ExecutionState::Released;
+    missing.completed_at_ms = Some(300);
+    assert!(db.update_kernel_execution(&ws, &missing).await.is_err());
+
+    // A second reservation takes the held -> released path.
+    let exec2 = ExecutionReservation {
+        id: "exec_test_2".to_string(),
+        action_id: "action-2".to_string(),
+        idempotency_key: "nonce-2".to_string(),
+        ..exec.clone()
+    };
+    db.insert_kernel_execution(&ws, &exec2).await.unwrap();
+    let mut released = exec2.clone();
+    released.state = ExecutionState::Released;
+    released.completed_at_ms = Some(400);
+    db.update_kernel_execution(&ws, &released).await.unwrap();
+    let got = db
+        .get_kernel_execution(&ws, "exec_test_2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.state, ExecutionState::Released);
+    assert_eq!(got.actual, None);
+
+    let all = db.all_kernel_executions(&ws).await.unwrap();
+    assert_eq!(all.len(), 2);
 }

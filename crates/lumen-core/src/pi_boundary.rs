@@ -455,9 +455,22 @@ impl DenyReason {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Obligation {
-    TruncateOutput { max_bytes: u64 },
+    TruncateOutput {
+        max_bytes: u64,
+    },
     RedactSecrets,
-    RequireSandboxProfile { profile: String },
+    RequireSandboxProfile {
+        profile: String,
+    },
+    /// Settle or release the execution-budget reservation created at
+    /// authorization time. The dispatcher settles the reservation after
+    /// dispatch (converting the hold into measured consumption) or releases
+    /// it when dispatch never happened or failed before any effect.
+    SettleBudget {
+        reservation_id: String,
+        lease_id: String,
+        action_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
