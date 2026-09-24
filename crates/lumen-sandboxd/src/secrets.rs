@@ -10,6 +10,9 @@
 //! - If the policy requests secrets and **no broker is configured**,
 //!   `prepare` fails closed ([`SandboxdError::SecretDenied`]).
 //! - Values are held in [`Secret`], which overwrites its bytes on drop.
+//!   The broker response buffer, the redactor's needles, and its
+//!   cross-chunk tail all live in `zeroize::Zeroizing` containers, so
+//!   secret plaintext does not linger in freed heap memory either.
 //! - The guest agent receives values over vsock (host-local), places them
 //!   in the workload environment, and **redacts** them from every
 //!   stdout/stderr byte it relays ([`Redactor`]).
@@ -20,12 +23,13 @@
 
 use std::{
     collections::HashSet,
-    io::{BufRead, BufReader, Write},
+    io::{Read, Write},
     os::unix::net::UnixStream,
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::error::SandboxdError;
 
@@ -119,14 +123,31 @@ impl SecretBroker {
             .map_err(|e| SandboxdError::SecretDenied(format!("broker write: {e}")))?;
 
         // Bounded response read (values are secrets; keep them small).
-        let mut reader = BufReader::new(sock);
-        let mut resp_line = Vec::with_capacity(4096);
-        // Read up to 64 KiB + newline.
-        let mut limited = std::io::Read::take(&mut reader, 65536 + 1);
-        limited
-            .read_until(b'\n', &mut resp_line)
-            .map_err(|e| SandboxdError::SecretDenied(format!("broker read: {e}")))?;
-        if resp_line.len() > 65536 + 1 || !resp_line.ends_with(b"\n") {
+        //
+        // Read straight from the socket into a zeroizing buffer — no
+        // BufReader, so no un-wiped 8 KiB staging buffer survives the
+        // fetch. `resp_line` is wiped when it drops after decoding.
+        let mut resp_line: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(4096));
+        let mut chunk = Zeroizing::new([0u8; 4096]);
+        loop {
+            let n = sock
+                .read(&mut chunk[..])
+                .map_err(|e| SandboxdError::SecretDenied(format!("broker read: {e}")))?;
+            if n == 0 {
+                break; // EOF
+            }
+            if resp_line.len() + n > 65536 + 1 {
+                return Err(SandboxdError::SecretDenied(
+                    "broker response too large".into(),
+                ));
+            }
+            resp_line.extend_from_slice(&chunk[..n]);
+            if resp_line.ends_with(b"\n") {
+                break;
+            }
+        }
+        // `chunk` is Zeroizing: wiped on drop at the end of this function.
+        if !resp_line.ends_with(b"\n") {
             return Err(SandboxdError::SecretDenied(
                 "broker response too large".into(),
             ));
@@ -181,26 +202,30 @@ pub fn fetch_granted_secrets(
 /// between `feed` calls so a secret split across chunk boundaries is still
 /// caught. Call [`Redactor::finish`] at EOF to flush the tail.
 pub struct Redactor {
-    needles: Vec<Vec<u8>>,
+    needles: Vec<Zeroizing<Vec<u8>>>,
     max_len: usize,
-    tail: Vec<u8>,
+    tail: Zeroizing<Vec<u8>>,
 }
 
 impl Redactor {
     pub fn new(secrets: &[Secret]) -> Self {
-        let mut needles: Vec<Vec<u8>> = secrets
+        let mut raw: Vec<Vec<u8>> = secrets
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .filter(|v| v.len() >= 4)
             .collect();
         // Longest first so overlapping secrets redact greedily.
-        needles.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        needles.dedup();
+        raw.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        raw.dedup();
+        // Move each needle into a zeroizing container: the plaintext is
+        // wiped when the redactor drops instead of lingering in freed
+        // heap memory.
+        let needles: Vec<Zeroizing<Vec<u8>>> = raw.into_iter().map(Zeroizing::new).collect();
         let max_len = needles.iter().map(|v| v.len()).max().unwrap_or(0);
         Self {
             needles,
             max_len,
-            tail: Vec::new(),
+            tail: Zeroizing::new(Vec::new()),
         }
     }
 
@@ -238,7 +263,8 @@ impl Redactor {
         loop {
             let win_start = emit_end.saturating_sub(self.max_len);
             // Combined view so occurrences extending into `held` are seen.
-            let mut buf = Vec::with_capacity((split - win_start) + held.len());
+            // Zeroizing: the window can hold secret bytes.
+            let mut buf = Zeroizing::new(Vec::with_capacity((split - win_start) + held.len()));
             buf.extend_from_slice(&raw_head[win_start..]);
             buf.extend_from_slice(held);
             let rel_emit = emit_end - win_start;
@@ -264,23 +290,22 @@ impl Redactor {
         }
 
         let out = redact_once(&self.tail[..emit_end], &self.needles);
-        // Retain everything from emit_end on for the next round.
-        self.tail = self.tail[emit_end..].to_vec();
+        // Retain everything from emit_end on for the next round. The old
+        // tail buffer is wiped by Zeroizing's drop during the assignment.
+        self.tail = Zeroizing::new(self.tail[emit_end..].to_vec());
         out
     }
 
     /// Flush remaining tail bytes (redacted).
     pub fn finish(&mut self) -> Vec<u8> {
         let tail = std::mem::take(&mut self.tail);
-        if self.needles.is_empty() {
-            return tail;
-        }
+        // `tail` is Zeroizing: any retained secret bytes are wiped on drop.
         redact_once(&tail, &self.needles)
     }
 }
 
 /// Replace all occurrences of any needle with `***`.
-fn redact_once(haystack: &[u8], needles: &[Vec<u8>]) -> Vec<u8> {
+fn redact_once(haystack: &[u8], needles: &[Zeroizing<Vec<u8>>]) -> Vec<u8> {
     if needles.is_empty() {
         return haystack.to_vec();
     }
@@ -320,6 +345,7 @@ pub fn filter_env_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
     fn secret(s: &str) -> Secret {

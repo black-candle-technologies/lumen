@@ -154,6 +154,7 @@ fn build_fixture() -> Result<Fixture, String> {
             socket: dir.join("api.sock"),
             token_file: dir.join("api.token"),
             allowed_uids: vec![0],
+            socket_group: None,
         },
         firecracker: FirecrackerConfig {
             binary: fc_bin,

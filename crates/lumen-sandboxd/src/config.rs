@@ -49,6 +49,11 @@ pub struct ApiConfig {
     pub token_file: PathBuf,
     /// Peer UIDs accepted via SO_PEERCRED (kernel service account).
     pub allowed_uids: Vec<u32>,
+    /// Group owning the API socket when several UIDs share access (the
+    /// socket is then 0660). Unneeded for a single allowed UID, which
+    /// gets a 0600 socket chowned to it.
+    #[serde(default)]
+    pub socket_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +148,7 @@ impl Default for ApiConfig {
             socket: PathBuf::from("/run/lumen/sandboxd.sock"),
             token_file: PathBuf::from("/etc/lumen/sandboxd-token"),
             allowed_uids: vec![0],
+            socket_group: None,
         }
     }
 }
@@ -233,6 +239,22 @@ impl DaemonConfig {
                 "max_concurrent_runs must be > 0".into(),
             ));
         }
+        // A zero host resource cap makes the daemon useless: adapt_spec
+        // rejects every run against it (a run must request >= 1 vCPU,
+        // >= 64 MiB RAM, > 0 wall time, > 0 disk). Reject the
+        // misconfiguration at load time with a descriptive error.
+        for (name, value) in [
+            ("max_vcpu", self.limits.max_vcpu as u64),
+            ("max_memory_mib", self.limits.max_memory_mib),
+            ("max_wall_time_secs", self.limits.max_wall_time_secs),
+            ("max_disk_mib", self.limits.max_disk_mib),
+        ] {
+            if value == 0 {
+                return Err(SandboxdError::State(format!(
+                    "{name} must be > 0: a zero cap rejects every run"
+                )));
+            }
+        }
         if self.limits.default_max_processes == 0 {
             return Err(SandboxdError::State(
                 "default_max_processes must be > 0".into(),
@@ -286,5 +308,21 @@ mod tests {
         let mut cfg = DaemonConfig::default();
         cfg.net.tap_prefix = "way-too-long-prefix-".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_resource_caps() {
+        for set_zero in [
+            (|c: &mut DaemonConfig| c.limits.max_vcpu = 0) as fn(&mut DaemonConfig),
+            |c: &mut DaemonConfig| c.limits.max_memory_mib = 0,
+            |c: &mut DaemonConfig| c.limits.max_wall_time_secs = 0,
+            |c: &mut DaemonConfig| c.limits.max_disk_mib = 0,
+            |c: &mut DaemonConfig| c.limits.max_concurrent_runs = 0,
+        ] {
+            let mut cfg = DaemonConfig::default();
+            set_zero(&mut cfg);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("must be > 0"), "descriptive error: {err}");
+        }
     }
 }

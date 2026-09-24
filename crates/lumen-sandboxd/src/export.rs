@@ -181,14 +181,12 @@ impl ExportValidator {
         Ok(cur)
     }
 
-    /// Check size limits before accepting bytes.
+    /// Check size limits before accepting bytes, reserving quota for one
+    /// file of `size` bytes. Call exactly once per file, at the
+    /// `ExportFile` header: [`stage_bytes`] re-checks only the per-file
+    /// cap and the byte-count match, so quota is never counted twice.
     pub fn check_size(&mut self, size: u64) -> Result<(), SandboxdError> {
-        if size > self.limits.max_file_bytes {
-            return Err(SandboxdError::ExportRejected(format!(
-                "file too large: {size} > {}",
-                self.limits.max_file_bytes
-            )));
-        }
+        self.check_file_cap(size)?;
         self.total_bytes = self
             .total_bytes
             .checked_add(size)
@@ -209,16 +207,40 @@ impl ExportValidator {
         Ok(())
     }
 
+    /// Enforce the per-file cap without reserving quota.
+    fn check_file_cap(&self, size: u64) -> Result<(), SandboxdError> {
+        if size > self.limits.max_file_bytes {
+            return Err(SandboxdError::ExportRejected(format!(
+                "file too large: {size} > {}",
+                self.limits.max_file_bytes
+            )));
+        }
+        Ok(())
+    }
+
     /// Stage validated bytes at a validated path. The file is created with
     /// `O_EXCL | O_NOFOLLOW`, mode 0o644 (setuid/setgid/sticky are never
     /// preserved). Returns the staged record with recomputed hash.
+    ///
+    /// Quota must already have been reserved with [`check_size`] at the
+    /// `ExportFile` header; `declared_size` is that reserved size. This
+    /// method re-checks the per-file cap (fail closed if the header check
+    /// was skipped) and requires the staged bytes to match the reservation
+    /// exactly, but does not touch the quota counters.
     pub fn stage_bytes(
         &mut self,
         guest_path: &str,
         expected_sha256: &str,
+        declared_size: u64,
         bytes: &[u8],
     ) -> Result<StagedFile, SandboxdError> {
-        self.check_size(bytes.len() as u64)?;
+        self.check_file_cap(bytes.len() as u64)?;
+        if bytes.len() as u64 != declared_size {
+            return Err(SandboxdError::ExportRejected(format!(
+                "size mismatch for {guest_path}: declared {declared_size}, staged {}",
+                bytes.len()
+            )));
+        }
         let dest = self.stage_path(guest_path)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(SandboxdError::Io)?;
@@ -351,8 +373,10 @@ mod tests {
     #[test]
     fn stages_a_normal_file() {
         let (_tmp, mut v) = validator();
+        // Driver flow: reserve quota at the ExportFile header, then stage.
+        v.check_size(11).unwrap();
         let rec = v
-            .stage_bytes("src/main.rs", &sha(b"fn main(){}"), b"fn main(){}")
+            .stage_bytes("src/main.rs", &sha(b"fn main(){}"), 11, b"fn main(){}")
             .unwrap();
         assert_eq!(rec.rel_path, "src/main.rs");
         assert_eq!(rec.size_bytes, 11);
@@ -433,9 +457,14 @@ mod tests {
         };
         let mut v2 = ExportValidator::new(_tmp.path().join("s2"), limits).unwrap();
         let big = vec![0u8; 11];
-        assert!(v2.stage_bytes("big.bin", &sha(&big), &big).is_err());
+        // The header reservation itself rejects the oversize file.
+        assert!(v2.check_size(11).is_err());
+        // stage_bytes also fails closed on the per-file cap even if the
+        // header check were skipped.
+        assert!(v2.stage_bytes("big.bin", &sha(&big), 11, &big).is_err());
         // Validator state unchanged by the rejection.
-        assert!(v.stage_bytes("ok", &sha(b"ok"), b"ok").is_ok());
+        v.check_size(2).unwrap();
+        assert!(v.stage_bytes("ok", &sha(b"ok"), 2, b"ok").is_ok());
     }
 
     #[test]
@@ -447,16 +476,49 @@ mod tests {
             ..Default::default()
         };
         let mut v2 = ExportValidator::new(tmp.path().join("s2"), limits).unwrap();
-        v2.stage_bytes("a", &sha(b"12345"), b"12345").unwrap();
-        assert!(v2.stage_bytes("b", &sha(b"123456"), b"123456").is_err());
+        // Quota is reserved once, at the header.
+        v2.check_size(5).unwrap();
+        v2.stage_bytes("a", &sha(b"12345"), 5, b"12345").unwrap();
+        // The second header reservation exceeds the total cap.
+        assert!(v2.check_size(6).is_err());
         let _ = v;
+    }
+
+    #[test]
+    fn quota_counted_once_per_file() {
+        // Regression: check_size ran at the header AND inside stage_bytes,
+        // halving the effective limits. Reserve-then-stage must account
+        // each file exactly once.
+        let (tmp, _) = validator();
+        let limits = ExportLimits {
+            max_total_bytes: 10,
+            max_files: 2,
+            ..Default::default()
+        };
+        let mut v = ExportValidator::new(tmp.path().join("s"), limits).unwrap();
+        v.check_size(5).unwrap();
+        v.stage_bytes("a", &sha(b"12345"), 5, b"12345").unwrap();
+        v.check_size(5).unwrap();
+        v.stage_bytes("b", &sha(b"12345"), 5, b"12345").unwrap();
+        // Both files fit exactly; a third must fail on the file count.
+        assert!(v.check_size(1).is_err());
+    }
+
+    #[test]
+    fn stage_size_mismatch_rejected() {
+        let (_tmp, mut v) = validator();
+        v.check_size(5).unwrap();
+        // Staged bytes must match the reserved size exactly.
+        assert!(v.stage_bytes("a", &sha(b"12345"), 6, b"12345").is_err());
+        assert!(v.stage_bytes("a", &sha(b"12345"), 4, b"12345").is_err());
     }
 
     #[test]
     fn hash_mismatch_rejected_and_cleaned() {
         let (tmp, mut v) = validator();
         let root = tmp.path().join("staging");
-        let res = v.stage_bytes("f", &sha(b"other"), b"content");
+        v.check_size(7).unwrap();
+        let res = v.stage_bytes("f", &sha(b"other"), 7, b"content");
         assert!(res.is_err());
         assert!(!root.join("f").exists());
     }

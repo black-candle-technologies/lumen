@@ -276,38 +276,43 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
+/// Read a key file and decide its format from the bytes: exactly 32 raw
+/// bytes, or whitespace-trimmed 64-char hex. Bytes are read first (not
+/// `read_to_string`) so raw keys containing invalid UTF-8 still load.
+fn read_key_bytes(path: &Path) -> Result<[u8; 32], SandboxdError> {
+    let bytes = std::fs::read(path)
+        .map_err(|_| SandboxdError::State(format!("cannot read key {}", path.display())))?;
+    if bytes.len() == 32 {
+        // Raw 32-byte key file.
+        return bytes
+            .try_into()
+            .map_err(|_| SandboxdError::State("key must be 32 bytes".into()));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| SandboxdError::State("key must be 32 raw bytes or 64 hex chars".into()))?;
+    let text = text.trim();
+    if text.len() != 64 {
+        return Err(SandboxdError::State(
+            "key must be 32 raw bytes or 64 hex chars".into(),
+        ));
+    }
+    let decoded = hex::decode(text).map_err(|_| SandboxdError::State("bad key hex".into()))?;
+    decoded
+        .try_into()
+        .map_err(|_| SandboxdError::State("key must be 32 bytes".into()))
+}
+
 /// Load a trusted Ed25519 public key from a file. Accepts raw 32 bytes or
 /// 64-char hex.
 pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey, SandboxdError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| SandboxdError::State(format!("cannot read key {}", path.display())))?;
-    let text = text.trim();
-    let bytes = if text.len() == 64 {
-        hex::decode(text).map_err(|_| SandboxdError::State("bad key hex".into()))?
-    } else {
-        // Try raw bytes file.
-        std::fs::read(path).map_err(SandboxdError::Io)?
-    };
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| SandboxdError::State("key must be 32 bytes".into()))?;
+    let arr = read_key_bytes(path)?;
     VerifyingKey::from_bytes(&arr)
         .map_err(|_| SandboxdError::State("invalid ed25519 public key".into()))
 }
 
 /// Load a signing (private) key from a file: 64-char hex seed or 32 raw bytes.
 pub fn load_signing_key(path: &Path) -> Result<SigningKey, SandboxdError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| SandboxdError::State(format!("cannot read key {}", path.display())))?;
-    let text = text.trim();
-    let bytes = if text.len() == 64 {
-        hex::decode(text).map_err(|_| SandboxdError::State("bad key hex".into()))?
-    } else {
-        std::fs::read(path).map_err(SandboxdError::Io)?
-    };
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| SandboxdError::State("key must be 32 bytes".into()))?;
+    let arr = read_key_bytes(path)?;
     Ok(SigningKey::from_bytes(&arr))
 }
 
@@ -443,6 +448,14 @@ fn open_pinned_artifact(
 /// Harden one image-store entry: the daemon runs as root and the store is
 /// a trust root, so every resolve re-asserts tight ownership and modes.
 ///
+/// `store_dir` is the already-pinned entry descriptor (opened
+/// `O_NOFOLLOW | O_DIRECTORY` by [`open_store_dir`]): every entry is
+/// opened through it with `O_NOFOLLOW` and hardened via its own
+/// descriptor (`fchown` / `fchmod`). The fd pins the exact inode that was
+/// inspected, so an entry swapped for a symlink between the type check
+/// and the chmod can no longer redirect the chmod at an attacker-chosen
+/// target.
+///
 /// - Entry dir: root:root, 0755. Artifact/manifest files: root:root, 0644.
 /// - Symlinks inside the entry are left untouched (never followed, never
 ///   re-owned); resolution rejects them anyway.
@@ -455,69 +468,83 @@ fn open_pinned_artifact(
 /// privileged promotion flow running under a restrictive umask (027), and
 /// no uid other than root can write to the store. The jailer uids that run
 /// guests never gain store write access.
-pub fn harden_store_entry(dir: &Path) -> Result<(), SandboxdError> {
-    let is_root = unsafe { libc::geteuid() } == 0;
+pub fn harden_store_entry(store_dir: &File) -> Result<(), SandboxdError> {
+    use std::os::unix::io::AsRawFd;
 
-    // lchown: never follow a trailing symlink. Best-effort: a failed
-    // chown must not break resolution in odd environments (and is skipped
-    // entirely when not root, e.g. dev-machine tests).
-    let lchown = |path: &Path| {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let dir_fd = store_dir.as_raw_fd();
+    let err = |what: &str| {
+        SandboxdError::Host(format!("cannot harden image store (fd {dir_fd}): {what}"))
+    };
+
+    // fchown/fchmod on a pinned descriptor: never follows a trailing
+    // symlink. Best-effort: a failed chown/chmod must not break
+    // resolution in odd environments (and chown is skipped entirely when
+    // not root, e.g. dev-machine tests).
+    let fchown = |file: &File| {
         if !is_root {
             return;
         }
-        if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-            // SAFETY: c_path is a valid NUL-terminated path; lchown has no
-            // other preconditions.
-            let _ = unsafe { libc::lchown(c_path.as_ptr(), 0, 0) };
-        }
+        // SAFETY: as_raw_fd yields a valid open descriptor owned by `file`.
+        let _ = unsafe { libc::fchown(file.as_raw_fd(), 0, 0) };
     };
-    let chmod = |path: &Path, mode: u32| {
-        let c = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        // SAFETY: c is a valid NUL-terminated path; chmod has no other
-        // preconditions. Applied to the entry dir and regular files only —
-        // symlinks are skipped by the caller (fchmodat would be needed to
-        // touch a link itself, and we want links untouched).
-        unsafe {
-            libc::chmod(c.as_ptr(), mode);
-        }
+    let fchmod = |file: &File, mode: u32| {
+        // SAFETY: as_raw_fd yields a valid open descriptor owned by `file`.
+        let _ = unsafe { libc::fchmod(file.as_raw_fd(), mode) };
     };
 
-    lchown(dir);
-    chmod(dir, 0o755);
-    let entries = std::fs::read_dir(dir).map_err(|e| {
-        SandboxdError::Host(format!("cannot harden image store {}: {e}", dir.display()))
-    })?;
-    let mut immutables = Vec::new();
+    fchown(store_dir);
+    fchmod(store_dir, 0o755);
+
+    // Enumerate through the pinned descriptor: the listing cannot be
+    // redirected at a different directory after the pin.
+    let via_fd = PathBuf::from(format!("/proc/self/fd/{dir_fd}"));
+    let entries = std::fs::read_dir(&via_fd).map_err(|e| err(&e.to_string()))?;
+    let mut immutables: Vec<File> = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            SandboxdError::Host(format!("cannot harden image store {}: {e}", dir.display()))
-        })?;
-        let meta = entry.metadata().map_err(|e| {
-            SandboxdError::Host(format!("cannot harden image store {}: {e}", dir.display()))
-        })?;
-        // Never touch symlinks: resolution rejects them, and following one
-        // here would chmod/chown an attacker-chosen target.
-        if meta.file_type().is_symlink() {
+        let entry = entry.map_err(|e| err(&e.to_string()))?;
+        // Open through the pinned dir with O_NOFOLLOW: a symlink entry
+        // fails with ELOOP and is skipped untouched, and the returned fd
+        // pins the inode that fstat/fchmod/fchown below all act on —
+        // closing the stat-then-chmod swap window.
+        let entry_path = via_fd.join(entry.file_name());
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&entry_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
+            Err(e) => return Err(err(&e.to_string())),
+        };
+        let ft = file
+            .metadata()
+            .map_err(|e| err(&e.to_string()))?
+            .file_type();
+        // Defense in depth: O_NOFOLLOW already rejected symlinks; never
+        // touch one if it somehow got through.
+        if ft.is_symlink() {
             continue;
         }
-        let path = entry.path();
-        lchown(&path);
-        if meta.is_dir() {
-            chmod(&path, 0o755);
-        } else if meta.is_file() {
-            chmod(&path, 0o644);
-            immutables.push(path);
+        fchown(&file);
+        if ft.is_dir() {
+            fchmod(&file, 0o755);
+        } else if ft.is_file() {
+            fchmod(&file, 0o644);
+            immutables.push(file);
         }
+        // Other types (fifo, socket, device): re-owned above, modes left
+        // alone — same as before.
     }
     // Immutable flag where feasible: gated on root, best-effort, failures
-    // ignored (unsupported fs, missing binary, containers, ...).
+    // ignored (unsupported fs, missing binary, containers, ...). Uses the
+    // pinned /proc/self/fd path so the flag lands on the hardened inode,
+    // not whatever the store path names now.
     if is_root {
-        for path in &immutables {
+        for file in &immutables {
+            let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
             let _ = std::process::Command::new("chattr")
-                .args(["+i", &path.to_string_lossy()])
+                .args(["+i", &fd_path])
                 .output();
         }
     }
@@ -597,7 +624,7 @@ pub fn resolve_image(
         }
     }
 
-    harden_store_entry(&dir)?;
+    harden_store_entry(&store_dir)?;
 
     Ok(StoredImage {
         dir,
@@ -828,6 +855,49 @@ mod tests {
     }
 
     #[test]
+    fn raw_key_with_invalid_utf8_loads() {
+        // Regression: the loaders used read_to_string first, so a raw
+        // 32-byte key containing invalid UTF-8 failed before the raw
+        // fallback ran. Most random keys are invalid UTF-8.
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = [0xffu8; 32]; // invalid UTF-8
+        assert!(std::str::from_utf8(&seed).is_err());
+        let raw_path = tmp.path().join("signing.raw");
+        std::fs::write(&raw_path, seed).unwrap();
+        let sk = load_signing_key(&raw_path).unwrap();
+        assert_eq!(sk.to_bytes(), seed);
+
+        let vk_path = tmp.path().join("verify.raw");
+        let vk_bytes = sk.verifying_key().to_bytes();
+        std::fs::write(&vk_path, vk_bytes).unwrap();
+        let vk = load_verifying_key(&vk_path).unwrap();
+        assert_eq!(vk.to_bytes(), vk_bytes);
+    }
+
+    #[test]
+    fn hex_key_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = [0x11u8; 32];
+        let hex_path = tmp.path().join("signing.hex");
+        // Trailing newline, as written by shell redirection.
+        std::fs::write(&hex_path, format!("{}\n", hex::encode(seed))).unwrap();
+        let sk = load_signing_key(&hex_path).unwrap();
+        assert_eq!(sk.to_bytes(), seed);
+    }
+
+    #[test]
+    fn malformed_key_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("bad");
+        std::fs::write(&bad, b"too short").unwrap();
+        assert!(load_signing_key(&bad).is_err());
+        assert!(load_verifying_key(&bad).is_err());
+        let bad_hex = tmp.path().join("badhex");
+        std::fs::write(&bad_hex, "zz".repeat(32)).unwrap();
+        assert!(load_signing_key(&bad_hex).is_err());
+    }
+
+    #[test]
     fn resolve_image_pins_verified_descriptors() {
         let (store, digest, k) = valid_store();
         let stored = resolve_image(store.path(), &digest, &[k.verifying_key()]).unwrap();
@@ -856,7 +926,8 @@ mod tests {
         std::fs::write(&f, b"x").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        harden_store_entry(&dir).unwrap();
+        let pinned = open_store_dir(&dir).unwrap();
+        harden_store_entry(&pinned).unwrap();
         let fm = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
         let dm = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(fm, 0o644, "file mode");
@@ -874,8 +945,48 @@ mod tests {
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("evil-link")).unwrap();
         // Must not fail, and must not touch the link target's mode.
-        harden_store_entry(&dir).unwrap();
+        let pinned = open_store_dir(&dir).unwrap();
+        harden_store_entry(&pinned).unwrap();
         let m = std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
         assert_eq!(m, 0o600, "link target must be untouched");
+    }
+
+    #[test]
+    fn harden_store_entry_uses_pinned_fd_not_path() {
+        // Pin the entry, then swap the path for a different directory
+        // before hardening: the modes must land on the pinned inodes,
+        // not on whatever the path names at hardening time.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vmlinux"), b"x").unwrap();
+        std::fs::set_permissions(dir.join("vmlinux"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let pinned = open_store_dir(&dir).unwrap();
+        let swapped = tmp.path().join("swapped");
+        std::fs::create_dir_all(&swapped).unwrap();
+        std::fs::write(swapped.join("vmlinux"), b"y").unwrap();
+        std::fs::set_permissions(
+            swapped.join("vmlinux"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::rename(&dir, tmp.path().join("entry-orig")).unwrap();
+        std::fs::rename(&swapped, &dir).unwrap();
+
+        harden_store_entry(&pinned).unwrap();
+
+        // The pinned (original) entry was hardened...
+        let orig = tmp.path().join("entry-orig").join("vmlinux");
+        let fm = std::fs::metadata(&orig).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fm, 0o644, "pinned entry hardened");
+        // ...and the swapped-in directory was NOT touched.
+        let sm = std::fs::metadata(dir.join("vmlinux"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(sm, 0o600, "swapped-in path untouched");
     }
 }
