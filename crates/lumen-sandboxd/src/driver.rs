@@ -726,16 +726,10 @@ async fn supervise(
         let v = validator
             .as_mut()
             .ok_or_else(|| "export data outside an export session".to_string())?;
-        if p.bytes.len() as u64 != p.size {
-            return Err(format!(
-                "export size mismatch for {}: declared {}, got {}",
-                p.path,
-                p.size,
-                p.bytes.len()
-            ));
-        }
+        // stage_bytes enforces the byte-count match against the size
+        // reserved at the ExportFile header (plus the per-file cap).
         let staged_file = v
-            .stage_bytes(&p.path, &p.sha256, &p.bytes)
+            .stage_bytes(&p.path, &p.sha256, p.size, &p.bytes)
             .map_err(|e| format!("export rejected: {e}"))?;
         staged.push(staged_file);
         Ok(())

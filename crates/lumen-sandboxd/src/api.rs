@@ -10,9 +10,14 @@
 //! Authentication is defense-in-depth:
 //! 1. SO_PEERCRED UID must be in `allowed_uids` (kernel service account).
 //! 2. Bearer token must match (constant-time compare).
-//! 3. Socket file is 0600, owned by the daemon user.
+//! 3. Socket file permissions admit exactly the authorized peers: 0600
+//!    owned by the single allowed UID, or 0660 group-owned (see
+//!    [`ApiConfig::socket_group`]) when several UIDs share access.
+//!    `connect()` needs write permission on the socket inode, so the
+//!    permissions are set before accepting connections; misconfiguration
+//!    fails closed instead of listening on an unreachable socket.
 
-use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
+use std::{ffi::CString, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -205,11 +210,48 @@ async fn handle_conn(
         };
         let req: ApiRequest = serde_json::from_slice(&req_bytes)
             .map_err(|e| SandboxdError::Protocol(format!("bad request: {e}")))?;
+        let id = req.id;
         let resp = dispatch(&driver, req).await;
-        let resp_bytes = serde_json::to_vec(&resp)
-            .map_err(|e| SandboxdError::Host(format!("response encode: {e}")))?;
-        write_msg(&mut stream, &resp_bytes).await?;
+        write_response(&mut stream, id, &resp).await?;
     }
+}
+
+/// Serialize one [`ApiResponse`] and write it to the stream.
+///
+/// A response that exceeds [`MAX_MSG_BYTES`] (e.g. a large `stream`
+/// result, whose JSON encoding is bigger than the raw output bytes) must
+/// NOT drop the connection: the client would lose the request
+/// correlation, and for `stream` the already-consumed output could never
+/// be recovered by retrying. Send a small error response carrying the
+/// same request id instead, so the client can correlate the failure and
+/// retry with a smaller output bound.
+async fn write_response(
+    stream: &mut UnixStream,
+    id: u64,
+    resp: &ApiResponse,
+) -> Result<(), SandboxdError> {
+    let resp_bytes = serde_json::to_vec(resp)
+        .map_err(|e| SandboxdError::Host(format!("response encode: {e}")))?;
+    if resp_bytes.len() > MAX_MSG_BYTES as usize {
+        let err = ApiResponse {
+            id,
+            result: None,
+            error: Some(ApiError {
+                code: "response_too_large".into(),
+                message: format!(
+                    "response ({} bytes) exceeds the {MAX_MSG_BYTES}-byte message cap; \
+                     retry with a smaller output bound",
+                    resp_bytes.len()
+                ),
+            }),
+        };
+        let err_bytes = serde_json::to_vec(&err)
+            .map_err(|e| SandboxdError::Host(format!("response encode: {e}")))?;
+        // The error envelope is a fixed small template; it cannot hit the
+        // oversize path, so this does not recurse.
+        return write_msg(stream, &err_bytes).await;
+    }
+    write_msg(stream, &resp_bytes).await
 }
 
 /// Map a SandboxError to an API error code.
@@ -338,6 +380,86 @@ async fn dispatch(driver: &Arc<Driver>, req: ApiRequest) -> ApiResponse {
     }
 }
 
+/// Set socket ownership/mode so every UID in `allowed_uids` can connect,
+/// without granting access more widely. SO_PEERCRED and the bearer token
+/// remain the other two factors; this only fixes the filesystem gate in
+/// front of them.
+///
+/// Fails closed: when the permission model cannot be expressed, refuse to
+/// serve rather than listen on a socket the authorized peers cannot reach
+/// (or one that is more permissive than configured).
+fn configure_socket_permissions(
+    socket: &Path,
+    allowed_uids: &[u32],
+    socket_group: Option<&str>,
+) -> Result<(), SandboxdError> {
+    let c_path = CString::new(socket.as_os_str().as_encoded_bytes())
+        .map_err(|e| SandboxdError::Host(format!("API socket path contains NUL: {e}")))?;
+    // chown(2): (uid_t)-1 / (gid_t)-1 leaves the id unchanged.
+    const NO_CHANGE_UID: libc::uid_t = u32::MAX;
+    const NO_CHANGE_GID: libc::gid_t = u32::MAX;
+    let chown = |uid: libc::uid_t, gid: libc::gid_t| {
+        // SAFETY: c_path is a valid NUL-terminated path.
+        let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+        if rc != 0 {
+            return Err(SandboxdError::Host(format!(
+                "cannot chown API socket {}: {}",
+                socket.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    };
+    let set_mode = |mode: u32| {
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(mode))
+            .map_err(SandboxdError::Io)
+    };
+
+    let euid = unsafe { libc::geteuid() };
+    if allowed_uids.len() == 1 && allowed_uids[0] != euid {
+        // Single non-daemon peer: hand the socket to that UID, 0600.
+        // Least privilege: no group access needed.
+        chown(allowed_uids[0], NO_CHANGE_GID)?;
+        set_mode(0o600)?;
+        return Ok(());
+    }
+    if allowed_uids.len() == 1 {
+        // The only authorized peer is the daemon user itself: 0600.
+        set_mode(0o600)?;
+        return Ok(());
+    }
+    // Several authorized UIDs: they must share a group. 0660 admits
+    // exactly that group; the operator names it via `socket_group`.
+    let group = socket_group.ok_or_else(|| {
+        SandboxdError::Host(
+            "multiple allowed_uids need api.socket_group: a 0600 socket cannot \
+             admit several users; refusing to serve"
+                .into(),
+        )
+    })?;
+    let gid = lookup_group_gid(group)?;
+    chown(NO_CHANGE_UID, gid)?;
+    set_mode(0o660)?;
+    Ok(())
+}
+
+/// Resolve a group name to its gid for API socket group ownership.
+fn lookup_group_gid(name: &str) -> Result<libc::gid_t, SandboxdError> {
+    let c_name = CString::new(name)
+        .map_err(|_| SandboxdError::Host("api.socket_group contains NUL".into()))?;
+    // SAFETY: c_name is a valid NUL-terminated string. Called once at
+    // startup before connection tasks spawn, so getgrnam's static
+    // storage is not a thread-safety concern here.
+    let entry = unsafe { libc::getgrnam(c_name.as_ptr()) };
+    if entry.is_null() {
+        return Err(SandboxdError::Host(format!(
+            "api.socket_group names an unknown group: {name}"
+        )));
+    }
+    // SAFETY: non-null on success; gr_gid is a plain field read.
+    Ok(unsafe { (*entry).gr_gid })
+}
+
 /// Serve the API on the configured socket. Never returns (except on fatal error).
 pub async fn serve(config: &ApiConfig, driver: Arc<Driver>) -> Result<(), SandboxdError> {
     let token = Arc::new(load_token(&config.token_file)?);
@@ -355,10 +477,16 @@ pub async fn serve(config: &ApiConfig, driver: Arc<Driver>) -> Result<(), Sandbo
     }
 
     let listener = UnixListener::bind(&config.socket).map_err(SandboxdError::Io)?;
-    // 0600: only the daemon user (and root) can connect. SO_PEERCRED provides
-    // the second factor (UID allowlist).
-    std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(0o600))
-        .map_err(SandboxdError::Io)?;
+    // Filesystem permissions are the first gate: `connect()` needs write
+    // permission on the socket inode, so a 0600 root-owned socket would
+    // lock out every non-root UID in `allowed_uids` before SO_PEERCRED
+    // ever runs. Admit exactly the authorized peers; fail closed when the
+    // permission model cannot be expressed.
+    configure_socket_permissions(
+        &config.socket,
+        &allowed_uids,
+        config.socket_group.as_deref(),
+    )?;
 
     loop {
         let (stream, _) = listener.accept().await.map_err(SandboxdError::Io)?;
@@ -444,5 +572,42 @@ mod tests {
         }
         let err = read_msg(&mut b).await.unwrap_err();
         assert!(matches!(err, SandboxdError::Protocol(_)));
+    }
+
+    // Oversized responses must not drop the connection: the client gets an
+    // error response carrying the same request id.
+    #[tokio::test]
+    async fn oversized_response_sends_error_with_same_id() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let big = ApiResponse {
+            id: 42,
+            result: Some(serde_json::json!({ "blob": "x".repeat(2 * 1024 * 1024) })),
+            error: None,
+        };
+        write_response(&mut a, 42, &big).await.unwrap();
+        drop(a);
+        let msg = read_msg(&mut b).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["error"]["code"], "response_too_large");
+        assert!(v.get("result").is_none());
+    }
+
+    // Normal responses pass through unchanged.
+    #[tokio::test]
+    async fn normal_response_written_as_is() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let resp = ApiResponse {
+            id: 7,
+            result: Some(serde_json::json!({ "ok": true })),
+            error: None,
+        };
+        write_response(&mut a, 7, &resp).await.unwrap();
+        drop(a);
+        let msg = read_msg(&mut b).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["ok"], true);
+        assert!(v.get("error").is_none());
     }
 }
