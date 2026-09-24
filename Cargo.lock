@@ -3273,6 +3273,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-sandboxd"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "lumen-protocol",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "uuid",
+]
+
+[[package]]
 name = "lumen-server"
 version = "0.1.0"
 dependencies = [
@@ -5892,6 +5913,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

@@ -4,16 +4,18 @@
 //! from a known, signed snapshot (strict profile = one disposable microVM
 //! per action). This crate implements the broker service (`sandboxd`) that
 //! owns KVM, the jailer, network setup, and cleanup — and nothing else.
-//! Policy lives in the kernel; sandboxd enforces the [`SandboxRunSpec`] it
-//! is given.
+//! Policy lives in the kernel; sandboxd enforces the frozen [`SandboxSpec`]
+//! it is given.
 //!
 //! # Layout
 //!
-//! - [`contracts`]: FROZEN copy of the phase-0 `SandboxDriver` v1 contract
-//!   (`SandboxRunSpec` / `SandboxResult` / `SandboxDriver` trait). Do not
-//!   edit; reconcile against `lumen-protocol` at phase-0 merge.
-//! - [`driver`]: [`contracts::SandboxDriver`] implementation over Firecracker.
-//! - [`api`]: authenticated local (Unix socket) API used by the kernel.
+//! - [`contracts`]: the frozen phase-0 `SandboxDriver` v1 boundary
+//!   (re-exported verbatim from `lumen-protocol`; never redefined here)
+//!   plus the daemon's runtime-internal shapes.
+//! - [`driver`]: [`contracts::SandboxDriver`] implementation over Firecracker,
+//!   including the frozen-spec -> runtime-spec adapter.
+//! - [`api`]: authenticated local (Unix socket) API used by the kernel; its
+//!   method set mirrors the frozen trait 1:1.
 //! - [`state`]: crash-safe run state machine + startup reconciliation.
 //! - `jailer`, [`seccomp`], [`cgroups`]: host policy perimeter.
 //! - [`network`], [`dns`], [`proxy`]: default-deny egress.
@@ -49,5 +51,9 @@ pub mod secrets;
 pub mod state;
 pub mod storage;
 
-pub use contracts::{ExportManifest, SandboxDriver, SandboxResult, SandboxRunSpec};
+pub use contracts::{
+    ExportManifest, ExportedFile, NetworkResource, OutputChunk, OutputSink, SANDBOX_DRIVER_VERSION,
+    SandboxDriver, SandboxError, SandboxHandle, SandboxOutcome, SandboxProfile, SandboxQuotas,
+    SandboxResult, SandboxRunSpec, SandboxSpec, StreamStats,
+};
 pub use error::SandboxdError;

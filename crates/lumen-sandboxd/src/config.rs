@@ -103,6 +103,14 @@ pub struct HostLimits {
     pub max_vcpu: u32,
     pub max_wall_time_secs: u64,
     pub max_disk_mib: u64,
+    /// Guest process cap applied to every run. The frozen v1 contract has no
+    /// per-run process field, so this is daemon policy (fail closed).
+    #[serde(default = "default_max_processes")]
+    pub default_max_processes: u32,
+}
+
+fn default_max_processes() -> u32 {
+    256
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +196,7 @@ impl Default for HostLimits {
             max_vcpu: 4,
             max_wall_time_secs: 3600,
             max_disk_mib: 20480,
+            default_max_processes: default_max_processes(),
         }
     }
 }
@@ -222,6 +231,11 @@ impl DaemonConfig {
         if self.limits.max_concurrent_runs == 0 {
             return Err(SandboxdError::State(
                 "max_concurrent_runs must be > 0".into(),
+            ));
+        }
+        if self.limits.default_max_processes == 0 {
+            return Err(SandboxdError::State(
+                "default_max_processes must be > 0".into(),
             ));
         }
         for name in [
