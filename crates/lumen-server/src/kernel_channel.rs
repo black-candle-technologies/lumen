@@ -17,6 +17,15 @@
 //!                     "result":{...},"usage":{...},"audit_ref":{...}}\n
 //! ```
 //!
+//! Reconciliation note (integration restack): this channel's envelope is the
+//! *host* schema. The kernel the host talks to speaks the *frozen*
+//! `lumen_core::pi_boundary` schema; the conversion happens at the
+//! [`crate::LocalKernelClient`] boundary, which resolves kernel-side
+//! semantics (digest, decision, lease-chain validation, audit) in favor of
+//! frozen. Switching the extension-facing schema itself to the frozen shape
+//! would change what the Pi extension must emit and is a coordinator design
+//! decision — the extension is currently a stub (`fake-pi.sh`).
+//!
 //! Authentication is two layers, per the design doc's deployment rule
 //! ("expose the kernel only through a local authenticated channel with
 //! peer-process validation"):

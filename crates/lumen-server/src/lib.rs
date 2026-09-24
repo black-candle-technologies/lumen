@@ -4,6 +4,7 @@ mod authd;
 mod jev;
 mod kernel_channel;
 mod kernel_client;
+mod kernel_local;
 mod model_gateway;
 mod orchestration;
 pub mod pi_supervisor;
@@ -32,6 +33,7 @@ pub use kernel_client::{
     POLICY_DECISION_VERSION, PolicyDecision, ResourceSet, ToolRef, deadline_rfc3339, now_ms,
     now_rfc3339, sha256_hex,
 };
+pub use kernel_local::LocalKernelClient;
 pub use model_gateway::{
     ChatMessage, CredentialVault, GatewayConfig, GatewayError, GatewayResponse, MemorySpendPool,
     MockProviderAdapter, MockProviderOutcome, ModelGateway, ModelPolicy, ModelRequest,
