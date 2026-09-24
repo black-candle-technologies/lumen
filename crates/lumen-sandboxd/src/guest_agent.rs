@@ -5,10 +5,12 @@
 //! It is baked into the signed read-only guest image, so its bytes are
 //! covered by image provenance ([`crate::provenance`]).
 //!
-//! Transport: vsock, guest dials host CID 2 on a per-run port. The port and
-//! the 128-bit run id are both unpredictable; the host binds the accepted
-//! connection to the expected run id on first message and drops anything
-//! else.
+//! Transport: vsock, host-initiated. The agent listens on [`VSOCK_PORT`]
+//! (overridable with the `lumen.vsock_port=` kernel cmdline); the host dials
+//! it through Firecracker's vsock UDS with a `CONNECT <port>` preamble. Run
+//! identity is bound by the handshake: the agent sends the run id from the
+//! `lumen.run_id=` kernel cmdline (set by the host in the Firecracker boot
+//! args) in `Hello`, and the host accepts only the run id it expects.
 //!
 //! Framing: `u32` big-endian length prefix + JSON body, capped at
 //! [`MAX_FRAME_BYTES`]. Binary payloads (stdio chunks, file data) travel as

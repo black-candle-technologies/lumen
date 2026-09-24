@@ -29,8 +29,12 @@ use lumen_sandboxd::{
 };
 use tokio::{
     io::{AsyncReadExt, BufReader},
-    net::TcpStream,
+    net::{
+        TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     process::{Child, Command},
+    sync::mpsc,
 };
 
 // Max single stdio chunk we relay (the host also caps).
@@ -168,7 +172,7 @@ async fn main() -> Result<(), SandboxdError> {
     // Handshake loop. The host may retry its CONNECT; if a handshake
     // attempt fails partway (the host went away), drop the connection and
     // go back to accept.
-    let (mut stream, argv, env, secrets, deadline_ms) = loop {
+    let (stream, argv, env, secrets, deadline_ms) = loop {
         let mut stream = vsock_accept(listen_fd).await?;
 
         // Hello.
@@ -223,12 +227,15 @@ async fn main() -> Result<(), SandboxdError> {
         }
     };
 
-    // Build the redactor from secret values.
+    // Build one redactor per stream from secret values. A shared redactor
+    // would mix the streams: its held-back tail is stream-agnostic, so
+    // stdout bytes could be emitted inside a stderr frame and vice versa.
     let secret_vals: Vec<lumen_sandboxd::secrets::Secret> = secrets
         .iter()
         .map(|(_, v)| lumen_sandboxd::secrets::Secret::new(v.as_bytes().to_vec()))
         .collect();
-    let redactor = Redactor::new(&secret_vals);
+    let out_redactor = Redactor::new(&secret_vals);
+    let err_redactor = Redactor::new(&secret_vals);
 
     // Spawn the workload.
     let mut cmd = Command::new(&argv[0]);
@@ -252,8 +259,26 @@ async fn main() -> Result<(), SandboxdError> {
         .spawn()
         .map_err(|e| SandboxdError::Host(format!("spawn {}: {e}", argv[0])))?;
 
+    // Split the stream: host frames are read by a dedicated task because
+    // `read_msg` is not cancel-safe inside a `select!` (a dropped future
+    // would lose already-consumed frame bytes). Reads are forwarded over
+    // `host_rx`; `mpsc::Receiver::recv` IS cancel-safe, so the supervise
+    // loop can select on it freely.
+    let (read_half, mut write_half) = stream.into_split();
+    let (host_tx, mut host_rx) = mpsc::channel::<Result<Option<HostMsg>, SandboxdError>>(16);
+    tokio::spawn(host_reader(read_half, host_tx));
+
     let deadline = Instant::now() + Duration::from_millis(deadline_ms);
-    let result = supervise(&mut stream, &mut child, redactor, deadline, &cfg).await;
+    let result = supervise(
+        &mut write_half,
+        &mut host_rx,
+        &mut child,
+        out_redactor,
+        err_redactor,
+        deadline,
+        &cfg,
+    )
+    .await;
 
     // Ensure the child is dead.
     let _ = child.kill().await;
@@ -262,11 +287,37 @@ async fn main() -> Result<(), SandboxdError> {
     result
 }
 
+/// Read host frames in a dedicated task and forward them over `tx`.
+///
+/// `read_msg` performs multiple reads (`read_u32`, then `read_exact`), so a
+/// `select!` that drops the future when another branch wins would discard
+/// the bytes it already consumed and desynchronize the stream. Here the
+/// future runs to completion for every frame; the terminal `Ok(None)`
+/// (clean EOF) or `Err` is forwarded once, then the task exits and dropping
+/// `tx` signals the supervise loop.
+async fn host_reader(
+    mut rx: OwnedReadHalf,
+    tx: mpsc::Sender<Result<Option<HostMsg>, SandboxdError>>,
+) {
+    loop {
+        let msg = read_msg::<_, HostMsg>(&mut rx).await;
+        let terminal = !matches!(msg, Ok(Some(_)));
+        if tx.send(msg).await.is_err() {
+            return;
+        }
+        if terminal {
+            return;
+        }
+    }
+}
+
 /// Supervise the workload: relay stdio, heartbeat, enforce deadline/cancel.
 async fn supervise(
-    stream: &mut TcpStream,
+    stream: &mut OwnedWriteHalf,
+    host_rx: &mut mpsc::Receiver<Result<Option<HostMsg>, SandboxdError>>,
     child: &mut Child,
-    mut redactor: Redactor,
+    mut out_redactor: Redactor,
+    mut err_redactor: Redactor,
     deadline: Instant,
     cfg: &AgentConfig,
 ) -> Result<(), SandboxdError> {
@@ -284,8 +335,19 @@ async fn supervise(
     let mut out_buf = vec![0u8; STDIO_CHUNK];
     let mut err_buf = vec![0u8; STDIO_CHUNK];
 
-    let mut last_heartbeat = Instant::now();
+    // A workload can close fd 1/2 (e.g. `exec 1>&-`) and keep running. Past
+    // EOF every read returns Ok(0) immediately; without tracking it the
+    // branch would be ready on every poll, spin at 100% CPU, and starve the
+    // heartbeat branch. Track EOF per pipe and park the branch instead.
+    let mut out_eof = false;
+    let mut err_eof = false;
+
+    // One interval for heartbeats, created outside the loop, so no branch
+    // can starve it. `interval` ticks immediately; consume that tick so the
+    // first heartbeat still goes out after `heartbeat_interval`.
     let heartbeat_interval = Duration::from_secs(5);
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    heartbeat.tick().await;
 
     loop {
         // Check deadline.
@@ -299,40 +361,58 @@ async fn supervise(
             return Ok(());
         }
 
-        // Check for Cancel from host (non-blocking).
-        // We use a short timeout on read to poll.
+        // Check for Cancel from host. Host frames arrive over `host_rx` from
+        // the dedicated reader task; `recv` is cancel-safe in `select!`.
         tokio::select! {
-            // Stdout.
-            n = out_reader.read(&mut out_buf) => {
+            // Stdout. Parked (never ready) after EOF.
+            n = async {
+                if out_eof {
+                    std::future::pending().await
+                } else {
+                    out_reader.read(&mut out_buf).await
+                }
+            } => {
                 let n = n.map_err(|e| SandboxdError::Host(format!("stdout read: {e}")))?;
-                if n > 0 {
-                    let redacted = redactor.feed(&out_buf[..n]);
+                if n == 0 {
+                    out_eof = true;
+                } else {
+                    let redacted = out_redactor.feed(&out_buf[..n]);
                     if !redacted.is_empty() {
                         write_msg(stream, &AgentMsg::stdout(&redacted)).await?;
                     }
                 }
             }
-            // Stderr.
-            n = err_reader.read(&mut err_buf) => {
+            // Stderr. Parked (never ready) after EOF.
+            n = async {
+                if err_eof {
+                    std::future::pending().await
+                } else {
+                    err_reader.read(&mut err_buf).await
+                }
+            } => {
                 let n = n.map_err(|e| SandboxdError::Host(format!("stderr read: {e}")))?;
-                if n > 0 {
-                    let redacted = redactor.feed(&err_buf[..n]);
+                if n == 0 {
+                    err_eof = true;
+                } else {
+                    let redacted = err_redactor.feed(&err_buf[..n]);
                     if !redacted.is_empty() {
                         write_msg(stream, &AgentMsg::stderr(&redacted)).await?;
                     }
                 }
             }
             // Host messages (Cancel).
-            msg = read_msg::<_, HostMsg>(stream) => {
-                match msg? {
-                    Some(HostMsg::Cancel) => {
+            msg = host_rx.recv() => {
+                match msg {
+                    Some(Ok(Some(HostMsg::Cancel))) => {
                         let _ = child.kill().await;
                         write_msg(stream, &AgentMsg::Exit { code: 130 }).await?; // 130 = SIGINT
                         return Ok(());
                     }
-                    Some(_) => {} // Ignore others during supervision.
-                    None => {
-                        // Host closed; workload is orphaned, kill it.
+                    Some(Ok(Some(_))) => {} // Ignore others during supervision.
+                    Some(Err(e)) => return Err(e), // Host read error.
+                    Some(Ok(None)) | None => {
+                        // Host closed (or the reader task is gone); the
+                        // workload is orphaned, kill it.
                         let _ = child.kill().await;
                         return Ok(());
                     }
@@ -352,7 +432,7 @@ async fn supervise(
                     if n == 0 {
                         break;
                     }
-                    let redacted = redactor.feed(&out_buf[..n]);
+                    let redacted = out_redactor.feed(&out_buf[..n]);
                     if !redacted.is_empty() {
                         write_msg(stream, &AgentMsg::stdout(&redacted)).await?;
                     }
@@ -363,27 +443,28 @@ async fn supervise(
                     if n == 0 {
                         break;
                     }
-                    let redacted = redactor.feed(&err_buf[..n]);
+                    let redacted = err_redactor.feed(&err_buf[..n]);
                     if !redacted.is_empty() {
                         write_msg(stream, &AgentMsg::stderr(&redacted)).await?;
                     }
                 }
-                // Flush redactor tail.
-                let tail = redactor.finish();
-                if !tail.is_empty() {
-                    write_msg(stream, &AgentMsg::stdout(&tail)).await?;
+                // Flush each redactor tail on its own stream.
+                let out_tail = out_redactor.finish();
+                if !out_tail.is_empty() {
+                    write_msg(stream, &AgentMsg::stdout(&out_tail)).await?;
+                }
+                let err_tail = err_redactor.finish();
+                if !err_tail.is_empty() {
+                    write_msg(stream, &AgentMsg::stderr(&err_tail)).await?;
                 }
                 // Stream exports from the workspace.
                 stream_exports(stream, &cfg.workspace).await?;
                 write_msg(stream, &AgentMsg::Exit { code }).await?;
                 return Ok(());
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // Heartbeat tick.
-                if last_heartbeat.elapsed() >= heartbeat_interval {
-                    write_msg(stream, &AgentMsg::Heartbeat).await?;
-                    last_heartbeat = Instant::now();
-                }
+            // Heartbeat tick.
+            _ = heartbeat.tick() => {
+                write_msg(stream, &AgentMsg::Heartbeat).await?;
             }
         }
     }
@@ -392,7 +473,10 @@ async fn supervise(
 /// Stream exports from the workspace directory.
 /// For now, exports everything under the workspace (the host validates).
 /// A real implementation would use the export manifest from the spec.
-async fn stream_exports(stream: &mut TcpStream, workspace: &Path) -> Result<(), SandboxdError> {
+async fn stream_exports(
+    stream: &mut OwnedWriteHalf,
+    workspace: &Path,
+) -> Result<(), SandboxdError> {
     let mut files = Vec::new();
     collect_files(workspace, workspace, &mut files)?;
 
@@ -432,8 +516,12 @@ async fn stream_exports(stream: &mut TcpStream, workspace: &Path) -> Result<(), 
             )
             .await?;
         }
-        write_msg(stream, &AgentMsg::ExportEnd).await?;
     }
+
+    // One ExportEnd per complete export. The host tears the export session
+    // down on ExportEnd (driver.rs), so a per-file ExportEnd would make the
+    // host reject every file after the first with "no export session".
+    write_msg(stream, &AgentMsg::ExportEnd).await?;
 
     Ok(())
 }
