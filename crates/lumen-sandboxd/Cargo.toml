@@ -1,0 +1,42 @@
+[package]
+name = "lumen-sandboxd"
+version.workspace = true
+edition.workspace = true
+description = "Strict-profile Firecracker sandbox broker: one disposable microVM per action"
+license = "Apache-2.0"
+
+[[bin]]
+name = "lumen-sandboxd"
+path = "src/main.rs"
+
+[[bin]]
+name = "lumen-guest-agent"
+path = "src/bin/guest-agent.rs"
+
+[lib]
+name = "lumen_sandboxd"
+path = "src/lib.rs"
+
+[features]
+default = []
+# KVM-gated integration tests: real Firecracker lifecycle. Runs only on a
+# KVM-capable host (lane-vps). `cargo test -p lumen-sandboxd` stays hermetic.
+kvm = []
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+ed25519-dalek = "2"
+hex = "0.4"
+libc = "0.2"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
