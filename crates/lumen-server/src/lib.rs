@@ -7,6 +7,7 @@ mod kernel_client;
 mod kernel_local;
 mod model_gateway;
 mod orchestration;
+mod pi_sandbox;
 pub mod pi_supervisor;
 mod routes;
 mod sandbox_driver;

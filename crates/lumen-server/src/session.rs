@@ -91,6 +91,12 @@ pub struct SupervisorConfig {
     /// listener the extension cannot mediate and every tool call fails
     /// closed inside the extension.
     pub channel_socket_path: Option<PathBuf>,
+    /// OS-level confinement for the Pi subprocess: network namespace,
+    /// Landlock filesystem policy, and a scrubbed environment. All
+    /// layers default to on; see [`crate::pi_sandbox`] for the threat
+    /// model and the residual risks. Disable a layer only on platforms
+    /// that cannot provide it.
+    pub pi_sandbox: crate::pi_sandbox::PiSandboxConfig,
 }
 
 impl SupervisorConfig {
@@ -132,6 +138,7 @@ impl Default for SupervisorConfig {
             event_buffer: 256,
             stderr_line_cap: 100,
             channel_socket_path: None,
+            pi_sandbox: crate::pi_sandbox::PiSandboxConfig::default(),
         }
     }
 }
@@ -824,16 +831,46 @@ impl SessionSupervisor {
         cmd_rx: mpsc::Receiver<Vec<u8>>,
         shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<Arc<tokio::sync::Mutex<Child>>, SupervisorError> {
+        use crate::pi_sandbox::{PiSandboxPaths, configure_child};
+
         let mut cmd = Command::new(&inner.config.pi_binary);
-        cmd.args(&inner.config.pi_args)
-            .env("LUMEN_SESSION_ID", id.to_string())
-            .env("LUMEN_SESSION_SUBJECT", session_subject);
+        cmd.args(&inner.config.pi_args);
         // Kernel channel contract (phase-0 names): the socket the BCT
-        // extension dials, and this session's credential for it.
+        // extension dials, and this session's credential for it. These
+        // are the only caller-controlled variables the child receives;
+        // the sandbox scrubs everything else.
+        let mut extra_env = vec![
+            ("LUMEN_SESSION_ID", id.to_string()),
+            ("LUMEN_SESSION_SUBJECT", session_subject.to_string()),
+        ];
+        let mut socket_dir: Option<PathBuf> = None;
         if let Some(channel) = channel {
-            cmd.env("LUMEN_KERNEL_SOCKET", channel.socket_path.as_os_str())
-                .env("LUMEN_KERNEL_NONCE", channel.nonce_hex);
+            extra_env.push((
+                "LUMEN_KERNEL_SOCKET",
+                channel.socket_path.to_string_lossy().into_owned(),
+            ));
+            extra_env.push(("LUMEN_KERNEL_NONCE", channel.nonce_hex.to_string()));
+            socket_dir = channel.socket_path.parent().map(|p| p.to_path_buf());
         }
+        // OS-enforced confinement for the untrusted Pi process:
+        // scrubbed environment, fresh network namespace, Landlock
+        // filesystem policy. Any setup failure aborts the spawn — Pi
+        // never runs unsandboxed (fail closed).
+        let tmp_dir = inner.config.session_dir.join("pi-tmp").join(id.to_string());
+        let extra_ref: Vec<(&str, &str)> =
+            extra_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        configure_child(
+            cmd.as_std_mut(),
+            &inner.config.pi_sandbox,
+            &PiSandboxPaths {
+                pi_binary: &inner.config.pi_binary,
+                session_dir: &inner.config.session_dir,
+                tmp_dir: &tmp_dir,
+                socket_dir: socket_dir.as_deref(),
+            },
+            &extra_ref,
+        )
+        .map_err(|e| SupervisorError::SpawnFailed(format!("pi sandbox: {e}")))?;
         let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1932,6 +1969,10 @@ mod tests {
         if let Some(mode) = mode {
             pi_args.push(mode.to_string());
         }
+        // The fixture script lives outside the sandbox's built-in
+        // read-only set; allowlist its directory so the Landlock
+        // policy can exec it (via /bin/sh) in tests.
+        let fixture_dir = script.parent().unwrap().to_path_buf();
         SupervisorConfig {
             pi_binary: script.clone(),
             pi_args,
@@ -1948,6 +1989,10 @@ mod tests {
             watchdog_interval: Duration::from_millis(50),
             event_buffer: 64,
             stderr_line_cap: 16,
+            pi_sandbox: crate::pi_sandbox::PiSandboxConfig {
+                extra_read_only_paths: vec![fixture_dir],
+                ..crate::pi_sandbox::PiSandboxConfig::default()
+            },
             ..SupervisorConfig::default()
         }
     }

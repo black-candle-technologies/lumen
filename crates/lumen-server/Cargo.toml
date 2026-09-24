@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = "0.8"
 futures-util = "0.3"
+libc = "0.2"
 lumen-core = { path = "../lumen-core" }
 lumen-sandboxd = { path = "../lumen-sandboxd" }
 serde = { version = "1", features = ["derive"] }

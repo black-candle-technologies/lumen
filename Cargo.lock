@@ -3302,6 +3302,7 @@ dependencies = [
  "axum",
  "futures-util",
  "http-body-util",
+ "libc",
  "lumen-core",
  "lumen-sandboxd",
  "serde",
