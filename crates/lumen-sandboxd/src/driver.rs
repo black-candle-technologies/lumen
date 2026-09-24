@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -125,9 +126,13 @@ pub struct JailSetup {
     pub spec: JailSpec,
     /// Path to the jailer binary (from DaemonConfig).
     pub jailer_bin: PathBuf,
-    /// Verified image directory (vmlinux, rootfs.ext4,
-    /// workspace-template.qcow2).
-    pub image_dir: PathBuf,
+    /// Pinned, digest-verified launch artifacts (vmlinux, rootfs.ext4,
+    /// workspace-template.raw). Opened `O_NOFOLLOW` and hashed at resolve
+    /// time; [`FirecrackerBackend::spawn_jailer`] re-hashes each descriptor
+    /// immediately before hard-linking it into the chroot from the pinned
+    /// descriptor itself. The image-store path is never re-joined here, so
+    /// there is no TOCTOU window between verification and launch.
+    pub artifacts: Vec<provenance::PinnedArtifact>,
     /// Rendered Firecracker config JSON (also written to the run dir).
     pub fc_config_json: String,
     /// In-jail Firecracker argv (paths are jail-relative).
@@ -547,10 +552,7 @@ impl Driver {
         // and every artifact must hash to its manifest digest. The guest
         // kernel always comes from that manifest — the caller cannot
         // nominate a different kernel than the image's.
-        let mut trusted_keys = Vec::new();
-        for path in &self.inner.config.images.trusted_keys {
-            trusted_keys.push(provenance::load_verifying_key(path)?);
-        }
+        let trusted_keys = load_trusted_keys(&self.inner.config)?;
         let stored = provenance::resolve_image(
             &self.inner.config.images.store,
             &spec.image_digest,
@@ -1032,8 +1034,19 @@ impl Driver {
         let fc_args =
             jailer::firecracker_argv(Path::new("/fc-api.sock"), Path::new("/firecracker.json"));
 
-        // Image dir for the backend to hard-link into the chroot.
-        let image_dir = self.inner.config.images.store.join(&spec.image_digest);
+        // Pinned launch artifacts for the backend to hard-link into the
+        // chroot. Re-resolve and PIN the image at launch time:
+        // resolve_image opens every artifact O_NOFOLLOW and digest-verifies
+        // it, and the pinned descriptors (not the store path) travel to
+        // spawn_jailer, which re-hashes them immediately before
+        // hard-linking. This closes the prepare->start TOCTOU window where
+        // a store write could swap the bytes that prepare verified.
+        let trusted_keys = load_trusted_keys(&self.inner.config)?;
+        let stored = provenance::resolve_image(
+            &self.inner.config.images.store,
+            &spec.image_digest,
+            &trusted_keys,
+        )?;
 
         self.inner.store.transition(run_id, RunState::Starting)?;
 
@@ -1072,7 +1085,7 @@ impl Driver {
         let setup = JailSetup {
             spec: jail_spec,
             jailer_bin: self.inner.config.firecracker.jailer.clone(),
-            image_dir,
+            artifacts: stored.artifacts,
             fc_config_json: fc_json,
             fc_args,
         };
@@ -1584,6 +1597,223 @@ async fn run_cmd(prog: &str, args: &[&str]) -> Result<String, SandboxdError> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Load the daemon's trusted image-signing keys (shared by the
+/// prepare-time and launch-time image resolutions).
+fn load_trusted_keys(config: &DaemonConfig) -> Result<Vec<VerifyingKey>, SandboxdError> {
+    let mut keys = Vec::new();
+    for path in &config.images.trusted_keys {
+        keys.push(provenance::load_verifying_key(path)?);
+    }
+    Ok(keys)
+}
+
+// ---------------------------------------------------------------------------
+// Bridge-netfilter fail-closed verification + host-namespace enforcement
+// ---------------------------------------------------------------------------
+
+/// `br_netfilter` sysctls that must read "1" for bridged guest traffic to
+/// traverse the run-netns nftables forward chain. Without them, frames
+/// bridged between the TAP and the veth skip netfilter entirely in the run
+/// netns, and the only remaining enforcement would be whatever the host
+/// happens to have configured — fail-open egress.
+const BRIDGE_NF_SYSCTLS: [&str; 3] = [
+    "bridge-nf-call-iptables",
+    "bridge-nf-call-ip6tables",
+    "bridge-nf-call-arptables",
+];
+
+/// Check the bridge-nf-call sysctls under `dir` (normally
+/// `/proc/sys/net/bridge`). Pure and unit-testable: every value must be
+/// exactly "1" (modulo surrounding whitespace). Fails closed on a missing
+/// file (module not loaded) or any non-"1" value.
+fn check_bridge_nf_sysctls(dir: &Path) -> Result<(), SandboxdError> {
+    for name in BRIDGE_NF_SYSCTLS {
+        let path = dir.join(name);
+        let val = std::fs::read_to_string(&path).map_err(|e| {
+            SandboxdError::Host(format!(
+                "bridge netfilter sysctl {} unreadable — br_netfilter is not active; \
+                 refusing to start because bridged guest traffic would bypass the \
+                 run-netns firewall: {e}",
+                path.display()
+            ))
+        })?;
+        if val.trim() != "1" {
+            return Err(SandboxdError::Host(format!(
+                "bridge netfilter disabled ({} = {:?}); refusing to start because \
+                 bridged guest traffic would bypass the run-netns firewall",
+                path.display(),
+                val.trim()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Fail-closed bridge filtering check for action startup: attempt to load
+/// `br_netfilter`, then require the sysctls to confirm it is actually
+/// active. The sysctl state — not the modprobe exit status — is
+/// authoritative (the module may be built in, in which case there is
+/// nothing to load).
+async fn ensure_bridge_filtering() -> Result<(), SandboxdError> {
+    let _ = run_cmd("modprobe", &["br_netfilter"]).await;
+    check_bridge_nf_sysctls(Path::new("/proc/sys/net/bridge"))
+}
+
+/// nftables table in the HOST (init) network namespace carrying the
+/// br_netfilter-independent enforcement layer. The run-netns forward chain
+/// only sees bridged guest traffic via br_netfilter; these host rules apply
+/// at the host stack's input/forward hooks no matter how the frames got
+/// there, so they hold even if bridge filtering were ever unavailable.
+const HOST_NFT_TABLE: &str = "lumen-host";
+const HOST_NFT_INPUT_CHAIN: &str = "sandbox_input";
+const HOST_NFT_FORWARD_CHAIN: &str = "sandbox_forward";
+
+/// Render the host-namespace nftables rules for one run. Each rule is the
+/// argument vector after `nft <add|delete> rule`; add and delete use the
+/// identical spec so teardown can remove exactly what setup installed.
+///
+/// Semantics:
+/// - input: from the run's host-side veth, allow only the intended
+///   guest->host flows (DNS + egress proxy on the host-leg address) plus
+///   established return traffic; drop everything else arriving on that
+///   interface. The final drop has no `ip` qualifier, so it also covers
+///   IPv6.
+/// - forward: the guest must never be L3-forwarded by the host; the egress
+///   proxy performs upstream fetches on the guest's behalf under its own
+///   policy. Dropped unconditionally.
+///
+/// The rules key on the ingress interface name, never on source IP: a guest
+/// that re-addresses itself, adds routes, or enables forwarding inside its
+/// own kernel still cannot pass these drops.
+fn host_nft_rules(plan: &network::NetPlan) -> Vec<Vec<String>> {
+    let veth = &plan.veth_host;
+    let host = &plan.host_ip;
+    let proxy = plan.proxy_port.to_string();
+    let mut rules = Vec::new();
+    let mut input = |rest: &[&str]| {
+        let mut r = vec![
+            "inet".to_string(),
+            HOST_NFT_TABLE.to_string(),
+            HOST_NFT_INPUT_CHAIN.to_string(),
+            "iifname".to_string(),
+            veth.clone(),
+        ];
+        r.extend(rest.iter().map(|s| s.to_string()));
+        rules.push(r);
+    };
+    input(&["ip", "daddr", host, "udp", "dport", "53", "accept"]);
+    input(&["ip", "daddr", host, "tcp", "dport", "53", "accept"]);
+    input(&["ip", "daddr", host, "tcp", "dport", &proxy, "accept"]);
+    input(&["ct", "state", "established,related", "accept"]);
+    input(&["drop"]);
+    rules.push(vec![
+        "inet".to_string(),
+        HOST_NFT_TABLE.to_string(),
+        HOST_NFT_FORWARD_CHAIN.to_string(),
+        "iifname".to_string(),
+        veth.clone(),
+        "drop".to_string(),
+    ]);
+    rules
+}
+
+/// Run nft in the host namespace with an argument vector.
+async fn nft(args: &[String]) -> Result<String, SandboxdError> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cmd("nft", &refs).await
+}
+
+/// Ensure the host table and chains exist (idempotent). Both chains use
+/// policy accept: only traffic from sandbox veth interfaces is ever
+/// dropped, so a missing or half-installed table cannot break unrelated
+/// host traffic.
+async fn ensure_host_nft_table() -> Result<(), SandboxdError> {
+    if nft(&[
+        "list".to_string(),
+        "table".to_string(),
+        "inet".to_string(),
+        HOST_NFT_TABLE.to_string(),
+    ])
+    .await
+    .is_err()
+    {
+        nft(&[
+            "add".to_string(),
+            "table".to_string(),
+            "inet".to_string(),
+            HOST_NFT_TABLE.to_string(),
+        ])
+        .await?;
+        for (chain, hook) in [
+            (HOST_NFT_INPUT_CHAIN, "input"),
+            (HOST_NFT_FORWARD_CHAIN, "forward"),
+        ] {
+            nft(&[
+                "add".to_string(),
+                "chain".to_string(),
+                "inet".to_string(),
+                HOST_NFT_TABLE.to_string(),
+                chain.to_string(),
+                format!("{{ type filter hook {hook} priority 0; policy accept; }}"),
+            ])
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Install the host-namespace enforcement rules for one run.
+/// Delete-then-add makes setup idempotent against stale rules left by a
+/// crashed run. Fail-closed: any error aborts action startup.
+async fn install_host_enforcement(plan: &network::NetPlan) -> Result<(), SandboxdError> {
+    ensure_host_nft_table().await?;
+    for rule in host_nft_rules(plan) {
+        let mut del = vec!["delete".to_string(), "rule".to_string()];
+        del.extend(rule.iter().cloned());
+        let _ = nft(&del).await; // Absent rule: fine.
+        let mut add = vec!["add".to_string(), "rule".to_string()];
+        add.extend(rule);
+        nft(&add).await?;
+    }
+    Ok(())
+}
+
+/// Remove one run's host-namespace rules. Best-effort: teardown must not
+/// fail because a rule is already gone (and a stale rule is inert once its
+/// veth is deleted, since it matches on the interface name).
+async fn remove_host_enforcement(plan: &network::NetPlan) {
+    for rule in host_nft_rules(plan) {
+        let mut del = vec!["delete".to_string(), "rule".to_string()];
+        del.extend(rule);
+        let _ = nft(&del).await;
+    }
+}
+
+/// Re-hash a pinned launch artifact immediately before hand-off and
+/// hard-link it into the chroot from its pinned descriptor (never via the
+/// image-store path).
+///
+/// Fail-closed: any digest mismatch aborts the launch. The descriptor pins
+/// the exact inode verified at resolve time, so a path swap in the store
+/// after resolve cannot redirect the link; the re-hash additionally
+/// catches in-place byte changes under the open handle.
+fn revalidate_and_link_artifact(
+    artifact: &provenance::PinnedArtifact,
+    jail_root: &Path,
+) -> Result<(), SandboxdError> {
+    let actual = provenance::digest_open_file(&artifact.file)?;
+    if actual != artifact.expected_digest {
+        return Err(SandboxdError::BadSignature(format!(
+            "launch revalidation failed for {}: {actual} != {}",
+            artifact.name, artifact.expected_digest
+        )));
+    }
+    let dst = jail_root.join(&artifact.name);
+    let _ = std::fs::remove_file(&dst);
+    artifact.hard_link_into(&dst)?;
+    Ok(())
+}
+
 struct NetnsTask {
     thread: Option<std::thread::JoinHandle<()>>,
     shutdown_tx: std::sync::mpsc::Sender<()>,
@@ -1713,6 +1943,19 @@ impl VmBackend for FirecrackerBackend {
         nftables_rules: &str,
     ) -> Result<(), SandboxdError> {
         // netns
+        //
+        // Guest route administration: the guest is a full KVM virtual
+        // machine, so its own root inherently holds CAP_NET_ADMIN over its
+        // own kernel — that cannot be revoked from the host (capabilities
+        // are a container concept; no host mechanism strips them inside a
+        // VM). The guest's network is configured statically by /init from
+        // the kernel command line (`lumen.guest_ip=`, `lumen.host_ip=`; see
+        // jailer::render_config) — no DHCP, no router advertisements — but
+        // a hostile guest root can still add routes or enable forwarding
+        // inside its own kernel. That is contained by construction: every
+        // enforcement rule installed here keys on the ingress interface
+        // (iifname), never on source IP or guest routing state, so no route
+        // the guest adds can escape the host-side drops.
         let _ = run_cmd("ip", &["netns", "delete", &plan.netns_name]).await;
         run_cmd("ip", &["netns", "add", &plan.netns_name]).await?;
         // veth pair
@@ -1829,19 +2072,29 @@ impl VmBackend for FirecrackerBackend {
         ])
         .await?;
         // nftables (default-deny; see network::render_nftables). Bridged
-        // guest traffic traverses the inet forward chain via br_netfilter;
-        // make sure the module is loaded so the policy actually applies.
-        // Best-effort: even without it the topology (no route, no NAT)
-        // denies egress; the nftables layer is defense in depth.
-        let _ = run_cmd("modprobe", &["br_netfilter"]).await;
+        // guest traffic traverses the inet forward chain ONLY via
+        // br_netfilter, so bridge filtering is verified fail-closed here:
+        // without it the run-netns policy would be silently bypassed
+        // (fail-open egress). The old "no route, no NAT" topology argument
+        // is NOT relied upon — it is an assumption about host state
+        // (forwarding flags, MASQUERADE rules, host listeners), not an
+        // enforced invariant, and a root guest is not bound by it.
+        ensure_bridge_filtering().await?;
         let nft_path = format!("/run/lumen-{}.nft", plan.netns_name);
         std::fs::write(&nft_path, nftables_rules).map_err(SandboxdError::Io)?;
         let nft_cmd = format!("ip netns exec {} nft -f {}", plan.netns_name, nft_path);
         run_cmd("sh", &["-c", &nft_cmd]).await?;
+        // Host-namespace enforcement, independent of bridge hooks: even if
+        // bridged frames ever bypassed the run-netns chains, the host stack
+        // still drops everything arriving on the sandbox veth except the
+        // intended guest->host DNS/proxy flows, and never L3-forwards guest
+        // traffic.
+        install_host_enforcement(plan).await?;
         Ok(())
     }
 
     async fn teardown_network(&self, plan: &network::NetPlan) -> Result<(), SandboxdError> {
+        remove_host_enforcement(plan).await;
         let _ = run_cmd("ip", &["netns", "delete", &plan.netns_name]).await;
         let _ = run_cmd("ip", &["link", "delete", &plan.veth_host, "type", "veth"]).await;
         let _ = run_cmd("ip", &["tuntap", "del", &plan.tap_name, "mode", "tap"]).await;
@@ -1886,12 +2139,13 @@ impl VmBackend for FirecrackerBackend {
         //    is hard-linked too, but the per-run workspace is a COPY (never
         //    a hard link): guest block writes through a hard link would
         //    dirty the shared template for every later run.
-        for name in ["vmlinux", "rootfs.ext4", "workspace-template.raw"] {
-            let src = setup.image_dir.join(name);
-            let dst = root.join(name);
-            let _ = std::fs::remove_file(&dst);
-            std::fs::hard_link(&src, &dst)
-                .map_err(|e| SandboxdError::Host(format!("hard-link {name}: {e}")))?;
+        //
+        //    Each artifact is re-hashed from its PINNED descriptor
+        //    immediately before linking (see revalidate_and_link_artifact):
+        //    launch aborts on any digest mismatch, so bytes swapped in the
+        //    store after resolve can never boot.
+        for artifact in &setup.artifacts {
+            revalidate_and_link_artifact(artifact, &root)?;
         }
         // 3. Per-run workspace: sparse (reflink-preferring) copy of the
         //    template. Firecracker's virtio-blk is raw-only, so this is a
@@ -1961,7 +2215,7 @@ impl VmBackend for FirecrackerBackend {
         // run's cgroup. Best effort: a failure here is logged, not fatal,
         // because the jailer's own rlimits still apply.
         if let Some(pid) = pid {
-            let _ = cgroups::add_process(cgroup_parent, &cgroup_rel, pid);
+            let _ = cgroups::add_process(cgroup_parent, cgroup_rel, pid);
         }
         // Reap in the background; the handle kills by pid.
         tokio::spawn(async move {
@@ -2661,5 +2915,166 @@ mod tests {
         assert!(is_secret_like("SECRET_KEY"));
         assert!(!is_secret_like("PATH"));
         assert!(!is_secret_like("HOME"));
+    }
+
+    // --- Adversarial-review regression tests (PR #73) ---
+
+    fn bridge_sysctl_dir(values: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, val) in values {
+            std::fs::write(tmp.path().join(name), val).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn bridge_nf_sysctls_require_all_one() {
+        // All "1" (with trailing newline, as the kernel writes them): ok.
+        let dir = bridge_sysctl_dir(&[
+            ("bridge-nf-call-iptables", "1\n"),
+            ("bridge-nf-call-ip6tables", "1\n"),
+            ("bridge-nf-call-arptables", "1"),
+        ]);
+        assert!(check_bridge_nf_sysctls(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn bridge_nf_sysctl_zero_fails_closed() {
+        let dir = bridge_sysctl_dir(&[
+            ("bridge-nf-call-iptables", "1\n"),
+            ("bridge-nf-call-ip6tables", "0\n"), // disabled
+            ("bridge-nf-call-arptables", "1\n"),
+        ]);
+        let err = check_bridge_nf_sysctls(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bridge-nf-call-ip6tables"), "msg: {msg}");
+        assert!(msg.contains("refusing to start"), "msg: {msg}");
+    }
+
+    #[test]
+    fn bridge_nf_sysctl_missing_fails_closed() {
+        // Module not loaded: /proc/sys/net/bridge/* absent entirely.
+        let dir = bridge_sysctl_dir(&[("bridge-nf-call-iptables", "1\n")]);
+        let err = check_bridge_nf_sysctls(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("refusing to start"));
+        // Empty dir at all.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(check_bridge_nf_sysctls(empty.path()).is_err());
+    }
+
+    #[test]
+    fn bridge_nf_sysctl_garbage_fails_closed() {
+        let dir = bridge_sysctl_dir(&[
+            ("bridge-nf-call-iptables", "1\n"),
+            ("bridge-nf-call-ip6tables", "1\n"),
+            ("bridge-nf-call-arptables", "yes\n"),
+        ]);
+        assert!(check_bridge_nf_sysctls(dir.path()).is_err());
+    }
+
+    fn test_plan() -> network::NetPlan {
+        network::plan_net("abcdef12", "10.244.0.0/16", 0, 18080, "lmvt-", "lmn-").unwrap()
+    }
+
+    #[test]
+    fn host_nft_rules_allow_only_intended_flows_then_drop() {
+        let plan = test_plan();
+        let rules = host_nft_rules(&plan);
+        // 5 input rules (dns udp, dns tcp, proxy tcp, established, drop)
+        // + 1 forward drop.
+        assert_eq!(rules.len(), 6);
+        let render = |r: &[String]| r.join(" ");
+        let texts: Vec<String> = rules.iter().map(|r| render(r)).collect();
+
+        // Every rule is scoped to this run's host-side veth by ingress
+        // interface — never by source IP (route-agnostic).
+        for t in &texts {
+            assert!(t.contains("iifname lmvh-abcdef12"), "rule: {t}");
+        }
+        // Intended flows: DNS + proxy on the host-leg address.
+        assert!(texts[0].contains("ip daddr 10.244.0.1 udp dport 53 accept"));
+        assert!(texts[1].contains("ip daddr 10.244.0.1 tcp dport 53 accept"));
+        assert!(texts[2].contains("ip daddr 10.244.0.1 tcp dport 18080 accept"));
+        assert!(texts[3].contains("ct state established,related accept"));
+        // Final input rule: family-agnostic drop (no `ip` qualifier, so
+        // IPv6 from the guest is dropped too).
+        assert_eq!(
+            texts[4],
+            "inet lumen-host sandbox_input iifname lmvh-abcdef12 drop"
+        );
+        // Forward: guest traffic is never L3-forwarded by the host.
+        assert_eq!(
+            texts[5],
+            "inet lumen-host sandbox_forward iifname lmvh-abcdef12 drop"
+        );
+    }
+
+    #[test]
+    fn host_nft_rules_differ_per_run() {
+        let a = test_plan();
+        let mut b = test_plan();
+        b.veth_host = "lmvh-99999999".into();
+        b.host_ip = "10.244.0.5".into();
+        let ra: Vec<String> = host_nft_rules(&a).iter().map(|r| r.join(" ")).collect();
+        let rb: Vec<String> = host_nft_rules(&b).iter().map(|r| r.join(" ")).collect();
+        assert_ne!(ra, rb);
+        // No rule for run A mentions run B's interface.
+        for t in &ra {
+            assert!(!t.contains("lmvh-99999999"), "rule: {t}");
+        }
+    }
+
+    fn pinned_artifact_for(content: &[u8]) -> (tempfile::TempDir, provenance::PinnedArtifact) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vmlinux");
+        std::fs::write(&path, content).unwrap();
+        let file = provenance::open_nofollow(&path).unwrap();
+        let artifact = provenance::PinnedArtifact {
+            name: "vmlinux".into(),
+            file,
+            expected_digest: provenance::digest_bytes(content),
+        };
+        (tmp, artifact)
+    }
+
+    #[test]
+    fn revalidate_and_link_artifact_links_verified_bytes() {
+        let (_tmp, artifact) = pinned_artifact_for(b"known-good-kernel");
+        let jail = tempfile::tempdir().unwrap();
+        revalidate_and_link_artifact(&artifact, jail.path()).unwrap();
+        let linked = std::fs::read(jail.path().join("vmlinux")).unwrap();
+        assert_eq!(linked, b"known-good-kernel");
+        // Linked through the pinned fd: same inode as the store file.
+        use std::os::unix::fs::MetadataExt;
+        let src_ino = artifact.file.metadata().unwrap().ino();
+        let dst_ino = std::fs::metadata(jail.path().join("vmlinux"))
+            .unwrap()
+            .ino();
+        assert_eq!(src_ino, dst_ino);
+    }
+
+    #[test]
+    fn revalidate_and_link_artifact_aborts_on_tampered_bytes() {
+        // Attacker rewrites the store file in place after resolve: the
+        // pinned descriptor sees the new bytes, the re-hash mismatches,
+        // and launch aborts before anything is linked.
+        let (tmp, artifact) = pinned_artifact_for(b"original-kernel");
+        std::fs::write(tmp.path().join("vmlinux"), b"evil-kernel").unwrap();
+        let jail = tempfile::tempdir().unwrap();
+        let err = revalidate_and_link_artifact(&artifact, jail.path()).unwrap_err();
+        assert!(
+            matches!(err, SandboxdError::BadSignature(_)),
+            "expected BadSignature, got {err:?}"
+        );
+        assert!(!jail.path().join("vmlinux").exists());
+    }
+
+    #[test]
+    fn load_trusted_keys_reads_key_files() {
+        let (img_store, _digest) = fake_image();
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_config(&img_store, &state);
+        let keys = load_trusted_keys(&cfg).unwrap();
+        assert_eq!(keys.len(), 1);
     }
 }
