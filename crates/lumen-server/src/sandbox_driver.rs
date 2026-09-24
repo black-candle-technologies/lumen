@@ -24,6 +24,22 @@
 //! the adapter's bookkeeping, but the guest already ran: effects cannot be
 //! un-executed.
 //!
+//! # No host writeback before commit (verified)
+//!
+//! The eager execution is contained: the guest runs inside the microVM,
+//! and its file changes land in the run-private staging directory
+//! (`.../runs/lmn-{tag}/staging`), never the host workspace. This adapter
+//! does NOT call [`Driver::export`]; it reads only the export *manifest*
+//! (metadata) from the [`SandboxResult`]. [`Driver::export`] itself returns
+//! metadata (`ExportedFile { path, content_hash, size_bytes }`), not file
+//! contents. On driver `destroy`, the staging directory is removed. A
+//! repository-wide search finds no `rename`/`copy` from staging to the host
+//! workspace and no export consumer: `commit` is currently an
+//! acknowledgement because there is no writeback path to trigger.
+//!
+//! Network egress is the one host-visible effect of eager execution, and it
+//! is policy-mediated (proxy, default-deny), not commit-gated.
+//!
 //! True stage/commit needs driver-level support (a prepare mode that holds
 //! the run's effects — overlayfs upper, buffered egress — until an explicit
 //! commit call). That is a Phase-2 design decision, marked
@@ -284,5 +300,45 @@ mod tests {
             .unwrap();
         rt.block_on(exec.commit()).unwrap();
         assert_eq!(*aborted.lock().unwrap(), 1);
+    }
+
+    /// Regression: an uncommitted staged export cannot mutate a host
+    /// target. `commit` only flips the committed flag; it never copies
+    /// export bytes to the host workspace (the adapter does not call
+    /// `Driver::export`, and `Driver::export` returns metadata, not
+    /// contents).
+    #[test]
+    fn uncommitted_staged_export_cannot_mutate_host_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_target = dir.path().join("host.txt");
+        std::fs::write(&host_target, b"original").unwrap();
+
+        // A staged execution whose manifest claims an export for the host
+        // target path. Committing must NOT write it.
+        let mut result = sample_result();
+        result.export_manifest = Some(ExportManifest {
+            changed: vec![lumen_sandboxd::contracts::ChangedPath {
+                path: host_target.to_str().unwrap().to_string(),
+                sha256: "deadbeef".to_string(),
+                size_bytes: 8,
+            }],
+        });
+        let chunks = vec![OutputChunk {
+            stream: "stdout".to_string(),
+            bytes: b"x".to_vec(),
+        }];
+        let exec = DriverStagedExecution::from_completed(&chunks, &result, None);
+        let exec: Box<dyn StagedExecution> = Box::new(exec);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(exec.commit()).unwrap();
+
+        assert_eq!(
+            std::fs::read(&host_target).unwrap(),
+            b"original",
+            "commit must not write export bytes to the host"
+        );
     }
 }

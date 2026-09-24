@@ -2,9 +2,10 @@
 
 mod authd;
 mod jev;
+mod kernel_authority;
 mod kernel_channel;
 mod kernel_client;
-mod kernel_local;
+mod kernel_convert;
 mod model_gateway;
 mod orchestration;
 mod pi_sandbox;
@@ -24,6 +25,9 @@ pub use jev::{
     JevError, JevFuture, JevRecommendation, JevRouter, MockJevRouter, ModelSwitchDecision,
     SizeBucket, TaskProfile, apply_recommendation,
 };
+pub use kernel_authority::{
+    AuthorityDb, AuthorityKernel, AuthorityKernelClient, AuthorityKernelConfig, PendingApprovalView,
+};
 pub use kernel_channel::{
     ChannelDecision, ChannelDeps, ChannelError, ChannelFuture, ChannelRequest, ChannelResponse,
     ChannelSession, ChannelSessionResolver, KERNEL_CHANNEL_PROTOCOL, KernelChannel,
@@ -33,10 +37,10 @@ pub use kernel_client::{
     ACTION_ENVELOPE_VERSION, ActionEnvelope, AuditEvent, AuditRef, Decision, EffectClass,
     EnvelopeError, KernelClient, KernelError, KernelFuture, LEASE_DOCUMENT_VERSION, LeaseDocument,
     LeaseLimits, LeaseVerification, MockKernelClient, MockVerdict, Obligation, OneShotGrant,
-    POLICY_DECISION_VERSION, PolicyDecision, ResourceSet, ToolRef, deadline_rfc3339, now_ms,
-    now_rfc3339, sha256_hex,
+    POLICY_DECISION_VERSION, PolicyDecision, ResourceSet, SessionEndReport,
+    SessionIdentityAuthority, SessionIdentityInfo, SupervisorKernel, ToolRef, deadline_rfc3339,
+    now_ms, now_rfc3339, sha256_hex,
 };
-pub use kernel_local::LocalKernelClient;
 pub use model_gateway::{
     ChatMessage, CredentialVault, GatewayConfig, GatewayError, GatewayResponse, MemorySpendPool,
     MockProviderAdapter, MockProviderOutcome, ModelGateway, ModelPolicy, ModelRequest,

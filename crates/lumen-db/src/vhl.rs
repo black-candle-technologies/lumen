@@ -146,6 +146,63 @@ impl Database {
     /// `vhl_decisions` row atomically with the transition — this method
     /// cannot, so permitting a decision edge here would silently skip the
     /// decision row the module documents as atomic.
+    /// List approval requests in a given durable state, newest last (for
+    /// the host/VHL poller). Reads the database, not any in-memory
+    /// mirror, so a poller sees requests that survived a restart.
+    pub async fn vhl_list_requests(
+        &self,
+        workspace_id: &WorkspaceId,
+        state: &str,
+    ) -> Result<Vec<VhlRequestRow>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT request_id,action_digest,session_subject,nonce,created_at_ms,expires_at_ms, \
+            decided_at_ms,decided_by,decision_reason,attestation_id,lease_id,minted_at_ms,consumed_at_ms, \
+            view_json FROM vhl_approval_requests WHERE workspace_id=? AND state=? \
+            ORDER BY created_at_ms DESC",
+        )
+        .bind(ws(workspace_id))
+        .bind(state)
+        .fetch_all(self.pool())
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let view_json: String = r.try_get("view_json")?;
+            let view: serde_json::Value =
+                serde_json::from_str(&view_json).map_err(RepositoryError::Serialization)?;
+            let kind = match view.get("kind").and_then(serde_json::Value::as_str) {
+                Some("standing_lease") => ApprovalKind::StandingLease,
+                Some("one_shot") | None => ApprovalKind::OneShot,
+                Some(other) => {
+                    return Err(RepositoryError::InvalidVhlState(format!(
+                        "unknown approval kind {other:?}"
+                    )));
+                }
+            };
+            out.push(VhlRequestRow {
+                request_id: r.try_get("request_id")?,
+                kind,
+                state: state.to_string(),
+                action_digest: r.try_get("action_digest")?,
+                session_subject: r.try_get("session_subject")?,
+                nonce: r.try_get("nonce")?,
+                created_at_ms: r.try_get("created_at_ms")?,
+                expires_at_ms: r.try_get("expires_at_ms")?,
+                decided_at_ms: r.try_get("decided_at_ms")?,
+                decided_by: r.try_get("decided_by")?,
+                decision_reason: r.try_get("decision_reason")?,
+                attestation_id: r.try_get("attestation_id")?,
+                lease_id: r.try_get("lease_id")?,
+                minted_at_ms: r.try_get("minted_at_ms")?,
+                consumed_at_ms: r.try_get("consumed_at_ms")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Atomically transition a request. The compare-and-swap on the current
+    /// state (plus the SQL trigger's forward-only guard) makes concurrent or
+    /// repeated decisions fail closed with `VhlStateConflict` instead of
+    /// silently winning twice.
     #[allow(clippy::too_many_arguments)]
     pub async fn vhl_transition(
         &self,

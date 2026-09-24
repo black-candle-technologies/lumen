@@ -378,13 +378,67 @@ pub trait KernelClient: Send + Sync {
         grant: &'a OneShotGrant,
     ) -> KernelFuture<'a, LeaseDocument>;
 
-    /// Revoke every lease descended from a session subject. Called at
-    /// session termination, before the session identity is destroyed.
+    /// Revoke every lease held by a session subject. Called at session
+    /// termination AFTER the session identity is destroyed through
+    /// [`SessionIdentityAuthority`]: a destroyed identity cannot mint new
+    /// leases while revocation is in flight.
     fn revoke_session<'a>(&'a self, session_subject: &'a str) -> KernelFuture<'a, ()>;
 
     /// Append an audit event. On failure the host must NOT commit the
     /// effect the event describes.
     fn append_audit<'a>(&'a self, event: &'a AuditEvent) -> KernelFuture<'a, AuditRef>;
+}
+
+/// Identity seam: per-session ephemeral Courier identities minted and
+/// destroyed inside kernel-controlled memory (phase-4 vault).
+///
+/// This is deliberately separate from [`KernelClient`] (whose v1 contract
+/// is frozen): identity lifecycle is authority-plane work the supervisor
+/// drives, and the real engine implements both traits against the same
+/// vault + session registry the kernel authorizes against.
+pub trait SessionIdentityAuthority: Send + Sync {
+    /// Mint a fresh ephemeral session identity (`ed25519:` subject),
+    /// optionally as a child of a live parent subject.
+    fn start_session_identity<'a>(
+        &'a self,
+        parent: Option<&'a str>,
+    ) -> KernelFuture<'a, SessionIdentityInfo>;
+
+    /// Destroy a session's root identity and every vault-known
+    /// descendant: private keys are zeroized, registry records
+    /// deactivated. Returns every affected subject so the supervisor can
+    /// revoke their leases. Idempotent across retries for the same
+    /// subject.
+    fn destroy_session_identity<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> KernelFuture<'a, SessionEndReport>;
+}
+
+/// The full authority a session supervisor needs: kernel policy decisions
+/// plus vault identity lifecycle. The real engine implements both against
+/// the same vault + session registry the kernel authorizes against.
+pub trait SupervisorKernel: KernelClient + SessionIdentityAuthority {}
+
+impl<T: KernelClient + SessionIdentityAuthority> SupervisorKernel for T {}
+
+/// A freshly minted session identity (public material only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionIdentityInfo {
+    /// The ephemeral Courier subject (`ed25519:...`).
+    pub subject: String,
+    /// Hex of the identity's verifying key (public; doubles as the
+    /// session's identity fingerprint in host references).
+    pub verifying_key_hex: String,
+}
+
+/// Report from [`SessionIdentityAuthority::destroy_session_identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEndReport {
+    pub subject: String,
+    /// The destroyed subject plus every vault-known descendant whose
+    /// authority died with it.
+    pub affected_subjects: Vec<String>,
 }
 
 /// Scripting hook for [`MockKernelClient`]: decides the outcome per envelope.
@@ -428,6 +482,9 @@ struct MockKernelState {
     fail_kinds: HashMap<String, u64>,
     fail_revoke: bool,
     decisions_made: u64,
+    /// Separate counter for vault-minted session ids (so identity minting
+    /// does not perturb `decisions_made`, which tests assert on).
+    sessions_minted: u64,
 }
 
 impl MockKernelClient {
@@ -667,6 +724,52 @@ impl KernelClient for MockKernelClient {
             };
             state.audit_log.push((event.clone(), audit_ref.clone()));
             Ok(audit_ref)
+        })
+    }
+}
+
+impl SessionIdentityAuthority for MockKernelClient {
+    fn start_session_identity<'a>(
+        &'a self,
+        parent: Option<&'a str>,
+    ) -> KernelFuture<'a, SessionIdentityInfo> {
+        Box::pin(async move {
+            let mut state = self.inner.lock().unwrap();
+            let id = state.sessions_minted;
+            state.sessions_minted += 1;
+            let subject = format!("ed25519:mock-session-{id}");
+            if let Some(parent) = parent {
+                state
+                    .revoked_subjects
+                    .push(format!("{parent}::child::{subject}"));
+            }
+            Ok(SessionIdentityInfo {
+                subject: subject.clone(),
+                verifying_key_hex: format!("mock-vk-{id}"),
+            })
+        })
+    }
+
+    fn destroy_session_identity<'a>(
+        &'a self,
+        subject: &'a str,
+    ) -> KernelFuture<'a, SessionEndReport> {
+        let subject = subject.to_string();
+        Box::pin(async move {
+            let state = self.inner.lock().unwrap();
+            // The mock tracks parent→child links as `{parent}::child::{child}`
+            // markers; destroying a parent reports its children as affected.
+            let prefix = format!("{subject}::child::");
+            let mut affected = vec![subject.clone()];
+            for marker in state.revoked_subjects.iter() {
+                if let Some(child) = marker.strip_prefix(&prefix) {
+                    affected.push(child.to_string());
+                }
+            }
+            Ok(SessionEndReport {
+                subject: subject.clone(),
+                affected_subjects: affected,
+            })
         })
     }
 }

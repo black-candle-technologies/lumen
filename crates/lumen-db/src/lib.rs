@@ -16,10 +16,14 @@ mod repositories;
 mod routing;
 mod trust_gate;
 mod vhl;
+
+pub use lease::KernelKeyGenerationRow;
+pub use vhl::VhlRequestRow;
 mod worker;
 
 use std::path::Path;
 
+use lumen_core::identity::WorkspaceId;
 use sqlx::{SqlitePool, migrate::MigrateError};
 use thiserror::Error;
 
@@ -56,6 +60,26 @@ impl Database {
 
     pub async fn connect_in_memory() -> Result<Self, RepositoryError> {
         migrations::connect_in_memory().await
+    }
+
+    /// Ensure a workspace row exists (`INSERT OR IGNORE`). The authority
+    /// tables FK to `workspaces(id)`; full workspace bootstrap (owner
+    /// identity, membership) stays with the orchestration layer.
+    pub async fn ensure_workspace(
+        &self,
+        id: &WorkspaceId,
+        name: &str,
+        created_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO workspaces(id,name,created_at) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .bind(created_at_ms)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     pub fn pool(&self) -> &SqlitePool {

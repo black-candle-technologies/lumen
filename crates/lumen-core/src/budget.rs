@@ -296,6 +296,18 @@ impl BudgetLedger {
         }
     }
 
+    /// Remove a lease's budget account. Used to roll back an in-memory
+    /// registration when the durable transaction that should have
+    /// persisted the lease fails: the lease never became durable, so its
+    /// account must not linger (a lingering zero-spend account would let a
+    /// retried mint double-register, and a lingering account with spend
+    /// would corrupt the budget invariant). Idempotent: removing a
+    /// non-existent account is a no-op.
+    pub fn remove_account(&self, lease_id: &str) {
+        let mut inner = self.inner.lock().expect("ledger mutex poisoned");
+        inner.accounts.remove(lease_id);
+    }
+
     /// Register a lease's budget caps. Called for root leases at issuance
     /// (caps are policy-granted) and for child leases after their reservation
     /// succeeds (the child's own caps are its held maximum).
@@ -433,6 +445,36 @@ impl BudgetLedger {
             }
         }
         inner.accounts.remove(lease_id);
+    /// Restore a lease's full budget account state from durable storage
+    /// (caps, reservations held, and consumed spend). Used at kernel open
+    /// so the ledger reflects spend settled before a restart; without
+    /// this, a restart would reset consumption to zero and the admission
+    /// check would over-authorize. Invariants are enforced: reserved and
+    /// consumed must each fit within caps.
+    pub fn restore_account(
+        &self,
+        lease_id: &str,
+        caps: &Budget,
+        reserved_out: &Budget,
+        consumed: &Budget,
+    ) -> Result<(), BudgetError> {
+        // The store's guard triggers keep caps immutable and debits within
+        // caps, so a violation here means store corruption or tampering:
+        // fail the restore rather than hydrate an impossible account.
+        if !caps.covers(reserved_out) || !caps.covers(consumed) {
+            return Err(BudgetError::Store(format!(
+                "corrupt budget account for lease {lease_id}: reserved/consumed exceed caps"
+            )));
+        }
+        let mut inner = self.inner.lock().expect("ledger mutex poisoned");
+        inner.accounts.insert(
+            lease_id.to_string(),
+            LeaseAccount {
+                caps: caps.clone(),
+                reserved_out: reserved_out.clone(),
+                consumed: consumed.clone(),
+            },
+        );
         Ok(())
     }
 

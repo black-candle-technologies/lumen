@@ -19,7 +19,7 @@ use lumen_core::{
         AuditLink, GENESIS_PREV_HASH, actor_to_string, parse_actor, render_detail, seal_event,
         verify_event_chain,
     },
-    lease::LeaseDocument,
+    lease::{LeaseDocument, LeaseLimits},
     pi_boundary::{AUDIT_EVENT_VERSION, AuditEvent, AuditEventKind},
 };
 use serde_json::Value;
@@ -95,6 +95,112 @@ impl Database {
     ) -> Result<(), RepositoryError> {
         let mut tx = self.pool().begin().await?;
         insert_lease_tx(&mut tx, workspace_id, doc).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Insert a lease row and register its budget account in ONE
+    /// transaction. A crash can never leave a lease without its budget
+    /// account (an unbacked budget) or an account without its lease.
+    /// Prefer this over `insert_kernel_lease` + `register_kernel_budget`
+    /// whenever the caller mints the lease.
+    pub async fn insert_kernel_lease_with_budget(
+        &self,
+        workspace_id: &WorkspaceId,
+        doc: &LeaseDocument,
+        now_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool().begin().await?;
+        insert_lease_tx(&mut tx, workspace_id, doc).await?;
+        register_budget_tx(
+            &mut tx,
+            workspace_id,
+            &doc.lease_id,
+            &doc.limits.budget,
+            now_ms,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically claim a VHL approval and persist its minted one-shot
+    /// lease: the grant-nonce replay gate, the `approved → minted`
+    /// compare-and-swap (recording the minted lease id), and the lease +
+    /// budget-account insert commit in ONE transaction.
+    ///
+    /// This is the durable boundary for one-shot minting. Either the
+    /// approval is claimed AND the lease is durable, or nothing happened:
+    /// the approval stays `approved`, the grant nonce is unburned, and a
+    /// retry is safe. A crash can never leave a claimed approval without
+    /// its lease, a lease without its approval claim, or a burned nonce
+    /// for a lease that was never minted.
+    pub async fn claim_approval_and_insert_one_shot(
+        &self,
+        workspace_id: &WorkspaceId,
+        approval_id: &str,
+        grant_nonce: &str,
+        now_ms: i64,
+        nonce_expires_at_ms: i64,
+        doc: &LeaseDocument,
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool().begin().await?;
+        // 1. Grant-nonce replay gate (durable). A replay means this grant
+        //    was already presented: the approval must already be claimed
+        //    (or the first attempt is still in flight, which the state
+        //    guard below will serialize).
+        let nonce_rows = sqlx::query(
+            "INSERT OR IGNORE INTO kernel_nonces(workspace_id,nonce,used_at_ms,expires_at_ms)
+             VALUES(?,?,?,?)",
+        )
+        .bind(ws(workspace_id))
+        .bind(grant_nonce)
+        .bind(now_ms)
+        .bind(nonce_expires_at_ms)
+        .execute(&mut *tx)
+        .await?;
+        if nonce_rows.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(RepositoryError::VhlStateConflict);
+        }
+        // 2. The minted lease and its budget account, together. Inserted
+        //    BEFORE the approval claim because
+        //    `vhl_approval_requests.lease_id` FK-references
+        //    `kernel_leases(lease_id)`: claiming first would violate the
+        //    foreign key. All four steps commit atomically, so a failed
+        //    claim below rolls the lease back — no orphan is possible.
+        insert_lease_tx(&mut tx, workspace_id, doc).await?;
+        register_budget_tx(
+            &mut tx,
+            workspace_id,
+            &doc.lease_id,
+            &doc.limits.budget,
+            now_ms,
+        )
+        .await?;
+        // 3. Claim the approval. The state guard trigger enforces the
+        //    `approved → minted` edge; zero rows means it was already
+        //    claimed (or never approved).
+        let claim_rows = sqlx::query(
+            "UPDATE vhl_approval_requests SET state='minted',lease_id=?,minted_at_ms=?
+             WHERE workspace_id=? AND request_id=? AND state='approved'",
+        )
+        .bind(&doc.lease_id)
+        .bind(now_ms)
+        .bind(ws(workspace_id))
+        .bind(approval_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(db) if db.message().contains("illegal state transition") => {
+                RepositoryError::VhlStateConflict
+            }
+            other => RepositoryError::from(other),
+        })?;
+        if claim_rows.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(RepositoryError::VhlStateConflict);
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -194,6 +300,47 @@ impl Database {
     // ------------------------------------------------------------------
     // Revocations
     // ------------------------------------------------------------------
+
+    /// Lease ids whose subject is exactly `subject`, in issue order.
+    /// Used by session termination to revoke every lease a destroyed
+    /// identity (or its vault-known descendants) could present.
+    pub async fn kernel_lease_ids_for_subject(
+        &self,
+        workspace_id: &WorkspaceId,
+        subject: &str,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT lease_id FROM kernel_leases WHERE workspace_id=? AND subject=? ORDER BY issued_at_ms",
+        )
+        .bind(ws(workspace_id))
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids)
+    }
+
+    /// (lease_id, budget caps) for every lease in the workspace. Used at
+    /// kernel startup to hydrate the in-memory [`BudgetLedger`] so budget
+    /// admission checks keep working across restarts. Consumed spend is
+    /// not tracked (there is no settle path yet); hydration starts every
+    /// account at zero consumption.
+    pub async fn kernel_lease_budgets(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Budget)>, RepositoryError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT lease_id, limits_json FROM kernel_leases WHERE workspace_id=?")
+                .bind(ws(workspace_id))
+                .fetch_all(self.pool())
+                .await?;
+        rows.into_iter()
+            .map(|(lease_id, limits_json)| {
+                let limits: LeaseLimits =
+                    serde_json::from_str(&limits_json).map_err(RepositoryError::Serialization)?;
+                Ok((lease_id, limits.budget))
+            })
+            .collect()
+    }
 
     /// Record a revocation. Idempotent: revoking twice is a no-op.
     pub async fn record_kernel_revocation(
@@ -795,6 +942,31 @@ impl Database {
             .saturating_sub(&exec_held))
     }
 
+    /// Full budget account state per lease (caps, held reservations,
+    /// consumed spend): the durable counterpart the in-memory ledger
+    /// hydrates from at open, so settled spend survives a restart.
+    pub async fn kernel_budget_account_states(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Budget, Budget, Budget)>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT lease_id, caps_json, reserved_out_json, consumed_json
+             FROM kernel_budget_accounts WHERE workspace_id = ?",
+        )
+        .bind(ws(workspace_id))
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let lease_id: String = r.get("lease_id");
+                let caps = parse_budget(r.get::<String, _>("caps_json").as_str())?;
+                let reserved_out = parse_budget(r.get::<String, _>("reserved_out_json").as_str())?;
+                let consumed = parse_budget(r.get::<String, _>("consumed_json").as_str())?;
+                Ok((lease_id, caps, reserved_out, consumed))
+            })
+            .collect()
+    }
+
     /// Active reservations (for crash-safe reconciliation: reservations whose
     /// child lease is dead must be released explicitly).
     pub async fn active_kernel_reservations(
@@ -1165,6 +1337,68 @@ impl Database {
             ))),
         }
     }
+
+    /// Record one kernel key generation's verifying key. Idempotent per
+    /// `(workspace_id, key_id)`: a generation's key material never changes,
+    /// and the immutability triggers enforce that at the store level.
+    pub async fn record_kernel_key_generation(
+        &self,
+        workspace_id: &WorkspaceId,
+        key_id: &str,
+        role: &str,
+        verifying_key_hex: &str,
+        created_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO kernel_key_generations
+             (workspace_id, key_id, role, verifying_key_hex, created_at_ms)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(workspace_id.to_string())
+        .bind(key_id)
+        .bind(role)
+        .bind(verifying_key_hex)
+        .bind(created_at_ms)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// List every recorded key generation for the workspace, oldest first.
+    pub async fn kernel_key_generations(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<KernelKeyGenerationRow>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT key_id, role, verifying_key_hex, created_at_ms
+             FROM kernel_key_generations
+             WHERE workspace_id = ?
+             ORDER BY created_at_ms ASC, key_id ASC",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(KernelKeyGenerationRow {
+                    key_id: r.get("key_id"),
+                    role: r.get("role"),
+                    verifying_key_hex: r.get("verifying_key_hex"),
+                    created_at_ms: r.get("created_at_ms"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// One recorded kernel key generation: a retired or live generation's
+/// public key, keyed by the `key_id` that signatures reference.
+#[derive(Clone, Debug)]
+pub struct KernelKeyGenerationRow {
+    pub key_id: String,
+    pub role: String,
+    pub verifying_key_hex: String,
+    pub created_at_ms: i64,
 }
 
 /// Parameters for one audit event append, mirroring the frozen v1

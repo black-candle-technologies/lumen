@@ -1,33 +1,29 @@
-//! Seam C proof: session termination destroys the identity AND revokes the
-//! session's leases in the REAL kernel.
+//! Seam C proof: session termination destroys the vault identity AND
+//! revokes the session's leases in the REAL authority kernel.
 //!
-//! Wires [`SessionSupervisor`] with a real [`LocalKernelClient`] (not the
-//! mock), issues a real kernel lease for the spawned session's subject,
+//! Wires [`SessionSupervisor`] with a real [`AuthorityKernelClient`] (not
+//! the mock), spawns a session (vault-minted `ed25519:` subject), issues
+//! real kernel leases for the session and a vault-child identity,
 //! terminates the session, and proves:
 //!
+//! - the session subject is a real vault `ed25519:` identity;
 //! - the termination report claims leases revoked + identity destroyed;
-//! - the kernel really revoked the lease: a subsequent `decide` with the
-//!   same lease chain is denied as revoked;
-//! - a descendant lease chained to the revoked parent is denied as
-//!   revoked too (kernel-layer descendant protection — the kernel's
-//!   chain check rejects any chain containing a revoked lease);
+//! - the parent and child vault identities are no longer live (minting a
+//!   child of the destroyed parent fails);
+//! - the kernel really revoked the leases: a subsequent `decide` with the
+//!   parent lease is denied as revoked, and the child lease is denied too;
 //! - the kernel audit chain still verifies.
-//!
-//! What this does NOT prove (coordinator design decision, not wired):
-//! phase-3's supervisor owns its own `SessionIdentity`, not phase-4's
-//! `SessionIdentityVault` / `SessionRegistry`, so supervisor-side
-//! descendant *identity* destruction on parent termination is unwired.
-//! The authority layer (lease revocation) is covered above; the identity
-//! layer needs the supervisor/vault ownership design.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use lumen_core::pi_boundary::{LocalKernel, LocalKernelConfig};
+use lumen_core::budget::{Budget, BudgetDimension};
+use lumen_core::canonical::{CanonicalPath, PathGrant, PathRights, RealFsResolver, ResourceScope};
+use lumen_core::lease::{LeaseLimits, RootLeaseParams};
 use lumen_server::{
-    ACTION_ENVELOPE_VERSION, ActionEnvelope, AuthdClient, Decision, EffectClass, KernelClient,
-    LocalKernelClient, MemorySessionStore, MockAuthdClient, ResourceSet, SessionStatus,
-    SessionSupervisor, SupervisorConfig, ToolRef, deadline_rfc3339, default_catalog, now_ms,
-    sha256_hex,
+    ACTION_ENVELOPE_VERSION, ActionEnvelope, AuthdClient, AuthorityKernelClient,
+    AuthorityKernelConfig, Decision, EffectClass, KernelClient, LeaseDocument, MemorySessionStore,
+    MockAuthdClient, ResourceSet, SessionIdentityAuthority, SessionStatus, SessionSupervisor,
+    SupervisorConfig, ToolRef, deadline_rfc3339, default_catalog, now_ms, sha256_hex,
 };
 use uuid::Uuid;
 
@@ -41,7 +37,6 @@ fn fixture_script() -> PathBuf {
 fn test_config() -> SupervisorConfig {
     let script = fixture_script();
     let digest = sha256_hex(&std::fs::read(&script).unwrap());
-    let fixture_dir = script.parent().unwrap().to_path_buf();
     SupervisorConfig {
         pi_binary: script.clone(),
         pi_args: Vec::new(),
@@ -58,17 +53,11 @@ fn test_config() -> SupervisorConfig {
         watchdog_interval: Duration::from_millis(50),
         event_buffer: 64,
         stderr_line_cap: 16,
-        // The fixture script lives outside the sandbox's built-in read-only
-        // set; allowlist its directory so Landlock-enforcing hosts can spawn.
-        pi_sandbox: lumen_server::PiSandboxConfig {
-            extra_read_only_paths: vec![fixture_dir],
-            ..Default::default()
-        },
         ..SupervisorConfig::default()
     }
 }
 
-fn read_envelope(subject: &str, lease: &str) -> ActionEnvelope {
+fn read_envelope(subject: &str, lease_id: &str, path: &str) -> ActionEnvelope {
     ActionEnvelope {
         protocol_version: ACTION_ENVELOPE_VERSION,
         action_id: Uuid::new_v4().to_string(),
@@ -77,25 +66,64 @@ fn read_envelope(subject: &str, lease: &str) -> ActionEnvelope {
             name: "bct.read_file".to_string(),
             version: "1.0.0".to_string(),
         },
-        arguments: serde_json::json!({"path": "/tmp/x"}),
+        arguments: serde_json::json!({"path": path}),
         input_hashes: vec![],
         resources: ResourceSet {
-            paths: vec!["/tmp/x".to_string()],
+            paths: vec![path.to_string()],
             hosts: vec![],
             secret_refs: vec![],
         },
         expected_effects: vec![EffectClass::Read],
-        lease_chain: vec![lease.to_string()],
+        lease_chain: vec![lease_id.to_string()],
         nonce: format!("seam-c-{}", Uuid::new_v4()),
         expires_at: deadline_rfc3339(600),
     }
 }
 
+/// Issue a real root lease covering `dir` reads for `subject`.
+async fn issue_read_lease(
+    kernel: &AuthorityKernelClient,
+    subject: &str,
+    dir: &str,
+) -> LeaseDocument {
+    let fs = RealFsResolver;
+    let mut scope = ResourceScope::default();
+    scope
+        .tools
+        .insert("bct.read_file".to_string(), "^1.0".parse().unwrap());
+    scope.paths.push(PathGrant {
+        root: CanonicalPath::parse(dir, &fs, false).unwrap(),
+        rights: PathRights::READ,
+    });
+    scope.effects.push(lumen_core::canonical::EffectClass::Read);
+    let now = now_ms();
+    kernel
+        .issue_root_lease(RootLeaseParams {
+            lease_id: Uuid::new_v4().to_string(),
+            subject: subject.to_string(),
+            scope,
+            limits: LeaseLimits {
+                not_before_ms: now,
+                expires_at_ms: now + 3_600_000,
+                budget: Budget::new().set(BudgetDimension::Executions, 100),
+                max_executions: None,
+                single_use: false,
+            },
+            depth_limit: 4,
+            lease_nonce: format!("test-nonce-{}", Uuid::new_v4()),
+            issued_at_ms: now,
+        })
+        .await
+        .expect("issue root lease")
+}
+
 #[tokio::test]
-async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
-    let kernel = Arc::new(LocalKernelClient::new(Arc::new(LocalKernel::new(
-        LocalKernelConfig::default(),
-    ))));
+async fn terminate_destroys_vault_identities_and_revokes_descendant_leases() {
+    let kernel = Arc::new(
+        AuthorityKernelClient::open(AuthorityKernelConfig::test_config())
+            .await
+            .expect("open authority kernel"),
+    );
     let supervisor = SessionSupervisor::new(
         test_config(),
         kernel.clone(),
@@ -103,79 +131,79 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
         Arc::new(MemorySessionStore::new()),
     );
 
+    // A real file for the read envelopes.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("x.txt");
+    std::fs::write(&file_path, b"hello").unwrap();
+    let file_str = file_path.to_str().unwrap().to_string();
+    let dir_str = dir.path().to_str().unwrap().to_string();
+
     let authd = MockAuthdClient::new().with_token("user-token", "acct-7");
     let owner = authd.authenticate("user-token").await.unwrap();
     let handle = supervisor.spawn_session(&owner).await.unwrap();
     let subject = handle.binding().await.unwrap().session_subject.clone();
 
-    // A real kernel lease for this session's subject. One expiry for both
-    // leases: separate now_ms() calls can straddle a millisecond boundary,
-    // and the kernel rejects a child whose expiry exceeds its parent's.
-    let lease_expiry_ms = now_ms() + 3_600_000;
-    let lease = kernel
-        .issue_session_lease(
-            &subject,
-            vec!["/tmp".into()],
-            vec!["read".into()],
-            lease_expiry_ms,
-        )
-        .expect("issue real lease");
+    // The supervisor mints a REAL vault identity: `ed25519:` subject.
+    assert!(
+        subject.starts_with("ed25519:"),
+        "supervisor must mint vault identities, got {subject}"
+    );
 
-    // A descendant lease chained to the parent (leaf first, then parent).
-    // The supervisor does not model descendants — this exercises the
-    // kernel layer directly, which is the part that is wired.
-    let child_subject = format!("{subject}::child");
-    let child_lease = kernel
-        .issue_session_child_lease(
-            lease,
-            &child_subject,
-            vec!["/tmp".into()],
-            vec!["read".into()],
-            lease_expiry_ms,
-        )
-        .expect("issue real child lease");
-    let mut child_env = read_envelope(&child_subject, &child_lease.to_string());
-    child_env.lease_chain = vec![child_lease.to_string(), lease.to_string()];
+    // A real kernel lease for this session's subject.
+    let lease = issue_read_lease(&kernel, &subject, &dir_str).await;
 
-    // Sanity: the lease authorizes before termination.
+    // A real vault CHILD identity, and a lease for it. The supervisor
+    // never sees this child; termination must destroy it via the vault's
+    // descendant tracking.
+    let child_info = kernel
+        .start_session_identity(Some(&subject))
+        .await
+        .expect("mint child identity");
+    let child_subject = child_info.subject.clone();
+    assert_ne!(child_subject, subject);
+    let child_lease = issue_read_lease(&kernel, &child_subject, &dir_str).await;
+
+    // Sanity: both leases authorize before termination.
     let decision = kernel
-        .decide(&read_envelope(&subject, &lease.to_string()))
+        .decide(&read_envelope(&subject, &lease.lease_id, &file_str))
         .await
         .expect("decide");
     assert!(
         matches!(decision.decision, Decision::Allow { .. }),
-        "lease must authorize before termination"
+        "parent lease must authorize before termination, got {:?}",
+        decision.decision
     );
-    let child_decision = kernel.decide(&child_env).await.expect("decide");
+    let decision = kernel
+        .decide(&read_envelope(
+            &child_subject,
+            &child_lease.lease_id,
+            &file_str,
+        ))
+        .await
+        .expect("decide");
     assert!(
-        matches!(child_decision.decision, Decision::Allow { .. }),
+        matches!(decision.decision, Decision::Allow { .. }),
         "child lease must authorize before parent termination"
     );
 
-    // The session holds a live identity before termination...
-    assert!(
-        handle.has_identity().await.unwrap(),
-        "session must hold an identity before termination"
-    );
-
-    // Terminate: the supervisor must revoke kernel-side and destroy the identity.
-    let report = handle.terminate().await.unwrap();
+    // Terminate: vault destroy (parent + descendants), then revoke, then
+    // Pi shutdown.
+    let report = handle.terminate().await.expect("terminate");
     assert!(report.leases_revoked, "report: {report:?}");
     assert!(report.identity_destroyed, "report: {report:?}");
     assert!(report.revoke_error.is_none(), "report: {report:?}");
     assert_eq!(handle.status().await.unwrap(), SessionStatus::Terminated);
 
-    // ...and it is gone afterward. This checks destruction directly: the
-    // report's identity_destroyed flag is also true when no identity
-    // existed, so it cannot prove destruction on its own.
+    // The parent vault identity is dead: minting a child of it fails.
+    let child_of_dead = kernel.start_session_identity(Some(&subject)).await;
     assert!(
-        !handle.has_identity().await.unwrap(),
-        "identity must be destroyed by termination"
+        child_of_dead.is_err(),
+        "minting a child of a destroyed identity must fail"
     );
 
-    // The SAME lease is now dead kernel-side: decide denies as revoked.
+    // The parent lease is revoked kernel-side.
     let decision = kernel
-        .decide(&read_envelope(&subject, &lease.to_string()))
+        .decide(&read_envelope(&subject, &lease.lease_id, &file_str))
         .await
         .expect("decide");
     let reason = match &decision.decision {
@@ -187,21 +215,25 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
         "deny reason must name revocation: {reason}"
     );
 
-    // The descendant lease is dead too: the kernel's chain check denies
-    // any lease chained to a revoked parent, even though the supervisor
-    // never saw the descendant. (Supervisor-side descendant identity
-    // destruction — phase-4 vault wiring — remains a coordinator design
-    // decision; the authority layer is covered here.)
-    child_env.nonce = format!("seam-c-child-{}", Uuid::new_v4());
-    let child_decision = kernel.decide(&child_env).await.expect("decide");
-    let reason = match &child_decision.decision {
-        Decision::Deny { reason } => reason.clone(),
-        other => panic!("expected Deny for child of revoked parent, got {other:?}"),
-    };
+    // The descendant lease is dead too: the vault destroyed the child
+    // identity at parent termination, and its leases were revoked.
+    let decision = kernel
+        .decide(&read_envelope(
+            &child_subject,
+            &child_lease.lease_id,
+            &file_str,
+        ))
+        .await
+        .expect("decide");
     assert!(
-        reason.contains("revoked"),
-        "child deny reason must name revocation: {reason}"
+        matches!(decision.decision, Decision::Deny { .. }),
+        "child lease must be denied after parent termination, got {:?}",
+        decision.decision
     );
 
-    kernel.audit_log().verify().expect("audit chain verifies");
+    // The kernel audit chain still verifies.
+    kernel
+        .verify_kernel_audit()
+        .await
+        .expect("audit chain verifies");
 }

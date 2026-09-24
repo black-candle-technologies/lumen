@@ -232,6 +232,14 @@ pub enum LeaseError {
 
 /// Kernel-held keys: the issuer key signs root leases and VHL one-shots; the
 /// host key signs audit checkpoints (see [`crate::kernel_audit`]).
+///
+/// Custody: the private keys live only in this struct and are zeroized when
+/// it drops, via `ed25519-dalek`'s `Drop for SigningKey` (enabled by the
+/// `zeroize` feature in `lumen-core/Cargo.toml`; the
+/// `kernel_keys_zeroize_on_drop` test pins the feature so it cannot be
+/// silently removed). They are never written to disk or logs. A kernel
+/// restart generates fresh keys, which the host must treat as a key
+/// rotation: leases signed by the previous issuer key no longer verify.
 pub struct KernelKeys {
     pub issuer_key_id: String,
     issuer: SigningKey,
@@ -1304,6 +1312,24 @@ fn no_covering_lease(
 mod tests {
     use super::*;
     use crate::canonical::FakeResolver;
+
+    /// The host-key custody requirement: `KernelKeys` must destroy its
+    /// private keys on drop. Destruction is provided by `ed25519-dalek`'s
+    /// `Drop for SigningKey`, which only exists with the crate's
+    /// `zeroize` feature. This pins the feature at compile time so a
+    /// `Cargo.toml` change cannot silently drop the guarantee.
+    #[test]
+    fn kernel_keys_zeroize_on_drop() {
+        fn requires_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        requires_zeroize_on_drop::<SigningKey>();
+        // The keys must still sign (i.e. the struct is usable) right up
+        // until they are dropped.
+        let keys = KernelKeys::generate();
+        let sig = keys.issuer_sign(b"custody-check");
+        keys.issuer_verifying()
+            .verify(b"custody-check", &sig)
+            .expect("issuer key must sign before drop");
+    }
 
     fn test_keys() -> (KernelKeys, SigningKey, VerifyingKey) {
         use rand::rngs::OsRng;
