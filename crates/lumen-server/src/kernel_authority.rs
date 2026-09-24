@@ -1230,6 +1230,27 @@ impl AuthorityKernel {
                 lease.lease_id
             )));
         }
+        // D4 ordering: time and revocation before key resolution and
+        // signature. An expired or revoked lease is dead regardless of
+        // which generation signed it, so those checks come first and
+        // their reasons are never masked by key-retention state.
+        if !stored.live_at(now) {
+            return Err(KernelError::VerificationFailed(format!(
+                "lease {} is not live",
+                lease.lease_id
+            )));
+        }
+        let revoked_mem = {
+            self.state
+                .lock()
+                .expect("kernel state mutex poisoned")
+                .revocations
+                .is_revoked(&lease.lease_id)
+        };
+        let revoked_db = self.db_run(|db, ws| db.is_kernel_revoked(ws, &lease.lease_id))?;
+        if revoked_mem || revoked_db {
+            return Err(KernelError::Revoked(lease.lease_id.clone()));
+        }
         // Signature: root and VHL one-shot leases verify under the
         // issuer generation named in `issuer_key_id` (current or
         // retired), resolved through the generation snapshot with the
@@ -1270,23 +1291,6 @@ impl AuthorityKernel {
         presented
             .verify_signature(&key)
             .map_err(|e| KernelError::VerificationFailed(format!("bad signature: {e}")))?;
-        if !presented.live_at(now) {
-            return Err(KernelError::VerificationFailed(format!(
-                "lease {} is not live",
-                lease.lease_id
-            )));
-        }
-        let revoked_mem = {
-            self.state
-                .lock()
-                .expect("kernel state mutex poisoned")
-                .revocations
-                .is_revoked(&lease.lease_id)
-        };
-        let revoked_db = self.db_run(|db, ws| db.is_kernel_revoked(ws, &lease.lease_id))?;
-        if revoked_mem || revoked_db {
-            return Err(KernelError::Revoked(lease.lease_id.clone()));
-        }
         Ok(LeaseVerification {
             lease_id: lease.lease_id.clone(),
             subject: lease.subject.clone(),
@@ -1673,6 +1677,39 @@ impl AuthorityKernel {
         let mut lease_ids: Vec<String> = Vec::new();
         for affected in &affected_subjects {
             lease_ids.extend(self.db_run(|db, ws| db.kernel_lease_ids_for_subject(ws, affected))?);
+        }
+        // Delegations orphaned by chain: any live lease whose
+        // verification needs a destroyed session's key — i.e. some
+        // document in its ancestor chain was signed by an affected
+        // subject — can never verify again. Revoke those leases now;
+        // otherwise the next boot's re-validation would fail the open
+        // on a permanently-unverifiable lease. (Leases held directly by
+        // affected subjects are already in `lease_ids` above.)
+        let affected_set: HashSet<String> = affected_subjects.iter().cloned().collect();
+        let live = self.db_run(|db, ws| db.kernel_live_leases(ws, now))?;
+        for doc in &live {
+            if lease_ids.iter().any(|id| id == &doc.lease_id) {
+                continue;
+            }
+            let mut current: Option<CoreLeaseDocument> = Some(doc.clone());
+            let mut orphaned = false;
+            for _ in 0..64 {
+                let d = match current.take() {
+                    Some(d) => d,
+                    None => break,
+                };
+                if d.parent_id.is_some() && affected_set.contains(&d.issuer_key_id) {
+                    orphaned = true;
+                    break;
+                }
+                current = match &d.parent_id {
+                    Some(pid) => self.db_run(|db, ws| db.kernel_lease(ws, pid))?,
+                    None => None,
+                };
+            }
+            if orphaned {
+                lease_ids.push(doc.lease_id.clone());
+            }
         }
         lease_ids.sort();
         lease_ids.dedup();

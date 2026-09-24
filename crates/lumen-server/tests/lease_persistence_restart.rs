@@ -19,7 +19,10 @@
 //! - §8.10 (no-new-delegation) is covered structurally by
 //!   `restored_session_cannot_mint`: the vault is empty after a restart,
 //!   so no signing key exists to mint with.
-//! - §8.11 `destroyed_session_stays_destroyed`
+//! - §8.11 `destroyed_session_stays_destroyed` (+
+//!   `destroy_session_revokes_orphaned_delegation_restart_succeeds`: the
+//!   kernel destroy path revokes chain-orphaned delegations so the next
+//!   boot succeeds)
 //! - §8.12 `killed_generation_fails_closed`
 //! - §8.13 `startup_tamper_detection`
 //! - §8.14 `audit_and_budget_continuity` (audit half; the budget half is
@@ -455,12 +458,10 @@ async fn restart_revoked_lease_stays_dead() {
 }
 
 /// §8.3, second half — revocation also denies after the issuing
-/// generation is purged. The denial then surfaces as an unknown
-/// generation rather than `Revoked`: `verify_lease` resolves the issuer
-/// key before consulting the revocation index, so the D4 ordering
-/// (revocation independent of key retention) holds for the *decision*
-/// (still denied) but not for the *reason* on this path. (`validate_chain`,
-/// used by `decide` and the boot self-check, does follow D4 order.)
+/// generation is purged. D4 ordering holds on the `verify_lease` path:
+/// revocation is checked before key resolution, so the denial surfaces
+/// as `Revoked` even though the generation row is gone. (`validate_chain`,
+/// used by `decide` and the boot self-check, follows the same order.)
 #[tokio::test]
 async fn restart_revoked_lease_denied_after_generation_purged() {
     let env = restart_env();
@@ -495,7 +496,10 @@ async fn restart_revoked_lease_denied_after_generation_purged() {
         .verify_lease(&lease)
         .await
         .expect_err("revoked lease must still be denied after its generation is purged");
-    assert_unknown_generation(&err, &lease.issuer_key_id);
+    assert!(
+        matches!(err, KernelError::Revoked(ref id) if *id == lease.lease_id),
+        "expected Revoked (D4: revocation before key resolution), got {err:?}"
+    );
 }
 
 /// §8.4 — a one-shot lease consumed before the restart cannot be replayed
@@ -1284,6 +1288,167 @@ async fn destroyed_session_stays_destroyed() {
             .await
             .expect("unrelated child lease must still verify");
     }
+}
+
+/// §8.11, destroy path — a session destroyed *through the kernel* revokes
+/// not only its own leases but delegations orphaned by chain: a child
+/// lease whose subject is not a session descendant, but whose
+/// verification needs the destroyed session's key, can never verify
+/// again. The destroy revokes it, so the next boot's re-validation
+/// succeeds and the session stays destroyed. (Contrast Part A of
+/// `destroyed_session_stays_destroyed`, which destroys via raw db writes,
+/// bypassing the kernel — that inconsistency must still fail the open.)
+#[tokio::test]
+async fn destroy_session_revokes_orphaned_delegation_restart_succeeds() {
+    let env = restart_env();
+    let now = now_ms();
+    let sess_signing = SigningKey::from_bytes(&[0xC1u8; 32]);
+    let sess_subject = session_address(&sess_signing.verifying_key());
+    let delegatee_signing = SigningKey::from_bytes(&[0xC2u8; 32]);
+
+    // Session row first: the boot hydrates the registry from it
+    // (`issue_root_lease` requires an active subject session).
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    db.ensure_workspace(&env.workspace, "test", now)
+        .await
+        .expect("ensure workspace");
+    db.insert_kernel_session(
+        &env.workspace,
+        &sess_subject,
+        None,
+        &hex::encode(sess_signing.verifying_key().to_bytes()),
+        now,
+    )
+    .await
+    .expect("session row");
+    drop(db);
+
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let root = h
+        .kernel
+        .issue_root_lease(RootLeaseParams {
+            lease_id: format!("root-orphan-{}", uuid::Uuid::new_v4()),
+            subject: sess_subject.clone(),
+            scope: ResourceScope::default(),
+            limits: CoreLeaseLimits {
+                not_before_ms: now,
+                expires_at_ms: now + 3_600_000,
+                budget: Budget::new().set(BudgetDimension::Executions, 100),
+                max_executions: None,
+                single_use: false,
+            },
+            depth_limit: 4,
+            lease_nonce: format!("root-nonce-orphan-{}", uuid::Uuid::new_v4()),
+            issued_at_ms: now,
+        })
+        .await
+        .expect("issue root lease");
+
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    let parent_doc = db
+        .kernel_lease(&env.workspace, &root.lease_id)
+        .await
+        .expect("fetch parent")
+        .expect("parent lease stored");
+
+    // A delegation to an *external* subject: its subject is not a session
+    // descendant, so subject-scoped revocation would miss it — but its
+    // signature was made by the session key, so destroying the session
+    // orphans it.
+    let mut sessions = SessionRegistry::new();
+    sessions.register(
+        sess_subject.clone(),
+        None,
+        sess_signing.verifying_key(),
+        now,
+    );
+    sessions.register(
+        "external-delegatee".to_string(),
+        Some(sess_subject.clone()),
+        delegatee_signing.verifying_key(),
+        now,
+    );
+    let revocations = RevocationIndex::default();
+    let ledger = BudgetLedger::new();
+    ledger
+        .register_lease(&parent_doc.lease_id, &parent_doc.limits.budget)
+        .expect("register parent budget");
+    let delegation = mint_child_lease(
+        &parent_doc,
+        ChildLeaseParams {
+            lease_id: format!("delegation-orphan-{}", uuid::Uuid::new_v4()),
+            subject: "external-delegatee".to_string(),
+            scope: ResourceScope::default(),
+            limits: CoreLeaseLimits {
+                not_before_ms: now,
+                expires_at_ms: now + 3_600_000,
+                budget: Budget::new().set(BudgetDimension::Executions, 10),
+                max_executions: Some(1),
+                single_use: false,
+            },
+            depth_limit: 3,
+            lease_nonce: format!("delegation-nonce-{}", uuid::Uuid::new_v4()),
+            issued_at_ms: now,
+        },
+        &sess_signing,
+        &sessions,
+        &revocations,
+        &ledger,
+        &NonceStore::new(),
+        now,
+    )
+    .expect("mint delegation");
+    db.insert_kernel_lease(&env.workspace, &delegation)
+        .await
+        .expect("insert delegation");
+    drop(db);
+    let host_delegation = to_host_doc(&delegation);
+
+    // Sanity: the delegation verifies while the session lives.
+    h.kernel
+        .verify_lease(&host_delegation)
+        .await
+        .expect("delegation verifies pre-destroy");
+
+    // Destroy through the kernel. The vault holds no private key for this
+    // session (it came from the durable row, not `start_session_identity`),
+    // so this exercises the durable-only path, including the
+    // orphan-delegation revocation.
+    let report = h
+        .kernel
+        .destroy_session_identity(&sess_subject)
+        .await
+        .expect("destroy session");
+    assert_eq!(report.affected_subjects, vec![sess_subject.clone()]);
+    drop(h);
+
+    // The restart must now SUCCEED: the orphaned delegation was revoked
+    // at destroy time instead of failing the boot re-validation.
+    let h2 = open_kernel(&env, HashMap::new(), None).await;
+
+    // The session stayed destroyed...
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    let active = db
+        .active_kernel_sessions(&env.workspace)
+        .await
+        .expect("active sessions");
+    assert!(
+        !active.iter().any(|s| s.subject == sess_subject),
+        "destroyed session must not resurrect after a restart"
+    );
+    drop(db);
+
+    // ...and the orphaned delegation is dead (revoked, not merely
+    // unverifiable).
+    let err = h2
+        .kernel
+        .verify_lease(&host_delegation)
+        .await
+        .expect_err("orphaned delegation must be revoked");
+    assert!(
+        matches!(err, KernelError::Revoked(_)),
+        "expected Revoked, got {err:?}"
+    );
 }
 
 /// §8.13 — startup tamper detection: if the stored issuer generation
