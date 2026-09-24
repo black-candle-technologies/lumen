@@ -15,6 +15,7 @@ mod orchestration;
 mod repositories;
 mod routing;
 mod trust_gate;
+mod vhl;
 mod worker;
 
 use std::path::Path;
@@ -138,6 +139,10 @@ pub enum RepositoryError {
     InvalidKernelLeaseState(String),
     #[error("kernel budget insufficient: {0}")]
     KernelBudgetInsufficient(String),
+    #[error("VHL approval state conflicts with repository constraints")]
+    VhlStateConflict,
+    #[error("stored VHL state is invalid: {0}")]
+    InvalidVhlState(String),
     #[error("kernel reservation conflicts with repository constraints")]
     KernelReservationConflict,
     #[error("kernel debit idempotency key was already used with different parameters")]

@@ -5,6 +5,11 @@
 //! lease engine), [`budget`] (reservation accounting), [`execution`]
 //! (execution lifecycle driver), [`nonce`] (replay protection), [`kernel_audit`] (append-only audit + checkpoints), and
 //! [`store`] (repository traits).
+//!
+//! Phase 4 adds human authority: [`session_identity`] (per-session
+//! ephemeral Ed25519 identity held by the kernel) and [`vhl`] (VHL approval
+//! requests, attestation verification, single-use lease minting, and the
+//! explicit standing-lease workflow).
 
 pub mod action;
 pub mod approval;
@@ -32,8 +37,10 @@ pub mod provider;
 pub mod routing;
 pub mod run;
 pub mod secret;
+pub mod session_identity;
 pub mod store;
 pub mod trust_gate;
+pub mod vhl;
 pub mod worker;
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {

@@ -3175,6 +3175,7 @@ name = "lumen-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "ed25519-dalek",
  "hex",
  "ipnet",
@@ -3185,6 +3186,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -3192,6 +3194,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3200,12 +3203,14 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "futures-util",
+ "hex",
  "lumen-core",
  "rand 0.8.8",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
