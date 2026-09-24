@@ -466,19 +466,3 @@ fn base64_encode(bytes: &[u8]) -> String {
     use base64::{Engine, engine::general_purpose::STANDARD};
     STANDARD.encode(bytes)
 }
-
-// Re-export rand for the nonce (or use a simple counter).
-mod rand {
-    pub fn random<T>() -> T
-    where
-        T: From<u8>,
-    {
-        // NOT cryptographic; the nonce just needs uniqueness, not secrecy.
-        // The host validates the run_id, not the nonce.
-        static mut COUNTER: u8 = 0;
-        unsafe {
-            COUNTER = COUNTER.wrapping_add(1);
-            T::from(COUNTER)
-        }
-    }
-}
