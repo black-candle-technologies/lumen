@@ -30,6 +30,16 @@ pub struct EgressDestination {
 
 /// Parse one allowlist entry: `scheme://host[:port]`.
 /// Schemes: `https`, `http`, `tcp`. Unknown schemes are rejected.
+///
+/// Scope model — what the proxy can actually enforce:
+/// - `http` / `https`: absolute-form requests (`GET https://host/path`).
+///   The proxy rewrites to origin-form and forwards the plaintext bytes;
+///   it never terminates or validates TLS, so an `https` lease is
+///   host:port authority over the forwarded stream, not a TLS guarantee.
+/// - `tcp`: `CONNECT host:port` tunnels. CONNECT carries no scheme, so a
+///   tunnel is authorized against `tcp` scope for that host:port only.
+///   An `https://host` lease does NOT authorize a CONNECT tunnel — scope
+///   narrowing is exact (design invariant 3).
 pub fn parse_destination(entry: &str) -> Result<EgressDestination, SandboxdError> {
     let (scheme, rest) = entry.split_once("://").ok_or_else(|| {
         SandboxdError::EgressDenied(format!(
@@ -37,14 +47,11 @@ pub fn parse_destination(entry: &str) -> Result<EgressDestination, SandboxdError
         ))
     })?;
     let scheme = scheme.to_ascii_lowercase();
-    let default_port = match scheme.as_str() {
-        "https" => 443,
-        "http" => 80,
-        "tcp" => {
-            return Err(SandboxdError::EgressDenied(
-                "tcp destinations must name an explicit port".into(),
-            ));
-        }
+    // `tcp` has no default port: a tcp-scope entry must name one explicitly.
+    let default_port: Option<u16> = match scheme.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        "tcp" => None,
         _ => {
             return Err(SandboxdError::EgressDenied(format!(
                 "unsupported scheme: {scheme}"
@@ -94,10 +101,19 @@ pub fn parse_destination(entry: &str) -> Result<EgressDestination, SandboxdError
             "empty host in destination: {entry}"
         )));
     }
+    let port = match (port, default_port) {
+        (Some(p), _) => p,
+        (None, Some(d)) => d,
+        (None, None) => {
+            return Err(SandboxdError::EgressDenied(
+                "tcp destinations must name an explicit port".into(),
+            ));
+        }
+    };
     Ok(EgressDestination {
         scheme,
         host: host.to_ascii_lowercase(),
-        port: port.unwrap_or(default_port),
+        port,
     })
 }
 
@@ -109,7 +125,8 @@ pub fn parse_destination(entry: &str) -> Result<EgressDestination, SandboxdError
 ///   lose to the deny flags);
 /// - DNS names must match an allowlist entry exactly, or as a `*.` suffix
 ///   wildcard with a full label boundary; bare `*` is rejected;
-/// - scheme and port must match the entry.
+/// - scheme and port must match the entry. In particular a `tcp`-scheme
+///   request (i.e. a CONNECT tunnel) never matches an `https` entry.
 pub fn check_destination(
     policy: &crate::contracts::NetworkPolicy,
     scheme: &str,
@@ -328,13 +345,24 @@ mod tests {
         assert_eq!(d.port, 443);
         let d = parse_destination("http://x.test").unwrap();
         assert_eq!(d.port, 80);
+        // tcp has no default port, but an explicit port is expressible —
+        // this is the scope CONNECT tunnels are authorized against.
+        let d = parse_destination("tcp://x.test:443").unwrap();
+        assert_eq!(
+            d,
+            EgressDestination {
+                scheme: "tcp".into(),
+                host: "x.test".into(),
+                port: 443
+            }
+        );
     }
 
     #[test]
     fn parse_destination_rejects() {
         assert!(parse_destination("api.example.com").is_err());
         assert!(parse_destination("ftp://x.test").is_err());
-        assert!(parse_destination("tcp://x.test").is_err()); // needs port
+        assert!(parse_destination("tcp://x.test").is_err()); // needs explicit port
         assert!(parse_destination("https://").is_err());
         assert!(parse_destination("https://::1").is_err()); // bare v6
         assert!(parse_destination("https://[::1]:443").is_ok());
