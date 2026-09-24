@@ -1,6 +1,9 @@
 pub mod config;
 mod extension_runtime;
+mod health;
+mod plugin_admission;
 mod runtime;
+mod support_bundle;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,11 +27,9 @@ use lumen_core::{
     secret::SecretRefId,
     worker::WorkerRunBudget,
 };
-use lumen_db::{
-    Database, RepositoryError, SecretReference, SecretReferenceError, StagedPluginPackage,
-};
+use lumen_db::{Database, RepositoryError, SecretReference, SecretReferenceError};
 use lumen_integrations::{
-    extension_package::{PackageStageError, PackageStager},
+    extension_package::PackageStageError,
     sandbox::{SandboxBackend, SandboxReport, SystemSandbox},
     secrets::{OsKeyringSecretStore, SecretStore, SecretStoreError},
 };
@@ -38,7 +39,7 @@ use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-fn relative_storage_path(path: &Path) -> Option<String> {
+pub(crate) fn relative_storage_path(path: &Path) -> Option<String> {
     let segments = path
         .components()
         .map(|component| match component {
@@ -66,6 +67,33 @@ pub enum Command {
         #[command(subcommand)]
         command: AuditCommand,
     },
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommand,
+    },
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommand,
+    },
+    /// Run health and diagnostics checks against the configured state.
+    Health,
+    /// Export a deterministic, redacted support bundle. The export is
+    /// deleted if the secret scan finds anything.
+    SupportBundle {
+        #[arg(long)]
+        out: PathBuf,
+        /// Export only the audit trail (plus health and manifest).
+        #[arg(long, default_value_t = false)]
+        audit_only: bool,
+    },
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
@@ -82,13 +110,44 @@ pub enum Command {
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum PluginCommand {
-    Stage {
+    /// Submit a local plugin directory for admission. Pins the content
+    /// digests and opens an admission record (status: submitted).
+    #[command(alias = "stage")]
+    Submit {
         #[arg(value_parser = parse_local_plugin_directory)]
         directory: PathBuf,
+        /// Why this plugin is being submitted (recorded on the admission).
+        #[arg(long)]
+        reason: String,
+        /// Operator principal recorded on the admission; defaults to the
+        /// configured bootstrap principal.
+        #[arg(long)]
+        as_principal: Option<String>,
     },
-    Review {
+    /// Inspect a staged package: manifest, digests, declared permissions,
+    /// and the admission review status.
+    #[command(alias = "review")]
+    Inspect {
         stage_id: uuid::Uuid,
     },
+    /// Run the admission test suite against a staged package and record
+    /// the result on its admission record.
+    Test {
+        stage_id: uuid::Uuid,
+    },
+    /// Approve a tested digest for deployment. Requires passing admission
+    /// tests, an explicit reason, and confirmation.
+    Approve {
+        stage_id: uuid::Uuid,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        #[arg(long)]
+        as_principal: Option<String>,
+    },
+    /// List admission records and their review status.
+    List,
     Install {
         stage_id: uuid::Uuid,
     },
@@ -99,6 +158,19 @@ pub enum PluginCommand {
     Disable {
         plugin_id: String,
         version: String,
+    },
+    /// Revoke a digest: terminal. Blocks reinstall/re-enable of the digest
+    /// and requests disable of any enabled deployment. Prior audit records
+    /// are preserved.
+    Revoke {
+        plugin_id: String,
+        version: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        #[arg(long)]
+        as_principal: Option<String>,
     },
     Invoke {
         plugin_id: String,
@@ -141,6 +213,50 @@ pub enum PluginCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum AuditCommand {
     Verify,
+    /// List audit events (newest last), with allow/deny/approval decisions
+    /// and their reasons.
+    List {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u16,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum ApprovalsCommand {
+    /// List pending approval requests with their exact normalized
+    /// arguments, capabilities, fingerprint, and expiry.
+    List,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum RunCommand {
+    /// Show a run's lifecycle state and diagnostics.
+    Show {
+        #[arg(value_parser = parse_run_id)]
+        run_id: RunId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum SessionCommand {
+    /// List Pi agent sessions.
+    ///
+    /// Sessions are a Phase-1 surface: the lease/session store does not
+    /// exist in this tree yet, so this command reports that explicitly
+    /// instead of inventing session data.
+    List,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum LeaseCommand {
+    /// Show a lease.
+    ///
+    /// Leases are a Phase-1 surface: the lease/session store does not
+    /// exist in this tree yet, so this command reports that explicitly
+    /// instead of inventing lease data.
+    Show { lease_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
@@ -169,26 +285,46 @@ pub enum SecretCommand {
 pub enum CommandOutput {
     Migrated,
     AuditVerified,
+    AuditListed(Vec<AuditEventSummary>),
     ServerStopped,
     SandboxReport(SandboxReport),
     SecretCreated(SecretReference),
     SecretReferences(Vec<SecretReference>),
     SecretDeleted(SecretRefId),
-    PluginStaged(PluginStageSummary),
-    PluginReview(PluginReviewSummary),
+    PluginSubmitted(PluginSubmissionSummary),
+    PluginInspected(PluginInspectionSummary),
+    PluginTested(PluginTestSummary),
+    PluginApproved(PluginApprovalSummary),
+    PluginAdmissionsListed(Vec<AdmissionRecordSummary>),
+    PluginRevoked(PluginRevocationSummary),
     PluginActionRequested(PluginActionRequest),
+    ApprovalsListed(Vec<PendingApprovalSummary>),
+    RunShown(RunSummary),
+    HealthReported(HealthSummary),
+    SupportBundleExported(SupportBundleSummary),
+    Unavailable(UnavailableSurface),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PluginStageSummary {
+pub struct PluginSubmissionSummary {
     pub stage_id: uuid::Uuid,
     pub plugin_id: String,
     pub version: String,
     pub package_digest: String,
+    pub admission_status: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PluginReviewSummary {
+pub struct AdmissionDecisionSummary {
+    pub kind: String,
+    pub decided_by: String,
+    pub decided_at: u64,
+    pub reason: String,
+    pub detail_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginInspectionSummary {
     pub stage_id: uuid::Uuid,
     pub plugin_id: String,
     pub version: String,
@@ -200,11 +336,350 @@ pub struct PluginReviewSummary {
     pub artifact_digest: String,
     pub file_hashes: BTreeMap<String, String>,
     pub requested_capabilities: Vec<String>,
+    pub admission_status: String,
+    pub decisions: Vec<AdmissionDecisionSummary>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginTestLegSummary {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginTestSummary {
+    pub stage_id: uuid::Uuid,
+    pub plugin_id: String,
+    pub version: String,
+    pub package_digest: String,
+    pub report_digest: String,
+    pub passed: bool,
+    pub legs: Vec<PluginTestLegSummary>,
+    pub admission_status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginApprovalSummary {
+    pub stage_id: uuid::Uuid,
+    pub plugin_id: String,
+    pub version: String,
+    pub package_digest: String,
+    pub admission_status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionRecordSummary {
+    pub plugin_id: String,
+    pub version: String,
+    pub package_digest: String,
+    pub status: String,
+    pub decisions: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginRevocationSummary {
+    pub plugin_id: String,
+    pub version: String,
+    pub package_digest: String,
+    pub disable_run_id: RunId,
+    pub disable_approval_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginActionRequest {
     pub run_id: RunId,
+    /// The pending approval the operator must decide (web UI / API) before
+    /// the action executes. `None` when no approval was created.
+    pub approval_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingApprovalSummary {
+    pub approval_id: String,
+    pub run_id: String,
+    pub kind: String,
+    pub fingerprint: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub arguments: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEventSummary {
+    pub sequence: i64,
+    pub event_id: String,
+    pub timestamp: u64,
+    pub kind: String,
+    pub outcome: String,
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub phase: String,
+    pub effect_certainty: String,
+    pub terminal_code: Option<String>,
+    pub primary_diagnostic: Option<String>,
+    pub secondary_diagnostic: Option<String>,
+    pub terminal_audit_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthCheckSummary {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthSummary {
+    pub healthy: bool,
+    pub checks: Vec<HealthCheckSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupportBundleSummary {
+    pub path: String,
+    pub files: usize,
+    pub audit_events: usize,
+    pub redactions: usize,
+    pub scanned_bytes: u64,
+}
+
+/// A CLI surface that has no backing store yet. Rendered explicitly instead
+/// of inventing data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnavailableSurface {
+    pub surface: String,
+    pub detail: String,
+}
+
+impl CommandOutput {
+    /// Human-readable rendering. Every state — including deny, pending,
+    /// and unavailable — renders as plain text with its reason.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Migrated => "database migrated\n".into(),
+            Self::AuditVerified => "audit chain verified\n".into(),
+            Self::AuditListed(events) => {
+                let mut out = String::new();
+                for event in events {
+                    out.push_str(&format!(
+                        "#{} {} {} outcome={}\n    {}\n",
+                        event.sequence, event.timestamp, event.kind, event.outcome, event.payload
+                    ));
+                }
+                if events.is_empty() {
+                    out.push_str("no audit events\n");
+                }
+                out
+            }
+            Self::ServerStopped => "server stopped\n".into(),
+            Self::SandboxReport(report) => {
+                format!(
+                    "sandbox backend: {}\nstrength: {:?}\n{}\n",
+                    report.backend(),
+                    report.strength(),
+                    report.detail().unwrap_or("")
+                )
+            }
+            Self::SecretCreated(reference) => {
+                format!("secret created: {}\n", reference.id())
+            }
+            Self::SecretReferences(references) => {
+                let mut out = String::new();
+                for reference in references {
+                    out.push_str(&format!("{}\n", reference.id()));
+                }
+                if references.is_empty() {
+                    out.push_str("no secret references\n");
+                }
+                out
+            }
+            Self::SecretDeleted(id) => format!("secret deleted: {id}\n"),
+            Self::PluginSubmitted(summary) => format!(
+                "submitted {} {} (stage {})\npackage digest: {}\nadmission status: {}\nnext: lumen plugin inspect {}\n",
+                summary.plugin_id,
+                summary.version,
+                summary.stage_id,
+                summary.package_digest,
+                summary.admission_status,
+                summary.stage_id
+            ),
+            Self::PluginInspected(inspection) => {
+                let mut out = format!(
+                    "plugin: {} {}\nname: {}\nruntime: {}\ndescription: {}\npackage digest:  {}\nmanifest digest: {}\nartifact digest: {}\nadmission status: {}\n",
+                    inspection.plugin_id,
+                    inspection.version,
+                    inspection.name,
+                    inspection.runtime,
+                    inspection.description,
+                    inspection.package_digest,
+                    inspection.manifest_digest,
+                    inspection.artifact_digest,
+                    inspection.admission_status
+                );
+                out.push_str("declared permissions:\n");
+                for capability in &inspection.requested_capabilities {
+                    out.push_str(&format!("  - {capability}\n"));
+                }
+                out.push_str("files:\n");
+                let mut files: Vec<_> = inspection.file_hashes.iter().collect();
+                files.sort_by_key(|(path, _)| *path);
+                for (path, digest) in files {
+                    out.push_str(&format!("  {path}: {digest}\n"));
+                }
+                out.push_str("admission decisions:\n");
+                for decision in &inspection.decisions {
+                    out.push_str(&format!(
+                        "  - {} by {} at {}: {}{}\n",
+                        decision.kind,
+                        decision.decided_by,
+                        decision.decided_at,
+                        decision.reason,
+                        decision
+                            .detail_digest
+                            .as_ref()
+                            .map(|digest| format!(" (detail {digest})"))
+                            .unwrap_or_default()
+                    ));
+                }
+                out
+            }
+            Self::PluginTested(summary) => {
+                let mut out = format!(
+                    "admission tests {} for {} {} ({})\nreport digest: {}\nadmission status: {}\n",
+                    if summary.passed { "PASSED" } else { "FAILED" },
+                    summary.plugin_id,
+                    summary.version,
+                    summary.package_digest,
+                    summary.report_digest,
+                    summary.admission_status
+                );
+                for leg in &summary.legs {
+                    out.push_str(&format!(
+                        "  [{}] {}\n      {}\n",
+                        if leg.passed { "pass" } else { "FAIL" },
+                        leg.name,
+                        leg.detail
+                    ));
+                }
+                if summary.passed {
+                    out.push_str(&format!(
+                        "next: lumen plugin approve {} --reason \"...\" --yes\n",
+                        summary.stage_id
+                    ));
+                }
+                out
+            }
+            Self::PluginApproved(summary) => format!(
+                "approved {} {} ({})\nadmission status: {}\nnext: lumen plugin install {} (requests approval-bound install)\n",
+                summary.plugin_id,
+                summary.version,
+                summary.package_digest,
+                summary.admission_status,
+                summary.stage_id
+            ),
+            Self::PluginAdmissionsListed(records) => {
+                let mut out = String::new();
+                for record in records {
+                    out.push_str(&format!(
+                        "{} {} {} status={} decisions={}\n",
+                        record.plugin_id,
+                        record.version,
+                        record.package_digest,
+                        record.status,
+                        record.decisions
+                    ));
+                }
+                if records.is_empty() {
+                    out.push_str("no admission records\n");
+                }
+                out
+            }
+            Self::PluginRevoked(summary) => format!(
+                "revoked {} {} ({})\nThis digest can never be installed or enabled again.\nDisable requested: run {}{}\n",
+                summary.plugin_id,
+                summary.version,
+                summary.package_digest,
+                summary.disable_run_id,
+                summary
+                    .disable_approval_id
+                    .as_ref()
+                    .map(|id| format!(" (approval {id} pending)"))
+                    .unwrap_or_default()
+            ),
+            Self::PluginActionRequested(request) => format!(
+                "action requested: run {}\n{}{}\n",
+                request.run_id,
+                request
+                    .approval_id
+                    .as_ref()
+                    .map(|id| format!("approval {id} is PENDING"))
+                    .unwrap_or_else(|| "no approval was created".into()),
+                request.approval_id.as_ref().map(|_| "\nDecide it in the web UI approvals page or via the API; the action executes after approval.").unwrap_or("")
+            ),
+            Self::ApprovalsListed(approvals) => {
+                let mut out = String::new();
+                for approval in approvals {
+                    out.push_str(&format!(
+                        "approval: {}\n  run: {}\n  kind: {}\n  fingerprint: {}\n  created: {} expires: {}\n  capabilities:\n",
+                        approval.approval_id,
+                        approval.run_id,
+                        approval.kind,
+                        approval.fingerprint,
+                        approval.created_at,
+                        approval.expires_at
+                    ));
+                    for capability in &approval.capabilities {
+                        out.push_str(&format!("    - {capability}\n"));
+                    }
+                    out.push_str(&format!("  arguments: {}\n", approval.arguments));
+                }
+                if approvals.is_empty() {
+                    out.push_str("no pending approvals\n");
+                }
+                out
+            }
+            Self::RunShown(summary) => format!(
+                "run: {}\nphase: {}\neffect certainty: {}\nterminal code: {}\nprimary diagnostic: {}\nsecondary diagnostic: {}\nterminal audit pending: {}\n",
+                summary.run_id,
+                summary.phase,
+                summary.effect_certainty,
+                summary.terminal_code.as_deref().unwrap_or("-"),
+                summary.primary_diagnostic.as_deref().unwrap_or("-"),
+                summary.secondary_diagnostic.as_deref().unwrap_or("-"),
+                summary.terminal_audit_pending
+            ),
+            Self::HealthReported(summary) => {
+                let mut out = String::new();
+                for check in &summary.checks {
+                    out.push_str(&format!(
+                        "[{}] {}\n    {}\n",
+                        if check.passed { "ok" } else { "FAIL" },
+                        check.name,
+                        check.detail
+                    ));
+                }
+                out.push_str(if summary.healthy {
+                    "overall: healthy\n"
+                } else {
+                    "overall: UNHEALTHY\n"
+                });
+                out
+            }
+            Self::SupportBundleExported(summary) => format!(
+                "support bundle exported to {}\nfiles: {}  audit events: {}  redactions: {}  scanned bytes: {}\n",
+                summary.path, summary.files, summary.audit_events, summary.redactions, summary.scanned_bytes
+            ),
+            Self::Unavailable(surface) => {
+                format!("{} is unavailable: {}\n", surface.surface, surface.detail)
+            }
+        }
+    }
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
@@ -271,6 +746,168 @@ pub async fn execute_with_secret_store(
             database.close().await;
             Ok(CommandOutput::AuditVerified)
         }
+        Command::Audit {
+            command: AuditCommand::List { kind, limit },
+        } => {
+            if !config.database.path.is_file() {
+                return Err(CliError::MissingDatabase(config.database.path));
+            }
+            let database = Database::connect(&config.database.path).await?;
+            let limit = limit.max(1);
+            let mut events = Vec::new();
+            let mut after: i64 = -1;
+            loop {
+                let batch = database
+                    .list_audit_records(config.workspace_id(), after, limit.min(500))
+                    .await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for record in &batch {
+                    after = after.max(record.sequence());
+                    let matches_kind = kind
+                        .as_ref()
+                        .is_none_or(|wanted| record.event().kind().as_str() == wanted.as_str());
+                    if !matches_kind {
+                        continue;
+                    }
+                    events.push(AuditEventSummary {
+                        sequence: record.sequence(),
+                        event_id: record.event().id().to_string(),
+                        timestamp: record.event().timestamp().as_u64(),
+                        kind: record.event().kind().as_str().to_owned(),
+                        outcome: serde_json::to_value(record.event().outcome())
+                            .map(|value| value.as_str().unwrap_or("unknown").to_owned())
+                            .unwrap_or_else(|_| "unknown".into()),
+                        payload: serde_json::to_string(record.event().payload())
+                            .unwrap_or_else(|_| "{}".into()),
+                    });
+                    if events.len() >= usize::from(limit) {
+                        break;
+                    }
+                }
+                if events.len() >= usize::from(limit) {
+                    break;
+                }
+            }
+            database.close().await;
+            Ok(CommandOutput::AuditListed(events))
+        }
+        Command::Approvals {
+            command: ApprovalsCommand::List,
+        } => {
+            if !config.database.path.is_file() {
+                return Err(CliError::MissingDatabase(config.database.path));
+            }
+            let database = Database::connect(&config.database.path).await?;
+            let pending = database
+                .list_pending_approvals(config.workspace_id(), runtime::now())
+                .await?;
+            let summaries = pending
+                .iter()
+                .map(|approval| PendingApprovalSummary {
+                    approval_id: approval.approval_id().to_string(),
+                    run_id: approval.run_id().to_string(),
+                    kind: approval.kind().to_owned(),
+                    fingerprint: approval.fingerprint().to_owned(),
+                    created_at: approval.created_at().as_u64(),
+                    expires_at: approval.expires_at().as_u64(),
+                    arguments: serde_json::to_string(approval.arguments())
+                        .unwrap_or_else(|_| "{}".into()),
+                    capabilities: approval
+                        .capabilities()
+                        .iter()
+                        .map(|capability| {
+                            serde_json::to_string(capability).unwrap_or_else(|_| "{}".into())
+                        })
+                        .collect(),
+                })
+                .collect();
+            database.close().await;
+            Ok(CommandOutput::ApprovalsListed(summaries))
+        }
+        Command::Run {
+            command: RunCommand::Show { run_id },
+        } => {
+            if !config.database.path.is_file() {
+                return Err(CliError::MissingDatabase(config.database.path));
+            }
+            let database = Database::connect(&config.database.path).await?;
+            let lifecycle = database
+                .get_run_lifecycle(config.workspace_id(), run_id)
+                .await?
+                .ok_or_else(|| CliError::Runtime("run was not found".into()))?;
+            let summary = RunSummary {
+                run_id: run_id.to_string(),
+                phase: lifecycle.phase().to_owned(),
+                effect_certainty: lifecycle.effect_certainty().as_str().to_owned(),
+                terminal_code: lifecycle.terminal_code().map(str::to_owned),
+                primary_diagnostic: lifecycle.primary_diagnostic().map(str::to_owned),
+                secondary_diagnostic: lifecycle.secondary_diagnostic().map(str::to_owned),
+                terminal_audit_pending: lifecycle.terminal_audit_pending(),
+            };
+            database.close().await;
+            Ok(CommandOutput::RunShown(summary))
+        }
+        Command::Session {
+            command: SessionCommand::List,
+        } => Ok(CommandOutput::Unavailable(UnavailableSurface {
+            surface: "session list".into(),
+            detail: "Pi agent sessions are a Phase-1 surface: the lease/session store \
+                     does not exist in this tree yet, so there is nothing to list. \
+                     This command will be wired to the Phase-1 session store when it lands."
+                .into(),
+        })),
+        Command::Lease {
+            command: LeaseCommand::Show { lease_id },
+        } => Ok(CommandOutput::Unavailable(UnavailableSurface {
+            surface: format!("lease show {lease_id}"),
+            detail: "Leases are a Phase-1 surface: the lease store does not exist in \
+                     this tree yet, so there is nothing to show. This command will \
+                     be wired to the Phase-1 lease store when it lands."
+                .into(),
+        })),
+        Command::Health => {
+            if !config.database.path.is_file() {
+                return Err(CliError::MissingDatabase(config.database.path));
+            }
+            let database = Database::connect(&config.database.path).await?;
+            let report = health::collect(&config, &database)
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            let summary = HealthSummary {
+                healthy: report.healthy,
+                checks: report
+                    .checks
+                    .into_iter()
+                    .map(|check| HealthCheckSummary {
+                        name: check.name,
+                        passed: check.passed,
+                        detail: check.detail,
+                    })
+                    .collect(),
+            };
+            database.close().await;
+            Ok(CommandOutput::HealthReported(summary))
+        }
+        Command::SupportBundle { out, audit_only } => {
+            if !config.database.path.is_file() {
+                return Err(CliError::MissingDatabase(config.database.path));
+            }
+            let database = Database::connect(&config.database.path).await?;
+            let report =
+                support_bundle::export_bundle(&config, &database, &cli.config, &out, audit_only)
+                    .await
+                    .map_err(|error| CliError::Runtime(error.to_string()))?;
+            database.close().await;
+            Ok(CommandOutput::SupportBundleExported(SupportBundleSummary {
+                path: report.path.display().to_string(),
+                files: report.files,
+                audit_events: report.audit_events,
+                redactions: report.redactions,
+                scanned_bytes: report.scanned_bytes,
+            }))
+        }
         Command::Sandbox {
             command: SandboxCommand::Report,
         } => Ok(CommandOutput::SandboxReport(
@@ -291,6 +928,12 @@ fn parse_local_plugin_directory(value: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(value))
 }
 
+fn parse_run_id(value: &str) -> Result<RunId, String> {
+    uuid::Uuid::parse_str(value)
+        .map(RunId::from_uuid)
+        .map_err(|_| "run id must be a UUID".into())
+}
+
 async fn execute_plugin_command(
     config: &Config,
     command: PluginCommand,
@@ -307,28 +950,21 @@ async fn execute_plugin_command(
         )
         .await?;
     let output = match command {
-        PluginCommand::Stage { directory } => {
-            let quarantine = config.runtime.data_directory.join("plugins/quarantine");
-            let staged = PackageStager::default().stage(directory, &quarantine)?;
-            let data_root = std::fs::canonicalize(&config.runtime.data_directory)?;
-            let relative = staged
-                .quarantine_path()
-                .strip_prefix(&data_root)
-                .map_err(|_| CliError::Runtime("quarantine escaped the data directory".into()))?;
-            let relative = relative_storage_path(relative)
-                .ok_or_else(|| CliError::Runtime("quarantine path is not portable".into()))?;
-            let stage_id = uuid::Uuid::new_v4();
-            let record = StagedPluginPackage::new(
-                stage_id,
-                staged.manifest().clone(),
-                relative,
-                staged.files().clone(),
-                staged.package_digest().clone(),
-                staged.manifest_digest().clone(),
-                config.bootstrap_principal(),
+        PluginCommand::Submit {
+            directory,
+            reason,
+            as_principal,
+        } => {
+            let submission = plugin_admission::submit(
+                config,
+                &database,
+                &directory,
+                &reason,
+                as_principal.as_deref(),
                 now,
-            )?;
-            database.insert_staged_plugin_package(&record).await?;
+            )
+            .await
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
             database
                 .append_audit_event(AuditEvent::new(
                     AuditEventId::new(),
@@ -337,69 +973,187 @@ async fn execute_plugin_command(
                     AuditOutcome::Success,
                     Some(config.workspace_id()),
                     CanonicalValue::object([
-                        ("stage_id", CanonicalValue::from(stage_id.to_string())),
+                        (
+                            "stage_id",
+                            CanonicalValue::from(submission.stage_id.to_string()),
+                        ),
                         (
                             "plugin_id",
-                            CanonicalValue::from(record.manifest().id().to_string()),
+                            CanonicalValue::from(submission.plugin_id.clone()),
                         ),
-                        (
-                            "version",
-                            CanonicalValue::from(record.manifest().version().to_string()),
-                        ),
+                        ("version", CanonicalValue::from(submission.version.clone())),
                         (
                             "package_digest",
-                            CanonicalValue::from(record.package_digest().to_string()),
+                            CanonicalValue::from(submission.package_digest.clone()),
                         ),
                     ]),
                 ))
                 .await?;
-            CommandOutput::PluginStaged(PluginStageSummary {
-                stage_id,
-                plugin_id: record.manifest().id().to_string(),
-                version: record.manifest().version().to_string(),
-                package_digest: record.package_digest().to_string(),
+            CommandOutput::PluginSubmitted(PluginSubmissionSummary {
+                stage_id: submission.stage_id,
+                plugin_id: submission.plugin_id,
+                version: submission.version,
+                package_digest: submission.package_digest,
+                admission_status: submission.status,
             })
         }
-        PluginCommand::Review { stage_id } => {
-            let staged = database
-                .staged_plugin_package(stage_id)
-                .await?
-                .ok_or_else(|| CliError::Runtime("staged plugin package was not found".into()))?;
-            let requested_capabilities = staged
-                .manifest()
-                .components()
-                .iter()
-                .flat_map(|component| {
-                    component.capabilities().iter().map(move |request| {
-                        format!(
-                            "{}:{}:{}",
-                            component.id(),
-                            request.name().as_str(),
-                            match request.scope() {
-                                lumen_core::extension::ManifestCapabilityScope::Workspace => {
-                                    "workspace"
-                                }
-                            }
-                        )
+        PluginCommand::Inspect { stage_id } => {
+            let inspection = plugin_admission::inspect(config, &database, stage_id)
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            CommandOutput::PluginInspected(PluginInspectionSummary {
+                stage_id: inspection.stage_id,
+                plugin_id: inspection.plugin_id,
+                version: inspection.version,
+                runtime: inspection.runtime,
+                name: inspection.name,
+                description: inspection.description,
+                package_digest: inspection.package_digest,
+                manifest_digest: inspection.manifest_digest,
+                artifact_digest: inspection.artifact_digest,
+                file_hashes: inspection.file_hashes.into_iter().collect(),
+                requested_capabilities: inspection.requested_capabilities,
+                admission_status: inspection.admission_status,
+                decisions: inspection
+                    .decisions
+                    .into_iter()
+                    .map(|decision| AdmissionDecisionSummary {
+                        kind: decision.kind.as_str().to_owned(),
+                        decided_by: decision.decided_by,
+                        decided_at: decision.decided_at,
+                        reason: decision.reason,
+                        detail_digest: decision.detail_digest,
                     })
-                })
-                .collect();
-            CommandOutput::PluginReview(PluginReviewSummary {
-                stage_id,
-                plugin_id: staged.manifest().id().to_string(),
-                version: staged.manifest().version().to_string(),
-                runtime: staged.manifest().runtime().runtime().as_str().to_owned(),
-                name: staged.manifest().name().to_owned(),
-                description: staged.manifest().description().to_owned(),
-                package_digest: staged.package_digest().to_string(),
-                manifest_digest: staged.manifest_digest().to_string(),
-                artifact_digest: staged.manifest().integrity().artifact().to_string(),
-                file_hashes: staged
-                    .file_hashes()
-                    .iter()
-                    .map(|(path, digest)| (path.clone(), digest.to_string()))
                     .collect(),
-                requested_capabilities,
+            })
+        }
+        PluginCommand::Test { stage_id } => {
+            let outcome = plugin_admission::test(config, &database, stage_id, None, now)
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            CommandOutput::PluginTested(PluginTestSummary {
+                stage_id: outcome.stage_id,
+                plugin_id: outcome.plugin_id,
+                version: outcome.version,
+                package_digest: outcome.package_digest,
+                report_digest: outcome.report_digest,
+                passed: outcome.passed,
+                legs: outcome
+                    .legs
+                    .into_iter()
+                    .map(|leg| PluginTestLegSummary {
+                        name: leg.name,
+                        passed: leg.passed,
+                        detail: leg.detail,
+                    })
+                    .collect(),
+                admission_status: outcome.status,
+            })
+        }
+        PluginCommand::Approve {
+            stage_id,
+            reason,
+            yes,
+            as_principal,
+        } => {
+            if !yes && !confirm_dangerous_action("approve this plugin digest for deployment")? {
+                return Err(CliError::Runtime("approval cancelled".into()));
+            }
+            let approval = plugin_admission::approve(
+                config,
+                &database,
+                stage_id,
+                &reason,
+                as_principal.as_deref(),
+                now,
+            )
+            .await
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
+            CommandOutput::PluginApproved(PluginApprovalSummary {
+                stage_id: approval.stage_id,
+                plugin_id: approval.plugin_id,
+                version: approval.version,
+                package_digest: approval.package_digest,
+                admission_status: approval.status,
+            })
+        }
+        PluginCommand::List => {
+            let records = plugin_admission::list(config)
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            CommandOutput::PluginAdmissionsListed(
+                records
+                    .into_iter()
+                    .map(|summary| AdmissionRecordSummary {
+                        plugin_id: summary.plugin_id,
+                        version: summary.version,
+                        package_digest: summary.package_digest,
+                        status: summary.status,
+                        decisions: summary.decisions,
+                    })
+                    .collect(),
+            )
+        }
+        PluginCommand::Revoke {
+            plugin_id,
+            version,
+            reason,
+            yes,
+            as_principal,
+        } => {
+            if !yes && !confirm_dangerous_action("revoke this plugin digest (terminal)")? {
+                return Err(CliError::Runtime("revocation cancelled".into()));
+            }
+            let revocation = plugin_admission::revoke(
+                config,
+                &plugin_id,
+                &version,
+                &reason,
+                as_principal.as_deref(),
+                now,
+            )
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
+            // Request disable of any enabled deployment through the normal
+            // approval-bound machinery; the digest itself is already revoked
+            // above and can never be re-enabled.
+            let proposal = extension_action_proposal(
+                config,
+                &database,
+                PluginCommand::Disable {
+                    plugin_id: plugin_id.clone(),
+                    version: version.clone(),
+                },
+            )
+            .await?;
+            let capabilities = lumen_core::capability::CapabilitySet::new(
+                extension_runtime::admin_capabilities(&plugin_id, &version)
+                    .map_err(|error| CliError::Runtime(error.to_string()))?,
+            );
+            let sandbox: Arc<dyn SandboxBackend> = Arc::new(SystemSandbox::detect());
+            let service = runtime::LocalRuntimeService::build_with_secret_store(
+                config,
+                database.clone(),
+                EventBroker::new(64),
+                sandbox,
+                Vec::new(),
+                secret_store,
+            )
+            .await?;
+            let run_id = service
+                .request_extension_action(
+                    config.workspace_id(),
+                    config.bootstrap_principal(),
+                    proposal.0,
+                    capabilities,
+                )
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
+            CommandOutput::PluginRevoked(PluginRevocationSummary {
+                plugin_id: revocation.plugin_id,
+                version: revocation.version,
+                package_digest: revocation.package_digest,
+                disable_run_id: run_id,
+                disable_approval_id: approval_id,
             })
         }
         PluginCommand::Invoke {
@@ -431,16 +1185,29 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            if !service.drain_submitted_work().await.is_clean() {
-                return Err(CliError::Runtime(
-                    "plugin invocation drain left unresolved work".into(),
-                ));
-            }
-            CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
+            // The request is approval-bound: the run parks awaiting the
+            // operator's decision. The CLI must not drain-and-cancel it —
+            // the approval stays pending for the web UI / API.
+            let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
+            CommandOutput::PluginActionRequested(PluginActionRequest {
+                run_id,
+                approval_id,
+            })
         }
         command => {
             let (proposal, plugin_id, version) =
                 extension_action_proposal(config, &database, command).await?;
+            // Install and enable are gated on the admission workflow: the
+            // digest must be approved and not revoked. Install arguments
+            // carry the staged digest; enable resolves it via the index.
+            if proposal.kind() == "plugin.enable" {
+                plugin_admission::require_enabled_at(
+                    &config.runtime.data_directory,
+                    &plugin_id,
+                    &version,
+                )
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            }
             let capabilities = lumen_core::capability::CapabilitySet::new(
                 extension_runtime::admin_capabilities(&plugin_id, &version)
                     .map_err(|error| CliError::Runtime(error.to_string()))?,
@@ -464,12 +1231,14 @@ async fn execute_plugin_command(
                 )
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            if !service.drain_submitted_work().await.is_clean() {
-                return Err(CliError::Runtime(
-                    "plugin action drain left unresolved work".into(),
-                ));
-            }
-            CommandOutput::PluginActionRequested(PluginActionRequest { run_id })
+            // The request is approval-bound: the run parks awaiting the
+            // operator's decision. The CLI must not drain-and-cancel it —
+            // the approval stays pending for the web UI / API.
+            let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
+            CommandOutput::PluginActionRequested(PluginActionRequest {
+                run_id,
+                approval_id,
+            })
         }
     };
     database.close().await;
@@ -492,6 +1261,15 @@ async fn extension_action_proposal(
                 .staged_plugin_package(stage_id)
                 .await?
                 .ok_or_else(|| CliError::Runtime("staged plugin package was not found".into()))?;
+            // Admission gate: only an approved, unrevoked digest may be
+            // installed.
+            plugin_admission::require_installable(
+                config,
+                staged.manifest().id().as_str(),
+                staged.manifest().version().as_str(),
+                staged.package_digest(),
+            )
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
             let arguments = InstallArguments {
                 stage_id,
                 plugin_id: staged.manifest().id().to_string(),
@@ -644,8 +1422,12 @@ async fn extension_action_proposal(
                 version,
             )
         }
-        PluginCommand::Stage { .. }
-        | PluginCommand::Review { .. }
+        PluginCommand::Submit { .. }
+        | PluginCommand::Inspect { .. }
+        | PluginCommand::Test { .. }
+        | PluginCommand::Approve { .. }
+        | PluginCommand::List
+        | PluginCommand::Revoke { .. }
         | PluginCommand::Invoke { .. } => {
             return Err(CliError::Runtime(
                 "command is not an extension action".into(),
@@ -659,6 +1441,65 @@ async fn extension_action_proposal(
         result.1,
         result.2,
     ))
+}
+
+/// Find the pending approval request for a run, if any.
+///
+/// Approval-bound CLI requests park the run awaiting the operator's
+/// decision; this resolves the approval the operator must decide in the
+/// web UI or API.
+async fn pending_approval_for_run(
+    database: &Database,
+    config: &Config,
+    run_id: RunId,
+) -> Result<Option<String>, CliError> {
+    let now = runtime::now();
+    let pending = database
+        .list_pending_approvals(config.workspace_id(), now)
+        .await?;
+    Ok(pending
+        .iter()
+        .find(|approval| approval.run_id() == run_id)
+        .map(|approval| approval.approval_id().to_string()))
+}
+
+/// Wait for the background run to durably create its approval request.
+/// The run executes asynchronously; the CLI must not exit until the
+/// approval is in the database, otherwise the request would be lost
+/// with the transient runtime. The run itself stays parked — this
+/// waits for creation, never for resolution.
+async fn wait_for_pending_approval(
+    database: &Database,
+    config: &Config,
+    run_id: RunId,
+) -> Result<Option<String>, CliError> {
+    use std::time::Duration;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(approval_id) = pending_approval_for_run(database, config, run_id).await? {
+            return Ok(Some(approval_id));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Interactive confirmation for dangerous actions. Returns true when the
+/// operator explicitly confirms. Non-tty stdin fails closed.
+fn confirm_dangerous_action(action: &str) -> Result<bool, CliError> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::Runtime(
+            "refusing dangerous action without a terminal; pass --yes to confirm".into(),
+        ));
+    }
+    print!("Confirm: {action}? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("y"))
 }
 
 async fn execute_secret_command(

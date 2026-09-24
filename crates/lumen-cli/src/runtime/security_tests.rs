@@ -67,6 +67,11 @@ use crate::{
         GrantArguments, GrantInput, InstallArguments, QuarantineReleaseArguments, SettingArguments,
         VersionArguments, action_proposal, admin_capabilities,
     },
+    plugin_admission::admission_store_at,
+};
+use lumen_integrations::admission::{
+    AdmissionDigests, AdmissionRecord, AdmissionTestLeg, AdmissionTestReport, DeclaredPermission,
+    LockedSource,
 };
 
 const TOKEN: &str = "security-test-token";
@@ -1151,7 +1156,74 @@ async fn stage_lifecycle_version(
         .insert_staged_plugin_package(&record)
         .await
         .expect("persist stage");
+    admit_lifecycle_fixture(harness, &record, &source);
     (record, staged.quarantine_path().to_path_buf())
+}
+
+/// Create an approved admission record for a test fixture. The security
+/// tests stage packages directly; the execution-time admission gate
+/// requires an approved, unrevoked digest, so the harness admits the
+/// fixture through the real state machine.
+fn admit_lifecycle_fixture(
+    harness: &Harness,
+    staged: &StagedPluginPackage,
+    source: &std::path::Path,
+) {
+    let data_root =
+        std::fs::canonicalize(harness._directory.path().join("runtime")).expect("data root");
+    let store = admission_store_at(&data_root).expect("admission store");
+    let manifest = staged.manifest();
+    let digests = AdmissionDigests::new(
+        staged.package_digest(),
+        staged.manifest_digest(),
+        manifest.integrity().artifact(),
+    );
+    let declared_permissions = manifest
+        .components()
+        .iter()
+        .flat_map(|component| {
+            component
+                .capabilities()
+                .iter()
+                .map(|capability| DeclaredPermission {
+                    component_id: component.id().to_string(),
+                    capability: format!("{capability:?}"),
+                    scope: "test".into(),
+                })
+        })
+        .collect();
+    let mut record = AdmissionRecord::new(
+        manifest.id().to_string(),
+        manifest.version().to_string(),
+        digests,
+        declared_permissions,
+        LockedSource::lock_local_directory(source).expect("lock source"),
+        "local:security-test".into(),
+        1,
+        "security test fixture".into(),
+    )
+    .expect("admission record");
+    let report = AdmissionTestReport::new(
+        uuid::Uuid::new_v4(),
+        staged.package_digest().to_string(),
+        1,
+        vec![AdmissionTestLeg {
+            name: "security-test".into(),
+            passed: true,
+            detail: "fixture".into(),
+        }],
+    );
+    record
+        .record_test(&report, "local:security-test".into(), 1)
+        .expect("record test");
+    record
+        .approve(
+            "local:security-test".into(),
+            1,
+            "security test fixture".into(),
+        )
+        .expect("approve");
+    store.save(&record).expect("save admission");
 }
 
 async fn stage_subprocess_fixture(harness: &Harness) -> StagedPluginPackage {
@@ -1179,6 +1251,7 @@ async fn stage_subprocess_fixture(harness: &Harness) -> StagedPluginPackage {
         .insert_staged_plugin_package(&record)
         .await
         .expect("persist stage");
+    admit_lifecycle_fixture(harness, &record, &source);
     record
 }
 
@@ -1207,6 +1280,7 @@ async fn stage_wasm_fixture(harness: &Harness, artifact: &[u8]) -> StagedPluginP
         .insert_staged_plugin_package(&record)
         .await
         .expect("persist stage");
+    admit_lifecycle_fixture(harness, &record, &source);
     record
 }
 
@@ -6250,8 +6324,8 @@ async fn wait_for_action_state(harness: &Harness, run_id: &str, expected: &str) 
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let actual: Option<(String, String)> =
-        sqlx::query_as("SELECT kind, state FROM actions WHERE run_id = ?")
+    let actual: Option<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT kind, state, terminal_reason FROM actions WHERE run_id = ?")
             .bind(run_id)
             .fetch_optional(harness.database.pool())
             .await

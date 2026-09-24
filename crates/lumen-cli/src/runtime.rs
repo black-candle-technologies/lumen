@@ -141,12 +141,6 @@ pub(crate) struct LocalRuntimeService {
     worker_scheduler: Arc<Mutex<Option<Arc<WorkerScheduler>>>>,
 }
 
-#[derive(Clone, Copy)]
-enum ShutdownMode {
-    ServerCancel,
-    CliDrain,
-}
-
 const SHUTDOWN_SETTLEMENT_BUDGET: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
@@ -1444,26 +1438,11 @@ impl LocalRuntimeService {
         report
     }
 
-    pub(crate) async fn drain_submitted_work(&self) -> Arc<ShutdownReport> {
-        let report = self
-            .wait_for_shutdown(ShutdownMode::CliDrain, Duration::from_secs(5))
-            .await;
-        if report.forced || !report.unresolved_runs.is_empty() {
-            eprintln!(
-                "event=cli_drain_incomplete unresolved_runs={} workers_still_running={}",
-                report.unresolved_runs.len(),
-                report.workers_still_running
-            );
-        }
-        report
-    }
-
     async fn shutdown_with_timeout(&self, drain_timeout: Duration) -> Arc<ShutdownReport> {
-        self.wait_for_shutdown(ShutdownMode::ServerCancel, drain_timeout)
-            .await
+        self.wait_for_shutdown(drain_timeout).await
     }
 
-    async fn wait_for_shutdown(&self, mode: ShutdownMode, total: Duration) -> Arc<ShutdownReport> {
+    async fn wait_for_shutdown(&self, total: Duration) -> Arc<ShutdownReport> {
         let (mut receiver, deadline) = {
             let mut state = self.shutdown_deadline.lock().expect("shutdown state lock");
             let deadline = match *state {
@@ -1477,7 +1456,7 @@ impl LocalRuntimeService {
                     tokio::spawn(async move {
                         let report = match tokio::time::timeout_at(
                             deadline,
-                            service.shutdown_supervisor(mode, deadline),
+                            service.shutdown_supervisor(deadline),
                         )
                         .await
                         {
@@ -1537,20 +1516,12 @@ impl LocalRuntimeService {
             .collect()
     }
 
-    async fn shutdown_supervisor(
-        &self,
-        mode: ShutdownMode,
-        deadline: tokio::time::Instant,
-    ) -> ShutdownReport {
+    async fn shutdown_supervisor(&self, deadline: tokio::time::Instant) -> ShutdownReport {
         self.scheduler_cancellation.cancel();
         self.admission.close_tracker();
         let cooperative = deadline - SHUTDOWN_SETTLEMENT_BUDGET;
-        let mut waiting_tasks = if matches!(mode, ShutdownMode::ServerCancel) {
-            self.request_shutdown_cancellation().await
-        } else {
-            Vec::new()
-        };
-        let mut forced = tokio::time::timeout_at(cooperative, async {
+        let mut waiting_tasks = self.request_shutdown_cancellation().await;
+        let forced = tokio::time::timeout_at(cooperative, async {
             for task in &mut waiting_tasks {
                 let _ = task.await;
             }
@@ -1558,20 +1529,6 @@ impl LocalRuntimeService {
         })
         .await
         .is_err();
-        if matches!(mode, ShutdownMode::CliDrain) {
-            waiting_tasks.extend(self.request_shutdown_cancellation().await);
-            if tokio::time::timeout_at(deadline, async {
-                for task in &mut waiting_tasks {
-                    let _ = task.await;
-                }
-                self.admission.wait().await;
-            })
-            .await
-            .is_err()
-            {
-                forced = true;
-            }
-        }
         if forced {
             for task in &waiting_tasks {
                 if !task.is_finished() {

@@ -690,6 +690,16 @@ impl ExtensionAdminExecutor {
     async fn install(&self, action: &ActionEnvelope) -> Result<CanonicalValue, String> {
         let arguments: InstallArguments = parse_executor(action.arguments())?;
         arguments.validate().map_err(|error| error.to_string())?;
+        // Defense in depth: the kernel re-checks the admission gate at
+        // execution time. Only an approved, unrevoked digest may be
+        // installed, no matter which surface requested it.
+        crate::plugin_admission::require_installable_at(
+            &self.data_root,
+            &arguments.plugin_id,
+            &arguments.plugin_version,
+            &arguments.package_digest,
+        )
+        .map_err(|error| error.to_string())?;
         let staged = self
             .database
             .staged_plugin_package(arguments.stage_id)
@@ -751,12 +761,59 @@ impl ExtensionAdminExecutor {
     async fn enable(&self, action: &ActionEnvelope) -> Result<CanonicalValue, String> {
         let arguments: VersionArguments = parse_executor(action.arguments())?;
         let (plugin, version) = arguments.parsed()?;
+        // Defense in depth: only an approved, unrevoked digest may be
+        // enabled, no matter which surface requested it.
+        crate::plugin_admission::require_enabled_at(
+            &self.data_root,
+            plugin.as_str(),
+            version.as_str(),
+        )
+        .map_err(|error| error.to_string())?;
         self.database
-            .enable_plugin_version(action.workspace_id(), plugin.clone(), version, now())
+            .enable_plugin_version(
+                action.workspace_id(),
+                plugin.clone(),
+                version.clone(),
+                now(),
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.active
             .cancel_workspace_plugin(action.workspace_id(), &plugin);
+        // Record the Approved → Enabled transition on the admission record.
+        // The actor requested the enablement; the approval decision recorded
+        // earlier is the authority for it. If the admission mark fails after
+        // the database enable, compensate by disabling in the database so
+        // the two stores cannot disagree about the deployment state.
+        let actor = action.actor();
+        let decided_by = format!("{}:{}", actor.provider(), actor.subject());
+        let mark = crate::plugin_admission::mark_enabled_at(
+            &self.data_root,
+            plugin.as_str(),
+            version.as_str(),
+            &decided_by,
+            now().as_u64(),
+        );
+        if let Err(mark_error) = mark {
+            let compensated = self
+                .database
+                .disable_plugin_version(
+                    action.workspace_id(),
+                    plugin.clone(),
+                    version.clone(),
+                    now(),
+                )
+                .await
+                .map_err(|error| error.to_string());
+            return Err(match compensated {
+                Ok(()) => format!(
+                    "admission record could not be marked enabled; database enable was rolled back: {mark_error}"
+                ),
+                Err(compensation_error) => format!(
+                    "admission record could not be marked enabled ({mark_error}) and the database rollback also failed ({compensation_error}); manual reconciliation required"
+                ),
+            });
+        }
         Ok(version_result(arguments, "enabled"))
     }
 

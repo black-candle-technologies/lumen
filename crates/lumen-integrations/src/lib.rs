@@ -1,5 +1,6 @@
 //! Provider, tool, and plugin integration boundaries for Lumen.
 
+pub mod admission;
 pub mod extension_package;
 pub mod extension_process;
 mod extension_protocol;

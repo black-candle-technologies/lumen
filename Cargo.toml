@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "apps/desktop/src-tauri",
     "crates/lumen-cli",
     "crates/lumen-core",
     "crates/lumen-db",

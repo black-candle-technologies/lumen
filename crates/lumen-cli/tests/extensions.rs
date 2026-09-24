@@ -22,6 +22,8 @@ path = {}
 [model]
 endpoint = "http://127.0.0.1:8080/v1/"
 model = "local-model"
+[runtime]
+data_directory = {}
 [workspace]
 id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
 name = "Default"
@@ -31,6 +33,7 @@ provider = "local"
 subject = "operator"
 "#,
             toml_path(root.join("lumen.sqlite3")),
+            toml_path(root.join("runtime")),
             toml_path(&workspace)
         ),
     )
@@ -73,16 +76,40 @@ artifact = "{artifact}"
 
 #[test]
 fn plugin_operator_commands_have_explicit_local_grammar() {
-    let cli = Cli::try_parse_from(["lumen", "plugin", "stage", "./fixture"]).expect("stage");
+    let cli = Cli::try_parse_from([
+        "lumen",
+        "plugin",
+        "submit",
+        "./fixture",
+        "--reason",
+        "operator review",
+    ])
+    .expect("submit");
     assert_eq!(
         cli.command,
         Command::Plugin {
-            command: PluginCommand::Stage {
+            command: PluginCommand::Submit {
                 directory: "./fixture".into(),
+                reason: "operator review".into(),
+                as_principal: None,
             },
         }
     );
-    assert!(Cli::try_parse_from(["lumen", "plugin", "stage", "https://example.com/p"]).is_err());
+    // The previous `stage`/`review` verbs remain as aliases.
+    assert!(
+        Cli::try_parse_from(["lumen", "plugin", "stage", "./fixture", "--reason", "r"]).is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "plugin",
+            "submit",
+            "https://example.com/p",
+            "--reason",
+            "r"
+        ])
+        .is_err()
+    );
     assert!(
         Cli::try_parse_from([
             "lumen",
@@ -99,6 +126,40 @@ fn plugin_operator_commands_have_explicit_local_grammar() {
         Cli::try_parse_from([
             "lumen",
             "plugin",
+            "test",
+            "26db5a31-94f0-4e92-a9c9-4cdf19d71c31",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "plugin",
+            "approve",
+            "26db5a31-94f0-4e92-a9c9-4cdf19d71c31",
+            "--reason",
+            "reviewed",
+            "--yes",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "plugin",
+            "revoke",
+            "dev.example.fixture",
+            "1.0.0",
+            "--reason",
+            "compromised",
+            "--yes",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "plugin",
             "invoke",
             "dev.example.fixture",
             "1.0.0",
@@ -108,10 +169,21 @@ fn plugin_operator_commands_have_explicit_local_grammar() {
         ])
         .is_ok()
     );
+    // Dangerous actions require an explicit reason.
+    assert!(
+        Cli::try_parse_from([
+            "lumen",
+            "plugin",
+            "approve",
+            "26db5a31-94f0-4e92-a9c9-4cdf19d71c31",
+            "--yes",
+        ])
+        .is_err()
+    );
 }
 
 #[tokio::test]
-async fn stage_records_quarantine_identity_without_installing_or_enabling() {
+async fn submit_records_quarantine_identity_without_installing_or_enabling() {
     let root = tempdir().expect("root");
     let config = write_config(root.path());
     let package = root.path().join("fixture");
@@ -121,15 +193,22 @@ async fn stage_records_quarantine_identity_without_installing_or_enabling() {
         Cli {
             config,
             command: Command::Plugin {
-                command: PluginCommand::Stage { directory: package },
+                command: PluginCommand::Submit {
+                    directory: package,
+                    reason: "test submission".into(),
+                    as_principal: None,
+                },
             },
         },
         Arc::new(InMemorySecretStore::new()),
         None,
     )
     .await
-    .expect("stage");
-    assert!(matches!(output, CommandOutput::PluginStaged(_)));
+    .expect("submit");
+    let CommandOutput::PluginSubmitted(submitted) = output else {
+        panic!("unexpected submit output");
+    };
+    assert_eq!(submitted.admission_status, "submitted");
 
     let database = Database::connect(root.path().join("lumen.sqlite3"))
         .await
@@ -147,10 +226,26 @@ async fn stage_records_quarantine_identity_without_installing_or_enabling() {
         .await
         .expect("enabled count");
     assert_eq!((staged, installed, enabled), (1, 0, 0));
+
+    // The admission record pins the digest.
+    let admissions = root.path().join("runtime/plugins/admissions/records");
+    let entries: Vec<_> = fs::read_dir(&admissions)
+        .expect("admissions dir")
+        .collect::<Result<_, _>>()
+        .expect("admission entries");
+    assert_eq!(entries.len(), 1);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(entries[0].path()).expect("record bytes"))
+            .expect("record json");
+    assert_eq!(record["decisions"][0]["kind"], "submitted");
+    assert_eq!(
+        record["digests"]["package"].as_str().expect("digest"),
+        submitted.package_digest
+    );
 }
 
 #[tokio::test]
-async fn review_returns_full_staged_identity_without_mutating_state() {
+async fn inspect_returns_full_staged_identity_without_mutating_state() {
     let root = tempdir().expect("root");
     let config = write_config(root.path());
     let package = root.path().join("fixture");
@@ -160,23 +255,27 @@ async fn review_returns_full_staged_identity_without_mutating_state() {
         Cli {
             config: config.clone(),
             command: Command::Plugin {
-                command: PluginCommand::Stage { directory: package },
+                command: PluginCommand::Submit {
+                    directory: package,
+                    reason: "test submission".into(),
+                    as_principal: None,
+                },
             },
         },
         Arc::new(InMemorySecretStore::new()),
         None,
     )
     .await
-    .expect("stage");
-    let CommandOutput::PluginStaged(staged) = staged else {
-        panic!("unexpected stage output");
+    .expect("submit");
+    let CommandOutput::PluginSubmitted(staged) = staged else {
+        panic!("unexpected submit output");
     };
 
     let reviewed = execute_with_secret_store(
         Cli {
             config,
             command: Command::Plugin {
-                command: PluginCommand::Review {
+                command: PluginCommand::Inspect {
                     stage_id: staged.stage_id,
                 },
             },
@@ -185,9 +284,9 @@ async fn review_returns_full_staged_identity_without_mutating_state() {
         None,
     )
     .await
-    .expect("review");
-    let CommandOutput::PluginReview(review) = reviewed else {
-        panic!("unexpected review output");
+    .expect("inspect");
+    let CommandOutput::PluginInspected(review) = reviewed else {
+        panic!("unexpected inspect output");
     };
     assert_eq!(review.stage_id, staged.stage_id);
     assert_eq!(review.plugin_id, "dev.example.fixture");
@@ -197,6 +296,9 @@ async fn review_returns_full_staged_identity_without_mutating_state() {
     assert_eq!(review.manifest_digest.len(), 64);
     assert_eq!(review.artifact_digest.len(), 64);
     assert!(review.file_hashes.contains_key("lumen-plugin.toml"));
+    assert_eq!(review.admission_status, "submitted");
+    assert_eq!(review.decisions.len(), 1);
+    assert_eq!(review.decisions[0].kind, "submitted");
 
     let database = Database::connect(root.path().join("lumen.sqlite3"))
         .await
@@ -212,36 +314,159 @@ async fn review_returns_full_staged_identity_without_mutating_state() {
     assert_eq!((actions, installed), (0, 0));
 }
 
-#[tokio::test]
-async fn install_command_creates_approval_bound_action_without_installing_directly() {
-    let root = tempdir().expect("root");
-    let config = write_config(root.path());
-    let package = root.path().join("fixture");
-    fs::create_dir(&package).expect("package");
-    write_package(&package);
-    let store = Arc::new(InMemorySecretStore::new());
-    let staged = execute_with_secret_store(
+/// Run the submit → test → approve admission flow and return the stage id.
+async fn admit_fixture(
+    config: &std::path::PathBuf,
+    package: &std::path::Path,
+    store: &Arc<InMemorySecretStore>,
+) -> uuid::Uuid {
+    let submitted = execute_with_secret_store(
         Cli {
             config: config.clone(),
             command: Command::Plugin {
-                command: PluginCommand::Stage { directory: package },
+                command: PluginCommand::Submit {
+                    directory: package.to_path_buf(),
+                    reason: "test admission".into(),
+                    as_principal: None,
+                },
             },
         },
         store.clone(),
         None,
     )
     .await
-    .expect("stage");
-    let CommandOutput::PluginStaged(staged) = staged else {
-        panic!("unexpected stage output");
+    .expect("submit");
+    let CommandOutput::PluginSubmitted(submitted) = submitted else {
+        panic!("unexpected submit output");
     };
+    let tested = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Test {
+                    stage_id: submitted.stage_id,
+                },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("test");
+    let CommandOutput::PluginTested(tested) = tested else {
+        panic!("unexpected test output");
+    };
+    assert!(tested.passed, "fixture admission tests must pass");
+    assert_eq!(tested.admission_status, "tested_passed");
+    // Approval requires an explicit reason and confirmation.
+    let approved = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Approve {
+                    stage_id: submitted.stage_id,
+                    reason: "reviewed digests and permissions".into(),
+                    yes: true,
+                    as_principal: None,
+                },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("approve");
+    let CommandOutput::PluginApproved(approved) = approved else {
+        panic!("unexpected approve output");
+    };
+    assert_eq!(approved.admission_status, "approved");
+    submitted.stage_id
+}
+
+#[tokio::test]
+async fn install_requires_admission_approval_and_leaves_approval_pending() {
+    let root = tempdir().expect("root");
+    let config = write_config(root.path());
+    let package = root.path().join("fixture");
+    fs::create_dir(&package).expect("package");
+    write_package(&package);
+    let store = Arc::new(InMemorySecretStore::new());
+
+    // Install without admission is refused: the digest was never approved.
+    let submitted = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Submit {
+                    directory: package.clone(),
+                    reason: "test admission".into(),
+                    as_principal: None,
+                },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("submit");
+    let CommandOutput::PluginSubmitted(submitted) = submitted else {
+        panic!("unexpected submit output");
+    };
+    let refused = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Install {
+                    stage_id: submitted.stage_id,
+                },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await;
+    assert!(refused.is_err(), "install without approval must be refused");
+
+    // Complete the admission flow, then install.
+    let tested = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Test {
+                    stage_id: submitted.stage_id,
+                },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("test");
+    assert!(matches!(tested, CommandOutput::PluginTested(_)));
+    execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Approve {
+                    stage_id: submitted.stage_id,
+                    reason: "reviewed".into(),
+                    yes: true,
+                    as_principal: None,
+                },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("approve");
 
     let requested = execute_with_secret_store(
         Cli {
             config,
             command: Command::Plugin {
                 command: PluginCommand::Install {
-                    stage_id: staged.stage_id,
+                    stage_id: submitted.stage_id,
                 },
             },
         },
@@ -250,22 +475,30 @@ async fn install_command_creates_approval_bound_action_without_installing_direct
     )
     .await
     .expect("request install");
-    assert!(matches!(requested, CommandOutput::PluginActionRequested(_)));
+    let CommandOutput::PluginActionRequested(requested) = requested else {
+        panic!("unexpected install output");
+    };
+    assert!(
+        requested.approval_id.is_some(),
+        "install request must surface the pending approval"
+    );
 
     let database = Database::connect(root.path().join("lumen.sqlite3"))
         .await
         .expect("database");
-    let action: (String, String, Option<String>) = sqlx::query_as(
-        "SELECT kind, state, terminal_reason FROM actions ORDER BY created_at DESC LIMIT 1",
-    )
-    .fetch_one(database.pool())
-    .await
-    .expect("stored action");
-    let approvals: i64 =
+    let action: (String, String) =
+        sqlx::query_as("SELECT kind, state FROM actions ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("stored action");
+    // The action is requested but not executed: nothing is installed
+    // directly, and the approval survives CLI exit for the operator to
+    // decide in the web UI.
+    let pending: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'pending'")
             .fetch_one(database.pool())
             .await
-            .expect("approval count");
+            .expect("pending approval count");
     let invalidated: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM approval_requests WHERE state = 'invalidated'")
             .fetch_one(database.pool())
@@ -279,13 +512,97 @@ async fn install_command_creates_approval_bound_action_without_installing_direct
         .fetch_one(database.pool())
         .await
         .expect("installed count");
-    assert_eq!(
-        action,
-        (
-            "plugin.install".to_owned(),
-            "cancelled".to_owned(),
-            Some("run_cancelled".to_owned())
-        )
+    assert_eq!(action.0, "plugin.install");
+    assert_ne!(
+        action.1, "cancelled",
+        "CLI exit must not cancel the request"
     );
-    assert_eq!((approvals, invalidated, attempts, installed), (0, 1, 0, 0));
+    assert_eq!((pending, invalidated, attempts, installed), (1, 0, 0, 0));
+}
+
+#[tokio::test]
+async fn revoked_digest_cannot_be_installed_or_enabled() {
+    let root = tempdir().expect("root");
+    let config = write_config(root.path());
+    let package = root.path().join("fixture");
+    fs::create_dir(&package).expect("package");
+    write_package(&package);
+    let store = Arc::new(InMemorySecretStore::new());
+    let stage_id = admit_fixture(&config, &package, &store).await;
+
+    let revoked = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Revoke {
+                    plugin_id: "dev.example.fixture".into(),
+                    version: "1.0.0".into(),
+                    reason: "compromised upstream".into(),
+                    yes: true,
+                    as_principal: None,
+                },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await
+    .expect("revoke");
+    let CommandOutput::PluginRevoked(revoked) = revoked else {
+        panic!("unexpected revoke output");
+    };
+    assert_eq!(revoked.plugin_id, "dev.example.fixture");
+
+    // Install of the revoked digest is refused.
+    let refused = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Install { stage_id },
+            },
+        },
+        store.clone(),
+        None,
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "install of revoked digest must be refused"
+    );
+
+    // Enable of the revoked digest is refused.
+    let refused = execute_with_secret_store(
+        Cli {
+            config: config.clone(),
+            command: Command::Plugin {
+                command: PluginCommand::Enable {
+                    plugin_id: "dev.example.fixture".into(),
+                    version: "1.0.0".into(),
+                },
+            },
+        },
+        store,
+        None,
+    )
+    .await;
+    assert!(refused.is_err(), "enable of revoked digest must be refused");
+
+    // The revocation is terminal: the decision history is preserved.
+    let listed = execute_with_secret_store(
+        Cli {
+            config,
+            command: Command::Plugin {
+                command: PluginCommand::List,
+            },
+        },
+        Arc::new(InMemorySecretStore::new()),
+        None,
+    )
+    .await
+    .expect("list");
+    let CommandOutput::PluginAdmissionsListed(records) = listed else {
+        panic!("unexpected list output");
+    };
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, "revoked");
 }

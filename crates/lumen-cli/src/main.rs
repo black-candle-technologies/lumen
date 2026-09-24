@@ -9,7 +9,7 @@ fn main() {
     let result = runtime.block_on(execute(Cli::parse()));
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     match result {
-        Ok(output) => println!("{output:?}"),
+        Ok(output) => print!("{}", output.render()),
         Err(error) => {
             eprintln!("error: {error}");
             std::process::exit(1);
