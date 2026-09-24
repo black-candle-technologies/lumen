@@ -342,6 +342,32 @@ async fn supervise(
             status = child.wait() => {
                 let status = status.map_err(|e| SandboxdError::Host(format!("wait: {e}")))?;
                 let code = status.code().unwrap_or(127);
+                // Drain both pipes to EOF now that the child is dead. The
+                // `select!` above races pipe reads against `child.wait()`;
+                // when the wait branch wins, output written just before exit
+                // would otherwise be lost.
+                loop {
+                    let n = out_reader.read(&mut out_buf).await
+                        .map_err(|e| SandboxdError::Host(format!("stdout drain: {e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                    let redacted = redactor.feed(&out_buf[..n]);
+                    if !redacted.is_empty() {
+                        write_msg(stream, &AgentMsg::stdout(&redacted)).await?;
+                    }
+                }
+                loop {
+                    let n = err_reader.read(&mut err_buf).await
+                        .map_err(|e| SandboxdError::Host(format!("stderr drain: {e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                    let redacted = redactor.feed(&err_buf[..n]);
+                    if !redacted.is_empty() {
+                        write_msg(stream, &AgentMsg::stderr(&redacted)).await?;
+                    }
+                }
                 // Flush redactor tail.
                 let tail = redactor.finish();
                 if !tail.is_empty() {

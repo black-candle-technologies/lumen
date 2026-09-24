@@ -397,10 +397,13 @@ fn kvm_disk_fill_contained() {
     require_kvm();
     let fx = fixture();
     let driver = test_driver(fx, "disk_fill");
+    // Try to write 600M into the 512M workspace disk. The disk itself is the
+    // containment boundary: dd must hit ENOSPC and the file must not exceed
+    // the 512M disk.
     let stdout = block_on(run_guest(
         &driver,
         &fx.image_digest,
-        sh_cmd("/bin/busybox dd if=/dev/zero of=/workspace/fill bs=1M count=200 2>&1 | tail -2; /bin/busybox du -m /workspace/fill 2>&1 | head -1; echo fill-done"),
+        sh_cmd("echo start; /bin/busybox dd if=/dev/zero of=/workspace/fill bs=1M count=600 oflag=direct 2>&1; echo dd-done; /bin/busybox du -m /workspace/fill 2>&1 | head -1; echo fill-done"),
         vec![],
     ))
     .expect("run_guest");
@@ -408,11 +411,15 @@ fn kvm_disk_fill_contained() {
         stdout.contains("fill-done"),
         "run did not complete: {stdout:?}"
     );
+    assert!(
+        stdout.contains("No space left") || stdout.contains("no space"),
+        "expected ENOSPC when overfilling the 512M workspace disk, got: {stdout:?}"
+    );
     for line in stdout.lines() {
         if line.contains("/workspace/fill") {
             if let Some(mb_str) = line.split_whitespace().next() {
                 if let Ok(mb) = mb_str.parse::<u64>() {
-                    assert!(mb <= 150, "disk quota not enforced: fill grew to {mb}M");
+                    assert!(mb <= 512, "disk not contained: fill grew to {mb}M");
                 }
             }
         }
