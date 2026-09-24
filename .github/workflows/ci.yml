@@ -32,7 +32,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # lumen-desktop is excluded: it is the killed Tauri app (obsolete
+      # rebuild-era baggage; the integration tree already dropped it from
+      # the workspace) and its GTK/GDK/WebKit system deps are not
+      # installed on the runner. Do not re-add it.
+      - run: cargo clippy --workspace --exclude lumen-desktop --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -56,5 +60,15 @@ jobs:
       # the whole job timeout. Observed 2026-09-24 on the phase-6 tree.
       # Re-enable once root-caused; see crates/lumen-integrations/src/extension_wasm.rs.
       - run: >
-          cargo test --workspace --exclude lumen-acceptance --
+          cargo test --workspace --exclude lumen-acceptance --exclude lumen-desktop --
           --skip fuel_deadline_and_cancellation_interrupt_guest_code
+
+  discord-feature-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The discord adapter lives behind a feature flag: the default
+      # workspace run never enables it, so it gets its own step.
+      - run: cargo test -p lumen-messaging --features discord
