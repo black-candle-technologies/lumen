@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "lumen-guest-agent"
 path = "src/bin/guest-agent.rs"
 
+[[bin]]
+name = "lumen-image-sign"
+path = "src/bin/image-sign.rs"
+
 [lib]
 name = "lumen_sandboxd"
 path = "src/lib.rs"

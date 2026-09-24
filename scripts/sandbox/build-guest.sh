@@ -79,7 +79,13 @@ if [[ -n "$BUSYBOX_BIN" && -f "$BUSYBOX_BIN" ]]; then
     # /init is a shell script: it needs /bin/sh.
     ln -s busybox "$ROOTFS_DIR/bin/sh"
 else
-    echo "WARNING: no busybox at BUSYBOX_BIN=$BUSYBOX_BIN; guest has no shell tools" >&2
+    # /init starts with #!/bin/sh and invokes /bin/busybox for every
+    # mount and for `ip`. Without busybox the kernel cannot run /init
+    # and panics at boot, so a missing busybox is fatal: never hash and
+    # publish an image that cannot boot.
+    echo "ERROR: no busybox at BUSYBOX_BIN=${BUSYBOX_BIN:-<unset>}; refusing to build an unbootable image" >&2
+    echo "Set BUSYBOX_BIN to a static busybox binary." >&2
+    exit 1
 fi
 
 # /init: mount essentials, configure the sandbox network from the kernel

@@ -11,7 +11,8 @@ every message.
 
 - **sandboxd** (host daemon): Owns the lifecycle. Exposes an authenticated
   Unix-socket API to the kernel. Manages Firecracker via the jailer,
-  network namespaces, cgroups, and seccomp.
+  network namespaces, and cgroups. Firecracker runs with its own default
+  seccomp filters; sandboxd does not install custom seccomp filters.
 - **lumen-guest-agent** (in-VM): Spawns the workload, relays stdio (redacted),
   streams exports, enforces deadlines. Untrusted.
 - **Image store**: Signed guest images (kernel + rootfs + workspace template).
@@ -42,8 +43,21 @@ every message.
 
 ## Resource Limits
 
-- cgroups v2: CPU, memory, pids, I/O.
-- Disk: CoW qcow2 with a size cap; the guest cannot fill the host disk.
+- cgroups v2, applied by the jailer to the host-side VMM process: CPU
+  (`cpu.max` hard cap + `cpu.weight` fair share), memory (`memory.max`,
+  swap disabled via `memory.swap.max=0`), and host process count
+  (`pids.max`). No I/O (`io.max`) limit is set. `pids.max` counts the
+  VMM process and its host children; guest processes inside the microVM
+  are vCPU threads of the VMM, not host processes, so `pids.max` does
+  not count them. Host-side fork-bomb containment is the quota monitor
+  (`pids.current >= max_processes` triggers termination via
+  `cgroup.kill`, which kills the VMM and any forked children).
+- Disk: per-run sparse copy of a raw ext4 workspace template
+  (`workspace.raw` in the jail chroot), capped by `max_disk_mib`; the
+  quota monitor watches the file's allocated blocks. The template is a
+  raw image, not CoW qcow2 — Firecracker's virtio-blk is raw-only, so a
+  run can never fill the host disk beyond the template's provisioned
+  size.
 - Output: stdout/stderr capped at `max_output_bytes`; the agent drops
   excess (the host is notified of truncation).
 

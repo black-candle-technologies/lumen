@@ -29,15 +29,15 @@ use lumen_sandboxd::state::RunStore;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-/// Skip if /dev/kvm is not present (e.g., accidentally run on dev machine).
+/// Fail the gate on a host that cannot run these tests. A silent
+/// `std::process::exit(0)` would report "all tests passed" on a
+/// misconfigured runner and hide the missing coverage.
 fn require_kvm() {
     if !PathBuf::from("/dev/kvm").exists() {
-        eprintln!("SKIP: /dev/kvm not present");
-        std::process::exit(0);
+        panic!("SKIP-REFUSED: /dev/kvm not present; failing the gate instead of reporting green");
     }
     if unsafe { libc::getuid() } != 0 {
-        eprintln!("SKIP: must run as root");
-        std::process::exit(0);
+        panic!("SKIP-REFUSED: must run as root; failing the gate instead of reporting green");
     }
 }
 
@@ -416,12 +416,11 @@ fn kvm_disk_fill_contained() {
         "expected ENOSPC when overfilling the 512M workspace disk, got: {stdout:?}"
     );
     for line in stdout.lines() {
-        if line.contains("/workspace/fill") {
-            if let Some(mb_str) = line.split_whitespace().next() {
-                if let Ok(mb) = mb_str.parse::<u64>() {
-                    assert!(mb <= 512, "disk not contained: fill grew to {mb}M");
-                }
-            }
+        if line.contains("/workspace/fill")
+            && let Some(mb_str) = line.split_whitespace().next()
+            && let Ok(mb) = mb_str.parse::<u64>()
+        {
+            assert!(mb <= 512, "disk not contained: fill grew to {mb}M");
         }
     }
 }
@@ -449,7 +448,7 @@ fn kvm_vmm_socket_isolated() {
     let stdout = block_on(run_guest(
         &driver,
         &fx.image_digest,
-        sh_cmd("ls /run/firecracker* 2>&1; ls /tmp/*.sock 2>&1 | head -3; echo scan-done"),
+        sh_cmd("ls -la /run/ /tmp/ 2>&1 | head -30; echo scan-done"),
         vec![],
     ))
     .expect("run_guest");
@@ -457,9 +456,16 @@ fn kvm_vmm_socket_isolated() {
         stdout.contains("scan-done"),
         "run did not complete: {stdout:?}"
     );
+    // The API socket is `fc-api.sock` and the vsock socket is `v.sock`
+    // (see jailer::expected_chroot_entries); asserting on the names the
+    // implementation actually uses so the check cannot pass vacuously.
     assert!(
-        !stdout.contains("firecracker.sock"),
-        "VMM socket visible in guest: {stdout:?}"
+        !stdout.contains("fc-api.sock"),
+        "VMM API socket visible in guest: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("v.sock"),
+        "VMM vsock socket visible in guest: {stdout:?}"
     );
 }
 
@@ -546,11 +552,25 @@ fn kvm_cleanup_complete() {
         assert!(!links.contains(&run_id[..8]), "TAP leaked");
 
         let chroot_base = &fx.config.firecracker.chroot_base;
+        // Leaked per-run jail dirs live under
+        // <chroot_base>/<exec_file_name>/ (jailer::jail_parent), not at the
+        // top level of chroot_base, so scan the right directory.
+        let jail_parent =
+            lumen_sandboxd::jailer::jail_parent(chroot_base, &fx.config.firecracker.binary);
+        if jail_parent.exists() {
+            for entry in std::fs::read_dir(&jail_parent).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(!name.contains(&run_id), "jail dir leaked: {name:?}");
+            }
+        }
+        // The jailer diagnostic logs (jailer-<id>.log, jailer-cmd-<id>.log)
+        // live directly in the chroot base.
         if chroot_base.exists() {
             for entry in std::fs::read_dir(chroot_base).unwrap() {
                 let entry = entry.unwrap();
                 let name = entry.file_name().to_string_lossy().to_string();
-                assert!(!name.contains(&run_id[..8]), "jail dir leaked: {name:?}");
+                assert!(!name.contains(&run_id), "jailer log leaked: {name:?}");
             }
         }
     });

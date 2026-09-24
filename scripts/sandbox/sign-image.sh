@@ -1,53 +1,58 @@
 #!/usr/bin/env bash
 # Sign a guest image manifest and verify signatures.
 #
-# Usage:
-#   sign-image.sh --manifest manifest.json --key signing.key --out manifest.sig
-#   verify-image.sh --manifest manifest.json --sig manifest.sig --key verify.key
+# Signatures are EMBEDDED in the manifest's `signatures[]` array:
+# {key_id, signature} — hex key id of the verifying key, hex 64-byte
+# Ed25519 signature over the canonical manifest bytes. This is the exact
+# format provenance::ImageManifest::verify checks when sandboxd resolves
+# an image. All crypto is done by the `lumen-image-sign` helper (a small
+# Rust bin in lumen-sandboxd); this script only handles arguments.
 #
-# The signing key is an Ed25519 private key (PEM). The verify key is the
-# corresponding public key. Keys are managed out-of-band; this script never
-# generates them (use `openssl genpkey` or your KMS).
+# Usage:
+#   sign-image.sh sign   --manifest M --key signing.key [--out O]
+#   sign-image.sh verify --manifest M --key verify.key
+#
+# sign writes the signed manifest back to --manifest in place (or to
+# --out when given) and prints the image digest. verify exits 0 on a
+# valid signature from the given key.
+#
+# Keys are Ed25519 seeds/public keys as 64-char hex or 32 raw bytes
+# (see provenance::load_signing_key / load_verifying_key). PEM is NOT
+# accepted, and detached manifest.sig files are no longer used.
 
 set -euo pipefail
 
 MODE="${1:-}"
 shift || true
 
-MANIFEST=""
-KEY=""
-SIG=""
+# Locate the helper: prefer PATH, else the release build next to this repo.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPER="$(command -v lumen-image-sign || true)"
+if [[ -z "$HELPER" ]]; then
+    CANDIDATE="$SCRIPT_DIR/../../../target/release/lumen-image-sign"
+    if [[ -x "$CANDIDATE" ]]; then
+        HELPER="$CANDIDATE"
+    fi
+fi
+if [[ -z "$HELPER" ]]; then
+    echo "ERROR: lumen-image-sign not found on PATH or at $SCRIPT_DIR/../../../target/release/lumen-image-sign" >&2
+    echo "Build it: cargo build --release -p lumen-sandboxd --bin lumen-image-sign" >&2
+    exit 1
+fi
 
+ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --manifest) MANIFEST="$2"; shift 2 ;;
-        --key) KEY="$2"; shift 2 ;;
-        --sig) SIG="$2"; shift 2 ;;
-        --out) SIG="$2"; shift 2 ;;
+        --manifest | --key | --out) ARGS+=("$1" "$2"); shift 2 ;;
+        --sig)
+            echo "ERROR: detached manifest.sig files are no longer used; signatures are embedded in the manifest's signatures[] array" >&2
+            exit 1
+            ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 
-if [[ "$MODE" == "sign" ]]; then
-    [[ -n "$MANIFEST" && -n "$KEY" && -n "$SIG" ]] || { echo "missing args" >&2; exit 1; }
-    # Sign the canonical JSON (sorted keys, no whitespace).
-    CANONICAL=$(mktemp)
-    trap 'rm -f "$CANONICAL"' EXIT
-    jq -S -c . "$MANIFEST" > "$CANONICAL"
-    openssl pkeyutl -sign -inkey "$KEY" -rawin -in "$CANONICAL" -out "$SIG"
-    echo "Signed $MANIFEST -> $SIG"
-elif [[ "$MODE" == "verify" ]]; then
-    [[ -n "$MANIFEST" && -n "$KEY" && -n "$SIG" ]] || { echo "missing args" >&2; exit 1; }
-    CANONICAL=$(mktemp)
-    trap 'rm -f "$CANONICAL"' EXIT
-    jq -S -c . "$MANIFEST" > "$CANONICAL"
-    if openssl pkeyutl -verify -pubin -inkey "$KEY" -rawin -in "$CANONICAL" -sigfile "$SIG"; then
-        echo "Signature OK"
-    else
-        echo "Signature FAILED" >&2
-        exit 1
-    fi
-else
-    echo "Usage: $0 {sign|verify} --manifest M --key K --sig S" >&2
-    exit 1
-fi
+case "$MODE" in
+    sign | verify) exec "$HELPER" "$MODE" "${ARGS[@]}" ;;
+    *) echo "Usage: $0 {sign|verify} --manifest M --key K [--out O]" >&2; exit 1 ;;
+esac
