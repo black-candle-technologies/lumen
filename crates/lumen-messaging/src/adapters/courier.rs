@@ -16,17 +16,28 @@
 //!
 //! Message wire form (`stdioMessage`): `{id, from, body, sent_at,
 //! received_at, flags?, request?, reply_to?, reply_quote?, bridged?}` with
-//! Unix-second timestamps. Signature verification is performed by the CLI
-//! itself (Courier verifies Ed25519 signatures on receipt); the adapter
-//! treats only CLI-delivered output as authenticated and additionally pins
-//! the reviewed binary (`courier version` >= `min_version`, optional
-//! expected SHA-256).
+//! Unix-second timestamps. Courier verifies Ed25519 signatures on receipt;
+//! the adapter treats as authenticated only bytes actually emitted by the
+//! supervised bridge child, which must be the digest-pinned reviewed binary
+//! (`courier version` >= `min_version`, mandatory expected SHA-256,
+//! absolute path — PATH resolution is rejected). The public `ingest` entry
+//! point fails closed on any bytes the bridge did not deliver, before
+//! parsing and before dedupe, so forged bytes can neither map a sender nor
+//! preempt legitimate messages via event-ID dedupe.
 //!
 //! Key material never enters the Pi process: the kernel materializes the
 //! ephemeral per-session identity into a kernel-owned directory and the
 //! adapter spawns the child with `HOME` pointed at it, so the CLI reads
 //! `<identity_dir>/.courier/config.json`. The adapter receives the directory
-//! path only — never key bytes.
+//! path only — never key bytes. The child runs with a scrubbed environment
+//! (only `HOME` plus the proxy variables the courier client honors — no
+//! ambient secrets), and the identity dir must be mode 0700.
+//!
+//! Long-term direction: replace the key file with a brokered signing
+//! interface (kernel-held key, sign-via-IPC) so the helper never sees key
+//! material at all. The courier CLI fundamentally needs the key file today,
+//! so the mandatory digest pin + absolute path + scrubbed environment is the
+//! containment boundary for this phase.
 //!
 //! TODO(PHASE4): phase-4 owns the session-identity API (issuing the
 //! ephemeral per-session Courier keypair and materializing it). When it
@@ -35,7 +46,7 @@
 //! operator configuration.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -126,14 +137,22 @@ impl SessionIdentityBinding {
 }
 
 /// Adapter configuration.
+///
+/// The helper binary is a trust root: Courier verifies Ed25519 signatures
+/// on receipt and the adapter's sender-authentication rests on the bridge
+/// being the reviewed binary. `bind` therefore fails closed unless `binary`
+/// is absolute (no PATH resolution) and `expected_binary_sha256` carries a
+/// well-formed pin.
 #[derive(Clone, Debug)]
 pub struct CourierConfig {
-    /// Path to the reviewed `courier` binary.
+    /// Absolute path to the reviewed `courier` binary. Relative paths are
+    /// rejected at bind: PATH resolution would let a substituted executable
+    /// impersonate the bridge.
     pub binary: PathBuf,
     /// Minimum accepted `courier version` (e.g. `0.13.0`).
     pub min_version: String,
-    /// Optional pinned SHA-256 of the binary. When set, bind fails closed on
-    /// mismatch.
+    /// Mandatory pinned SHA-256 (64 hex characters) of the binary. Bind
+    /// fails closed when absent or malformed; spawn re-hashes before exec.
     pub expected_binary_sha256: Option<String>,
     /// Kernel-owned directory holding the materialized session identity
     /// (`<dir>/.courier/config.json`). The child runs with `HOME` set here.
@@ -243,16 +262,27 @@ pub struct CourierStdioTransport {
 
 impl CourierStdioTransport {
     pub async fn spawn(config: &CourierConfig) -> Result<Self, CourierError> {
-        if let Some(expected) = &config.expected_binary_sha256 {
-            let actual = sha256_file(&config.binary).map_err(|e| CourierError::Transport {
-                reason: format!("cannot hash courier binary: {e}"),
-            })?;
-            if &actual != expected {
-                return Err(CourierError::BinaryHashMismatch {
-                    expected: expected.clone(),
-                    actual,
-                });
-            }
+        // The pin is mandatory (validated at bind); re-verify here so a
+        // direct spawn can never run an unpinned helper either.
+        let expected = config
+            .expected_binary_sha256
+            .as_ref()
+            .ok_or(CourierError::BinaryPinRequired)?;
+        let actual = sha256_file(&config.binary).map_err(|e| CourierError::Transport {
+            reason: format!("cannot hash courier binary: {e}"),
+        })?;
+        if actual != expected.to_ascii_lowercase() {
+            return Err(CourierError::BinaryHashMismatch {
+                expected: expected.clone(),
+                actual,
+            });
+        }
+        if !config.binary.is_absolute() {
+            return Err(CourierError::RelativeBinaryPath);
+        }
+        if let Some(dir) = &config.identity_dir {
+            // The session private key lives here: 0700 or no child.
+            check_identity_dir(dir)?;
         }
 
         let mut command = Command::new(&config.binary);
@@ -264,14 +294,14 @@ impl CourierStdioTransport {
             // Revocation and drop must terminate the bridge: without this,
             // dropping the Child would orphan the CLI process.
             .kill_on_drop(true);
-        if let Some(dir) = &config.identity_dir {
-            // Kernel-materialized session identity; the CLI reads
-            // <identity_dir>/.courier/config.json. Key bytes never cross
-            // into this process.
-            command.env("HOME", dir);
+        // Scrubbed environment: the child sees only HOME (the
+        // kernel-materialized identity dir, or the ambient HOME when no
+        // session identity is bound) and the proxy variables the courier
+        // client honors. Ambient secrets never reach the helper.
+        command.env_clear();
+        for (key, value) in child_env(config.identity_dir.as_ref()) {
+            command.env(key, value);
         }
-        // Note: the environment is otherwise inherited so proxy variables
-        // (HTTPS_PROXY etc., honored by the courier client) keep working.
 
         let mut child = command.spawn().map_err(|e| CourierError::Transport {
             reason: format!("failed to spawn courier stdio: {e}"),
@@ -501,6 +531,125 @@ fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Maximum digests of bridge-delivered messages retained for the public
+/// `ingest` gate. `poll()` registers-then-ingests immediately, so this only
+/// needs to cover host re-ingest shortly after delivery.
+const MAX_BRIDGE_DELIVERED: usize = 2048;
+
+/// Digests of raw messages actually emitted by the supervised, digest-pinned
+/// bridge child. This is the adapter-side half of the authenticated
+/// transport binding: the public `ingest` entry point only accepts bytes the
+/// bridge delivered, so a caller with crafted JSON cannot map a sender or
+/// preempt legitimate messages via event-ID dedupe.
+#[derive(Default)]
+struct BridgeDeliveryLog {
+    digests: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl BridgeDeliveryLog {
+    fn note(&mut self, raw_event: &[u8]) {
+        let digest: [u8; 32] = Sha256::digest(raw_event).into();
+        if self.digests.insert(digest) {
+            self.order.push_back(digest);
+            while self.order.len() > MAX_BRIDGE_DELIVERED {
+                if let Some(old) = self.order.pop_front() {
+                    self.digests.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, raw_event: &[u8]) -> bool {
+        let digest: [u8; 32] = Sha256::digest(raw_event).into();
+        self.digests.contains(&digest)
+    }
+}
+
+/// Validates the helper-binary trust root before anything executes it:
+/// absolute path (no PATH resolution) and a well-formed mandatory digest
+/// pin. Fail-closed: an unpinned or PATH-resolved helper must never run.
+fn validate_binary_config(config: &CourierConfig) -> Result<(), CourierError> {
+    if !config.binary.is_absolute() {
+        return Err(CourierError::RelativeBinaryPath);
+    }
+    match &config.expected_binary_sha256 {
+        None => Err(CourierError::BinaryPinRequired),
+        Some(pin) => {
+            let well_formed = pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit());
+            if well_formed {
+                Ok(())
+            } else {
+                Err(CourierError::MalformedBinaryPin)
+            }
+        }
+    }
+}
+
+/// Environment for the supervised `courier` child: scrubbed, not inherited.
+///
+/// A substituted helper must not see ambient secrets (API keys, tokens),
+/// so the child gets only `HOME` — the kernel-owned identity dir, or the
+/// ambient `HOME` when no session identity is bound — plus the proxy
+/// variables the courier client honors. Everything else is dropped.
+fn child_env(identity_dir: Option<&PathBuf>) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let home = match identity_dir {
+        Some(dir) => dir.to_string_lossy().into_owned(),
+        None => std::env::var("HOME").unwrap_or_default(),
+    };
+    if !home.is_empty() {
+        env.push(("HOME".to_owned(), home));
+    }
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            env.push((var.to_owned(), value));
+        }
+    }
+    env
+}
+
+/// The kernel-owned identity dir holds the session private key; it must be
+/// a mode-0700 directory or the child is not spawned.
+#[cfg(unix)]
+fn check_identity_dir(dir: &PathBuf) -> Result<(), CourierError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(dir).map_err(|e| CourierError::Transport {
+        reason: format!("cannot stat courier identity dir: {e}"),
+    })?;
+    if !metadata.is_dir() {
+        return Err(CourierError::Transport {
+            reason: format!("courier identity dir is not a directory: {}", dir.display()),
+        });
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(CourierError::IdentityDirInsecure(dir.display().to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_identity_dir(dir: &PathBuf) -> Result<(), CourierError> {
+    let metadata = std::fs::metadata(dir).map_err(|e| CourierError::Transport {
+        reason: format!("cannot stat courier identity dir: {e}"),
+    })?;
+    if !metadata.is_dir() {
+        return Err(CourierError::Transport {
+            reason: format!("courier identity dir is not a directory: {}", dir.display()),
+        });
+    }
+    Ok(())
 }
 
 /// Checks `courier version` output against the minimum version.
@@ -826,6 +975,10 @@ pub struct CourierAdapter {
     state: ConnectionState,
     /// Cursor for inbox polling: last seen provider message id.
     inbox_cursor: Option<i64>,
+    /// Digests of raw messages actually emitted by the supervised bridge.
+    /// The public `ingest` entry point fails closed on any bytes absent
+    /// here; see [`BridgeDeliveryLog`].
+    bridge_delivered: std::sync::Mutex<BridgeDeliveryLog>,
 }
 
 impl CourierAdapter {
@@ -854,6 +1007,7 @@ impl CourierAdapter {
             session: None,
             state: ConnectionState::Unbound,
             inbox_cursor: None,
+            bridge_delivered: std::sync::Mutex::new(BridgeDeliveryLog::default()),
         }
     }
 
@@ -906,12 +1060,31 @@ impl CourierAdapter {
             let raw = serde_json::to_vec(&message).map_err(|e| IngestError::MalformedEvent {
                 reason: e.to_string(),
             })?;
+            // These bytes came from the supervised, digest-pinned bridge:
+            // record them so the public ingest gate accepts exactly them.
+            self.note_bridge_delivery(&raw);
             // Known redeliveries collapse to None and never disturb the batch.
             if let Some(envelope) = self.ingest_message(&raw, &message, now_millis)? {
                 envelopes.push(envelope);
             }
         }
         Ok(envelopes)
+    }
+
+    /// Records raw bytes emitted by the supervised bridge. Only registered
+    /// bytes pass the public `ingest` gate.
+    fn note_bridge_delivery(&self, raw_event: &[u8]) {
+        if let Ok(mut log) = self.bridge_delivered.lock() {
+            log.note(raw_event);
+        }
+    }
+
+    /// Whether these exact bytes were delivered by the supervised bridge.
+    fn was_bridge_delivered(&self, raw_event: &[u8]) -> bool {
+        self.bridge_delivered
+            .lock()
+            .map(|log| log.contains(raw_event))
+            .unwrap_or(false)
     }
 
     fn ingest_message(
@@ -1069,6 +1242,14 @@ impl MessagingAdapter for CourierAdapter {
         if !config.courier_enabled {
             return Err(AdapterError::Disabled);
         }
+        // The helper binary is a trust root: validate it before executing
+        // anything. Absolute path (no PATH resolution) and a well-formed
+        // mandatory digest pin, or bind fails closed here.
+        validate_binary_config(&self.config).map_err(|e: CourierError| {
+            AdapterError::Transport {
+                reason: e.to_string(),
+            }
+        })?;
         // Pin the reviewed CLI before trusting it with anything. This is a
         // blocking child process call; run it off the async executor.
         let binary = self.config.binary.clone();
@@ -1112,9 +1293,15 @@ impl MessagingAdapter for CourierAdapter {
         raw_event: &[u8],
         now_millis: i64,
     ) -> Result<Option<MessageEnvelope>, IngestError> {
-        // Raw events are `courier stdio` / `courier wake` message JSON.
-        // Signature verification was performed by the CLI on receipt; the
-        // adapter additionally requires the pinned, supervised bridge.
+        // Authenticated-transport gate: only bytes actually emitted by the
+        // supervised, digest-pinned bridge may enter. Courier's Ed25519
+        // signatures are verified by the CLI on receipt; the adapter's half
+        // is proving these bytes came from that CLI. This runs before
+        // parsing and before dedupe, so forged bytes can neither map a
+        // sender nor preempt legitimate messages via event-ID dedupe.
+        if !self.was_bridge_delivered(raw_event) {
+            return Err(IngestError::SignatureVerificationFailed);
+        }
         let message: StdioMessage =
             serde_json::from_slice(raw_event).map_err(|e| IngestError::MalformedEvent {
                 reason: format!("not courier message JSON: {e}"),
@@ -1200,6 +1387,16 @@ pub enum CourierError {
     InvalidSession,
     #[error("courier binary hash mismatch: expected {expected}, got {actual}")]
     BinaryHashMismatch { expected: String, actual: String },
+    #[error("courier binary must be an absolute path; PATH resolution is not allowed")]
+    RelativeBinaryPath,
+    #[error(
+        "courier binary digest pin (expected_binary_sha256) is required; refusing to run an unpinned helper"
+    )]
+    BinaryPinRequired,
+    #[error("malformed courier binary digest pin: expected 64 hex characters")]
+    MalformedBinaryPin,
+    #[error("courier identity dir must be a mode-0700 directory: {0}")]
+    IdentityDirInsecure(String),
     #[error("unsupported courier CLI version: found {found}, minimum {min}")]
     UnsupportedCliVersion { found: String, min: String },
     #[error("courier transport error: {reason}")]
@@ -1283,6 +1480,8 @@ mod tests {
         let adapter = test_adapter();
         let now = now_millis();
         let raw = wake_json("ed25519:sender", 42, "hello", false);
+        // The bytes must have come from the supervised bridge.
+        adapter.note_bridge_delivery(&raw);
         let env = adapter
             .ingest(&raw, now)
             .unwrap()
@@ -1304,6 +1503,8 @@ mod tests {
         let now = now_millis();
         let a = wake_json("ed25519:sender", 42, "a", false);
         let b = wake_json("ed25519:sender", 43, "b", false);
+        adapter.note_bridge_delivery(&a);
+        adapter.note_bridge_delivery(&b);
         // Batch: A, A-redelivery, B — the redelivery must not abort the batch.
         let mut envelopes = Vec::new();
         for raw in [&a, &a, &b] {
@@ -1320,6 +1521,7 @@ mod tests {
     fn ingest_fails_closed_on_unknown_sender() {
         let adapter = test_adapter();
         let raw = wake_json("ed25519:stranger", 43, "hello", false);
+        adapter.note_bridge_delivery(&raw);
         assert_eq!(
             adapter.ingest(&raw, now_millis()).unwrap_err(),
             IngestError::UnknownIdentity
@@ -1330,11 +1532,52 @@ mod tests {
     fn bridged_messages_are_marked_provider_terminated() {
         let adapter = test_adapter();
         let raw = wake_json("ed25519:sender", 44, "hello", true);
+        adapter.note_bridge_delivery(&raw);
         let env = adapter
             .ingest(&raw, now_millis())
             .unwrap()
             .expect("first delivery ingests");
         assert!(env.transport_is_untrusted());
+    }
+
+    #[test]
+    fn ingest_rejects_bytes_never_delivered_by_bridge() {
+        let adapter = test_adapter();
+        let now = now_millis();
+        // Well-formed JSON from a mapped sender — but the supervised bridge
+        // never emitted these bytes.
+        let forged = wake_json("ed25519:sender", 42, "forged command", false);
+        assert_eq!(
+            adapter.ingest(&forged, now).unwrap_err(),
+            IngestError::SignatureVerificationFailed
+        );
+
+        // The same bytes, once genuinely delivered by the bridge, ingest.
+        adapter.note_bridge_delivery(&forged);
+        assert!(adapter.ingest(&forged, now).unwrap().is_some());
+    }
+
+    #[test]
+    fn forged_event_id_cannot_preempt_dedupe() {
+        let adapter = test_adapter();
+        let now = now_millis();
+        // Forged bytes reuse a legitimate event id but were never delivered.
+        let forged = wake_json("ed25519:sender", 99, "forged", false);
+        assert_eq!(
+            adapter.ingest(&forged, now).unwrap_err(),
+            IngestError::SignatureVerificationFailed
+        );
+
+        // The gate runs before dedupe, so the forged bytes did not consume
+        // the dedupe slot: the real delivery still ingests exactly once.
+        let legit = wake_json("ed25519:sender", 99, "legit", false);
+        adapter.note_bridge_delivery(&legit);
+        let env = adapter
+            .ingest(&legit, now)
+            .unwrap()
+            .expect("legit delivery ingests");
+        assert_eq!(env.content, "legit");
+        assert_eq!(adapter.ingest(&legit, now).unwrap(), None);
     }
 
     #[test]
@@ -1417,5 +1660,121 @@ mod tests {
             adapter.bind(binding, &config).await.unwrap_err(),
             AdapterError::Disabled
         );
+    }
+
+    fn bind_config() -> (CourierAdapter, ConnectionBinding, MessagingConfig) {
+        let adapter = test_adapter();
+        let binding = ConnectionBinding::new(
+            ConnectionId::new("conn-1").unwrap(),
+            "bct-account",
+            CredentialHandle::new("handle-1").unwrap(),
+        )
+        .unwrap();
+        let config = MessagingConfig {
+            courier_enabled: true,
+            ..Default::default()
+        };
+        (adapter, binding, config)
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_unpinned_binary() {
+        let (mut adapter, binding, config) = bind_config();
+        // Absolute path but no digest pin: bind must fail closed before the
+        // binary is ever executed (no `courier` on disk needed).
+        adapter.config.binary = PathBuf::from("/usr/local/bin/courier");
+        let err = adapter.bind(binding, &config).await.unwrap_err();
+        assert_eq!(
+            err,
+            AdapterError::Transport {
+                reason: CourierError::BinaryPinRequired.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_relative_binary_path() {
+        let (mut adapter, binding, config) = bind_config();
+        adapter.config.binary = PathBuf::from("courier");
+        adapter.config.expected_binary_sha256 = Some("a".repeat(64));
+        let err = adapter.bind(binding, &config).await.unwrap_err();
+        assert_eq!(
+            err,
+            AdapterError::Transport {
+                reason: CourierError::RelativeBinaryPath.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_malformed_pin() {
+        let (mut adapter, binding, config) = bind_config();
+        adapter.config.binary = PathBuf::from("/usr/local/bin/courier");
+        adapter.config.expected_binary_sha256 = Some("not-hex".to_owned());
+        let err = adapter.bind(binding, &config).await.unwrap_err();
+        assert_eq!(
+            err,
+            AdapterError::Transport {
+                reason: CourierError::MalformedBinaryPin.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn child_env_is_scrubbed() {
+        // SAFETY: no other test in this binary reads these variables, and
+        // they are removed before the test returns.
+        unsafe {
+            std::env::set_var("LUMEN_COURIER_TEST_SECRET", "s3cr3t");
+            std::env::set_var("https_proxy", "http://proxy:8080");
+        }
+
+        let env = child_env(None);
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+
+        // Ambient secrets never reach the helper.
+        assert_eq!(get("LUMEN_COURIER_TEST_SECRET"), None);
+        // Proxy variables pass through so the client keeps working.
+        assert_eq!(get("https_proxy").as_deref(), Some("http://proxy:8080"));
+        // No session identity bound: ambient HOME is preserved.
+        assert_eq!(
+            get("HOME").as_deref(),
+            std::env::var("HOME").ok().as_deref()
+        );
+
+        // Bound session identity: HOME points at the kernel-owned dir.
+        let dir = PathBuf::from("/run/lumen/session-1");
+        let env = child_env(Some(&dir));
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("HOME").as_deref(), Some("/run/lumen/session-1"));
+
+        // SAFETY: paired with the setup above; no other test reads these.
+        unsafe {
+            std::env::remove_var("LUMEN_COURIER_TEST_SECRET");
+            std::env::remove_var("https_proxy");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_dir_requires_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "lumen-courier-identity-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            check_identity_dir(&dir),
+            Err(CourierError::IdentityDirInsecure(_))
+        ));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_identity_dir(&dir).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
