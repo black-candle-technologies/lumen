@@ -1,6 +1,7 @@
 //! HTTP API and streaming server surface for Lumen.
 
 mod orchestration;
+pub mod pi_supervisor;
 mod routes;
 mod sse;
 mod state;

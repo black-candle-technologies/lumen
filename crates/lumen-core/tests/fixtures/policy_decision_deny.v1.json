@@ -1,0 +1,1 @@
+{"decision":"deny","reason":{"code":"scope_exceeded","detail":"path '/etc/passwd' is outside the leaf lease scope"},"version":1}

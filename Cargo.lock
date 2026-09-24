@@ -3033,8 +3033,10 @@ dependencies = [
  "lumen-integrations",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -3089,6 +3091,7 @@ dependencies = [
 name = "lumen-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "semver",
  "serde",
  "serde_json",
@@ -3181,6 +3184,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
