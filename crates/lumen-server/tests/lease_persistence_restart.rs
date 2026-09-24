@@ -1202,10 +1202,10 @@ async fn restored_session_cannot_mint() {
 /// §8.11 — destroying a session pre-restart stays destroyed.
 ///
 /// The kernel fails closed at boot: a destroyed session with live
-/// leases makes the startup re-validation refuse the open (the live
-/// lease's chain can no longer resolve), rather than booting with an
-/// unverifiable lease. A destroyed session with *no* live leases boots
-/// cleanly and stays destroyed.
+/// leases makes session hydration refuse the open (the child session's
+/// ancestry no longer resolves to a live parent), rather than booting
+/// with an unverifiable lease. A destroyed session with *no* live leases
+/// boots cleanly and stays destroyed.
 #[tokio::test]
 async fn destroyed_session_stays_destroyed() {
     // Part A: destroyed parent with a live child lease → the restart
@@ -1235,7 +1235,7 @@ async fn destroyed_session_stays_destroyed() {
             .expect_err("open must fail closed on a destroyed session with live leases");
         match &err {
             KernelError::Unavailable(msg) => assert!(
-                msg.contains("startup re-validation failed") && msg.contains("unknown session key"),
+                msg.contains("refusing to hydrate") && msg.contains("inactive parent"),
                 "expected the boot fail-closed refusal, got: {msg}"
             ),
             other => panic!("expected Unavailable, got {other:?}"),
@@ -1577,4 +1577,102 @@ async fn audit_and_budget_continuity() {
         .verify_kernel_audit()
         .await
         .expect("kernel audit chain must verify across the restart");
+}
+
+/// Wall-clock rollback fails the open: when the durable time anchor is
+/// ahead of the wall clock by more than the tolerance, the kernel
+/// refuses to boot rather than resurrect expired authority. A small
+/// skew inside the tolerance still opens (and runs at the anchor).
+#[tokio::test]
+async fn rollback_clock_refuses_open() {
+    let env = restart_env();
+    let h1 = open_kernel(&env, HashMap::new(), None).await;
+    drop(h1);
+
+    // Simulate a backward clock jump: the anchor is now an hour ahead of
+    // the wall clock.
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    let ahead = now_ms() + 3_600_000;
+    db.record_time_high_water(&env.workspace, ahead)
+        .await
+        .expect("record high water");
+    drop(db);
+
+    let mut config = AuthorityKernelConfig::test_config();
+    config.db = AuthorityDb::Path(env.db_path.clone());
+    config.workspace = env.workspace;
+    let err = AuthorityKernelClient::open(config)
+        .await
+        .map(|_| ())
+        .expect_err("open must fail closed on a backward clock");
+    match &err {
+        KernelError::Unavailable(msg) => assert!(
+            msg.contains("backward clock"),
+            "expected the rollback refusal, got: {msg}"
+        ),
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+
+    // Inside the tolerance (60s skew) the kernel still opens — on a
+    // fresh env, since the anchor only ever advances.
+    let env2 = restart_env();
+    let h1 = open_kernel(&env2, HashMap::new(), None).await;
+    drop(h1);
+    let db = Database::connect(&env2.db_path).await.expect("db connect");
+    let slight = now_ms() + 60_000;
+    db.record_time_high_water(&env2.workspace, slight)
+        .await
+        .expect("record high water");
+    drop(db);
+    let _h2 = open_kernel(&env2, HashMap::new(), None).await;
+
+    // The anchor advanced to at least the boot time and never regressed.
+    let db = Database::connect(&env2.db_path).await.expect("db connect");
+    let mark = db
+        .time_high_water(&env2.workspace)
+        .await
+        .expect("read high water");
+    assert!(
+        mark >= slight,
+        "time anchor must not regress across boots: {mark} < {slight}"
+    );
+}
+
+/// Session hydration fails the open on a subject/key mismatch: the
+/// subject is derived from the verifying key, so a tampered row cannot
+/// hydrate a session the key doesn't own.
+#[tokio::test]
+async fn session_subject_key_mismatch_refuses_open() {
+    let env = restart_env();
+    let h1 = open_kernel(&env, HashMap::new(), None).await;
+    drop(h1);
+
+    // A row whose subject is not the address of its verifying key.
+    let other_key = SigningKey::from_bytes(&[0x42u8; 32]);
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    db.insert_kernel_session(
+        &env.workspace,
+        "ed25519:not-the-address-of-this-key",
+        None,
+        &hex::encode(other_key.verifying_key().as_bytes()),
+        now_ms(),
+    )
+    .await
+    .expect("insert mismatched session");
+    drop(db);
+
+    let mut config = AuthorityKernelConfig::test_config();
+    config.db = AuthorityDb::Path(env.db_path.clone());
+    config.workspace = env.workspace;
+    let err = AuthorityKernelClient::open(config)
+        .await
+        .map(|_| ())
+        .expect_err("open must fail closed on a subject/key mismatch");
+    match &err {
+        KernelError::Unavailable(msg) => assert!(
+            msg.contains("refusing to hydrate a mismatched identity"),
+            "expected the mismatch refusal, got: {msg}"
+        ),
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
 }

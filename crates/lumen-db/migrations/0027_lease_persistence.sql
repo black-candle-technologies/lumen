@@ -44,6 +44,9 @@ CREATE TABLE kernel_killed_generations(
  role TEXT NOT NULL CHECK(role IN ('issuer','host')),
  killed_at_ms INTEGER NOT NULL CHECK(killed_at_ms >= 0),
  reason TEXT NOT NULL CHECK(length(reason) > 0),
+ -- The operator principal that authorized the kill
+ -- (`provider:subject`), durable actor evidence for the kill-list.
+ killed_by TEXT NOT NULL CHECK(length(killed_by) > 0),
  PRIMARY KEY(workspace_id, key_id)
 ) STRICT;
 
@@ -73,7 +76,21 @@ CREATE TABLE kernel_sessions(
  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
  destroyed_at_ms INTEGER NULL
    CHECK(destroyed_at_ms IS NULL OR destroyed_at_ms >= 0),
- PRIMARY KEY(workspace_id, subject)
+ -- Lifecycle consistency, enforced at insert as well as update: a live
+ -- row carries no destroy timestamp; a destroyed row carries one that is
+ -- not earlier than creation.
+ CHECK(
+   (active = 1 AND destroyed_at_ms IS NULL)
+   OR (active = 0 AND destroyed_at_ms IS NOT NULL
+       AND destroyed_at_ms >= created_at_ms)
+ ),
+ PRIMARY KEY(workspace_id, subject),
+ -- Parent linkage integrity: a non-null parent must name a recorded
+ -- session in the same workspace. (NULL parents are root sessions and
+ -- are not checked, per SQL standard.)
+ FOREIGN KEY (workspace_id, parent_subject)
+   REFERENCES kernel_sessions(workspace_id, subject)
+   ON DELETE RESTRICT
 ) STRICT;
 
 -- The only allowed mutation is the destroy transition, once: active 1 -> 0

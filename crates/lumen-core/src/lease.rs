@@ -400,6 +400,29 @@ impl SessionRegistry {
         out.sort();
         out
     }
+
+    /// Full active-ancestry predicate: `subject` and every ancestor up to
+    /// the root must be live (registered, active, within TTL) at `now_ms`.
+    /// Unlike `is_active_descendant(subject, subject, …)` — which checks
+    /// only the named record and returns before walking its ancestry — this
+    /// walks the whole parent chain, so a live session under a destroyed
+    /// or TTL-expired ancestor still fails closed. Bounded at 256 hops;
+    /// deeper ancestry is treated as invalid (a cycle can never hydrate —
+    /// boot rejects it — but belt and braces costs nothing here).
+    pub fn is_subject_live(&self, subject: &str, now_ms: i64) -> bool {
+        let mut current = subject;
+        for _ in 0..256 {
+            let record = match self.sessions.get(current) {
+                Some(r) if self.record_live_at(r, now_ms) => r,
+                _ => return false,
+            };
+            match &record.parent_subject {
+                Some(parent) => current = parent,
+                None => return true,
+            }
+        }
+        false
+    }
 }
 
 /// Process-local revocation index. Revocation is recorded per lease;
@@ -749,6 +772,16 @@ pub fn validate_chain(
                 .get(&parent.subject)
                 .map(|r| r.verifying_key)
                 .ok_or_else(|| LeaseError::UnknownKey(parent.subject.clone()))?;
+            // Active ancestry at validation time: the issuing session's
+            // whole ancestry must be live (registered, active, within
+            // its TTL), not merely known. Revocation is the primary kill
+            // path for a destroyed session's leases, but validation must
+            // not depend on the revocation index alone — a lost
+            // revocation row (crash between destroy and durable revoke)
+            // must still fail closed here.
+            if !sessions.is_subject_live(&parent.subject, now_ms) {
+                return Err(LeaseError::SubjectInactive(parent.subject.clone()));
+            }
             doc.verify_signature(&key)?;
             if doc.depth != parent.depth + 1 {
                 return Err(LeaseError::DepthViolation(doc.depth, parent.depth_limit));
@@ -1720,6 +1753,143 @@ mod tests {
             300,
         );
         assert!(matches!(err, Err(LeaseError::Revoked(_))));
+
+        // A destroyed issuing session fails closed even when the
+        // revocation index was lost (crash between destroy and durable
+        // revoke): validation checks active ancestry, not just the
+        // revocation list.
+        let (keys, session_key, session_vk) = test_keys();
+        let child_key = SigningKey::generate(&mut OsRng);
+        let mut sessions = test_sessions(session_vk, child_key.verifying_key());
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let root = mint_root_lease(
+            root_params(parent_scope()),
+            &keys,
+            &sessions,
+            &ledger,
+            &nonces,
+            100,
+        )
+        .unwrap();
+        let r = FakeResolver::default();
+        let mut child_scope = ResourceScope::default();
+        child_scope.tools.insert(
+            "fs.read".to_string(),
+            semver::VersionReq::parse("=1.2.3").unwrap(),
+        );
+        child_scope.paths.push(PathGrant {
+            root: CanonicalPath::parse("/workspace/src", &r, false).unwrap(),
+            rights: PathRights::READ,
+        });
+        child_scope.effects.push(EffectClass::Read);
+        let child = mint_child_lease(
+            &root,
+            ChildLeaseParams {
+                lease_id: "lease-child-dead-parent".to_string(),
+                subject: "ed25519:child-session".to_string(),
+                scope: child_scope,
+                limits: LeaseLimits {
+                    not_before_ms: 0,
+                    expires_at_ms: 500_000,
+                    budget: Budget::new().set(BudgetDimension::Executions, 10),
+                    max_executions: None,
+                    single_use: false,
+                },
+                depth_limit: 4,
+                lease_nonce: "child-nonce-dead".to_string(),
+                issued_at_ms: 200,
+            },
+            &session_key,
+            &sessions,
+            &RevocationIndex::new(),
+            &ledger,
+            &nonces,
+            200,
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert(root.lease_id.clone(), root.clone());
+        map.insert(child.lease_id.clone(), child.clone());
+        let chain_ids = vec![child.lease_id.clone(), root.lease_id.clone()];
+        // Sanity: the chain validates while the issuing session is live.
+        validate_chain(
+            &map,
+            &chain_ids,
+            &RevocationIndex::new(),
+            &sessions,
+            &issuer_resolver(&keys),
+            &HashSet::new(),
+            300,
+        )
+        .unwrap();
+        // Destroy the issuing session without revoking: validation must
+        // still fail closed on the dead ancestry.
+        sessions.deactivate("ed25519:parent-session");
+        let err = validate_chain(
+            &map,
+            &chain_ids,
+            &RevocationIndex::new(),
+            &sessions,
+            &issuer_resolver(&keys),
+            &HashSet::new(),
+            300,
+        );
+        assert!(matches!(err, Err(LeaseError::SubjectInactive(_))));
+    }
+
+    #[test]
+    fn subject_liveness_walks_full_ancestry() {
+        use rand::rngs::OsRng;
+        let gp_key = SigningKey::generate(&mut OsRng);
+        let p_key = SigningKey::generate(&mut OsRng);
+        let c_key = SigningKey::generate(&mut OsRng);
+        let mut sessions = SessionRegistry::new();
+        sessions.register(
+            "ed25519:grandparent".to_string(),
+            None,
+            gp_key.verifying_key(),
+            0,
+        );
+        sessions.register(
+            "ed25519:parent".to_string(),
+            Some("ed25519:grandparent".to_string()),
+            p_key.verifying_key(),
+            0,
+        );
+        sessions.register(
+            "ed25519:child".to_string(),
+            Some("ed25519:parent".to_string()),
+            c_key.verifying_key(),
+            0,
+        );
+        // All live: the whole ancestry holds.
+        assert!(sessions.is_subject_live("ed25519:child", 300));
+        // Deactivating the grandparent kills the child's ancestry even
+        // though the child and parent records are still active — this is
+        // the case `is_active_descendant(x, x, …)` misses, because it
+        // returns after checking only the named record.
+        sessions.deactivate("ed25519:grandparent");
+        assert!(sessions.is_active_descendant("ed25519:child", "ed25519:child", 300));
+        assert!(!sessions.is_subject_live("ed25519:child", 300));
+        assert!(!sessions.is_subject_live("ed25519:parent", 300));
+        assert!(!sessions.is_subject_live("ed25519:grandparent", 300));
+        // Unknown subjects are not live.
+        assert!(!sessions.is_subject_live("ed25519:nobody", 300));
+    }
+
+    #[test]
+    fn subject_liveness_enforces_session_ttl() {
+        use rand::rngs::OsRng;
+        let key = SigningKey::generate(&mut OsRng);
+        let mut sessions = SessionRegistry::new();
+        sessions.set_max_lifetime(Some(1_000));
+        sessions.register("ed25519:short".to_string(), None, key.verifying_key(), 0);
+        assert!(sessions.is_subject_live("ed25519:short", 999));
+        assert!(!sessions.is_subject_live("ed25519:short", 1_000));
+        // Disabling the TTL restores liveness for the active record.
+        sessions.set_max_lifetime(None);
+        assert!(sessions.is_subject_live("ed25519:short", 1_000_000));
     }
 
     #[test]

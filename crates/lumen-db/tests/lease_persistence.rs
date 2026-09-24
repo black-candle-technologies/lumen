@@ -229,7 +229,7 @@ async fn purge_with_no_live_refs_deletes_row() {
     record_generation(&db, &ws, "gen-orphan", "issuer").await;
 
     let outcome = db
-        .purge_key_generation(&ws, "gen-orphan", 500_000, 0)
+        .purge_key_generation(&ws, "gen-orphan", 500_000, &[])
         .await
         .unwrap();
     assert_eq!(outcome, PurgeOutcome::Purged);
@@ -246,7 +246,7 @@ async fn purge_refused_while_live_lease_references_generation() {
     record_generation(&db, &ws, &doc.issuer_key_id, "issuer").await;
 
     let outcome = db
-        .purge_key_generation(&ws, &doc.issuer_key_id, 500_000, 0)
+        .purge_key_generation(&ws, &doc.issuer_key_id, 500_000, &[])
         .await
         .unwrap();
     assert_eq!(outcome, PurgeOutcome::StillReferenced);
@@ -258,7 +258,7 @@ async fn purge_unknown_key_is_not_found() {
     let db = test_db().await;
     let ws = test_workspace(&db).await;
     let outcome = db
-        .purge_key_generation(&ws, "gen-missing", 500_000, 0)
+        .purge_key_generation(&ws, "gen-missing", 500_000, &[])
         .await
         .unwrap();
     assert_eq!(outcome, PurgeOutcome::NotFound);
@@ -272,7 +272,7 @@ async fn purge_permit_does_not_leak_onto_pooled_connection() {
     record_generation(&db, &ws, "gen-kept", "issuer").await;
 
     assert_eq!(
-        db.purge_key_generation(&ws, "gen-purged", 500_000, 0)
+        db.purge_key_generation(&ws, "gen-purged", 500_000, &[])
             .await
             .unwrap(),
         PurgeOutcome::Purged
@@ -326,31 +326,34 @@ async fn purge_host_generation_with_retained_checkpoints_refuses() {
     db.checkpoint_kernel_audit(&ws, &link, 3_000).await.unwrap();
 
     assert!(
-        db.host_generation_has_retained_checkpoints(&ws, "host-gen-x", 0)
+        db.host_generation_has_checkpoints(&ws, "host-gen-x")
             .await
             .unwrap()
     );
     assert!(
-        !db.host_generation_has_retained_checkpoints(&ws, "host-gen-x", 3_001)
+        !db.host_generation_has_checkpoints(&ws, "host-gen-unreferenced")
             .await
             .unwrap()
     );
 
-    // Retention window covers the checkpoint -> refuse.
+    // Any checkpoint referencing the host generation -> refuse, whatever
+    // its age. Purging would make the immutable checkpoint unverifiable
+    // (verify_kernel_audit fails closed on an unknown host key).
     let err = db
-        .purge_key_generation(&ws, "host-gen-x", 10_000, 60_000)
+        .purge_key_generation(&ws, "host-gen-x", 10_000_000, &[])
         .await
         .unwrap_err();
     assert!(db_err_message(err).contains("retained checkpoints"));
     assert!(has_generation(&db, &ws, "host-gen-x").await);
 
-    // Retention window excludes the checkpoint -> purge proceeds.
+    // A host generation with no checkpoints at all purges normally.
+    record_generation(&db, &ws, "host-gen-unreferenced", "host").await;
     let outcome = db
-        .purge_key_generation(&ws, "host-gen-x", 10_000, 5_000)
+        .purge_key_generation(&ws, "host-gen-unreferenced", 10_000_000, &[])
         .await
         .unwrap();
     assert_eq!(outcome, PurgeOutcome::Purged);
-    assert!(!has_generation(&db, &ws, "host-gen-x").await);
+    assert!(!has_generation(&db, &ws, "host-gen-unreferenced").await);
 }
 
 #[tokio::test]
@@ -515,13 +518,20 @@ async fn kill_list_is_idempotent_and_append_only() {
     let ws = test_workspace(&db).await;
 
     assert!(
-        db.kill_key_generation(&ws, "gen-evil", "issuer", 9_000, "suspected compromise")
-            .await
-            .unwrap()
+        db.kill_key_generation(
+            &ws,
+            "gen-evil",
+            "issuer",
+            9_000,
+            "suspected compromise",
+            "test:operator"
+        )
+        .await
+        .unwrap()
     );
     // Second kill is a no-op.
     assert!(
-        !db.kill_key_generation(&ws, "gen-evil", "issuer", 9_001, "again")
+        !db.kill_key_generation(&ws, "gen-evil", "issuer", 9_001, "again", "test:operator")
             .await
             .unwrap()
     );
@@ -531,7 +541,7 @@ async fn kill_list_is_idempotent_and_append_only() {
 
     // Invalid role fails in Rust before the insert.
     assert!(
-        db.kill_key_generation(&ws, "gen-x", "root", 9_000, "bad role")
+        db.kill_key_generation(&ws, "gen-x", "root", 9_000, "bad role", "test:operator")
             .await
             .is_err()
     );
@@ -593,15 +603,208 @@ async fn live_lease_refs_counts_only_live_matching_leases() {
     // Purge is refused while that one live lease exists, then allowed once
     // the clock passes its expiry.
     assert_eq!(
-        db.purge_key_generation(&ws, &key_id, 500_000, 0)
+        db.purge_key_generation(&ws, &key_id, 500_000, &[])
             .await
             .unwrap(),
         PurgeOutcome::StillReferenced
     );
     assert_eq!(
-        db.purge_key_generation(&ws, &key_id, 1_000_001, 0)
+        db.purge_key_generation(&ws, &key_id, 1_000_001, &[])
             .await
             .unwrap(),
         PurgeOutcome::Purged
     );
+}
+
+#[tokio::test]
+async fn purge_refuses_current_generation() {
+    // The store itself refuses to purge a live generation, even with no
+    // live lease references: the kernel's purge pass already excludes
+    // them, but no caller may orphan the signing key in active use.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    record_generation(&db, &ws, "gen-current", "issuer").await;
+
+    let outcome = db
+        .purge_key_generation(&ws, "gen-current", 500_000, &["gen-current"])
+        .await
+        .unwrap();
+    assert_eq!(outcome, PurgeOutcome::CurrentGeneration);
+    assert!(has_generation(&db, &ws, "gen-current").await);
+
+    // A retired generation with no refs still purges.
+    record_generation(&db, &ws, "gen-retired", "issuer").await;
+    let outcome = db
+        .purge_key_generation(&ws, "gen-retired", 500_000, &["gen-current"])
+        .await
+        .unwrap();
+    assert_eq!(outcome, PurgeOutcome::Purged);
+    assert!(!has_generation(&db, &ws, "gen-retired").await);
+}
+
+#[tokio::test]
+async fn time_high_water_roundtrip_and_monotonic() {
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+
+    assert_eq!(db.time_high_water(&ws).await.unwrap(), 0);
+
+    db.record_time_high_water(&ws, 1_000).await.unwrap();
+    assert_eq!(db.time_high_water(&ws).await.unwrap(), 1_000);
+
+    // A smaller value never lowers the mark.
+    db.record_time_high_water(&ws, 500).await.unwrap();
+    assert_eq!(db.time_high_water(&ws).await.unwrap(), 1_000);
+
+    db.record_time_high_water(&ws, 2_000).await.unwrap();
+    assert_eq!(db.time_high_water(&ws).await.unwrap(), 2_000);
+}
+
+#[tokio::test]
+async fn kill_with_audit_commits_both_atomically() {
+    use lumen_db::lease::{KernelAuditAppend, KillGenerationRequest};
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    record_generation(&db, &ws, "gen-doomed", "issuer").await;
+
+    let audit = KernelAuditAppend {
+        actor: "kernel",
+        kind: AuditEventKind::PolicyDenied,
+        session_id: "ed25519:test",
+        action_digest: &format!("{:064x}", 42),
+        decision: None,
+        timestamp_ms: 9_000,
+        details: json!({"host_kind": "kernel.key_generation.killed"}),
+    };
+    let (killed, event) = db
+        .kill_key_generation_with_audit(
+            &ws,
+            &KillGenerationRequest {
+                key_id: "gen-doomed",
+                role: "issuer",
+                killed_at_ms: 9_000,
+                reason: "suspected compromise",
+                killed_by: "test:operator",
+                audit: &audit,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(killed);
+    let event = event.expect("audit event on kill");
+
+    // The kill row carries the authorizing actor.
+    let row: (String, String) = sqlx::query_as(
+        "SELECT reason, killed_by FROM kernel_killed_generations
+         WHERE workspace_id=? AND key_id='gen-doomed'",
+    )
+    .bind(ws.to_string())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, "suspected compromise");
+    assert_eq!(row.1, "test:operator");
+
+    // The audit event is durable in the same unit.
+    let events = db
+        .kernel_audit_events(&ws, &lumen_db::lease::KernelAuditQuery::default())
+        .await
+        .unwrap();
+    assert!(events.iter().any(|e| e.event_id == event.event_id));
+
+    // Idempotent retry: no second row, no second audit event.
+    let (killed_again, event_again) = db
+        .kill_key_generation_with_audit(
+            &ws,
+            &KillGenerationRequest {
+                key_id: "gen-doomed",
+                role: "issuer",
+                killed_at_ms: 9_001,
+                reason: "again",
+                killed_by: "test:operator",
+                audit: &audit,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!killed_again);
+    assert!(event_again.is_none());
+}
+
+#[tokio::test]
+async fn session_lifecycle_checks_reject_bad_inserts() {
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let ws_s = ws.to_string();
+
+    // A live row must not carry a destroy timestamp.
+    let err = sqlx::query(
+        "INSERT INTO kernel_sessions(workspace_id,subject,parent_subject,
+         verifying_key_hex,active,created_at_ms,destroyed_at_ms)
+         VALUES(?,?,NULL,?,1,0,100)",
+    )
+    .bind(&ws_s)
+    .bind("ed25519:bad-live")
+    .bind(vk_hex(3))
+    .execute(db.pool())
+    .await
+    .unwrap_err();
+    assert!(db_err_message(err).contains("CHECK constraint failed"));
+
+    // A destroyed row must carry a destroy timestamp.
+    let err = sqlx::query(
+        "INSERT INTO kernel_sessions(workspace_id,subject,parent_subject,
+         verifying_key_hex,active,created_at_ms,destroyed_at_ms)
+         VALUES(?,?,NULL,?,0,0,NULL)",
+    )
+    .bind(&ws_s)
+    .bind("ed25519:bad-dead")
+    .bind(vk_hex(4))
+    .execute(db.pool())
+    .await
+    .unwrap_err();
+    assert!(db_err_message(err).contains("CHECK constraint failed"));
+
+    // The destroy timestamp may not precede creation.
+    let err = sqlx::query(
+        "INSERT INTO kernel_sessions(workspace_id,subject,parent_subject,
+         verifying_key_hex,active,created_at_ms,destroyed_at_ms)
+         VALUES(?,?,NULL,?,0,100,50)",
+    )
+    .bind(&ws_s)
+    .bind("ed25519:bad-time")
+    .bind(vk_hex(5))
+    .execute(db.pool())
+    .await
+    .unwrap_err();
+    assert!(db_err_message(err).contains("CHECK constraint failed"));
+
+    // A non-null parent must name a recorded session in the workspace.
+    db.insert_kernel_session(&ws, "ed25519:real-parent", None, &vk_hex(6), 0)
+        .await
+        .unwrap();
+    let err = sqlx::query(
+        "INSERT INTO kernel_sessions(workspace_id,subject,parent_subject,
+         verifying_key_hex,active,created_at_ms,destroyed_at_ms)
+         VALUES(?,?,?, ?,1,0,NULL)",
+    )
+    .bind(&ws_s)
+    .bind("ed25519:orphan")
+    .bind("ed25519:no-such-parent")
+    .bind(vk_hex(7))
+    .execute(db.pool())
+    .await
+    .unwrap_err();
+    assert!(db_err_message(err).contains("FOREIGN KEY constraint failed"));
+
+    // The well-formed rows still insert.
+    db.insert_kernel_session(
+        &ws,
+        "ed25519:good-child",
+        Some("ed25519:real-parent"),
+        &vk_hex(8),
+        0,
+    )
+    .await
+    .unwrap();
 }

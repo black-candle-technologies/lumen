@@ -1554,6 +1554,8 @@ impl Database {
     /// verifying key stays recorded. Idempotent: killing twice is a no-op.
     /// `role` must be `issuer` or `host` (validated in Rust; the CHECK would
     /// also reject anything else, but the caller deserves a clear error).
+    /// `killed_by` is the authorizing operator principal
+    /// (`provider:subject`): durable actor evidence for the kill-list.
     pub async fn kill_key_generation(
         &self,
         workspace_id: &WorkspaceId,
@@ -1561,6 +1563,7 @@ impl Database {
         role: &str,
         killed_at_ms: i64,
         reason: &str,
+        killed_by: &str,
     ) -> Result<bool, RepositoryError> {
         if role != "issuer" && role != "host" {
             return Err(RepositoryError::InvalidKernelLeaseState(format!(
@@ -1569,17 +1572,76 @@ impl Database {
         }
         let res = sqlx::query(
             "INSERT OR IGNORE INTO kernel_killed_generations
-             (workspace_id,key_id,role,killed_at_ms,reason)
-             VALUES(?,?,?,?,?)",
+             (workspace_id,key_id,role,killed_at_ms,reason,killed_by)
+             VALUES(?,?,?,?,?,?)",
         )
         .bind(ws(workspace_id))
         .bind(key_id)
         .bind(role)
         .bind(killed_at_ms)
         .bind(reason)
+        .bind(killed_by)
         .execute(self.pool())
         .await?;
         Ok(res.rows_affected() == 1)
+    }
+
+    /// Kill a generation AND append its audit event in ONE transaction
+    /// (with the audit sequence-race retry around the whole unit): either
+    /// the kill and its audit record both commit, or neither does. A kill
+    /// without a durable audit record would be a forensic gap; an audit
+    /// record without the kill row would be worse (the kill would not
+    /// take effect), so the two share one atomic unit. Returns
+    /// `(killed, audit_event)`: when the generation was already on the
+    /// kill-list nothing is written and the event is `None`.
+    pub async fn kill_key_generation_with_audit(
+        &self,
+        workspace_id: &WorkspaceId,
+        request: &KillGenerationRequest<'_>,
+    ) -> Result<(bool, Option<AuditEvent>), RepositoryError> {
+        let role = request.role;
+        if role != "issuer" && role != "host" {
+            return Err(RepositoryError::InvalidKernelLeaseState(format!(
+                "kill_key_generation: invalid role {role:?}"
+            )));
+        }
+        for attempt in 0..AUDIT_APPEND_RETRIES {
+            let mut tx = self.pool().begin().await?;
+            let killed = sqlx::query(
+                "INSERT OR IGNORE INTO kernel_killed_generations
+                 (workspace_id,key_id,role,killed_at_ms,reason,killed_by)
+                 VALUES(?,?,?,?,?,?)",
+            )
+            .bind(ws(workspace_id))
+            .bind(request.key_id)
+            .bind(role)
+            .bind(request.killed_at_ms)
+            .bind(request.reason)
+            .bind(request.killed_by)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+            if !killed {
+                tx.rollback().await?;
+                return Ok((false, None));
+            }
+            match append_audit_attempt(&mut tx, workspace_id, request.audit).await {
+                Ok(event) => {
+                    tx.commit().await?;
+                    return Ok((true, Some(event)));
+                }
+                Err(e) if is_retryable(&e) => {
+                    tx.rollback().await?;
+                    audit_retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(RepositoryError::KernelAuditBreak(
+            "kill+audit lost too many sequence races".to_string(),
+        ))
     }
 
     /// Every killed generation id for the workspace: the set the kernel
@@ -1594,6 +1656,47 @@ impl Database {
                 .fetch_all(self.pool())
                 .await?;
         Ok(ids.into_iter().collect())
+    }
+
+    // ------------------------------------------------------------------
+    // Monotonic time anchor (migration 0026)
+    // ------------------------------------------------------------------
+
+    /// The greatest effective time the kernel has acted on, or 0 when the
+    /// workspace has no recorded mark yet. Read at open to detect a
+    /// backward wall-clock jump before any authority decision runs.
+    pub async fn time_high_water(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<i64, RepositoryError> {
+        let mark: Option<i64> = sqlx::query_scalar(
+            "SELECT high_water_ms FROM kernel_time_high_water WHERE workspace_id=?",
+        )
+        .bind(ws(workspace_id))
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(mark.unwrap_or(0))
+    }
+
+    /// Advance the time anchor. Only ever moves forward: a smaller value
+    /// is ignored, so a stray call can never lower the mark a rollback
+    /// check depends on.
+    pub async fn record_time_high_water(
+        &self,
+        workspace_id: &WorkspaceId,
+        high_water_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO kernel_time_high_water(workspace_id, high_water_ms)
+             VALUES(?, ?)
+             ON CONFLICT(workspace_id) DO UPDATE
+             SET high_water_ms = max(high_water_ms, excluded.high_water_ms)",
+        )
+        .bind(ws(workspace_id))
+        .bind(high_water_ms)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     /// Live references to a generation: leases with `issuer_key_id=key_id`
@@ -1638,23 +1741,27 @@ impl Database {
         rows.iter().map(lease_from_row).collect()
     }
 
-    /// True when any audit checkpoint in the workspace references `key_id`
-    /// with `created_at >= since_ms`. Host generations with retained
-    /// checkpoints must not be purged, or audit history would become
-    /// unverifiable.
-    pub async fn host_generation_has_retained_checkpoints(
+    /// True when any audit checkpoint in the workspace references `key_id`.
+    /// Host generations with retained checkpoints must not be purged, or
+    /// audit history would become unverifiable (`verify_kernel_audit`
+    /// fails closed on a checkpoint whose host key is unknown). The check
+    /// covers checkpoints of ANY age: checkpoints are immutable and are
+    /// never deleted by the kernel, so an age-bounded check would let an
+    /// old host key be purged while its old checkpoints still need it.
+    /// Host-key accumulation is therefore bounded only by rotation
+    /// frequency until an authenticated archive/compaction protocol
+    /// exists (spec §8.4, open).
+    pub async fn host_generation_has_checkpoints(
         &self,
         workspace_id: &WorkspaceId,
         key_id: &str,
-        since_ms: i64,
     ) -> Result<bool, RepositoryError> {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM kernel_audit_checkpoints
-             WHERE workspace_id=? AND key_id=? AND created_at>=?",
+             WHERE workspace_id=? AND key_id=?",
         )
         .bind(ws(workspace_id))
         .bind(key_id)
-        .bind(since_ms)
         .fetch_one(self.pool())
         .await?;
         Ok(n > 0)
@@ -1670,16 +1777,26 @@ impl Database {
     /// orphaned). The permit is therefore never visible outside the
     /// purging transaction — a crashed purge rolls it back, and it cannot
     /// leak onto a reused pooled connection to authorize an unrelated
-    /// delete. Host generations additionally refuse when retained
-    /// checkpoints reference them (the `host_retention_ms` window): purging
-    /// those would make audit history unverifiable.
+    /// delete. Host generations are refused while any checkpoint
+    /// references them ([`Database::host_generation_has_checkpoints`]):
+    /// purging those would make audit history unverifiable.
+    ///
+    /// `current_key_ids` carries the live generations (the current issuer
+    /// and host ids): purging one of those is refused with
+    /// [`PurgeOutcome::CurrentGeneration`] even when it has no live lease
+    /// references yet. The boot purge pass already excludes them, but the
+    /// store refuses too, so no caller can orphan the signing key the
+    /// kernel is actively using.
     pub async fn purge_key_generation(
         &self,
         workspace_id: &WorkspaceId,
         key_id: &str,
         now_ms: i64,
-        host_retention_ms: i64,
+        current_key_ids: &[&str],
     ) -> Result<PurgeOutcome, RepositoryError> {
+        if current_key_ids.contains(&key_id) {
+            return Ok(PurgeOutcome::CurrentGeneration);
+        }
         let role: Option<String> = sqlx::query_scalar(
             "SELECT role FROM kernel_key_generations WHERE workspace_id=? AND key_id=?",
         )
@@ -1692,11 +1809,7 @@ impl Database {
         };
         if role == "host"
             && self
-                .host_generation_has_retained_checkpoints(
-                    workspace_id,
-                    key_id,
-                    now_ms - host_retention_ms,
-                )
+                .host_generation_has_checkpoints(workspace_id, key_id)
                 .await?
         {
             return Err(RepositoryError::InvalidKernelLeaseState(format!(
@@ -1750,8 +1863,31 @@ pub enum PurgeOutcome {
     Purged,
     /// The row was kept: at least one live lease still references it.
     StillReferenced,
+    /// The row was kept: it is one of the kernel's live generations
+    /// (current issuer/host). Purging it would orphan the signing key in
+    /// active use.
+    CurrentGeneration,
     /// No row exists for (workspace_id, key_id).
     NotFound,
+}
+
+/// Parameters for [`Database::kill_key_generation_with_audit`]: the kill
+/// row fields plus the audit event that must commit in the same
+/// transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct KillGenerationRequest<'a> {
+    /// Generation id to kill.
+    pub key_id: &'a str,
+    /// `"issuer"` or `"host"`.
+    pub role: &'a str,
+    /// Kill timestamp (also the audit event's timestamp).
+    pub killed_at_ms: i64,
+    /// Human-readable reason (durable).
+    pub reason: &'a str,
+    /// Authorizing operator principal (`provider:subject`).
+    pub killed_by: &'a str,
+    /// The audit event appended atomically with the kill row.
+    pub audit: &'a KernelAuditAppend<'a>,
 }
 
 fn session_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<KernelSessionRow, RepositoryError> {
@@ -1837,6 +1973,7 @@ async fn purge_key_generation_permitted(
 /// [`AuditEvent`]: `actor` is the kernel actor string (`"kernel"`,
 /// `"ed25519:<session-id>"`, or a human subject); `decision` is `"allow"` |
 /// `"deny"` | `"pending"`, or `None` when the event records no decision.
+#[derive(Clone, Debug)]
 pub struct KernelAuditAppend<'a> {
     pub actor: &'a str,
     pub kind: AuditEventKind,
