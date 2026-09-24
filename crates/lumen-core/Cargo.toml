@@ -9,7 +9,6 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
-lumen-protocol = { path = "../lumen-protocol" }
 rand = "0.8"
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

@@ -35,7 +35,11 @@ use lumen_core::{
     },
     nonce::NonceStore,
 };
-use lumen_protocol::{ActionEnvelope, EffectClass, ResourceSet, ToolRef};
+use lumen_core::canonical::EffectClass;
+use lumen_core::pi_boundary::{
+    ACTION_ENVELOPE_VERSION, ActionEnvelope, EffectClasses, LeaseId, PathResource,
+    PathRights as WirePathRights, ResourceSet, ToolRef,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -709,21 +713,31 @@ proptest! {
         let r = FakeResolver::default();
 
         let env = ActionEnvelope {
-            protocol_version: 1,
-            action_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            version: ACTION_ENVELOPE_VERSION,
+            action_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
             session_id: "ed25519:session-0".to_string(),
             tool: ToolRef { name: tool.clone(), version: ver.to_string() },
-            arguments: json!({}),
-            input_hashes: vec![],
+            // The frozen contract requires integer-only arguments.
+            arguments: [("n".to_string(), json!(1))].into_iter().collect(),
+            inputs: vec![],
             resources: ResourceSet {
-                paths: vec![path.clone()],
-                hosts: vec![],
-                secret_refs: vec![],
+                paths: vec![PathResource {
+                    path: path.clone(),
+                    rights: WirePathRights::Read,
+                }],
+                network: vec![],
+                secrets: vec![],
+            },
+            expected_effects: EffectClasses {
+                file_read: true,
+                file_write: false,
+                network_egress: false,
+                network_ingress: false,
+                process_spawn: false,
             },
             lease_chain: vec![],
-            nonce: "env-nonce".to_string(),
-            expires_at: "2026-09-24T00:00:00Z".to_string(),
-            expected_effects: vec![EffectClass::Read],
+            nonce: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
+            expires_at_ms: 1_000_000,
         };
         let action = CanonicalAction::from_envelope(&env, &r, false).unwrap();
         let vhl = SigningKey::generate(&mut OsRng);
@@ -756,7 +770,7 @@ proptest! {
         let mut map = HashMap::new();
         map.insert(lease.lease_id.clone(), lease.clone());
         let mut env2 = env.clone();
-        env2.lease_chain = vec![lease.lease_id.clone()];
+        env2.lease_chain = vec![LeaseId::from_uuid(lease.lease_id.parse().expect("lease id is a UUID"))];
         let mut tracker2: HashSet<String> = HashSet::new();
         let params = AuthorizeParams {
             now_ms: 500, case_insensitive_fs: false,
@@ -808,17 +822,26 @@ proptest! {
         tamper in arb_tamper(),
         redact_note in prop::string::string_regex("[a-z]{0,12}").unwrap(),
     ) {
+        use lumen_core::kernel_audit::GENESIS_PREV_HASH;
+        use lumen_core::pi_boundary::AuditEventKind;
         let keys = KernelKeys::generate();
         let mut log = KernelAuditLog::new(MemoryAuditStore::default());
+        // 64-hex action digests (the frozen contract's digest shape).
+        let digest = |i: usize| format!("{:064x}", i + 1);
         for i in 0..count {
+            let allowed = i % 2 == 0;
             log.append(
                 "kernel",
-                &format!("digest-{i}"),
-                if i % 2 == 0 { "lease.allow" } else { "lease.deny" },
+                if allowed { AuditEventKind::PolicyAllowed } else { AuditEventKind::PolicyDenied },
+                "ed25519:session-0",
+                &digest(i),
+                Some(if allowed { "allow" } else { "deny" }),
                 1000 + i as i64,
                 json!({"lease_id": format!("lease-{i}"), "api_key": redact_note.clone()}),
             ).unwrap();
         }
+        // The genesis event links to the frozen genesis prev_hash.
+        prop_assert_eq!(log.store().events()[0].prev_hash.as_str(), GENESIS_PREV_HASH);
         log.checkpoint((count - 1) as u64, &keys).unwrap();
         // Untouched, everything verifies.
         log.verify(&keys.host_verifying(), &keys.host_key_id).unwrap();
@@ -830,11 +853,11 @@ proptest! {
             Tamper::DeleteOne => { events.remove(0); }
             Tamper::SwapTwo => { events.swap(0, 1); }
             Tamper::FlipDecision => {
-                events[0].decision = if events[0].decision == "lease.allow" {
-                    "lease.deny".to_string()
+                events[0].decision = Some(if events[0].decision.as_deref() == Some("allow") {
+                    "deny".to_string()
                 } else {
-                    "lease.allow".to_string()
-                };
+                    "allow".to_string()
+                });
             }
             Tamper::DropCheckpoint => { checkpoints.clear(); }
             Tamper::ForgeCheckpoint => {
@@ -863,7 +886,7 @@ proptest! {
         // Redaction held for every event: the secret value must appear only
         // as the redaction marker, never as its own JSON string value.
         for e in tampered.store().events() {
-            let s = serde_json::to_string(&e.details).unwrap();
+            let s = e.detail.clone();
             let quoted = format!("\"{}\"", redact_note);
             prop_assert!(redact_note.is_empty() || !s.contains(&quoted),
                 "secret leaked into audit: {}", s);

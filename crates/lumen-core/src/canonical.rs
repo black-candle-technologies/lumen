@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use lumen_protocol::{EffectClass, canonical};
+use crate::pi_boundary::canonical_digest;
 
 /// Errors from resource canonicalization. Every variant fails closed: the
 /// caller must treat the resource as unusable, never as "close enough".
@@ -851,6 +851,55 @@ impl ModelClass {
 // Scope: the full typed resource set of a lease
 // ---------------------------------------------------------------------------
 
+/// Kernel-internal effect classes for lease scopes.
+///
+/// The frozen wire contract carries effects as boolean flags
+/// ([`crate::pi_boundary::EffectClasses`]); the kernel derives these classes from
+/// those flags at the envelope boundary
+/// ([`crate::lease::CanonicalAction::from_envelope`]) for structural
+/// scope-subset proofs. This enum is a kernel type, not a wire contract.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectClass {
+    Read,
+    Write,
+    Network,
+    Execute,
+    SecretUse,
+    MessageSend,
+}
+
+impl EffectClass {
+    /// Derive the kernel-internal effect classes from the frozen wire flags.
+    ///
+    /// `secret_refs` is the number of secret references declared on the
+    /// envelope; any declared secret implies [`EffectClass::SecretUse`].
+    /// There is no wire flag for message sending, so `MessageSend` can only
+    /// ever be granted on a lease, never asserted by an action.
+    pub fn from_wire(
+        flags: &crate::pi_boundary::EffectClasses,
+        secret_refs: usize,
+    ) -> Vec<EffectClass> {
+        let mut out = Vec::new();
+        if flags.file_read {
+            out.push(EffectClass::Read);
+        }
+        if flags.file_write {
+            out.push(EffectClass::Write);
+        }
+        if flags.network_egress || flags.network_ingress {
+            out.push(EffectClass::Network);
+        }
+        if flags.process_spawn {
+            out.push(EffectClass::Execute);
+        }
+        if secret_refs > 0 {
+            out.push(EffectClass::SecretUse);
+        }
+        out
+    }
+}
+
 /// The complete typed resource scope of a lease. Every dimension is a set of
 /// typed grants; the subset proof checks each dimension structurally.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -999,7 +1048,7 @@ impl ResourceScope {
             items.push(format!("effect:{e}"));
         }
         let value = serde_json::to_value(&items).map_err(|_| CanonicalError::TooLong)?;
-        canonical::digest_value(&value).map_err(|_| CanonicalError::TooLong)
+        canonical_digest(&value).map_err(|_| CanonicalError::TooLong)
     }
 }
 

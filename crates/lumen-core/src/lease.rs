@@ -30,18 +30,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use lumen_protocol::{
-    ActionEnvelope, Decision as ProtocolDecision, EffectClass, PolicyDecision,
-    canonical::{self, CanonicalError as ProtocolCanonicalError},
-};
-
 use crate::{
     budget::{Budget, BudgetDimension, BudgetError, BudgetLedger},
     canonical::{
-        CanonicalPath, NetworkDestination, PathGrant, PathResolver, PathRights, ResourceScope,
-        ScopeSubsetError, SecretRef, ToolName,
+        CanonicalPath, EffectClass, NetworkDestination, PathGrant, PathResolver, PathRights,
+        ResourceScope, ScopeSubsetError, SecretRef, ToolName,
     },
     nonce::{NonceError, NonceStore},
+    pi_boundary::{ActionEnvelope, BoundaryError, DenyReason, PolicyDecision, canonical_json},
 };
 
 /// Contract version for [`LeaseDocument`].
@@ -117,11 +113,10 @@ impl LeaseDocument {
 
     /// Canonical bytes covered by the signature.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, LeaseError> {
-        canonical::canonical_json(
+        canonical_json(
             &serde_json::to_value(self.signing_view())
                 .map_err(|e| LeaseError::Encoding(e.to_string()))?,
         )
-        .map(|s| s.into_bytes())
         .map_err(LeaseError::ProtocolCanonical)
     }
 
@@ -167,7 +162,7 @@ pub enum LeaseError {
     #[error("canonicalization failed: {0}")]
     Canonical(#[from] crate::canonical::CanonicalError),
     #[error("protocol canonicalization failed: {0}")]
-    ProtocolCanonical(#[from] ProtocolCanonicalError),
+    ProtocolCanonical(#[from] BoundaryError),
     #[error("subset proof failed: {0}")]
     Subset(#[from] ScopeSubsetError),
     #[error("budget error: {0}")]
@@ -735,10 +730,9 @@ impl OneShotGrant {
             created_at_ms: self.created_at_ms,
             expires_at_ms: self.expires_at_ms,
         };
-        canonical::canonical_json(
+        canonical_json(
             &serde_json::to_value(view).map_err(|e| LeaseError::Encoding(e.to_string()))?,
         )
-        .map(|s| s.into_bytes())
         .map_err(LeaseError::ProtocolCanonical)
     }
 
@@ -766,6 +760,9 @@ pub struct CanonicalAction {
     pub tool_name: ToolName,
     pub tool_version: semver::Version,
     pub paths: Vec<CanonicalPath>,
+    /// Declared rights per path, parallel to `paths`, mapped from the frozen
+    /// [`pi_boundary::PathRights`] at the envelope boundary.
+    pub path_rights: Vec<PathRights>,
     pub destinations: Vec<NetworkDestination>,
     pub secrets: Vec<SecretRef>,
     pub effects: Vec<EffectClass>,
@@ -784,22 +781,36 @@ impl CanonicalAction {
         let tool_version = semver::Version::parse(&env.tool.version)
             .map_err(|e| LeaseError::BadEnvelope(format!("tool version: {e}")))?;
         let mut paths = Vec::new();
+        let mut path_rights = Vec::new();
         for p in &env.resources.paths {
             paths.push(
-                CanonicalPath::parse(p, resolver, case_insensitive_fs)
+                CanonicalPath::parse(&p.path, resolver, case_insensitive_fs)
                     .map_err(LeaseError::Canonical)?,
             );
+            // The frozen contract declares per-resource rights; the kernel
+            // authorizes exactly what the envelope declares, nothing more.
+            path_rights.push(match p.rights {
+                crate::pi_boundary::PathRights::Read => PathRights::READ,
+                crate::pi_boundary::PathRights::Write => PathRights::READ_WRITE,
+            });
         }
         let mut destinations = Vec::new();
-        for h in &env.resources.hosts {
+        for nr in &env.resources.network {
+            // Bracket IPv6 literals so the destination parses as one host.
+            let host = if nr.host.contains(':') && !nr.host.starts_with('[') {
+                format!("[{}]", nr.host)
+            } else {
+                nr.host.clone()
+            };
+            let rendered = format!("{}://{}:{}", nr.scheme, host, nr.port);
             destinations.push(
-                NetworkDestination::parse(h, &[])
+                NetworkDestination::parse(&rendered, &[])
                     .map_err(|e| LeaseError::BadEnvelope(e.to_string()))?,
             );
         }
         let mut secrets = Vec::new();
-        for s in &env.resources.secret_refs {
-            secrets.push(SecretRef::parse(s).map_err(LeaseError::Canonical)?);
+        for s in &env.resources.secrets {
+            secrets.push(SecretRef::parse(&s.id).map_err(LeaseError::Canonical)?);
         }
         let digest = env
             .digest()
@@ -809,9 +820,10 @@ impl CanonicalAction {
             tool_name,
             tool_version,
             paths,
+            path_rights,
             destinations,
             secrets,
-            effects: env.expected_effects.to_vec(),
+            effects: EffectClass::from_wire(&env.expected_effects, env.resources.secrets.len()),
         })
     }
 
@@ -822,15 +834,15 @@ impl CanonicalAction {
             self.tool_name.as_str().to_string(),
             semver::VersionReq::parse(&format!("={}", self.tool_version)).expect("pinned"),
         );
-        let rights = PathRights {
-            read: self.effects.contains(&EffectClass::Read)
-                || self.effects.contains(&EffectClass::Execute),
-            write: self.effects.contains(&EffectClass::Write),
-        };
-        for root in &self.paths {
+        debug_assert_eq!(
+            self.paths.len(),
+            self.path_rights.len(),
+            "path_rights is parallel to paths"
+        );
+        for (root, rights) in self.paths.iter().zip(self.path_rights.iter()) {
             scope.paths.push(PathGrant {
                 root: root.clone(),
-                rights,
+                rights: *rights,
             });
         }
         scope.destinations.extend(self.destinations.iter().cloned());
@@ -887,7 +899,7 @@ pub fn mint_one_shot_lease(
     let budget = Budget::new().set(BudgetDimension::Executions, 1);
     let mut doc = LeaseDocument {
         protocol_version: LEASE_PROTOCOL_VERSION,
-        lease_id: format!("oneshot_{}", Uuid::new_v4()),
+        lease_id: Uuid::new_v4().to_string(),
         parent_id: None,
         subject: grant.session_subject.clone(),
         issuer_key_id: keys.issuer_key_id.clone(),
@@ -964,36 +976,38 @@ pub struct AuthorizeParams {
     pub approval_ttl_ms: i64,
 }
 
-fn deny(env_digest: &str, now_ms: i64, reason: String) -> PolicyDecision {
-    PolicyDecision {
-        protocol_version: lumen_protocol::policy_decision::POLICY_DECISION_VERSION,
-        action_digest: env_digest.to_string(),
-        decision: ProtocolDecision::Deny { reason },
-        decided_at: ms_to_rfc3339(now_ms),
+/// Map a lease-chain validation failure to a typed [`DenyReason`].
+///
+/// Identity-shaped failures (unknown, revoked, consumed, issuer mismatch)
+/// get their own codes; structural failures fall back to `invalid_envelope`
+/// with the full detail preserved in the reason.
+fn deny_reason_for_chain_error(e: &LeaseError) -> DenyReason {
+    match e {
+        LeaseError::NotFound(id) => DenyReason::unknown_lease(id.clone()),
+        LeaseError::Revoked(id) => DenyReason::lease_revoked(id.clone()),
+        LeaseError::AlreadyConsumed(id) => {
+            DenyReason::replay_detected(format!("one-shot lease {id} already consumed"))
+        }
+        LeaseError::IssuerMismatch(issuer, parent) => DenyReason::subject_mismatch(format!(
+            "issuer {issuer} does not match parent subject {parent}"
+        )),
+        LeaseError::UnknownKey(subject) => {
+            DenyReason::subject_mismatch(format!("unknown session key for {subject}"))
+        }
+        _ => DenyReason::invalid_envelope(format!("lease chain invalid: {e}")),
     }
 }
 
-pub(crate) fn ms_to_rfc3339(ms: i64) -> String {
-    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-    OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000)
-        .map(|dt| dt.format(&Rfc3339).unwrap_or_default())
-        .unwrap_or_default()
-}
-
-fn rfc3339_to_ms(s: &str) -> Option<i64> {
-    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-    OffsetDateTime::parse(s, &Rfc3339)
-        .ok()
-        .map(|dt| dt.unix_timestamp_nanos())
-        .map(|nanos: i128| (nanos / 1_000_000) as i64)
-}
-
-/// Authorize one [`ActionEnvelope`] against the lease store, producing a
-/// [`PolicyDecision`] v1 bound to the envelope digest.
+/// Authorize one [`ActionEnvelope`] against the lease store, producing the
+/// frozen [`PolicyDecision`] wire shape.
 ///
 /// This is the kernel's policy decision point (the rebuild's analogue of the
 /// old trust-gate evaluation): structural checks only, no natural-language
 /// interpretation. There is no default allow.
+///
+/// The decision carries no action digest or timestamp itself; the binding to
+/// the envelope happens at the wire layer
+/// ([`crate::pi_boundary::KernelWireResponse::action_digest`]).
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_envelope(
     env: &ActionEnvelope,
@@ -1009,38 +1023,33 @@ pub fn authorize_envelope(
     params: &AuthorizeParams,
 ) -> PolicyDecision {
     let now_ms = params.now_ms;
-    // Bind the decision to the envelope digest up front so every denial
-    // already carries the right binding.
+    // Parse and canonicalize the envelope first; a rejected envelope denies
+    // with no lease information at all.
     let action = match CanonicalAction::from_envelope(env, resolver, params.case_insensitive_fs) {
         Ok(a) => a,
         Err(e) => {
-            let digest = env.digest().unwrap_or_default();
-            return deny(&digest, now_ms, format!("envelope rejected: {e}"));
+            return PolicyDecision::deny(DenyReason::invalid_envelope(format!(
+                "envelope rejected: {e}"
+            )))
         }
     };
     // Hard deadline on the envelope itself.
-    match rfc3339_to_ms(&env.expires_at) {
-        Some(deadline) if now_ms < deadline => {}
-        _ => {
-            return deny(
-                &action.digest,
-                now_ms,
-                "action past its hard deadline".to_string(),
-            );
-        }
+    if now_ms >= env.expires_at_ms {
+        return PolicyDecision::deny(DenyReason::expired_action("action past its hard deadline"));
     }
     // Replay protection on (action_id, nonce).
     let envelope_nonce = format!("{}:{}", env.action_id, env.nonce);
-    let ttl = rfc3339_to_ms(&env.expires_at).map(|d| d.saturating_sub(now_ms).max(1));
-    if let Err(e) = nonces.check_and_insert(&envelope_nonce, now_ms, ttl.unwrap_or(60_000)) {
-        return deny(&action.digest, now_ms, format!("replay rejected: {e}"));
+    let ttl = env.expires_at_ms.saturating_sub(now_ms).max(1);
+    if let Err(e) = nonces.check_and_insert(&envelope_nonce, now_ms, ttl) {
+        return PolicyDecision::deny(DenyReason::replay_detected(format!("replay rejected: {e}")));
     }
     if env.lease_chain.is_empty() {
         return no_covering_lease(&action, env, outbox, params);
     }
+    let presented: Vec<String> = env.lease_chain.iter().map(|id| id.to_string()).collect();
     let chain = match validate_chain(
         lease_resolver,
-        &env.lease_chain,
+        &presented,
         revocations,
         sessions,
         keys,
@@ -1048,40 +1057,36 @@ pub fn authorize_envelope(
         now_ms,
     ) {
         Ok(c) => c,
-        Err(e) => return deny(&action.digest, now_ms, format!("lease chain invalid: {e}")),
+        Err(e) => return PolicyDecision::deny(deny_reason_for_chain_error(&e)),
     };
     let leaf = chain.leaf;
     // Single-use leases are consumed exactly once, at authorization time.
     if leaf.limits.single_use
         && let Err(e) = consume_single_use(&leaf, one_shot, now_ms)
     {
-        return deny(&action.digest, now_ms, format!("one-shot lease: {e}"));
+        let reason = match e {
+            LeaseError::AlreadyConsumed(id) => {
+                DenyReason::replay_detected(format!("one-shot lease {id} already consumed"))
+            }
+            _ => DenyReason::invalid_envelope(format!("one-shot lease: {e}")),
+        };
+        return PolicyDecision::deny(reason);
     }
     // The action's exact scope must be covered by the leaf lease.
     if let Err(e) = action.exact_scope().is_subset_of(&leaf.scope) {
-        return deny(
-            &action.digest,
-            now_ms,
-            format!("action not covered by lease: {e}"),
-        );
+        return PolicyDecision::deny(DenyReason::scope_exceeded(format!(
+            "action not covered by lease: {e}"
+        )));
     }
     // Fail fast when the lease has no execution budget left.
     let need = Budget::new().set(BudgetDimension::Executions, 1);
     match ledger.remaining(&leaf.lease_id) {
         Ok(remaining) if remaining.covers(&need) => {}
         _ => {
-            return deny(&action.digest, now_ms, "lease budget exhausted".to_string());
+            return PolicyDecision::deny(DenyReason::scope_exceeded("lease budget exhausted"));
         }
     }
-    PolicyDecision {
-        protocol_version: lumen_protocol::policy_decision::POLICY_DECISION_VERSION,
-        action_digest: action.digest,
-        decision: ProtocolDecision::Allow {
-            lease_id: leaf.lease_id,
-            obligations: vec![],
-        },
-        decided_at: ms_to_rfc3339(now_ms),
-    }
+    PolicyDecision::allow(vec![])
 }
 
 fn no_covering_lease(
@@ -1091,11 +1096,7 @@ fn no_covering_lease(
     params: &AuthorizeParams,
 ) -> PolicyDecision {
     if !params.allow_approval_fallback {
-        return deny(
-            &action.digest,
-            params.now_ms,
-            "no covering lease".to_string(),
-        );
+        return PolicyDecision::deny(DenyReason::no_lease("no covering lease"));
     }
     let req = VhlRequest {
         request_id: format!("vhl_{}", Uuid::new_v4()),
@@ -1106,15 +1107,7 @@ fn no_covering_lease(
     };
     let request_id = req.request_id.clone();
     outbox.push(req);
-    PolicyDecision {
-        protocol_version: lumen_protocol::policy_decision::POLICY_DECISION_VERSION,
-        action_digest: action.digest.clone(),
-        decision: ProtocolDecision::PendingApproval {
-            approval_request_id: request_id,
-            reason: "no covering lease; human approval requested".to_string(),
-        },
-        decided_at: ms_to_rfc3339(params.now_ms),
-    }
+    PolicyDecision::pending_approval(request_id, "no covering lease; human approval requested")
 }
 
 #[cfg(test)]
@@ -1397,24 +1390,34 @@ mod tests {
 
         // Build an action and its grant.
         let env = ActionEnvelope {
-            protocol_version: 1,
-            action_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            version: crate::pi_boundary::ACTION_ENVELOPE_VERSION,
+            action_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             session_id: "ed25519:parent-session".to_string(),
-            tool: lumen_protocol::ToolRef {
+            tool: crate::pi_boundary::ToolRef {
                 name: "fs.read".to_string(),
                 version: "1.2.3".to_string(),
             },
-            arguments: serde_json::json!({"path": "/workspace/README.md"}),
-            input_hashes: vec![],
-            resources: lumen_protocol::ResourceSet {
-                paths: vec!["/workspace/README.md".to_string()],
-                hosts: vec![],
-                secret_refs: vec![],
+            // The frozen contract requires integer-only arguments.
+            arguments: [("n".to_string(), serde_json::json!(1))].into_iter().collect(),
+            inputs: vec![],
+            resources: crate::pi_boundary::ResourceSet {
+                paths: vec![crate::pi_boundary::PathResource {
+                    path: "/workspace/README.md".to_string(),
+                    rights: crate::pi_boundary::PathRights::Read,
+                }],
+                network: vec![],
+                secrets: vec![],
+            },
+            expected_effects: crate::pi_boundary::EffectClasses {
+                file_read: true,
+                file_write: false,
+                network_egress: false,
+                network_ingress: false,
+                process_spawn: false,
             },
             lease_chain: vec![],
-            nonce: "env-nonce-1".to_string(),
-            expires_at: "2026-09-24T00:00:00Z".to_string(),
-            expected_effects: vec![EffectClass::Read],
+            nonce: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
+            expires_at_ms: 1_000_000,
         };
         let action = CanonicalAction::from_envelope(&env, &r, false).unwrap();
         let mut grant = OneShotGrant {
@@ -1439,7 +1442,9 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(one_shot.lease_id.clone(), one_shot.clone());
         let mut env2 = env.clone();
-        env2.lease_chain = vec![one_shot.lease_id.clone()];
+        env2.lease_chain = vec![crate::pi_boundary::LeaseId::from_uuid(
+            one_shot.lease_id.parse().expect("one-shot id is a UUID"),
+        )];
         let mut tracker: HashSet<String> = HashSet::new();
         let outbox: &mut Vec<VhlRequest> = &mut vec![];
         let params = AuthorizeParams {
@@ -1462,8 +1467,21 @@ mod tests {
             &params,
         );
         assert!(d1.is_allow());
-        d1.bind(&env2).unwrap();
-        // Second authorization replays the one-shot: denied.
+        // The frozen decision carries no digest; binding to the envelope
+        // happens at the wire layer.
+        let digest = env2.digest().unwrap();
+        let wire = crate::pi_boundary::KernelWireResponse {
+            protocol: crate::pi_boundary::KERNEL_WIRE_PROTOCOL.to_string(),
+            decision: Some(d1),
+            audit_sequence: Some(0),
+            action_digest: Some(digest.clone()),
+            error: None,
+        };
+        assert_eq!(wire.action_digest.as_deref(), Some(digest.as_str()));
+        assert!(wire.decision.expect("decision").is_allow());
+        // The one-shot is consumed exactly once, at authorization time.
+        assert!(tracker.contains(&one_shot.lease_id));
+        // Second authorization with the same envelope is rejected.
         let d2 = authorize_envelope(
             &env2,
             &r,
