@@ -415,6 +415,46 @@ async fn resolve_destination<U: DnsUpstream + 'static>(
     Ok(ip)
 }
 
+/// CONNECT carries no scheme; the port is the protocol hint. Map it to
+/// the scheme an allowlist entry would use for that protocol, so
+/// `CONNECT example.com:443` authorizes against `https://example.com:443`.
+/// An explicit `tcp://host:port` entry also authorizes a tunnel (the proxy
+/// cannot distinguish TLS from raw TCP inside a CONNECT anyway).
+fn connect_scheme(port: u16) -> &'static str {
+    match port {
+        443 => "https",
+        80 => "http",
+        _ => "tcp",
+    }
+}
+
+/// Authorize one guest request against the run's [`NetworkPolicy`].
+fn authorize(
+    policy: &crate::contracts::NetworkPolicy,
+    req: &ProxyRequest,
+) -> Result<network::EgressDestination, SandboxdError> {
+    if req.is_connect {
+        let hinted = connect_scheme(req.port);
+        // Try the port-hinted scheme first, then raw tcp: either entry
+        // expresses "this host:port may be tunneled". The deny flags inside
+        // `check_destination` still reject metadata/private/loopback even
+        // when listed.
+        match network::check_destination(policy, hinted, &req.host, req.port) {
+            ok @ Ok(_) => ok,
+            Err(first) => {
+                if hinted == "tcp" {
+                    Err(first)
+                } else {
+                    network::check_destination(policy, "tcp", &req.host, req.port)
+                }
+            }
+        }
+    } else {
+        network::check_destination(policy, &req.scheme, &req.host, req.port)
+    }
+}
+}
+
 /// Authorize + resolve + relay one guest connection.
 async fn handle_one<U: DnsUpstream + 'static>(
     mut guest: TcpStream,
@@ -444,7 +484,7 @@ async fn handle_one<U: DnsUpstream + 'static>(
             .map_err(|_| SandboxdError::Protocol("request head timeout".into()))??;
         req = parse_request(&head)?;
         // 1. Allowlist authorization (typed scheme/host/port).
-        let dest = network::check_destination(&cfg.network, &req.scheme, &req.host, req.port)?;
+        let dest = authorize(&cfg.network, &req)?;
         // 2. Resolution (literals skip DNS) + literal re-validation
         //    (defense in depth: even a compromised resolver path cannot
         //    smuggle a metadata/private address through).
@@ -731,5 +771,113 @@ mod tests {
         assert!(!log.contains("CONNECT"));
 
         server.abort();
+    }
+
+    /// CONNECT authorization against NetworkPolicy, no KVM, mock upstream.
+    ///
+    /// The standard HTTPS-proxy flow: a client fetching an `https://` URL
+    /// through a forward proxy opens `CONNECT host:443` (CONNECT carries no
+    /// scheme on the wire). An allowlist entry written as
+    /// `https://host:443` must authorize that tunnel — otherwise the
+    /// `https://` entries are dead for every real HTTPS client, which
+    /// always tunnels via CONNECT.
+    ///
+    /// Regression history: `parse_destination` used to reject every
+    /// `tcp://` entry (even with an explicit port), so CONNECT — which
+    /// `parse_request` labels `"tcp"` — could never be authorized, and the
+    /// `?` in `check_destination` let that one bad entry poison the whole
+    /// policy.
+    #[test]
+    fn connect_authorizes_against_network_policy() {
+        let connect = |raw: &[u8]| {
+            let req = parse_request(raw).unwrap();
+            assert!(req.is_connect);
+            req
+        };
+
+        // `tcp://host:port` entries authorize CONNECT tunnels.
+        let tcp_policy = policy(&["tcp://api.example.com:443"]);
+        assert!(
+            authorize(
+                &tcp_policy,
+                &connect(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")
+            )
+            .is_ok()
+        );
+
+        // `https://host:443` entries authorize CONNECT to :443 (the primary
+        // HTTPS use case); `http://host:80` likewise for :80.
+        let https_policy = policy(&["https://api.example.com:443"]);
+        assert!(
+            authorize(
+                &https_policy,
+                &connect(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")
+            )
+            .is_ok()
+        );
+        let http_policy = policy(&["http://api.example.com:80"]);
+        assert!(
+            authorize(
+                &http_policy,
+                &connect(b"CONNECT api.example.com:80 HTTP/1.1\r\n\r\n")
+            )
+            .is_ok()
+        );
+
+        // A `tcp://` entry no longer poisons the rest of the policy: the
+        // https:// absolute-form request still authorizes alongside it.
+        let mixed = policy(&["tcp://api.example.com:443", "https://api.example.com:443"]);
+        let abs = parse_request(b"GET https://api.example.com/a HTTP/1.1\r\n\r\n").unwrap();
+        assert!(!abs.is_connect);
+        assert!(authorize(&mixed, &abs).is_ok());
+        assert!(
+            authorize(
+                &mixed,
+                &connect(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")
+            )
+            .is_ok()
+        );
+
+        // Unlisted hosts, wrong ports, and scheme-mismatched ports deny.
+        assert!(
+            authorize(
+                &https_policy,
+                &connect(b"CONNECT evil.example:443 HTTP/1.1\r\n\r\n")
+            )
+            .is_err()
+        );
+        assert!(
+            authorize(
+                &https_policy,
+                &connect(b"CONNECT api.example.com:8443 HTTP/1.1\r\n\r\n")
+            )
+            .is_err()
+        );
+        assert!(
+            authorize(
+                &http_policy,
+                &connect(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")
+            )
+            .is_err()
+        );
+
+        // Deny flags still win even when the tunnel is listed: metadata
+        // and loopback never tunnel.
+        let listed_meta = policy(&["https://169.254.169.254:443"]);
+        assert!(
+            authorize(
+                &listed_meta,
+                &connect(b"CONNECT 169.254.169.254:443 HTTP/1.1\r\n\r\n")
+            )
+            .is_err()
+        );
+        let listed_loop = policy(&["tcp://127.0.0.1:443"]);
+        assert!(
+            authorize(
+                &listed_loop,
+                &connect(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n")
+            )
+            .is_err()
+        );
     }
 }

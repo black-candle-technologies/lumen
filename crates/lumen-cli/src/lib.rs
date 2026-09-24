@@ -389,8 +389,9 @@ pub struct PluginRevocationSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginActionRequest {
     pub run_id: RunId,
-    /// The pending approval the operator must decide (web UI / API) before
-    /// the action executes. `None` when no approval was created.
+    /// The pending approval the operator must decide (control-plane API;
+    /// the web approvals UI is not built yet — see docs/WEB_UI_FOLLOWUP.md)
+    /// before the action executes. `None` when no approval was created.
     pub approval_id: Option<String>,
 }
 
@@ -620,7 +621,7 @@ impl CommandOutput {
                     .as_ref()
                     .map(|id| format!("approval {id} is PENDING"))
                     .unwrap_or_else(|| "no approval was created".into()),
-                request.approval_id.as_ref().map(|_| "\nDecide it in the web UI approvals page or via the API; the action executes after approval.").unwrap_or("")
+                request.approval_id.as_ref().map(|_| "\nDecide it via the control-plane API (the web approvals UI is not built yet — see docs/WEB_UI_FOLLOWUP.md); the action executes after approval.").unwrap_or("")
             ),
             Self::ApprovalsListed(approvals) => {
                 let mut out = String::new();
@@ -1187,7 +1188,8 @@ async fn execute_plugin_command(
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
             // The request is approval-bound: the run parks awaiting the
             // operator's decision. The CLI must not drain-and-cancel it —
-            // the approval stays pending for the web UI / API.
+            // the approval stays pending for the operator to decide via the
+            // control-plane API (the web approvals UI is not built yet).
             let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
             CommandOutput::PluginActionRequested(PluginActionRequest {
                 run_id,
@@ -1233,7 +1235,8 @@ async fn execute_plugin_command(
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
             // The request is approval-bound: the run parks awaiting the
             // operator's decision. The CLI must not drain-and-cancel it —
-            // the approval stays pending for the web UI / API.
+            // the approval stays pending for the operator to decide via the
+            // control-plane API (the web approvals UI is not built yet).
             let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
             CommandOutput::PluginActionRequested(PluginActionRequest {
                 run_id,
@@ -1446,8 +1449,8 @@ async fn extension_action_proposal(
 /// Find the pending approval request for a run, if any.
 ///
 /// Approval-bound CLI requests park the run awaiting the operator's
-/// decision; this resolves the approval the operator must decide in the
-/// web UI or API.
+/// decision; this resolves the approval the operator must decide via the
+/// control-plane API (the web approvals UI is not built yet).
 async fn pending_approval_for_run(
     database: &Database,
     config: &Config,
