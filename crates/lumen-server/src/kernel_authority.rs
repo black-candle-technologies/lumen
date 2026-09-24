@@ -67,15 +67,22 @@
 //! `lumen-core/Cargo.toml`; the `kernel_keys_zeroize_on_drop` test pins the
 //! feature so it cannot be silently removed). They are never written to disk
 //! or logs. A kernel restart generates fresh keys, which the host must treat
-//! as a key rotation: leases signed by the previous issuer key no longer
-//! verify after restart (the durable lease rows remain for audit).
+//! as a key rotation: **retired generations' verifying keys are retained
+//! durably in `kernel_key_generations`, so leases minted under a retired
+//! issuer keep verifying after restart**; only the private keys die with the
+//! boot (zeroized on drop at rotation).
 //!
 //! Signatures that must survive a restart are keyed to their generation:
 //! every boot records its issuer/host verifying keys in the durable
-//! `kernel_key_generations` table, and [`AuthorityKernelClient::verify_kernel_audit`]
+//! `kernel_key_generations` table, and lease validation resolves each root
+//! document's `issuer_key_id` through the [`IssuerKeyResolver`]
+//! implementation over the in-memory generation index (hydrated at open),
+//! with the kill-list checked first. A generation that was killed
+//! (`kernel_killed_generations`) fails closed even though its verifying key
+//! remains recorded. [`AuthorityKernelClient::verify_kernel_audit`]
 //! resolves each checkpoint's signing key from those recorded generations,
-//! so retired generations' checkpoints keep verifying. A checkpoint that
-//! references an unknown generation fails closed.
+//! so retired generations' checkpoints keep verifying. A checkpoint or lease
+//! that references an unknown generation fails closed.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -86,15 +93,18 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::VerifyingKey;
 use lumen_core::budget::{Budget, BudgetLedger};
 use lumen_core::canonical::{RealFsResolver, ResourceScope};
-use lumen_core::identity::WorkspaceId;
+use lumen_core::identity::{PrincipalId, WorkspaceId};
 use lumen_core::kernel_audit::{AuditLink, verify_event_chain};
 use lumen_core::lease::{
-    AuthorizeParams, CanonicalAction, KernelKeys, LeaseDocument as CoreLeaseDocument,
+    AuthorizeParams, CanonicalAction, DEFAULT_SESSION_MAX_LIFETIME_MS, IssuerKeyResolver,
+    KernelKeys, LeaseDocument as CoreLeaseDocument, LeaseError,
     LeaseLimits as CoreLeaseLimits, LeaseResolver, OneShotGrant as CoreOneShotGrant,
     OneShotTracker, RevocationIndex, RootLeaseParams, SessionRegistry, VhlRequest,
-    authorize_envelope, mint_one_shot_lease, mint_root_lease,
+    authorize_envelope, mint_one_shot_lease, mint_root_lease, validate_chain,
+};
 };
 use lumen_core::nonce::NonceStore;
+use lumen_core::operator::{AuthorityRequest, OperatorAuthorityPort, OperatorOperation};
 use lumen_core::pi_boundary;
 use lumen_core::pi_boundary::{
     ActionEnvelope as FrozenEnvelope, AuditEventKind, DecisionOutcome, DenyReason,
@@ -102,13 +112,15 @@ use lumen_core::pi_boundary::{
 };
 use lumen_core::session_identity::SessionIdentityVault;
 use lumen_core::vhl::{ApprovalKind, VhlApprovalRequest};
-use lumen_db::lease::{KernelAuditAppend, KernelAuditQuery};
+use lumen_db::lease::{KernelAuditAppend, KernelAuditQuery, PurgeOutcome};
 use lumen_db::{Database, RepositoryError};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::kernel_client::{
-    ActionEnvelope, AuditEvent, AuditRef, KernelClient, KernelError, KernelFuture, LeaseDocument,
-    LeaseLimits, LeaseVerification, OneShotGrant, PolicyDecision, SessionEndReport,
-    SessionIdentityAuthority, SessionIdentityInfo, now_ms,
+    ActionEnvelope, AuditEvent, AuditRef, KernelClient, KernelError, KernelFuture, KeyPurgeReport,
+    KeyRotationReport, LeaseDocument, LeaseLimits, LeaseVerification, OneShotGrant, PolicyDecision,
+    SessionEndReport, SessionIdentityAuthority, SessionIdentityInfo, now_ms,
 };
 use crate::kernel_convert::{to_frozen_envelope, to_host_decision};
 
@@ -138,6 +150,12 @@ pub struct AuthorityKernelConfig {
     /// Whether the filesystem is case-insensitive (macOS/Windows
     /// canonicalization).
     pub case_insensitive_fs: bool,
+    /// Operator authority for key-custody control-plane operations
+    /// (rotation, kill, purge). `None` denies all of them.
+    pub operator_authority: Option<std::sync::Arc<dyn OperatorAuthorityPort>>,
+    /// Session max lifetime: sessions older than this are destroyed
+    /// durably at open (spec §6.3). Defaults to 24h.
+    pub session_max_lifetime_ms: Option<i64>,
 }
 
 impl AuthorityKernelConfig {
@@ -150,6 +168,8 @@ impl AuthorityKernelConfig {
             vhl_keys: HashMap::new(),
             approval_ttl_ms: 15 * 60 * 1000,
             case_insensitive_fs: false,
+            operator_authority: None,
+            session_max_lifetime_ms: Some(DEFAULT_SESSION_MAX_LIFETIME_MS),
         }
     }
 }
@@ -176,11 +196,92 @@ pub struct PendingApprovalView {
     pub expires_at_ms: i64,
 }
 
+/// Recorded kernel key generations, hydrated from
+/// `kernel_key_generations` at open plus every boot's fresh generation.
+/// All recorded generations (current and retired) live here so lease
+/// validation can resolve retired issuers; only the *current* generation's
+/// private keys exist (in [`KernelMutable::keys`], never persisted).
+#[derive(Clone, Debug, Default)]
+pub struct GenerationIndex {
+    /// ALL recorded issuer generations including the current one,
+    /// `key_id -> verifying key`.
+    pub issuer: HashMap<String, VerifyingKey>,
+    /// ALL recorded host generations including the current one.
+    pub host: HashMap<String, VerifyingKey>,
+    /// Killed generation ids (compromise response; fail closed).
+    pub killed: HashSet<String>,
+    /// `key_id -> created_at_ms` for every recorded generation.
+    pub created_at_ms: HashMap<String, i64>,
+}
+
+/// Point-in-time issuer-key view for lease validation: the resolver the
+/// phase-1 `validate_chain` and the envelope path consult so retired
+/// generations keep verifying after a restart.
+#[derive(Clone, Default)]
+struct IssuerKeySnapshot {
+    keys: HashMap<String, VerifyingKey>,
+    killed: HashSet<String>,
+}
+
+impl IssuerKeyResolver for IssuerKeySnapshot {
+    fn issuer_verifying_key(&self, key_id: &str) -> Option<VerifyingKey> {
+        self.keys.get(key_id).cloned()
+    }
+    fn is_generation_killed(&self, key_id: &str) -> bool {
+        self.killed.contains(key_id)
+    }
+}
+
+/// Host-generation retention for the purge pass: one year, per the
+/// approved audit-retention default (spec §9.4). Host generations younger
+/// than this are never purge candidates, on top of the checkpoint rule
+/// the store enforces.
+pub const HOST_GENERATION_RETENTION_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+/// SHA-256 hex fingerprint of a verifying key (public fingerprint for
+/// audit correlation, not key material).
+fn verifying_key_sha256_hex(vk: &VerifyingKey) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(vk.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Parse one recorded verifying key (a key generation row or a session
+/// row). Any malformed key (bad hex, wrong length, bad point) fails the
+/// open: hydrating an index with a corrupt key would silently break
+/// verification (startup tamper detection, spec §8.13).
+fn parse_recorded_verifying_key(
+    what: &str,
+    id: &str,
+    verifying_key_hex: &str,
+) -> Result<VerifyingKey, KernelError> {
+    let corrupt = |detail: String| {
+        KernelError::Unavailable(format!(
+            "recorded {what} '{id}' verifying key is corrupt ({detail}); refusing to hydrate"
+        ))
+    };
+    let bytes = hex::decode(verifying_key_hex).map_err(|e| corrupt(e.to_string()))?;
+    let raw: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| corrupt("bad length".to_string()))?;
+    VerifyingKey::from_bytes(&raw).map_err(|e| corrupt(e.to_string()))
+}
+
 /// Mutable kernel state behind one mutex. The mutex is held across
 /// `authorize_envelope` (which also performs durable IO through the
 /// adapters below on the kernel's private runtime): the adapters never
 /// touch this mutex, so there is no lock cycle.
+///
+/// `keys` lives here (not on [`AuthorityKernel`]) so rotation can swap it
+/// under the same lock that guards the generation index — no second lock,
+/// no lock-ordering hazards.
 struct KernelMutable {
+    /// The current boot's (or the latest rotation's) kernel keys. The
+    /// private keys exist only here; dropping replaces them (zeroized).
+    keys: KernelKeys,
+    /// Recorded issuer/host generations (current + retired) and the
+    /// kill set.
+    generations: GenerationIndex,
     sessions: SessionRegistry,
     vault: SessionIdentityVault,
     revocations: RevocationIndex,
@@ -196,10 +297,20 @@ struct KernelMutable {
     destroyed: HashMap<String, Vec<String>>,
 }
 
+impl KernelMutable {
+    /// Build the point-in-time issuer view validation uses. The maps are
+    /// cloned so the resolver never holds the state lock.
+    fn issuer_snapshot(&self) -> IssuerKeySnapshot {
+        IssuerKeySnapshot {
+            keys: self.generations.issuer.clone(),
+            killed: self.generations.killed.clone(),
+        }
+    }
+}
+
 /// The synchronous authority core. All public async entry points funnel
 /// through `spawn_blocking` into these `*_sync` methods.
 pub struct AuthorityKernel {
-    keys: KernelKeys,
     fs: RealFsResolver,
     nonces: NonceStore,
     ledger: BudgetLedger,
@@ -209,10 +320,7 @@ pub struct AuthorityKernel {
     /// on blocking workers outside any async context. `None` after the
     /// kernel is dropped (see `Drop`).
     rt: Option<tokio::runtime::Runtime>,
-    workspace: WorkspaceId,
-    vhl_keys: HashMap<String, VerifyingKey>,
-    approval_ttl_ms: i64,
-    case_insensitive_fs: bool,
+    config: AuthorityKernelConfig,
 }
 
 impl Drop for AuthorityKernel {
@@ -251,7 +359,7 @@ impl AuthorityKernel {
         F: FnOnce(&'s Database, &'s WorkspaceId) -> Fut,
         Fut: Future<Output = Result<T, RepositoryError>> + 's,
     {
-        let fut = make(&self.db, &self.workspace);
+        let fut = make(&self.db, &self.config.workspace);
         self.rt
             .as_ref()
             .expect("kernel runtime used after drop")
@@ -261,10 +369,565 @@ impl AuthorityKernel {
     fn authorize_params(&self, now: i64) -> AuthorizeParams {
         AuthorizeParams {
             now_ms: now,
-            case_insensitive_fs: self.case_insensitive_fs,
+            case_insensitive_fs: self.config.case_insensitive_fs,
             allow_approval_fallback: true,
-            approval_ttl_ms: self.approval_ttl_ms,
+            approval_ttl_ms: self.config.approval_ttl_ms,
         }
+    }
+
+    /// Gate a key-custody control-plane operation on the configured
+    /// operator authority. No authority configured, or a deny, fails
+    /// closed with [`KernelError::OperatorDenied`].
+    async fn authorize_operator(
+        &self,
+        actor: &PrincipalId,
+        op: OperatorOperation,
+    ) -> Result<(), KernelError> {
+        let authority = self.config.operator_authority.clone().ok_or_else(|| {
+            KernelError::OperatorDenied("no operator authority configured".into())
+        })?;
+        let req = AuthorityRequest {
+            workspace_id: self.config.workspace,
+            actor: actor.clone(),
+            operation: op,
+            orchestration_id: None,
+        };
+        if authority
+            .authorize(&req)
+            .await
+            .map_err(|e| KernelError::Unavailable(e.to_string()))?
+        {
+            Ok(())
+        } else {
+            Err(KernelError::OperatorDenied(format!(
+                "operator {:?} denied {op:?}",
+                req.actor
+            )))
+        }
+    }
+
+    /// Boot tail (spec §4.2): generation hydration, fresh-generation
+    /// recording, session TTL expiry, session hydration, boot audit, the
+    /// re-validation self-check, and the purge pass. Runs on a blocking
+    /// worker; the state mutex is never held across audit or db calls.
+    fn boot_sequence_sync(&self) -> Result<(), KernelError> {
+        let now = now_ms();
+        let boot_id = format!("boot-{}", Uuid::new_v4());
+        let max_lifetime = self.config.session_max_lifetime_ms;
+        let ttl = max_lifetime.unwrap_or(DEFAULT_SESSION_MAX_LIFETIME_MS);
+
+        // 1. Load recorded generations + kill set into the in-memory
+        //    index. A malformed recorded key fails the open rather than
+        //    hydrating a corrupt index.
+        let rows = self.db_run(|db, ws| db.kernel_key_generations(ws))?;
+        let killed = self.db_run(|db, ws| db.killed_key_generation_ids(ws))?;
+        {
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            for row in &rows {
+                let vk = parse_recorded_verifying_key(
+                    "generation",
+                    &row.key_id,
+                    &row.verifying_key_hex,
+                )?;
+                match row.role.as_str() {
+                    "issuer" => {
+                        state.generations.issuer.insert(row.key_id.clone(), vk);
+                    }
+                    "host" => {
+                        state.generations.host.insert(row.key_id.clone(), vk);
+                    }
+                    other => {
+                        return Err(KernelError::Unavailable(format!(
+                            "recorded key generation '{}' has unknown role {other:?}; refusing to hydrate",
+                            row.key_id
+                        )));
+                    }
+                }
+                state
+                    .generations
+                    .created_at_ms
+                    .insert(row.key_id.clone(), row.created_at_ms);
+            }
+            state.generations.killed = killed;
+        }
+
+        // 2. Record this boot's fresh generation and insert it into the
+        //    index. The previous issuer generation is the recorded issuer
+        //    row (excluding the new id) with the latest created_at_ms;
+        //    count its live refs for the retirement audit event.
+        let (new_issuer_id, new_host_id, new_issuer_vk, new_host_vk, prev_issuer) = {
+            let state = self.state.lock().expect("kernel state mutex poisoned");
+            let new_issuer_id = state.keys.issuer_key_id.clone();
+            let prev_issuer = state
+                .generations
+                .issuer
+                .keys()
+                .filter(|id| id.as_str() != new_issuer_id)
+                .max_by_key(|id| {
+                    state
+                        .generations
+                        .created_at_ms
+                        .get(*id)
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .cloned();
+            (
+                new_issuer_id,
+                state.keys.host_key_id.clone(),
+                state.keys.issuer_verifying(),
+                state.keys.host_verifying(),
+                prev_issuer,
+            )
+        };
+        let new_issuer_hex = hex::encode(new_issuer_vk.to_bytes());
+        let new_host_hex = hex::encode(new_host_vk.to_bytes());
+        self.db_run(|db, ws| {
+            db.record_kernel_key_generation(ws, &new_issuer_id, "issuer", &new_issuer_hex, now)
+        })?;
+        self.db_run(|db, ws| {
+            db.record_kernel_key_generation(ws, &new_host_id, "host", &new_host_hex, now)
+        })?;
+        {
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            state
+                .generations
+                .issuer
+                .insert(new_issuer_id.clone(), new_issuer_vk);
+            state
+                .generations
+                .host
+                .insert(new_host_id.clone(), new_host_vk);
+            state
+                .generations
+                .created_at_ms
+                .insert(new_issuer_id.clone(), now);
+            state
+                .generations
+                .created_at_ms
+                .insert(new_host_id.clone(), now);
+        }
+        let prev_issuer_live_refs = match &prev_issuer {
+            Some(id) => self.db_run(|db, ws| db.live_lease_refs_to_generation(ws, id, now))?,
+            None => 0,
+        };
+
+        // 3. Session TTL: destroy-transition every session older than the
+        //    max lifetime, and revoke its leases durably (spec §6.3).
+        let expired = self.db_run(|db, ws| db.expire_kernel_sessions(ws, ttl, now))?;
+        for subject in &expired {
+            let ids = self.db_run(|db, ws| db.kernel_lease_ids_for_subject(ws, subject))?;
+            self.db_run(|db, ws| {
+                db.destroy_sessions_and_revoke(
+                    ws,
+                    std::slice::from_ref(subject),
+                    &ids,
+                    now,
+                    "session TTL expired",
+                )
+            })?;
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            for id in &ids {
+                state.revocations.revoke(id);
+            }
+            state.sessions.deactivate(subject);
+        }
+
+        // 4. Hydrate the session registry from active rows
+        //    (validating-only: the vault stays empty, D2).
+        let active = self.db_run(|db, ws| db.active_kernel_sessions(ws))?;
+        {
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            state.sessions.set_max_lifetime(max_lifetime);
+            for row in &active {
+                let vk =
+                    parse_recorded_verifying_key("session", &row.subject, &row.verifying_key_hex)?;
+                state.sessions.register(
+                    row.subject.clone(),
+                    row.parent_subject.clone(),
+                    vk,
+                    row.created_at_ms,
+                );
+            }
+        }
+
+        // 5. Boot audit events (signed by the new host key).
+        let recorded = |key_id: &str, role: &str, vk: &VerifyingKey| {
+            serde_json::json!({
+                "host_kind": "kernel.key_generation.recorded",
+                "key_id": key_id,
+                "role": role,
+                "verifying_key_sha256": verifying_key_sha256_hex(vk),
+                "boot_id": boot_id,
+                "at_ms": now,
+            })
+        };
+        self.audit_event_sync(
+            "kernel",
+            AuditEventKind::ActionProposed,
+            "kernel",
+            "kernel.key_generation.recorded",
+            None,
+            now,
+            recorded(&new_issuer_id, "issuer", &new_issuer_vk),
+        )
+        .map(|_| ())?;
+        self.audit_event_sync(
+            "kernel",
+            AuditEventKind::ActionProposed,
+            "kernel",
+            "kernel.key_generation.recorded",
+            None,
+            now,
+            recorded(&new_host_id, "host", &new_host_vk),
+        )
+        .map(|_| ())?;
+        if let Some(prev_id) = &prev_issuer {
+            self.audit_event_sync(
+                "kernel",
+                AuditEventKind::ActionProposed,
+                "kernel",
+                "kernel.key_generation.retired",
+                None,
+                now,
+                serde_json::json!({
+                    "host_kind": "kernel.key_generation.retired",
+                    "key_id": prev_id,
+                    "role": "issuer",
+                    "live_lease_refs": prev_issuer_live_refs,
+                    "at_ms": now,
+                }),
+            )
+            .map(|_| ())?;
+        }
+        self.audit_event_sync(
+            "kernel",
+            AuditEventKind::ActionProposed,
+            "kernel",
+            "kernel.session.restored",
+            None,
+            now,
+            serde_json::json!({
+                "host_kind": "kernel.session.restored",
+                "count": active.len(),
+                "at_ms": now,
+            }),
+        )
+        .map(|_| ())?;
+
+        // 6. Re-validation self-check: every live lease's chain must
+        //    verify against the generation snapshot. A signature mismatch
+        //    against a *known* generation is tamper evidence and fails the
+        //    open; unknown generations are counted (expected for
+        //    pre-migration leases, spec §7 — not tamper).
+        let leases = self.db_run(|db, ws| db.kernel_live_leases(ws, now))?;
+        let mut verified_ok: u64 = 0;
+        let mut unknown_generation: u64 = 0;
+        {
+            let state = self.state.lock().expect("kernel state mutex poisoned");
+            let snapshot = state.issuer_snapshot();
+            let db_resolver = DbLeaseResolver {
+                kernel: self,
+                store_error: Cell::new(None),
+            };
+            let one_shot: HashSet<String> = HashSet::new();
+            for lease in &leases {
+                // Walk the chain to the root via the resolver (cap 64
+                // hops against corrupt data); `validate_chain` re-walks
+                // and requires the presented chain to match exactly.
+                let mut chain_ids = vec![lease.lease_id.clone()];
+                let mut parent = lease.parent_id.clone();
+                for _ in 0..64 {
+                    let Some(pid) = parent else { break };
+                    chain_ids.push(pid.clone());
+                    parent = db_resolver.lease(&pid).and_then(|d| d.parent_id);
+                }
+                match validate_chain(
+                    &db_resolver,
+                    &chain_ids,
+                    &state.revocations,
+                    &state.sessions,
+                    &snapshot,
+                    &one_shot,
+                    now,
+                ) {
+                    Ok(_)
+                    | Err(LeaseError::AlreadyConsumed(_))
+                    | Err(LeaseError::KilledIssuerGeneration(_)) => {
+                        verified_ok += 1;
+                    }
+                    Err(LeaseError::UnknownIssuerGeneration(_)) => {
+                        unknown_generation += 1;
+                    }
+                    Err(e) => {
+                        return Err(KernelError::Unavailable(format!(
+                            "startup re-validation failed for lease {}: {e}",
+                            lease.lease_id
+                        )));
+                    }
+                }
+            }
+            if let Some(store_error) = db_resolver.take_store_error() {
+                return Err(KernelError::Unavailable(format!(
+                    "startup re-validation hit a store failure: {store_error}"
+                )));
+            }
+        }
+        self.audit_event_sync(
+            "kernel",
+            AuditEventKind::ActionProposed,
+            "kernel",
+            "kernel.restart.revalidation",
+            None,
+            now,
+            serde_json::json!({
+                "host_kind": "kernel.restart.revalidation",
+                "live_leases": leases.len(),
+                "verified_ok": verified_ok,
+                "unknown_generation": unknown_generation,
+                "tamper_failures": 0,
+                "at_ms": now,
+            }),
+        )
+        .map(|_| ())?;
+
+        // 7. Purge pass for eligible retired generations.
+        let _ = self.purge_pass_sync(now)?;
+        Ok(())
+    }
+
+    /// Purge retired generations: every recorded generation except the
+    /// current issuer/host ids is a candidate. Issuer generations need
+    /// zero live lease refs; host generations additionally need age
+    /// beyond [`HOST_GENERATION_RETENTION_MS`] (the store itself refuses
+    /// host generations with retained checkpoints). The delete runs
+    /// through the store's guarded permit path; the in-memory index is
+    /// kept in sync and each purge is audited.
+    fn purge_pass_sync(&self, now: i64) -> Result<KeyPurgeReport, KernelError> {
+        // Snapshot the candidates under the lock; the db calls run
+        // lock-free.
+        let candidates: Vec<(String, String)> = {
+            let state = self.state.lock().expect("kernel state mutex poisoned");
+            let mut candidates = Vec::new();
+            for id in state.generations.issuer.keys() {
+                if *id != state.keys.issuer_key_id {
+                    candidates.push((id.clone(), "issuer".to_string()));
+                }
+            }
+            for id in state.generations.host.keys() {
+                if *id == state.keys.host_key_id {
+                    continue;
+                }
+                let created = state
+                    .generations
+                    .created_at_ms
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0);
+                if created >= now - HOST_GENERATION_RETENTION_MS {
+                    continue;
+                }
+                candidates.push((id.clone(), "host".to_string()));
+            }
+            candidates
+        };
+        let mut report = KeyPurgeReport::default();
+        for (key_id, role) in candidates {
+            let refs = self.db_run(|db, ws| db.live_lease_refs_to_generation(ws, &key_id, now))?;
+            if refs != 0 {
+                report.skipped_live.push(key_id);
+                continue;
+            }
+            match self.db_run_typed(|db, ws| {
+                db.purge_key_generation(ws, &key_id, now, HOST_GENERATION_RETENTION_MS)
+            }) {
+                Ok(PurgeOutcome::Purged) => {
+                    {
+                        let mut state = self.state.lock().expect("kernel state mutex poisoned");
+                        if role == "issuer" {
+                            state.generations.issuer.remove(&key_id);
+                        } else {
+                            state.generations.host.remove(&key_id);
+                        }
+                        state.generations.created_at_ms.remove(&key_id);
+                    }
+                    let at = now_ms();
+                    self.audit_event_sync(
+                        "kernel",
+                        AuditEventKind::ActionProposed,
+                        "kernel",
+                        "kernel.key_generation.purged",
+                        None,
+                        at,
+                        serde_json::json!({
+                            "host_kind": "kernel.key_generation.purged",
+                            "key_id": key_id,
+                            "role": role,
+                            "at_ms": at,
+                        }),
+                    )
+                    .map(|_| ())?;
+                    report.purged.push(key_id);
+                }
+                Ok(PurgeOutcome::StillReferenced) | Ok(PurgeOutcome::NotFound) => {}
+                // Host retention refusal (retained checkpoints): the
+                // generation stays; not an open failure.
+                Err(RepositoryError::InvalidKernelLeaseState(_)) => {}
+                Err(e) => {
+                    return Err(KernelError::Unavailable(format!(
+                        "kernel store: purge of generation {key_id} failed: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Mid-boot emergency rotation: generate fresh keys, record both
+    /// generations, swap them in (the old `KernelKeys` drops here, its
+    /// private keys zeroized), update the index, and audit. Retired
+    /// generations' verifying keys stay recorded, so outstanding leases
+    /// keep verifying.
+    fn rotate_issuer_keys_sync(&self, reason: &str) -> Result<KeyRotationReport, KernelError> {
+        let now = now_ms();
+        let new_keys = KernelKeys::generate();
+        let new_issuer_id = new_keys.issuer_key_id.clone();
+        let new_host_id = new_keys.host_key_id.clone();
+        let new_issuer_vk = new_keys.issuer_verifying();
+        let new_host_vk = new_keys.host_verifying();
+        let new_issuer_hex = hex::encode(new_issuer_vk.to_bytes());
+        let new_host_hex = hex::encode(new_host_vk.to_bytes());
+        self.db_run(|db, ws| {
+            db.record_kernel_key_generation(ws, &new_issuer_id, "issuer", &new_issuer_hex, now)
+        })?;
+        self.db_run(|db, ws| {
+            db.record_kernel_key_generation(ws, &new_host_id, "host", &new_host_hex, now)
+        })?;
+        // Swap under the state lock: the old KernelKeys drops here and
+        // its private keys are zeroized by ZeroizeOnDrop.
+        let (old_issuer_id, old_host_id) = {
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            let old_issuer_id = state.keys.issuer_key_id.clone();
+            let old_host_id = state.keys.host_key_id.clone();
+            state.keys = new_keys;
+            state
+                .generations
+                .issuer
+                .insert(new_issuer_id.clone(), new_issuer_vk);
+            state
+                .generations
+                .host
+                .insert(new_host_id.clone(), new_host_vk);
+            state
+                .generations
+                .created_at_ms
+                .insert(new_issuer_id.clone(), now);
+            state
+                .generations
+                .created_at_ms
+                .insert(new_host_id.clone(), now);
+            (old_issuer_id, old_host_id)
+        };
+        let live_refs =
+            self.db_run(|db, ws| db.live_lease_refs_to_generation(ws, &old_issuer_id, now))?;
+        let rotation_id = format!("rotation-{}", Uuid::new_v4());
+        for (key_id, role, vk) in [
+            (&new_issuer_id, "issuer", new_issuer_vk),
+            (&new_host_id, "host", new_host_vk),
+        ] {
+            self.audit_event_sync(
+                "kernel",
+                AuditEventKind::ActionProposed,
+                "kernel",
+                "kernel.key_generation.recorded",
+                None,
+                now,
+                serde_json::json!({
+                    "host_kind": "kernel.key_generation.recorded",
+                    "key_id": key_id,
+                    "role": role,
+                    "verifying_key_sha256": verifying_key_sha256_hex(&vk),
+                    "boot_id": rotation_id,
+                    "reason": reason,
+                    "at_ms": now,
+                }),
+            )
+            .map(|_| ())?;
+        }
+        self.audit_event_sync(
+            "kernel",
+            AuditEventKind::ActionProposed,
+            "kernel",
+            "kernel.key_generation.retired",
+            None,
+            now,
+            serde_json::json!({
+                "host_kind": "kernel.key_generation.retired",
+                "key_id": old_issuer_id,
+                "role": "issuer",
+                "live_lease_refs": live_refs,
+                "reason": reason,
+                "at_ms": now,
+            }),
+        )
+        .map(|_| ())?;
+        Ok(KeyRotationReport {
+            old_issuer_key_id: old_issuer_id,
+            new_issuer_key_id: new_issuer_id,
+            old_host_key_id: old_host_id,
+            new_host_key_id: new_host_id,
+            live_lease_refs_on_old_issuer: live_refs,
+        })
+    }
+
+    /// Kill a generation (compromise response): record it in the durable
+    /// kill-list and the in-memory kill set; verification fails closed
+    /// for it from here on. The current generation cannot be killed
+    /// (rotate first).
+    fn kill_key_generation_sync(
+        &self,
+        key_id: &str,
+        role: &str,
+        reason: &str,
+    ) -> Result<bool, KernelError> {
+        if role != "issuer" && role != "host" {
+            return Err(KernelError::Unavailable(format!(
+                "kill_key_generation: invalid role {role:?}"
+            )));
+        }
+        {
+            let state = self.state.lock().expect("kernel state mutex poisoned");
+            if key_id == state.keys.issuer_key_id || key_id == state.keys.host_key_id {
+                return Err(KernelError::Unavailable(
+                    "cannot kill the current generation; rotate first".to_string(),
+                ));
+            }
+        }
+        let now = now_ms();
+        let killed = self.db_run(|db, ws| db.kill_key_generation(ws, key_id, role, now, reason))?;
+        if killed {
+            {
+                let mut state = self.state.lock().expect("kernel state mutex poisoned");
+                state.generations.killed.insert(key_id.to_string());
+            }
+            self.audit_event_sync(
+                "kernel",
+                AuditEventKind::ActionProposed,
+                "kernel",
+                "kernel.key_generation.killed",
+                None,
+                now,
+                serde_json::json!({
+                    "host_kind": "kernel.key_generation.killed",
+                    "key_id": key_id,
+                    "role": role,
+                    "reason": reason,
+                    "at_ms": now,
+                }),
+            )
+            .map(|_| ())?;
+        }
+        Ok(killed)
     }
 
     /// Evaluate one envelope against the real phase-1 kernel and audit
@@ -277,15 +940,18 @@ impl AuthorityKernel {
         // envelopes never burn a nonce (mirrors authorize_envelope's own
         // ordering: canonicalization, expiry, then the nonce check). A
         // canonicalization failure is a deny, not a kernel error.
-        let action =
-            match CanonicalAction::from_envelope(&frozen, &self.fs, self.case_insensitive_fs) {
-                Ok(action) => action,
-                Err(e) => {
-                    let reason = DenyReason::invalid_envelope(e.to_string());
-                    let _ = self.audit_decision(&frozen, "deny", &reason);
-                    return to_host_decision(&FrozenDecision::deny(reason), envelope);
-                }
-            };
+        let action = match CanonicalAction::from_envelope(
+            &frozen,
+            &self.fs,
+            self.config.case_insensitive_fs,
+        ) {
+            Ok(action) => action,
+            Err(e) => {
+                let reason = DenyReason::invalid_envelope(e.to_string());
+                let _ = self.audit_decision(&frozen, "deny", &reason);
+                return to_host_decision(&FrozenDecision::deny(reason), envelope);
+            }
+        };
         if frozen.expires_at_ms <= now {
             let reason = DenyReason::expired_action("action expired".to_string());
             let _ = self.audit_decision(&frozen, "deny", &reason);
@@ -309,7 +975,13 @@ impl AuthorityKernel {
 
         // Evaluate against the real kernel. The resolver and one-shot
         // tracker consult the durable store; the in-memory structures are
-        // hot caches over the same rows.
+        // hot caches over the same rows. Issuer keys resolve through the
+        // point-in-time generation snapshot (current + retired), not the
+        // live keys: retired generations keep verifying after restart.
+        let issuer_snapshot = {
+            let state = self.state.lock().expect("kernel state mutex poisoned");
+            state.issuer_snapshot()
+        };
         let decision = {
             let mut guard = self.state.lock().expect("kernel state mutex poisoned");
             // Split the state into disjoint borrows up front: the
@@ -341,7 +1013,7 @@ impl AuthorityKernel {
                 &lease_resolver,
                 revocations,
                 sessions,
-                &self.keys,
+                &issuer_snapshot,
                 &mut one_shot,
                 &self.nonces,
                 &self.ledger,
@@ -384,7 +1056,7 @@ impl AuthorityKernel {
                 &action,
                 &frozen,
                 1,
-                self.approval_ttl_ms,
+                self.config.approval_ttl_ms,
                 now,
             )
             .map_err(|e| KernelError::Unavailable(format!("approval request: {e}")))?;
@@ -393,7 +1065,7 @@ impl AuthorityKernel {
             // nonce, and one expiry.
             approval.request_id = approval_id.clone();
             approval.nonce = frozen.nonce.clone();
-            approval.expires_at_ms = now.saturating_add(self.approval_ttl_ms);
+            approval.expires_at_ms = now.saturating_add(self.config.approval_ttl_ms);
             let expires_at_ms = approval.expires_at_ms;
             self.db_run(|db, ws| db.vhl_insert_request(ws, &approval))?;
             let mut state = self.state.lock().expect("kernel state mutex poisoned");
@@ -512,7 +1184,12 @@ impl AuthorityKernel {
                 chain_hash: event.hash.clone(),
                 signature: String::new(),
             };
-            link.sign(&self.keys);
+            // Sign under the state lock (keys live in KernelMutable);
+            // the guard is dropped before the checkpoint write below.
+            {
+                let state = self.state.lock().expect("kernel state mutex poisoned");
+                link.sign(&state.keys);
+            }
             db.checkpoint_kernel_audit(ws, &link, timestamp_ms).await?;
             Ok(event)
         })
@@ -553,11 +1230,30 @@ impl AuthorityKernel {
                 lease.lease_id
             )));
         }
-        // Signature: root and VHL one-shot leases verify under the kernel
-        // issuer key; child leases under the parent session's key. The
-        // check runs over the presented document, not a stored copy.
-        let key: VerifyingKey = if presented.is_root() {
-            self.keys.issuer_verifying()
+        // Signature: root and VHL one-shot leases verify under the
+        // issuer generation named in `issuer_key_id` (current or
+        // retired), resolved through the generation snapshot with the
+        // kill-list checked first; child leases under the parent
+        // session's key.
+        let key: VerifyingKey = if stored.is_root() {
+            let snapshot = {
+                let state = self.state.lock().expect("kernel state mutex poisoned");
+                state.issuer_snapshot()
+            };
+            if snapshot.is_generation_killed(&stored.issuer_key_id) {
+                return Err(KernelError::VerificationFailed(format!(
+                    "issuer generation {} was killed",
+                    stored.issuer_key_id
+                )));
+            }
+            snapshot
+                .issuer_verifying_key(&stored.issuer_key_id)
+                .ok_or_else(|| {
+                    KernelError::VerificationFailed(format!(
+                        "unknown issuer generation {}",
+                        stored.issuer_key_id
+                    ))
+                })?
         } else {
             let state = self.state.lock().expect("kernel state mutex poisoned");
             state
@@ -681,6 +1377,7 @@ impl AuthorityKernel {
         // 2. The grant signature must verify against an enrolled human
         //    VHL key.
         let vhl_key = self
+            .config
             .vhl_keys
             .get(&core_grant.signer_key_id)
             .ok_or_else(|| {
@@ -733,7 +1430,7 @@ impl AuthorityKernel {
                 &core_grant,
                 vhl_key,
                 &pending.action,
-                &self.keys,
+                &state.keys,
                 &state.sessions,
                 &self.ledger,
                 &self.nonces,
@@ -851,7 +1548,7 @@ impl AuthorityKernel {
             let state = self.state.lock().expect("kernel state mutex poisoned");
             mint_root_lease(
                 params,
-                &self.keys,
+                &state.keys,
                 &state.sessions,
                 &self.ledger,
                 &self.nonces,
@@ -877,6 +1574,29 @@ impl AuthorityKernel {
                 .start_session(sessions, parent.map(str::to_string), now)
                 .map_err(|e| KernelError::Unavailable(format!("identity mint failed: {e}")))?
         };
+        // Durable session registry: public identity only (subject,
+        // parent, verifying key, liveness). Private keys stay in the
+        // vault. On a store failure the vault session is rolled back
+        // (best-effort) so memory and store cannot disagree about the
+        // session's existence.
+        if let Err(e) = self.db_run(|db, ws| {
+            db.insert_kernel_session(
+                ws,
+                &receipt.subject,
+                receipt.parent_subject.as_deref(),
+                &receipt.verifying_key_hex,
+                receipt.created_at_ms,
+            )
+        }) {
+            let mut guard = self.state.lock().expect("kernel state mutex poisoned");
+            let KernelMutable {
+                vault, sessions, ..
+            } = &mut *guard;
+            let _ = vault.end_session(sessions, &receipt.subject, now);
+            return Err(KernelError::Unavailable(format!(
+                "kernel store: session record insert failed: {e}"
+            )));
+        }
         let _ = self.audit_identity_event(
             "session_started",
             &receipt.subject,
@@ -889,6 +1609,16 @@ impl AuthorityKernel {
         })
     }
 
+    /// Destroy a session identity through the three paths, all ending in
+    /// ONE durable destroy+revoke transition:
+    /// - **Vault path:** `end_session` succeeds (normal case).
+    /// - **Remembered path:** `end_session` errs but the kernel remembers
+    ///   the subject (idempotent retry): the durable transition already
+    ///   applied, so it is skipped.
+    /// - **Durable-only path (post-restart):** `end_session` errs and the
+    ///   subject is not remembered, but the hydrated registry still has
+    ///   active descendants — those lose authority now.
+    ///   Anything else is an unknown session.
     fn destroy_session_identity_sync(
         &self,
         subject: &str,
@@ -909,11 +1639,58 @@ impl AuthorityKernel {
                     destroyed.insert(subject.to_string(), receipt.affected_subjects.clone());
                     receipt.affected_subjects
                 }
-                Err(_) => destroyed.get(subject).cloned().ok_or_else(|| {
-                    KernelError::Unavailable(format!("unknown session identity {subject}"))
-                })?,
+                Err(_) => {
+                    if let Some(remembered) = destroyed.get(subject).cloned() {
+                        // Idempotent retry: the durable destroy+revoke
+                        // already applied; nothing left to do.
+                        return Ok(SessionEndReport {
+                            subject: subject.to_string(),
+                            affected_subjects: remembered,
+                        });
+                    }
+                    // Post-restart: the vault holds no private key, but
+                    // the hydrated registry may still have active
+                    // descendants whose authority dies with this subject.
+                    let descendants = sessions.active_descendants_inclusive(subject, now);
+                    if descendants.is_empty() {
+                        return Err(KernelError::Unavailable(format!(
+                            "unknown session identity {subject}"
+                        )));
+                    }
+                    for descendant in &descendants {
+                        sessions.deactivate(descendant);
+                    }
+                    destroyed.insert(subject.to_string(), descendants.clone());
+                    descendants
+                }
             }
         };
+        // The durable counterpart of termination: destroy the session
+        // records AND revoke every lease any affected subject could
+        // present, in ONE transaction. A restart can never resurrect a
+        // destroyed session nor lose the revocations termination
+        // requires.
+        let mut lease_ids: Vec<String> = Vec::new();
+        for affected in &affected_subjects {
+            lease_ids.extend(self.db_run(|db, ws| db.kernel_lease_ids_for_subject(ws, affected))?);
+        }
+        lease_ids.sort();
+        lease_ids.dedup();
+        self.db_run(|db, ws| {
+            db.destroy_sessions_and_revoke(
+                ws,
+                &affected_subjects,
+                &lease_ids,
+                now,
+                "session terminated",
+            )
+        })?;
+        {
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            for id in &lease_ids {
+                state.revocations.revoke(id);
+            }
+        }
         let _ = self.audit_identity_event(
             "session_ended",
             subject,
@@ -1318,38 +2095,21 @@ impl AuthorityKernelClient {
             .map_err(|e| KernelError::Unavailable(format!("kernel budget restore: {e}")))?;
         }
 
-        // Fresh key generation for this boot. The verifying keys are
-        // recorded durably (keyed by key_id) so signatures made by this
-        // generation — audit checkpoints today, lease documents in future
-        // — remain verifiable after the next restart retires these keys.
-        // The private keys are never persisted; they are zeroized on drop.
+        // Fresh key generation for this boot. The generation is recorded
+        // durably (verifying keys only) inside `boot_sequence_sync` below,
+        // so signatures made by this generation — audit checkpoints and
+        // lease documents — remain verifiable after the next restart
+        // retires these keys. The private keys are never persisted; they
+        // are zeroized on drop.
         let keys = KernelKeys::generate();
-        let now = now_ms();
-        db.record_kernel_key_generation(
-            &config.workspace,
-            &keys.issuer_key_id,
-            "issuer",
-            &hex::encode(keys.issuer_verifying().to_bytes()),
-            now,
-        )
-        .await
-        .map_err(|e| KernelError::Unavailable(format!("kernel key generation record: {e}")))?;
-        db.record_kernel_key_generation(
-            &config.workspace,
-            &keys.host_key_id,
-            "host",
-            &hex::encode(keys.host_verifying().to_bytes()),
-            now,
-        )
-        .await
-        .map_err(|e| KernelError::Unavailable(format!("kernel key generation record: {e}")))?;
 
         let kernel = AuthorityKernel {
-            keys,
             fs: RealFsResolver,
             nonces: NonceStore::new(),
             ledger,
             state: Mutex::new(KernelMutable {
+                keys,
+                generations: GenerationIndex::default(),
                 sessions: SessionRegistry::new(),
                 vault: SessionIdentityVault::new(),
                 revocations,
@@ -1360,14 +2120,16 @@ impl AuthorityKernelClient {
             }),
             db,
             rt: Some(rt),
-            workspace: config.workspace,
-            vhl_keys: config.vhl_keys,
-            approval_ttl_ms: config.approval_ttl_ms,
-            case_insensitive_fs: config.case_insensitive_fs,
+            config,
         };
-        Ok(Self {
-            kernel: Arc::new(kernel),
-        })
+        let kernel = Arc::new(kernel);
+        // The boot tail runs synchronously on a blocking worker (it does
+        // database IO through the kernel's private runtime): generation
+        // hydration, session TTL expiry, session hydration, audit, the
+        // re-validation self-check, and the purge pass.
+        let boot = Arc::clone(&kernel);
+        blocking(move || boot.boot_sequence_sync()).await?;
+        Ok(Self { kernel })
     }
 
     /// Mint a root lease for a live session subject (test/operator
@@ -1464,6 +2226,59 @@ impl AuthorityKernelClient {
                 .map_err(|e| KernelError::Unavailable(format!("approval decision failed: {e}")))
         })
         .await
+    }
+
+    /// Emergency rotation (control-plane, operator-gated): mint a
+    /// mid-boot issuer/host generation, record both, zeroize the
+    /// superseded private keys by drop. Outstanding leases keep verifying
+    /// via the retired generation's recorded verifying key.
+    pub async fn rotate_issuer_keys(
+        &self,
+        reason: &str,
+        actor: &PrincipalId,
+    ) -> Result<KeyRotationReport, KernelError> {
+        self.kernel
+            .authorize_operator(actor, OperatorOperation::KeyManagement)
+            .await?;
+        let kernel = Arc::clone(&self.kernel);
+        let reason = reason.to_string();
+        blocking(move || kernel.rotate_issuer_keys_sync(&reason)).await
+    }
+
+    /// Kill a key generation (compromise response, operator-gated):
+    /// verification fails closed for it immediately, even though its
+    /// verifying key stays recorded. The current generation cannot be
+    /// killed — rotate first. Returns true when the kill was recorded.
+    pub async fn kill_key_generation(
+        &self,
+        key_id: &str,
+        role: &str,
+        reason: &str,
+        actor: &PrincipalId,
+    ) -> Result<bool, KernelError> {
+        self.kernel
+            .authorize_operator(actor, OperatorOperation::KeyManagement)
+            .await?;
+        let kernel = Arc::clone(&self.kernel);
+        let key_id = key_id.to_string();
+        let role = role.to_string();
+        let reason = reason.to_string();
+        blocking(move || kernel.kill_key_generation_sync(&key_id, &role, &reason)).await
+    }
+
+    /// Purge retired generations eligible under the retention rules
+    /// (operator-gated): the same pass the boot tail runs — unreferenced
+    /// retired generations are deleted, generations with live lease refs
+    /// are retained.
+    pub async fn purge_key_generations(
+        &self,
+        actor: &PrincipalId,
+    ) -> Result<KeyPurgeReport, KernelError> {
+        self.kernel
+            .authorize_operator(actor, OperatorOperation::KeyManagement)
+            .await?;
+        let kernel = Arc::clone(&self.kernel);
+        blocking(move || kernel.purge_pass_sync(now_ms())).await
     }
 }
 

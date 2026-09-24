@@ -356,6 +356,30 @@ pub enum KernelError {
     AuditFailed(String),
     #[error("one-shot lease request rejected: {0}")]
     OneShotRejected(String),
+    #[error("operator authority denied: {0}")]
+    OperatorDenied(String),
+}
+
+/// Report from `AuthorityKernelClient::rotate_issuer_keys`: the
+/// superseded generation's ids, the new generation's ids, and how many
+/// live leases still reference the old issuer (they keep verifying via
+/// the retired generation's recorded verifying key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRotationReport {
+    pub old_issuer_key_id: String,
+    pub new_issuer_key_id: String,
+    pub old_host_key_id: String,
+    pub new_host_key_id: String,
+    pub live_lease_refs_on_old_issuer: u64,
+}
+
+/// Report from `AuthorityKernelClient::purge_key_generations`: which
+/// retired generations were deleted and which were retained because a
+/// live lease still references them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyPurgeReport {
+    pub purged: Vec<String>,
+    pub skipped_live: Vec<String>,
 }
 
 /// Boxed future for [`KernelClient`] methods (the trait must stay

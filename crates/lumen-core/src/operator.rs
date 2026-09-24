@@ -16,6 +16,11 @@ pub enum OperatorOperation {
     Reassign,
     Narrow,
     Pin,
+    /// Issuer/host key rotation, generation kill, and generation purge.
+    /// Gates the authority kernel's key-custody control plane: rotating
+    /// mid-boot generations, killing compromised generations (fail-closed),
+    /// and purging unreferenced retired generations.
+    KeyManagement,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityRequest {
