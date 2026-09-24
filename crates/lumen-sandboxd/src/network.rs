@@ -11,8 +11,11 @@
 //!   typed destination allowlist and logs destination + bytes.
 //!
 //! Direct egress from the guest never exists in v1: there is no default
-//! route and no MASQUERADE. Cloud metadata (169.254.169.254), private
-//! ranges, and loopback are denied regardless of the allowlist.
+//! route and no MASQUERADE. Cloud metadata (169.254.169.254) and every
+//! non-globally-reachable address (private, link-local, shared/CGNAT,
+//! reserved, documentation, loopback) are denied regardless of the
+//! allowlist — deny-by-default, with globally-reachable unicast as the
+//! only permitted class.
 
 use std::net::IpAddr;
 
@@ -121,8 +124,8 @@ pub fn parse_destination(entry: &str) -> Result<EgressDestination, SandboxdError
 ///
 /// Fail-closed rules:
 /// - IP literals are rejected unless they appear literally in the
-///   allowlist AND pass the deny flags (metadata/private/loopback always
-///   lose to the deny flags);
+///   allowlist AND pass the deny flags (metadata/non-global/loopback
+///   always lose to the deny flags);
 /// - DNS names must match an allowlist entry exactly, or as a `*.` suffix
 ///   wildcard with a full label boundary; bare `*` is rejected;
 /// - scheme and port must match the entry. In particular a `tcp`-scheme
@@ -184,20 +187,29 @@ fn host_matches(pattern: &str, host: &str) -> bool {
 }
 
 /// Apply the always-enforced deny flags to a literal IP.
+///
+/// Fail-closed ordering:
+/// - loopback, unspecified, and multicast are never valid egress targets,
+///   regardless of the allowlist or the deny flags;
+/// - the cloud metadata address is denied when `deny_metadata` holds;
+/// - when `deny_private_ranges` holds, the predicate is deny-by-default:
+///   only globally-reachable unicast ([`is_global_unicast`]) may be dialed.
+///   Every other class — link-local, shared/CGNAT, reserved, documentation,
+///   benchmarking, protocol-assignment — is denied even if allowlisted.
 pub fn deny_ip(ip: IpAddr, policy: &crate::contracts::NetworkPolicy) -> Result<(), SandboxdError> {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return Err(SandboxdError::EgressDenied(format!(
+            "non-routable address denied: {ip}"
+        )));
+    }
     if is_metadata_ip(ip) && policy.deny_metadata {
         return Err(SandboxdError::EgressDenied(format!(
             "cloud metadata address denied: {ip}"
         )));
     }
-    if is_private_ip(ip) && policy.deny_private_ranges {
+    if policy.deny_private_ranges && !is_global_unicast(ip) {
         return Err(SandboxdError::EgressDenied(format!(
-            "private range address denied: {ip}"
-        )));
-    }
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return Err(SandboxdError::EgressDenied(format!(
-            "non-routable address denied: {ip}"
+            "non-global address denied: {ip}"
         )));
     }
     Ok(())
@@ -212,14 +224,59 @@ pub fn is_metadata_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// RFC 1918 + ULA. (Loopback/link-local/multicast handled separately.)
-pub fn is_private_ip(ip: IpAddr) -> bool {
+/// True only for globally-reachable unicast addresses.
+///
+/// Deny-by-default: every IANA special-purpose range (RFC 6890 / RFC 8190)
+/// is excluded — private, loopback, link-local, shared/CGNAT, reserved,
+/// documentation, benchmarking, and protocol-assignment space, plus
+/// multicast. IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are judged by
+/// their inner IPv4 address, so the mapping cannot smuggle a non-global
+/// address past the check.
+pub fn is_global_unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            o[0] == 10 || (o[0] == 172 && (16..32).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
+            !(
+                o[0] == 0 // 0.0.0.0/8 — "this network" (RFC 1122)
+                || o[0] == 10 // 10.0.0.0/8 — private (RFC 1918)
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40) // 100.64.0.0/10 — shared/CGNAT (RFC 6598)
+                || o[0] == 127 // 127.0.0.0/8 — loopback (RFC 1122)
+                || (o[0] == 169 && o[1] == 254) // 169.254.0.0/16 — link-local (RFC 3927)
+                || (o[0] == 172 && (16..32).contains(&o[1])) // 172.16.0.0/12 — private (RFC 1918)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 — IETF assignments (RFC 6890)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2) // 192.0.2.0/24 — TEST-NET-1 (RFC 5737)
+                || (o[0] == 192 && o[1] == 31 && o[2] == 196) // 192.31.196.0/24 — AS112 (RFC 7535)
+                || (o[0] == 192 && o[1] == 52 && o[2] == 193) // 192.52.193.0/24 — AMT (RFC 7450)
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99.0/24 — deprecated 6to4 relay (RFC 7526)
+                || (o[0] == 192 && o[1] == 168) // 192.168.0.0/16 — private (RFC 1918)
+                || (o[0] == 192 && o[1] == 175 && o[2] == 48) // 192.175.48.0/24 — AS112 direct (RFC 7535)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 — benchmarking (RFC 2544)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100) // 198.51.100.0/24 — TEST-NET-2 (RFC 5737)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113) // 203.0.113.0/24 — TEST-NET-3 (RFC 5737)
+                || (o[0] & 0xf0) == 0xe0 // 224.0.0.0/4 — multicast (RFC 5771)
+                || (o[0] & 0xf0) == 0xf0
+                // 240.0.0.0/4 — reserved (RFC 1112)
+            )
         }
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+        IpAddr::V6(v6) => {
+            // Judge IPv4-mapped addresses by their inner IPv4 address.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_global_unicast(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            !(
+                v6.is_unspecified() // ::/128
+                || v6.is_loopback() // ::1/128
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0) // 64:ff9b::/96 — NAT64 WKP (RFC 6052)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // 100::/64 — discard (RFC 6666)
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 — documentation (RFC 3849)
+                || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 — unique-local (RFC 4193)
+                || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 — link-local (RFC 4291)
+                || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 — site-local, deprecated (RFC 3879)
+                || (s[0] & 0xff00) == 0xff00
+                // ff00::/8 — multicast (RFC 4291)
+            )
+        }
     }
 }
 
@@ -432,13 +489,137 @@ mod tests {
     }
 
     #[test]
-    fn ip_classification() {
+    fn metadata_ip_detection() {
         assert!(is_metadata_ip("169.254.169.254".parse().unwrap()));
         assert!(!is_metadata_ip("169.254.169.253".parse().unwrap()));
-        assert!(is_private_ip("10.1.2.3".parse().unwrap()));
-        assert!(is_private_ip("172.16.0.1".parse().unwrap()));
-        assert!(is_private_ip("192.168.0.1".parse().unwrap()));
-        assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
-        assert!(!is_private_ip("172.15.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn global_unicast_predicate_is_deny_by_default() {
+        // (address, expected is_global_unicast). Every IANA
+        // special-purpose range must be excluded; boundary addresses on
+        // both sides of each range are covered.
+        let cases: &[(&str, bool)] = &[
+            // Allowed: globally reachable unicast, incl. range boundaries.
+            ("8.8.8.8", true),
+            ("1.1.1.1", true),
+            ("93.184.216.34", true),
+            ("9.255.255.255", true),   // below 10/8
+            ("11.0.0.1", true),        // above 10/8
+            ("100.63.255.255", true),  // below 100.64/10
+            ("100.128.0.1", true),     // above 100.64/10
+            ("172.15.255.255", true),  // below 172.16/12
+            ("172.32.0.1", true),      // above 172.16/12
+            ("192.167.255.255", true), // below 192.168/16
+            ("192.169.0.1", true),     // above 192.168/16
+            ("198.17.255.255", true),  // below 198.18/15
+            ("198.20.0.1", true),      // above 198.18/15
+            ("223.255.255.255", true), // below 224/4
+            // Denied IPv4: every listed non-global class.
+            ("0.0.0.0", false),         // 0/8
+            ("0.255.255.255", false),   // 0/8
+            ("10.0.0.1", false),        // 10/8
+            ("10.255.255.255", false),  // 10/8
+            ("100.64.0.1", false),      // 100.64/10
+            ("100.127.255.254", false), // 100.64/10
+            ("127.0.0.1", false),       // 127/8
+            ("127.255.255.255", false), // 127/8
+            ("169.254.0.1", false),     // 169.254/16
+            ("169.254.169.254", false), // 169.254/16 (metadata)
+            ("169.254.255.255", false), // 169.254/16
+            ("172.16.0.1", false),      // 172.16/12
+            ("172.31.255.255", false),  // 172.16/12
+            ("192.0.0.1", false),       // 192.0.0.0/24
+            ("192.0.2.1", false),       // 192.0.2.0/24 TEST-NET-1
+            ("192.168.0.1", false),     // 192.168/16
+            ("192.168.255.255", false), // 192.168/16
+            ("198.18.0.1", false),      // 198.18.0.0/15
+            ("198.19.255.255", false),  // 198.18.0.0/15
+            ("198.51.100.7", false),    // 198.51.100.0/24 TEST-NET-2
+            ("203.0.113.9", false),     // 203.0.113.0/24 TEST-NET-3
+            ("224.0.0.1", false),       // 224/4 multicast
+            ("239.255.255.255", false), // 224/4 multicast
+            ("240.0.0.1", false),       // 240/4 reserved
+            ("255.255.255.255", false), // 240/4 reserved
+            // Allowed IPv6.
+            ("2606:4700:4700::1111", true),
+            ("2001:4860:4860::8888", true),
+            ("::ffff:8.8.8.8", true), // v4-mapped global
+            // Denied IPv6.
+            ("::", false),                     // unspecified
+            ("::1", false),                    // loopback
+            ("fe80::1", false),                // fe80::/10
+            ("febf::1234", false),             // fe80::/10 top edge
+            ("fc00::1", false),                // fc00::/7
+            ("fd12:3456::1", false),           // fc00::/7
+            ("fec0::1", false),                // fec0::/10 deprecated site-local
+            ("ff02::1", false),                // ff00::/8 multicast
+            ("2001:db8::1", false),            // documentation
+            ("::ffff:10.0.0.1", false),        // v4-mapped private
+            ("::ffff:169.254.169.254", false), // v4-mapped link-local/metadata
+        ];
+        for (addr, want) in cases {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert_eq!(is_global_unicast(ip), *want, "is_global_unicast({addr})");
+        }
+    }
+
+    #[test]
+    fn deny_ip_rejects_non_global_when_private_egress_disabled() {
+        let strict = policy(&[]); // deny_private_ranges: true
+        // The adversarial case: link-local, shared, reserved and
+        // documentation ranges are denied even though they are not
+        // RFC1918/ULA — and even if allowlisted.
+        for addr in [
+            "169.254.10.20",
+            "100.64.0.5",
+            "192.0.0.7",
+            "192.0.2.44",
+            "198.18.3.3",
+            "198.51.100.9",
+            "203.0.113.2",
+            "240.1.2.3",
+            "224.0.0.9",
+            "fe80::5",
+            "2001:db8::9",
+        ] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(deny_ip(ip, &strict).is_err(), "deny_ip({addr})");
+            // The deny flags beat the allowlist: explicitly listing the
+            // address must not open it.
+            let entry = if addr.contains(':') {
+                format!("https://[{addr}]:443")
+            } else {
+                format!("https://{addr}:443")
+            };
+            let listed = policy(&[entry.as_str()]);
+            assert!(
+                check_destination(&listed, "https", addr, 443).is_err(),
+                "allowlisted non-global {addr} must still be denied"
+            );
+        }
+        assert!(deny_ip("8.8.8.8".parse().unwrap(), &strict).is_ok());
+        assert!(deny_ip("2606:4700:4700::1111".parse().unwrap(), &strict).is_ok());
+    }
+
+    #[test]
+    fn deny_ip_allows_non_global_when_flag_off_but_never_loopback() {
+        let permissive = NetworkPolicy {
+            allow_egress: vec![],
+            deny_metadata: false,
+            deny_private_ranges: false,
+        };
+        // With private egress explicitly allowed, non-global addresses pass
+        // the range check.
+        assert!(deny_ip("10.1.2.3".parse().unwrap(), &permissive).is_ok());
+        assert!(deny_ip("169.254.10.20".parse().unwrap(), &permissive).is_ok());
+        assert!(deny_ip("100.64.0.5".parse().unwrap(), &permissive).is_ok());
+        // Loopback / unspecified / multicast are never valid egress
+        // targets, regardless of the flags.
+        assert!(deny_ip("127.0.0.1".parse().unwrap(), &permissive).is_err());
+        assert!(deny_ip("::1".parse().unwrap(), &permissive).is_err());
+        assert!(deny_ip("0.0.0.0".parse().unwrap(), &permissive).is_err());
+        assert!(deny_ip("224.0.0.1".parse().unwrap(), &permissive).is_err());
+        assert!(deny_ip("ff02::1".parse().unwrap(), &permissive).is_err());
     }
 }
