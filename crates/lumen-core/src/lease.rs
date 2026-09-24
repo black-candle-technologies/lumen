@@ -1030,7 +1030,7 @@ pub fn authorize_envelope(
         Err(e) => {
             return PolicyDecision::deny(DenyReason::invalid_envelope(format!(
                 "envelope rejected: {e}"
-            )))
+            )));
         }
     };
     // Hard deadline on the envelope itself.
@@ -1398,7 +1398,9 @@ mod tests {
                 version: "1.2.3".to_string(),
             },
             // The frozen contract requires integer-only arguments.
-            arguments: [("n".to_string(), serde_json::json!(1))].into_iter().collect(),
+            arguments: [("n".to_string(), serde_json::json!(1))]
+                .into_iter()
+                .collect(),
             inputs: vec![],
             resources: crate::pi_boundary::ResourceSet {
                 paths: vec![crate::pi_boundary::PathResource {

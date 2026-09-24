@@ -12,7 +12,7 @@
 CREATE TABLE kernel_leases(
  lease_id TEXT PRIMARY KEY,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
- parent_id TEXT NULL REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ parent_id TEXT NULL,
  subject TEXT NOT NULL CHECK(length(subject)>0),
  issuer_key_id TEXT NOT NULL CHECK(length(issuer_key_id)>0),
  issued_at_ms INTEGER NOT NULL CHECK(issued_at_ms>=0),
@@ -26,7 +26,13 @@ CREATE TABLE kernel_leases(
  signature TEXT NOT NULL CHECK(length(signature)=128 AND signature NOT GLOB '*[^0-9a-f]*'),
  document_digest TEXT NOT NULL CHECK(length(document_digest)=64 AND document_digest NOT GLOB '*[^0-9a-f]*'),
  created_at INTEGER NOT NULL CHECK(created_at>=0),
- UNIQUE(workspace_id, lease_nonce)
+ UNIQUE(workspace_id, lease_nonce),
+ UNIQUE(workspace_id, lease_id),
+ /* A parent lease must live in the same workspace: the composite FK makes
+    cross-workspace parent references fail closed at the SQL layer. NULL
+    parent_id (a root lease) satisfies the FK, per SQL semantics. */
+ FOREIGN KEY(workspace_id, parent_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_leases_no_update BEFORE UPDATE ON kernel_leases BEGIN SELECT RAISE(ABORT,'kernel leases are immutable');END;
 CREATE TRIGGER kernel_leases_no_delete BEFORE DELETE ON kernel_leases BEGIN SELECT RAISE(ABORT,'kernel leases are immutable');END;
@@ -38,10 +44,13 @@ CREATE INDEX kernel_leases_subject_idx ON kernel_leases(workspace_id, subject);
 -- descendants at validation time; no cascade writes are needed.
 -- ---------------------------------------------------------------------------
 CREATE TABLE kernel_revocations(
- lease_id TEXT PRIMARY KEY REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ lease_id TEXT NOT NULL,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
  revoked_at_ms INTEGER NOT NULL CHECK(revoked_at_ms>=0),
- reason TEXT NOT NULL
+ reason TEXT NOT NULL,
+ PRIMARY KEY(workspace_id, lease_id),
+ FOREIGN KEY(workspace_id, lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_revocations_no_update BEFORE UPDATE ON kernel_revocations BEGIN SELECT RAISE(ABORT,'revocations are immutable');END;
 CREATE TRIGGER kernel_revocations_no_delete BEFORE DELETE ON kernel_revocations BEGIN SELECT RAISE(ABORT,'revocations are immutable');END;
@@ -64,9 +73,12 @@ CREATE INDEX kernel_nonces_expiry_idx ON kernel_nonces(workspace_id, expires_at_
 -- One-shot uses: single-use lease consumption. Immutable once recorded.
 -- ---------------------------------------------------------------------------
 CREATE TABLE kernel_one_shot_uses(
- lease_id TEXT PRIMARY KEY REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ lease_id TEXT NOT NULL,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
- consumed_at_ms INTEGER NOT NULL CHECK(consumed_at_ms>=0)
+ consumed_at_ms INTEGER NOT NULL CHECK(consumed_at_ms>=0),
+ PRIMARY KEY(workspace_id, lease_id),
+ FOREIGN KEY(workspace_id, lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_one_shot_uses_no_update BEFORE UPDATE ON kernel_one_shot_uses BEGIN SELECT RAISE(ABORT,'one-shot uses are immutable');END;
 CREATE TRIGGER kernel_one_shot_uses_no_delete BEFORE DELETE ON kernel_one_shot_uses BEGIN SELECT RAISE(ABORT,'one-shot uses are immutable');END;
@@ -77,12 +89,15 @@ CREATE TRIGGER kernel_one_shot_uses_no_delete BEFORE DELETE ON kernel_one_shot_u
 -- reserve/debit/release paths. DELETE blocked.
 -- ---------------------------------------------------------------------------
 CREATE TABLE kernel_budget_accounts(
- lease_id TEXT PRIMARY KEY REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ lease_id TEXT NOT NULL,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
  caps_json TEXT NOT NULL CHECK(json_valid(caps_json)),
  reserved_out_json TEXT NOT NULL CHECK(json_valid(reserved_out_json)),
  consumed_json TEXT NOT NULL CHECK(json_valid(consumed_json)),
- updated_at INTEGER NOT NULL CHECK(updated_at>=0)
+ updated_at INTEGER NOT NULL CHECK(updated_at>=0),
+ PRIMARY KEY(workspace_id, lease_id),
+ FOREIGN KEY(workspace_id, lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_budget_accounts_update_guard BEFORE UPDATE ON kernel_budget_accounts
 WHEN (NEW.lease_id!=OLD.lease_id OR NEW.workspace_id!=OLD.workspace_id OR NEW.caps_json!=OLD.caps_json)
@@ -95,15 +110,20 @@ CREATE TRIGGER kernel_budget_accounts_no_delete BEFORE DELETE ON kernel_budget_a
 -- held/consumed move only via the transactional debit path.
 -- ---------------------------------------------------------------------------
 CREATE TABLE kernel_reservations(
- reservation_id TEXT PRIMARY KEY,
+ reservation_id TEXT NOT NULL,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
- parent_lease_id TEXT NOT NULL REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
- child_lease_id TEXT NOT NULL REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ parent_lease_id TEXT NOT NULL,
+ child_lease_id TEXT NOT NULL,
  held_json TEXT NOT NULL CHECK(json_valid(held_json)),
  consumed_json TEXT NOT NULL CHECK(json_valid(consumed_json)),
  state TEXT NOT NULL CHECK(state IN('active','released')),
  created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
- released_at_ms INTEGER NULL CHECK(released_at_ms IS NULL OR released_at_ms>=0)
+ released_at_ms INTEGER NULL CHECK(released_at_ms IS NULL OR released_at_ms>=0),
+ PRIMARY KEY(workspace_id, reservation_id),
+ FOREIGN KEY(workspace_id, parent_lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT,
+ FOREIGN KEY(workspace_id, child_lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_reservations_update_guard BEFORE UPDATE ON kernel_reservations
 WHEN (
@@ -130,10 +150,12 @@ CREATE INDEX kernel_reservations_parent_idx ON kernel_reservations(parent_lease_
 CREATE TABLE kernel_debits(
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
  idempotency_key TEXT NOT NULL CHECK(length(idempotency_key)>0),
- reservation_id TEXT NOT NULL REFERENCES kernel_reservations(reservation_id) ON DELETE RESTRICT,
+ reservation_id TEXT NOT NULL,
  amounts_json TEXT NOT NULL CHECK(json_valid(amounts_json)),
  debited_at_ms INTEGER NOT NULL CHECK(debited_at_ms>=0),
- PRIMARY KEY(workspace_id, idempotency_key)
+ PRIMARY KEY(workspace_id, idempotency_key),
+ FOREIGN KEY(workspace_id, reservation_id)
+   REFERENCES kernel_reservations(workspace_id, reservation_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_debits_no_update BEFORE UPDATE ON kernel_debits BEGIN SELECT RAISE(ABORT,'debits are immutable');END;
 CREATE TRIGGER kernel_debits_no_delete BEFORE DELETE ON kernel_debits BEGIN SELECT RAISE(ABORT,'debits are immutable');END;
@@ -148,7 +170,8 @@ CREATE TABLE kernel_lease_debits(
     amounts_json TEXT NOT NULL,
     debited_at_ms INTEGER NOT NULL,
     PRIMARY KEY(workspace_id,idempotency_key),
-    FOREIGN KEY(lease_id_link) REFERENCES kernel_leases(lease_id)
+    FOREIGN KEY(workspace_id, lease_id_link)
+      REFERENCES kernel_leases(workspace_id, lease_id)
 );
 CREATE TRIGGER kernel_lease_debits_no_update BEFORE UPDATE ON kernel_lease_debits BEGIN SELECT RAISE(ABORT,'lease debits are immutable');END;
 CREATE TRIGGER kernel_lease_debits_no_delete BEFORE DELETE ON kernel_lease_debits BEGIN SELECT RAISE(ABORT,'lease debits are immutable');END;
@@ -156,18 +179,31 @@ CREATE INDEX kernel_lease_debits_lease_idx ON kernel_lease_debits(workspace_id,l
 
 -- ---------------------------------------------------------------------------
 -- Audit events: the hash-chained, append-only kernel audit log.
--- seq is a global rowid; per-workspace chains are linked by prev_hash.
+-- `seq` is per workspace (composite primary key): two workspaces can each
+-- have their own genesis event. The gapless-sequence trigger and the
+-- prev_hash chain are both scoped to the workspace.
+--
+-- Columns mirror the frozen v1 AuditEvent contract: the typed actor is
+-- stored in the kernel's canonical actor string ("kernel",
+-- "ed25519:<session-id>", or the human subject), `detail` is the canonical
+-- JSON string, and `decision` is NULL for events that record no decision.
+-- `action_digest` may be the string "none" for transport-level events.
 -- ---------------------------------------------------------------------------
 CREATE TABLE kernel_audit_events(
- seq INTEGER PRIMARY KEY,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+ seq INTEGER NOT NULL CHECK(seq>=0),
+ version INTEGER NOT NULL CHECK(version>0),
+ event_id TEXT NOT NULL CHECK(length(event_id)=36),
+ kind TEXT NOT NULL CHECK(length(kind)>0),
+ actor TEXT NOT NULL CHECK(length(actor)>0),
+ session_id TEXT NOT NULL,
+ action_digest TEXT NOT NULL CHECK(length(action_digest)>0),
+ decision TEXT NULL,
+ detail TEXT NOT NULL CHECK(json_valid(detail)),
  prev_hash TEXT NOT NULL CHECK(length(prev_hash)=64 AND prev_hash NOT GLOB '*[^0-9a-f]*'),
  hash TEXT NOT NULL CHECK(length(hash)=64 AND hash NOT GLOB '*[^0-9a-f]*'),
- action_digest TEXT NOT NULL CHECK(length(action_digest)=64 AND action_digest NOT GLOB '*[^0-9a-f]*'),
- decision TEXT NOT NULL CHECK(length(decision)>0),
- actor TEXT NOT NULL CHECK(length(actor)>0),
- details_json TEXT NOT NULL CHECK(json_valid(details_json)),
- recorded_at INTEGER NOT NULL CHECK(recorded_at>=0)
+ timestamp_ms INTEGER NOT NULL CHECK(timestamp_ms>=0),
+ PRIMARY KEY(workspace_id, seq)
 ) STRICT;
 CREATE TRIGGER kernel_audit_events_no_update BEFORE UPDATE ON kernel_audit_events BEGIN SELECT RAISE(ABORT,'audit events are immutable');END;
 CREATE TRIGGER kernel_audit_events_no_delete BEFORE DELETE ON kernel_audit_events BEGIN SELECT RAISE(ABORT,'audit events are immutable');END;
@@ -183,19 +219,27 @@ CREATE UNIQUE INDEX kernel_audit_events_hash_idx ON kernel_audit_events(workspac
 CREATE INDEX kernel_audit_events_action_idx ON kernel_audit_events(workspace_id, action_digest);
 CREATE INDEX kernel_audit_events_actor_idx ON kernel_audit_events(workspace_id, actor);
 CREATE INDEX kernel_audit_events_decision_idx ON kernel_audit_events(workspace_id, decision);
-CREATE INDEX kernel_audit_events_time_idx ON kernel_audit_events(workspace_id, recorded_at);
+CREATE INDEX kernel_audit_events_time_idx ON kernel_audit_events(workspace_id, timestamp_ms);
+
+/* Event ids are globally unique (random UUIDs); the index makes the
+   guarantee explicit and cheap to check. */
+CREATE UNIQUE INDEX kernel_audit_event_id_idx ON kernel_audit_events(event_id);
 
 -- ---------------------------------------------------------------------------
 -- Audit checkpoints: host-key signatures over chain prefixes. Immutable.
+-- The (workspace_id, seq) FK ties each checkpoint to a real event in the
+-- same workspace; the db refuses checkpoints that reference unknown events.
 -- ---------------------------------------------------------------------------
 CREATE TABLE kernel_audit_checkpoints(
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
- seq INTEGER NOT NULL REFERENCES kernel_audit_events(seq) ON DELETE RESTRICT,
+ seq INTEGER NOT NULL,
  hash TEXT NOT NULL CHECK(length(hash)=64 AND hash NOT GLOB '*[^0-9a-f]*'),
  signature TEXT NOT NULL CHECK(length(signature)=128 AND signature NOT GLOB '*[^0-9a-f]*'),
  key_id TEXT NOT NULL CHECK(length(key_id)>0),
  created_at INTEGER NOT NULL CHECK(created_at>=0),
- PRIMARY KEY(workspace_id, seq)
+ PRIMARY KEY(workspace_id, seq),
+ FOREIGN KEY(workspace_id, seq)
+   REFERENCES kernel_audit_events(workspace_id, seq) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_audit_checkpoints_no_update BEFORE UPDATE ON kernel_audit_checkpoints BEGIN SELECT RAISE(ABORT,'checkpoints are immutable');END;
 CREATE TRIGGER kernel_audit_checkpoints_no_delete BEFORE DELETE ON kernel_audit_checkpoints BEGIN SELECT RAISE(ABORT,'checkpoints are immutable');END;

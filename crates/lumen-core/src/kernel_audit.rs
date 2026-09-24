@@ -177,11 +177,7 @@ impl<S: AuditStore> KernelAuditLog<S> {
             ));
         }
         let actor_ty = parse_actor(actor)?;
-        let mut redacted = details;
-        redact_details(&mut redacted);
-        let detail_bytes = canonical_json(&redacted).map_err(KernelAuditError::Boundary)?;
-        let detail = String::from_utf8(detail_bytes)
-            .map_err(|e| KernelAuditError::BadEvent(format!("detail not UTF-8: {e}")))?;
+        let detail = render_detail(&details)?;
         let (sequence, prev_hash) = self.prev_link();
         let mut event = AuditEvent {
             version: AUDIT_EVENT_VERSION,
@@ -216,9 +212,7 @@ impl<S: AuditStore> KernelAuditLog<S> {
             .events()
             .iter()
             .find(|e| e.sequence == through_seq)
-            .ok_or_else(|| {
-                KernelAuditError::BadEvent(format!("no event at seq {through_seq}"))
-            })?;
+            .ok_or_else(|| KernelAuditError::BadEvent(format!("no event at seq {through_seq}")))?;
         let mut link = AuditLink {
             key_id: String::new(),
             through_seq,
@@ -298,7 +292,13 @@ pub fn verify_event_chain(events: &[AuditEvent]) -> Result<(), KernelAuditError>
 ///
 /// `"kernel"` → [`AuditActor::Kernel`]; an `ed25519:`-prefixed subject →
 /// [`AuditActor::Session`]; anything else → [`AuditActor::Human`].
-fn parse_actor(actor: &str) -> Result<AuditActor, KernelAuditError> {
+/// Parse the kernel's canonical actor string back into a typed [`AuditActor`].
+///
+/// This is the inverse of [`actor_to_string`]: `"kernel"` maps to
+/// [`AuditActor::Kernel`], `"ed25519:<id>"` to [`AuditActor::Session`], and
+/// anything else to [`AuditActor::Human`]. The full `"ed25519:..."` string is
+/// retained in `session_id`, matching the frozen fixture semantics.
+pub fn parse_actor(actor: &str) -> Result<AuditActor, KernelAuditError> {
     if actor.is_empty() {
         return Err(KernelAuditError::BadEvent(
             "actor must not be empty".to_string(),
@@ -306,15 +306,48 @@ fn parse_actor(actor: &str) -> Result<AuditActor, KernelAuditError> {
     }
     Ok(if actor == "kernel" {
         AuditActor::Kernel
-    } else if let Some(session_id) = actor.strip_prefix("ed25519:") {
+    } else if actor.starts_with("ed25519:") {
         AuditActor::Session {
-            session_id: session_id.to_string(),
+            session_id: actor.to_string(),
         }
     } else {
         AuditActor::Human {
             subject: actor.to_string(),
         }
     })
+}
+
+/// The kernel's canonical string form of a typed [`AuditActor`], used as the
+/// durable actor column in the database. Round-trips through [`parse_actor`].
+pub fn actor_to_string(actor: &AuditActor) -> String {
+    match actor {
+        AuditActor::Kernel => "kernel".to_string(),
+        AuditActor::Session { session_id } => session_id.clone(),
+        AuditActor::Human { subject } => subject.clone(),
+    }
+}
+
+/// Redact secrets from `details` and render the canonical JSON string the
+/// frozen audit contract stores in `AuditEvent.detail`. Shared by the
+/// in-memory log and durable stores so both seal byte-identical details.
+pub fn render_detail(details: &Value) -> Result<String, KernelAuditError> {
+    let mut redacted = details.clone();
+    redact_details(&mut redacted);
+    let detail_bytes = canonical_json(&redacted).map_err(KernelAuditError::Boundary)?;
+    String::from_utf8(detail_bytes)
+        .map_err(|e| KernelAuditError::BadEvent(format!("detail not UTF-8: {e}")))
+}
+
+/// Seal a fully-formed [`AuditEvent`] against its previous chain link:
+/// assigns `prev_hash` and computes `hash` per the frozen contract. Used by
+/// durable stores that assign their own sequence numbers (the in-memory log
+/// above seals through [`KernelAuditLog::append`] instead).
+pub fn seal_event(mut event: AuditEvent, prev_hash: &str) -> Result<AuditEvent, KernelAuditError> {
+    event.prev_hash = prev_hash.to_string();
+    event.hash = event
+        .compute_hash(prev_hash)
+        .map_err(KernelAuditError::Boundary)?;
+    Ok(event)
 }
 
 /// Provenance queries over a verified event slice.
@@ -341,11 +374,7 @@ impl<'a> AuditQueries<'a> {
         let parsed = parse_actor(actor);
         self.events
             .iter()
-            .filter(|e| {
-                parsed
-                    .as_ref()
-                    .is_ok_and(|want| &e.actor == want)
-            })
+            .filter(|e| parsed.as_ref().is_ok_and(|want| &e.actor == want))
             .collect()
     }
 
@@ -394,9 +423,7 @@ impl<'a> AuditQueries<'a> {
         let mut index = HashMap::new();
         for e in self.events {
             if !e.action_digest.is_empty() {
-                index
-                    .entry(e.action_digest.as_str())
-                    .or_insert(e.sequence);
+                index.entry(e.action_digest.as_str()).or_insert(e.sequence);
             }
         }
         index
@@ -468,20 +495,28 @@ pub fn redact_details(value: &mut Value) {
                 }
             }
         }
-        Value::String(s) => {
-            if looks_like_secret_value(s) {
-                *s = "[REDACTED]".to_string();
-            }
+        Value::String(s) if looks_like_secret_value(s) => {
+            *s = "[REDACTED]".to_string();
         }
+        Value::String(_) => {}
         _ => {}
     }
 }
 
 fn is_secret_key(key: &str) -> bool {
     let lower = key.to_lowercase();
-    ["secret", "password", "passwd", "token", "api_key", "apikey", "cookie", "credential"]
-        .iter()
-        .any(|pat| lower.contains(pat))
+    [
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "api_key",
+        "apikey",
+        "cookie",
+        "credential",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
 }
 
 fn looks_like_secret_value(s: &str) -> bool {
@@ -674,10 +709,12 @@ mod tests {
     #[test]
     fn actor_parsing() {
         assert_eq!(parse_actor("kernel").unwrap(), AuditActor::Kernel);
+        // The full "ed25519:..." address is retained, matching the frozen
+        // fixture semantics ("session_id":"ed25519:fixture-session-address").
         assert_eq!(
             parse_actor("ed25519:abc").unwrap(),
             AuditActor::Session {
-                session_id: "abc".to_string()
+                session_id: "ed25519:abc".to_string()
             }
         );
         assert_eq!(
@@ -687,5 +724,12 @@ mod tests {
             }
         );
         assert!(parse_actor("").is_err());
+    }
+
+    #[test]
+    fn actor_string_round_trips() {
+        for s in ["kernel", "ed25519:abc", "riley"] {
+            assert_eq!(actor_to_string(&parse_actor(s).unwrap()), s);
+        }
     }
 }

@@ -20,6 +20,11 @@ use rand::rngs::OsRng;
 use semver::{Version, VersionReq};
 use serde_json::json;
 
+use lumen_core::canonical::EffectClass;
+use lumen_core::pi_boundary::{
+    ACTION_ENVELOPE_VERSION, ActionEnvelope, EffectClasses, LeaseId, PathResource,
+    PathRights as WirePathRights, ResourceSet, ToolRef,
+};
 use lumen_core::{
     budget::{Budget, BudgetDimension, BudgetLedger},
     canonical::{
@@ -34,11 +39,6 @@ use lumen_core::{
         mint_root_lease, validate_chain,
     },
     nonce::NonceStore,
-};
-use lumen_core::canonical::EffectClass;
-use lumen_core::pi_boundary::{
-    ACTION_ENVELOPE_VERSION, ActionEnvelope, EffectClasses, LeaseId, PathResource,
-    PathRights as WirePathRights, ResourceSet, ToolRef,
 };
 
 // ---------------------------------------------------------------------------
