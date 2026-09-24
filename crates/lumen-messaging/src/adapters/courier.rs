@@ -562,10 +562,10 @@ fn version_gte(found: &str, min: &str) -> bool {
 ///
 /// The kernel mints the approval (immutable action digest + nonce); this
 /// type only serializes the carriage into the message and parses it back.
-/// Verification of the digest/nonce against the kernel's [`ApprovalRequest`]
-/// happens host-side.
-///
-/// TODO(PHASE4): wire verification to the kernel approval store.
+/// Use [`VhlCourierCarriage::from_vhl_request`] to build it from the
+/// phase-4 backend's real [`lumen_core::vhl::VhlApprovalRequest`], and
+/// [`VhlCourierCarriage::verify_against`] to check a received carriage
+/// against that backend before acting on it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VhlCourierCarriage {
     pub approval_id: String,
@@ -608,6 +608,104 @@ impl VhlCourierCarriage {
             Err(_) => (None, body.to_owned()),
         }
     }
+
+    /// Build the carriage from the phase-4 backend's real approval request.
+    /// The kernel mints the request; the adapter only carries it.
+    pub fn from_vhl_request(request: &lumen_core::vhl::VhlApprovalRequest) -> Self {
+        Self {
+            approval_id: request.request_id.clone(),
+            action_digest: request.action_digest.clone(),
+            nonce: request.nonce.clone(),
+            expires_at_millis: request.expires_at_ms,
+        }
+    }
+
+    /// Verify a received carriage against the phase-4 backend's approval
+    /// request: id, action digest, and nonce must match, and the approval
+    /// must not be expired at `now_ms`. This is the host-side half of the
+    /// old `TODO(PHASE4)`; the kernel-side half (the request state machine,
+    /// attestation verification, one-shot minting) stays in
+    /// `lumen_core::vhl` and is never reimplemented here.
+    pub fn verify_against(
+        &self,
+        request: &lumen_core::vhl::VhlApprovalRequest,
+        now_ms: i64,
+    ) -> Result<(), CourierError> {
+        // These are identifiers, not secrets (they travel in the message),
+        // so plain equality is the right comparison.
+        if self.approval_id != request.request_id {
+            return Err(CourierError::Vhl {
+                reason: "approval id does not match the kernel approval request".to_string(),
+            });
+        }
+        if self.action_digest != request.action_digest {
+            return Err(CourierError::Vhl {
+                reason: "action digest does not match the kernel approval request".to_string(),
+            });
+        }
+        if self.nonce != request.nonce {
+            return Err(CourierError::Vhl {
+                reason: "nonce does not match the kernel approval request".to_string(),
+            });
+        }
+        if now_ms >= request.expires_at_ms {
+            return Err(CourierError::Vhl {
+                reason: "approval expired".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VHL protocol payloads as native Courier message types
+// ---------------------------------------------------------------------------
+
+/// Body envelope for a phase-4 VHL protocol payload carried as a native
+/// Courier message type. The payload's own
+/// [`lumen_core::vhl::VhlCourierMessage::message_type`] travels alongside
+/// the payload so the receiver can dispatch on the type without parsing
+/// the payload first; the payload bytes are the phase-4 backend's
+/// canonical JSON, re-serialized through `serde_json::Value` so the body
+/// stays a single JSON document.
+#[derive(Debug, Deserialize, Serialize)]
+struct VhlNativeBody {
+    lumen_vhl_type: String,
+    lumen_vhl_payload: serde_json::Value,
+}
+
+/// Encode a phase-4 [`lumen_core::vhl::VhlCourierMessage`] as a Courier
+/// message body. The phase-4 backend constructs (and on receipt, verifies)
+/// the payload; the adapter only carries it. Transport is unchanged.
+pub fn encode_vhl_message(
+    msg: &lumen_core::vhl::VhlCourierMessage,
+) -> Result<String, CourierError> {
+    let bytes = msg.encode().map_err(|e| CourierError::Vhl {
+        reason: e.to_string(),
+    })?;
+    let payload =
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| CourierError::Vhl {
+            reason: e.to_string(),
+        })?;
+    serde_json::to_string(&VhlNativeBody {
+        lumen_vhl_type: msg.message_type().to_string(),
+        lumen_vhl_payload: payload,
+    })
+    .map_err(|e| CourierError::Vhl {
+        reason: e.to_string(),
+    })
+}
+
+/// Decode a body produced by [`encode_vhl_message`]. Returns `None` for
+/// anything else (plain text, approval carriages, foreign bodies). The
+/// envelope type must agree with the payload's own message type; the
+/// payload itself is parsed by the phase-4 backend's
+/// [`lumen_core::vhl::VhlCourierMessage::decode`].
+pub fn decode_vhl_message(body: &str) -> Option<lumen_core::vhl::VhlCourierMessage> {
+    let env: VhlNativeBody = serde_json::from_str(body).ok()?;
+    let bytes = lumen_core::pi_boundary::canonical_json(&env.lumen_vhl_payload).ok()?;
+    let msg = lumen_core::vhl::VhlCourierMessage::decode(&bytes).ok()?;
+    (msg.message_type() == env.lumen_vhl_type).then_some(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,6 +1210,8 @@ pub enum CourierError {
     MalformedHandoff,
     #[error("handoff payload digest mismatch")]
     HandoffDigestMismatch,
+    #[error("vhl payload error: {reason}")]
+    Vhl { reason: String },
 }
 
 impl From<CourierError> for AdapterError {

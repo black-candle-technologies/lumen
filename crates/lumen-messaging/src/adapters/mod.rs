@@ -15,7 +15,8 @@ pub use common::{
 pub use courier::{
     ADAPTER_VERSION as COURIER_ADAPTER_VERSION, CourierAdapter, CourierAddress, CourierConfig,
     CourierError, CourierStdioTransport, HandoffArtifact, HandoffSignature,
-    MAX_HANDOFF_PAYLOAD_BYTES, SessionIdentityBinding, VhlCourierCarriage,
+    MAX_HANDOFF_PAYLOAD_BYTES, SessionIdentityBinding, VhlCourierCarriage, decode_vhl_message,
+    encode_vhl_message,
 };
 #[cfg(feature = "discord")]
 pub use discord::{

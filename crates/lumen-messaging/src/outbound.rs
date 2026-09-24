@@ -197,6 +197,21 @@ impl VhlApprovalCarriage {
             expires_at_millis,
         })
     }
+
+    /// Build the carriage from the phase-4 backend's real approval request.
+    /// The kernel mints the request; the outbound path only carries the
+    /// reference. Validation still applies: a malformed kernel request
+    /// fails here rather than on the wire.
+    pub fn from_vhl_request(
+        request: &lumen_core::vhl::VhlApprovalRequest,
+    ) -> Result<Self, OutboundError> {
+        Self::new(
+            request.request_id.clone(),
+            request.action_digest.clone(),
+            request.nonce.clone(),
+            request.expires_at_ms,
+        )
+    }
 }
 
 /// A single outbound messaging effect awaiting kernel authorization.

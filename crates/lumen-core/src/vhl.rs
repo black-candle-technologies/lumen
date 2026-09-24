@@ -2390,9 +2390,12 @@ impl crate::canonical::PathResolver for StrictNoFsResolver {
 
 /// Native Courier message payloads for VHL approval traffic.
 ///
-/// TODO(INTEGRATION): the phase-5 `lumen-messaging` Courier adapter carries
-/// these payloads as native message types (`VhlApprovalCarriage` on the
-/// outbound path). This crate constructs the payload; it never wires the
+/// The phase-5 `lumen-messaging` Courier adapter carries these payloads as
+/// native message types (see `courier::encode_vhl_message` /
+/// `courier::decode_vhl_message`, which wrap the payload with its
+/// [`VhlCourierMessage::message_type`]); the approval *reference* on the
+/// outbound path is `lumen_messaging::outbound::VhlApprovalCarriage`.
+/// This crate constructs and verifies the payload; it never wires the
 /// transport.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
