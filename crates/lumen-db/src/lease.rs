@@ -751,7 +751,12 @@ impl Database {
         Ok(returned)
     }
 
-    /// Remaining balance for a lease: caps − reserved_out − consumed.
+    /// Remaining balance for a lease: caps − reserved_out − consumed −
+    /// held execution reservations. Durable execution holds
+    /// (authorized-but-unsettled dispatches) encumber the lease exactly
+    /// like the in-memory ledger's `exec_held`; omitting them would let a
+    /// crash-recovered dispatcher over-admit against budget that is
+    /// already spoken for.
     pub async fn kernel_budget_remaining(
         &self,
         workspace_id: &WorkspaceId,
@@ -769,7 +774,25 @@ impl Database {
         let caps = parse_budget(row.get::<String, _>("caps_json").as_str())?;
         let reserved_out = parse_budget(row.get::<String, _>("reserved_out_json").as_str())?;
         let consumed = parse_budget(row.get::<String, _>("consumed_json").as_str())?;
-        Ok(caps.saturating_sub(&reserved_out).saturating_sub(&consumed))
+        let held_rows = sqlx::query(
+            "SELECT held_json FROM kernel_executions
+             WHERE workspace_id=? AND lease_id=? AND state='held'",
+        )
+        .bind(ws(workspace_id))
+        .bind(lease_id)
+        .fetch_all(self.pool())
+        .await?;
+        let mut exec_held = Budget::new();
+        for held_row in &held_rows {
+            let held = parse_budget(held_row.get::<String, _>("held_json").as_str())?;
+            exec_held = exec_held
+                .checked_add(&held)
+                .ok_or_else(|| insufficient("execution held overflow"))?;
+        }
+        Ok(caps
+            .saturating_sub(&reserved_out)
+            .saturating_sub(&consumed)
+            .saturating_sub(&exec_held))
     }
 
     /// Active reservations (for crash-safe reconciliation: reservations whose

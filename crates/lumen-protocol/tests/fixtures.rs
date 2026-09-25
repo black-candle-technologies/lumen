@@ -38,9 +38,17 @@ fn facade_policy_decision_fixtures() {
         ("policy_decision_pending.v1.json", "pending"),
     ] {
         let value = fixture(name);
-        let decision: PolicyDecision = serde_json::from_value(value)
+        let decision: PolicyDecision = serde_json::from_value(value.clone())
             .unwrap_or_else(|e| panic!("fixture {name} must parse via facade: {e}"));
         assert_eq!(decision.summary(), expected);
+        // Exact-shape check: deserialization ignores unknown fields, so
+        // re-serializing and comparing against the fixture proves the
+        // documented frozen shape — obligations and denial details included.
+        let round_tripped = serde_json::to_value(&decision).expect("decision serializes");
+        assert_eq!(
+            round_tripped, value,
+            "fixture {name} must round-trip exactly (frozen shape)"
+        );
     }
 }
 
@@ -85,4 +93,11 @@ fn facade_kernel_wire_fixtures() {
         serde_json::from_value(fixture("kernel_wire_response.v1.json")).unwrap();
     assert!(response.error.is_none());
     assert!(response.decision.expect("decision").is_allow());
+    // The response must bind to the request it answers: an allow for a
+    // different action must never satisfy this fixture contract.
+    assert_eq!(
+        response.action_digest.as_deref(),
+        Some(request.envelope.digest().expect("request digest").as_str()),
+        "wire response must carry the requesting envelope's action digest"
+    );
 }

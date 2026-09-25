@@ -1158,14 +1158,19 @@ pub fn authorize_envelope(
     if now_ms >= env.expires_at_ms {
         return PolicyDecision::deny(DenyReason::expired_action("action past its hard deadline"));
     }
+    // The approval fallback must not consume the action nonce: a
+    // pending-approval envelope carries the nonce the human will approve,
+    // and the approved re-presentation of the verbatim envelope must still
+    // pass replay protection. Nonce consumption happens only when the
+    // envelope actually reaches authorization.
+    if env.lease_chain.is_empty() {
+        return no_covering_lease(&action, env, outbox, params);
+    }
     // Replay protection on (action_id, nonce).
     let envelope_nonce = format!("{}:{}", env.action_id, env.nonce);
     let ttl = env.expires_at_ms.saturating_sub(now_ms).max(1);
     if let Err(e) = nonces.check_and_insert(&envelope_nonce, now_ms, ttl) {
         return PolicyDecision::deny(DenyReason::replay_detected(format!("replay rejected: {e}")));
-    }
-    if env.lease_chain.is_empty() {
-        return no_covering_lease(&action, env, outbox, params);
     }
     let presented: Vec<String> = env.lease_chain.iter().map(|id| id.to_string()).collect();
     let chain = match validate_chain(
@@ -2212,6 +2217,71 @@ mod tests {
             !tracker.contains(&one_shot_id),
             "a budget-denied envelope must not burn the one-shot grant"
         );
+    }
+
+    #[test]
+    fn approval_fallback_does_not_consume_action_nonce() {
+        let (env, map, one_shot_id, keys, sessions, ledger) = one_shot_fixture();
+        // The pre-approval presentation carries no lease chain: it goes to
+        // the human-approval fallback and must come back pending.
+        let mut pending_env = env.clone();
+        pending_env.lease_chain = vec![];
+        let mut tracker = HashSet::new();
+        let nonces = NonceStore::new();
+        let mut outbox: Vec<VhlRequest> = vec![];
+        let fallback_params = AuthorizeParams {
+            now_ms: 300,
+            case_insensitive_fs: false,
+            allow_approval_fallback: true,
+            approval_ttl_ms: 60_000,
+        };
+        let d = authorize_envelope(
+            &pending_env,
+            &FakeResolver::default(),
+            &map,
+            &RevocationIndex::new(),
+            &sessions,
+            &keys,
+            &mut tracker,
+            &nonces,
+            &ledger,
+            &mut outbox,
+            &fallback_params,
+        );
+        assert!(
+            matches!(d.outcome, DecisionOutcome::PendingApproval { .. }),
+            "expected pending approval, got {:?}",
+            d.outcome
+        );
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].nonce, pending_env.nonce);
+        // The human approves; the verbatim envelope is re-presented with
+        // the minted one-shot lease. The nonce the human approved must
+        // still be usable — the fallback must not have burned it.
+        let d2 = authorize_envelope(
+            &env,
+            &FakeResolver::default(),
+            &map,
+            &RevocationIndex::new(),
+            &sessions,
+            &keys,
+            &mut tracker,
+            &nonces,
+            &ledger,
+            &mut outbox,
+            &AuthorizeParams {
+                now_ms: 300,
+                case_insensitive_fs: false,
+                allow_approval_fallback: true,
+                approval_ttl_ms: 60_000,
+            },
+        );
+        assert!(
+            d2.is_allow(),
+            "approved re-presentation denied (nonce burned by fallback?): {:?}",
+            d2.outcome
+        );
+        assert!(tracker.contains(&one_shot_id));
     }
 
     #[test]

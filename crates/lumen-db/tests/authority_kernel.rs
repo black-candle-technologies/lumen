@@ -1626,3 +1626,89 @@ async fn lease_debits_table_has_kernel_constraints() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn one_shot_action_digest_round_trips_through_store() {
+    // The `approved_action_digest` binding (Codex P1 / Lane one-shot
+    // finding) must survive a store round-trip; a legacy row without the
+    // column value loads as None (fail-closed at authorization).
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+
+    let mut one_shot = mint_root(&fx, "lease-one-shot-1", "os-nonce-1");
+    one_shot.approved_action_digest = Some("deadbeef".repeat(8));
+    db.insert_kernel_lease(&ws, &one_shot).await.unwrap();
+    let loaded = db
+        .kernel_lease(&ws, "lease-one-shot-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.approved_action_digest.as_deref(),
+        Some("deadbeef".repeat(8).as_str())
+    );
+
+    // Standing leases persist a NULL digest.
+    let standing = mint_root(&fx, "lease-standing-1", "st-nonce-1");
+    assert!(standing.approved_action_digest.is_none());
+    db.insert_kernel_lease(&ws, &standing).await.unwrap();
+    let loaded = db
+        .kernel_lease(&ws, "lease-standing-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(loaded.approved_action_digest.is_none());
+}
+
+#[tokio::test]
+async fn budget_remaining_counts_durable_execution_holds() {
+    // Held execution reservations encumber the lease durably, exactly like
+    // the in-memory ledger's exec_held: remaining must subtract them, or a
+    // crash-recovered dispatcher could over-admit against budget that is
+    // already spoken for.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    db.insert_kernel_lease(&ws, &root).await.unwrap();
+    db.register_kernel_budget(&ws, "lease-root-1", &root.limits.budget, 100)
+        .await
+        .unwrap();
+
+    let remaining = db
+        .kernel_budget_remaining(&ws, "lease-root-1")
+        .await
+        .unwrap();
+    assert_eq!(remaining.get(BudgetDimension::Executions), 100);
+
+    let exec = ExecutionReservation {
+        id: "exec_hold_1".to_string(),
+        lease_id: "lease-root-1".to_string(),
+        action_id: "action-1".to_string(),
+        held: Budget::new().set(BudgetDimension::Executions, 7),
+        state: ExecutionState::Held,
+        idempotency_key: "exec-nonce-1".to_string(),
+        created_at_ms: 200,
+        completed_at_ms: None,
+        actual: None,
+    };
+    db.insert_kernel_execution(&ws, &exec).await.unwrap();
+    let remaining = db
+        .kernel_budget_remaining(&ws, "lease-root-1")
+        .await
+        .unwrap();
+    assert_eq!(remaining.get(BudgetDimension::Executions), 93);
+
+    // A settled execution no longer encumbers the lease.
+    let mut settled = exec.clone();
+    settled.state = ExecutionState::Settled;
+    settled.completed_at_ms = Some(300);
+    settled.actual = Some(Budget::new().set(BudgetDimension::Executions, 1));
+    db.update_kernel_execution(&ws, &settled).await.unwrap();
+    let remaining = db
+        .kernel_budget_remaining(&ws, "lease-root-1")
+        .await
+        .unwrap();
+    assert_eq!(remaining.get(BudgetDimension::Executions), 100);
+}
