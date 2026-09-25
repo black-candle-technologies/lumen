@@ -331,6 +331,40 @@ fn approve_once_mints_single_use_lease_for_exact_action() {
     );
 }
 
+#[test]
+fn consume_audit_failure_leaves_request_minted() {
+    let mut h = Harness::new();
+    let env = envelope(
+        &h.session_subject.clone(),
+        json!({"path": "/workspace/README.md"}),
+        vec!["sha256:input-1".to_string()],
+    );
+    let mut request = h.approved_request(&env);
+    let grant = h.grant_for(&request);
+    h.mint_lease(&mut request, &grant, &env)
+        .expect("lease mints");
+    assert!(matches!(request.state, VhlRequestState::Minted { .. }));
+
+    // A failed audit append must not advance the request: it stays Minted
+    // (retryable) instead of becoming Consumed with no audit event.
+    let mut failing = FailingAudit;
+    let err = h
+        .authority
+        .note_consumed(&mut request, &mut failing, NOW_MS)
+        .expect_err("audit failure must fail the consume");
+    assert!(matches!(err, VhlError::Encoding(_)), "got {err:?}");
+    assert!(
+        matches!(request.state, VhlRequestState::Minted { .. }),
+        "failed consume must not advance the request"
+    );
+
+    // Retry with a working audit completes the lifecycle.
+    h.authority
+        .note_consumed(&mut request, &mut h.audit, NOW_MS)
+        .expect("retry records");
+    assert!(matches!(request.state, VhlRequestState::Consumed { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // Argument mutation: the approved action is exactly what was reviewed
 // ---------------------------------------------------------------------------

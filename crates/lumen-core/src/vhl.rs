@@ -2031,7 +2031,10 @@ impl<V: VhlVerifier> VhlAuthority<V> {
                 )));
             }
         };
-        request.note_consumed(now_ms)?;
+        // Audit before the state transition: if the durable append fails,
+        // the request stays Minted and the consume is retryable, instead of
+        // leaving a Consumed request with no audit event. The transition
+        // below is infallible — the state was just checked above.
         audit.record_vhl(
             "kernel",
             &request.session_subject,
@@ -2042,7 +2045,8 @@ impl<V: VhlVerifier> VhlAuthority<V> {
                 "lease_id": lease_id,
             }),
             now_ms,
-        )
+        )?;
+        request.note_consumed(now_ms)
     }
 
     /// End a session's authority outright: destroy the session key and every
