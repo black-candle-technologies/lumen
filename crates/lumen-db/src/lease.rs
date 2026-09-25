@@ -1477,24 +1477,42 @@ impl Database {
     }
 
     /// Destroy-transition for every active session older than `ttl_ms`
-    /// (`created_at_ms + ttl_ms <= now_ms`): the durable session-TTL
-    /// rotation that bounds the stolen-session-key window. Returns the
-    /// destroyed subjects.
+    /// (`created_at_ms <= now_ms - ttl_ms`), **plus the complete active
+    /// descendant subtree of each expired session**: the durable
+    /// session-TTL rotation that bounds the stolen-session-key window.
+    /// A child of a TTL-expired parent is destroyed even if the child
+    /// itself is within its TTL — its authority derives from the parent,
+    /// and the hydration pass would otherwise reject the dangling child
+    /// and fail the open until the database is manually repaired.
+    /// Returns every destroyed subject (expired roots and descendants).
     pub async fn expire_kernel_sessions(
         &self,
         workspace_id: &WorkspaceId,
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<Vec<String>, RepositoryError> {
+        // Overflow-safe expiry cutoff computed in Rust: `created_at_ms <=
+        // now_ms - ttl_ms` (SQLite integer arithmetic wraps on overflow,
+        // so `created_at_ms + ttl_ms` must not be computed in SQL).
+        let cutoff = now_ms.saturating_sub(ttl_ms);
         let subjects: Vec<String> = sqlx::query_scalar(
-            "UPDATE kernel_sessions SET active=0,destroyed_at_ms=?
-             WHERE workspace_id=? AND active=1 AND created_at_ms+?<=?
+            "WITH RECURSIVE expired_subtree(subject) AS (
+                 SELECT subject FROM kernel_sessions
+                 WHERE workspace_id=? AND active=1 AND created_at_ms<=?
+                 UNION
+                 SELECT ks.subject FROM kernel_sessions ks
+                 JOIN expired_subtree e ON ks.parent_subject=e.subject
+                 WHERE ks.workspace_id=? AND ks.active=1
+             )
+             UPDATE kernel_sessions SET active=0,destroyed_at_ms=?
+             WHERE workspace_id=? AND subject IN (SELECT subject FROM expired_subtree)
              RETURNING subject",
         )
+        .bind(ws(workspace_id))
+        .bind(cutoff)
+        .bind(ws(workspace_id))
         .bind(now_ms)
         .bind(ws(workspace_id))
-        .bind(ttl_ms)
-        .bind(now_ms)
         .fetch_all(self.pool())
         .await?;
         Ok(subjects)

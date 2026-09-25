@@ -199,6 +199,8 @@ pub enum LeaseError {
     NotBeforeTooEarly(i64, i64),
     #[error("invalid time bounds: not_before {0} >= expires_at {1}")]
     InvalidTimeBounds(i64, i64),
+    #[error("issued_at_ms {0} is after the authority time {1}: minting happens now")]
+    IssuedInFuture(i64, i64),
     #[error("lease already expired at issuance")]
     AlreadyExpired,
     #[error("depth {0} violates parent depth limit {1}")]
@@ -545,18 +547,24 @@ pub fn mint_root_lease(
 ) -> Result<LeaseDocument, LeaseError> {
     check_time_bounds(&params.limits, now_ms)?;
     // Retention bound (spec §6.4): cap how long a compromised old issuer
-    // key stays a live signing capability.
-    let lifetime = params
-        .limits
-        .expires_at_ms
-        .saturating_sub(params.issued_at_ms);
+    // key stays a live signing capability. The cap is computed from the
+    // trusted authority clock, never from the caller-supplied issued_at_ms:
+    // otherwise a caller could set issued_at_ms = expires_at_ms - 1 and
+    // get a 1ms computed lifetime for a year-long lease. A future
+    // issued_at_ms is likewise rejected — minting happens now — but the
+    // lifetime cap is checked first so the spoof cannot hide behind the
+    // timestamp rejection.
+    let lifetime = params.limits.expires_at_ms.saturating_sub(now_ms);
     if lifetime > MAX_ROOT_LEASE_LIFETIME_MS {
         return Err(LeaseError::ExceedsMaxLifetime(
             lifetime,
             MAX_ROOT_LEASE_LIFETIME_MS,
         ));
     }
-    if !sessions.get(&params.subject).is_some_and(|r| r.active) {
+    if params.issued_at_ms > now_ms {
+        return Err(LeaseError::IssuedInFuture(params.issued_at_ms, now_ms));
+    }
+    if !sessions.is_subject_live(&params.subject, now_ms) {
         return Err(LeaseError::SubjectInactive(params.subject.clone()));
     }
     if params.depth_limit == 0 {
@@ -807,6 +815,15 @@ pub fn validate_chain(
             // Root: signed by the kernel issuer generation named in
             // issuer_key_id (current or retired). Revocation and expiry
             // were checked above (D4: liveness precedes crypto).
+            //
+            // The issuing session's whole ancestry must be live
+            // (registered, active, within its TTL): a standing root lease
+            // for a TTL-expired session must stop authorizing once the
+            // kernel has been running past the session's TTL, not just
+            // after a restart or for delegated chains.
+            if !sessions.is_subject_live(&doc.subject, now_ms) {
+                return Err(LeaseError::SubjectInactive(doc.subject.clone()));
+            }
             if issuer_resolver.is_generation_killed(&doc.issuer_key_id) {
                 return Err(LeaseError::KilledIssuerGeneration(
                     doc.issuer_key_id.clone(),
@@ -2779,6 +2796,98 @@ mod tests {
         params.limits.expires_at_ms = 100 + MAX_ROOT_LEASE_LIFETIME_MS;
         mint_root_lease(params, &keys, &sessions, &ledger, &nonces, 100)
             .expect("30-day root lease mints");
+    }
+
+    /// The 30-day cap is computed from the trusted authority clock, not
+    /// the caller-supplied issued_at_ms: setting issued_at_ms near
+    /// expires_at_ms must not smuggle a year-long lease past the cap.
+    #[test]
+    fn root_mint_rejects_spoofed_issued_at() {
+        let (keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let now = 1_000_000;
+        let year_ms = 365 * 24 * 60 * 60 * 1000;
+        let mut params = root_params(parent_scope());
+        params.lease_nonce = "spoofed-issued-at".to_string();
+        params.limits.not_before_ms = now;
+        params.limits.expires_at_ms = now + year_ms;
+        // Bypass attempt: 1ms of "computed" lifetime, a year of actual use.
+        params.issued_at_ms = now + year_ms - 1;
+        let err = mint_root_lease(params, &keys, &sessions, &ledger, &nonces, now)
+            .expect_err("spoofed issued_at must not bypass the lifetime cap");
+        assert!(
+            matches!(err, LeaseError::ExceedsMaxLifetime(l, m) if l == year_ms && m == MAX_ROOT_LEASE_LIFETIME_MS),
+            "got {err:?}"
+        );
+    }
+
+    /// A root lease cannot claim to have been issued in the future.
+    #[test]
+    fn root_mint_rejects_future_issued_at() {
+        let (keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let mut params = root_params(parent_scope());
+        params.lease_nonce = "future-issued-at".to_string();
+        params.issued_at_ms = 200;
+        let err = mint_root_lease(params, &keys, &sessions, &ledger, &nonces, 100)
+            .expect_err("future issued_at must be refused");
+        assert!(
+            matches!(err, LeaseError::IssuedInFuture(200, 100)),
+            "got {err:?}"
+        );
+    }
+
+    /// A root-only chain for a TTL-expired session fails closed: the
+    /// session bound is enforced for ordinary root leases, not just
+    /// after a restart or for delegated chains.
+    #[test]
+    fn root_chain_rejects_ttl_expired_session() {
+        let (keys, _, session_vk) = test_keys();
+        let mut sessions = SessionRegistry::new();
+        sessions.set_max_lifetime(Some(DEFAULT_SESSION_MAX_LIFETIME_MS));
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let mut params = root_params(parent_scope());
+        params.lease_nonce = "ttl-root-nonce".to_string();
+        // Lease outlives the session TTL so the TTL check is the one
+        // that fires.
+        params.limits.expires_at_ms = 2 * DEFAULT_SESSION_MAX_LIFETIME_MS;
+        let root = mint_root_lease(params, &keys, &sessions, &ledger, &nonces, 100).unwrap();
+        let mut map = HashMap::new();
+        map.insert(root.lease_id.clone(), root.clone());
+        let revocations = RevocationIndex::new();
+        let one_shot = HashSet::new();
+        let chain_ids = vec![root.lease_id.clone()];
+        // Within the TTL the root chain validates.
+        validate_chain(
+            &map,
+            &chain_ids,
+            &revocations,
+            &sessions,
+            &issuer_resolver(&keys),
+            &one_shot,
+            DEFAULT_SESSION_MAX_LIFETIME_MS - 1,
+        )
+        .expect("root chain validates within session TTL");
+        // Past the session TTL it fails closed.
+        let err = validate_chain(
+            &map,
+            &chain_ids,
+            &revocations,
+            &sessions,
+            &issuer_resolver(&keys),
+            &one_shot,
+            DEFAULT_SESSION_MAX_LIFETIME_MS + 1,
+        )
+        .expect_err("TTL-expired session must not authorize");
+        assert!(matches!(err, LeaseError::SubjectInactive(_)), "got {err:?}");
     }
 
     /// Session TTL: a record past `max_lifetime_ms` is not a live

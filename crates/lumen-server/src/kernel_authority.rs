@@ -250,6 +250,15 @@ pub const CLOCK_ROLLBACK_TOLERANCE_MS: i64 = 5 * 60 * 1000;
 /// single decision would be pure IO amplification.
 const TIME_ANCHOR_PERSIST_INTERVAL_MS: i64 = 30_000;
 
+/// Write-ahead anchor: the ceiling of `t` to the next persist-interval
+/// boundary. Persisting the ceiling (rather than the mark) keeps the
+/// durable anchor >= the greatest effective time the kernel has acted
+/// on, so a crash can never reopen an already-observed expiry.
+fn anchor_ceiling(t: i64) -> i64 {
+    (t + TIME_ANCHOR_PERSIST_INTERVAL_MS - 1) / TIME_ANCHOR_PERSIST_INTERVAL_MS
+        * TIME_ANCHOR_PERSIST_INTERVAL_MS
+}
+
 /// SHA-256 hex fingerprint of a verifying key (public fingerprint for
 /// audit correlation, not key material).
 fn verifying_key_sha256_hex(vk: &VerifyingKey) -> String {
@@ -305,8 +314,11 @@ struct KernelMutable {
     outbox: Vec<VhlRequest>,
     /// Subjects destroyed by the vault, kept so a retried terminate can
     /// still revoke the right leases after the vault reports the session
-    /// as already destroyed.
-    destroyed: HashMap<String, Vec<String>>,
+    /// as already destroyed. Each entry records the affected subjects and
+    /// whether the durable destroy+revoke transition committed: a retry
+    /// after a failed durable write must rerun the transition, not
+    /// report success.
+    destroyed: HashMap<String, (Vec<String>, bool)>,
     /// Monotonic authority-time anchor: the greatest effective time the
     /// kernel has acted on. Every authority decision runs at
     /// `max(wall clock, this mark)` and advances it, so a backward
@@ -317,9 +329,12 @@ struct KernelMutable {
     /// [`CLOCK_ROLLBACK_TOLERANCE_MS`].
     time_high_water_ms: i64,
     /// The last anchor value actually written to the database. The
-    /// in-memory mark advances on every decision; the durable write is
-    /// throttled to [`TIME_ANCHOR_PERSIST_INTERVAL_MS`] of movement so a
-    /// hot kernel is not doing a database write per decision.
+    /// in-memory mark advances on every decision; the durable write
+    /// persists the *ceiling* of the mark to the next
+    /// [`TIME_ANCHOR_PERSIST_INTERVAL_MS`] boundary, throttled to one
+    /// write per interval of movement, so the durable anchor never lags
+    /// the latest decision (write-ahead: a crash cannot reopen an
+    /// already-observed expiry).
     time_high_water_persisted_ms: i64,
 }
 
@@ -380,14 +395,19 @@ impl AuthorityKernel {
     /// The kernel's authority time: `max(wall clock, time high-water)`.
     /// Every authority decision (expiry, TTL, nonce windows, mint
     /// timestamps) runs at this time. The in-memory mark advances on
-    /// every call; the durable write is throttled to
-    /// [`TIME_ANCHOR_PERSIST_INTERVAL_MS`] of movement so a hot kernel
-    /// does not do a database write per decision — a staleness far below
-    /// the rollback tolerance is irrelevant to the boot check. A backward
-    /// clock therefore cannot move authority time: the mark only ever
-    /// rises, and the boot sequence fails closed on a material backward
-    /// jump before any decision runs. The in-memory update is max-guarded
-    /// so concurrent advances cannot regress it.
+    /// every call; the durable write persists the *ceiling* of the mark
+    /// to the next [`TIME_ANCHOR_PERSIST_INTERVAL_MS`] boundary, so the
+    /// durable anchor can never lag the latest authority decision — a
+    /// crash followed by a clock rollback (or VM snapshot restore)
+    /// resumes at a mark >= every decision time, and a lease already
+    /// observed as expired can never appear live again. The write still
+    /// happens at most once per interval of movement, and the ceiling is
+    /// at most one interval ahead of the decision time — far below the
+    /// boot rollback tolerance, so the boot check is unaffected. A
+    /// backward clock therefore cannot move authority time: the mark only
+    /// ever rises, and the boot sequence fails closed on a material
+    /// backward jump before any decision runs. The in-memory update is
+    /// max-guarded so concurrent advances cannot regress it.
     fn effective_now_sync(&self) -> Result<i64, KernelError> {
         let wall = now_ms();
         let (mark, persisted) = {
@@ -396,12 +416,20 @@ impl AuthorityKernel {
         };
         let effective = wall.max(mark);
         if effective > mark {
+            // Write-ahead: persist the ceiling, not the mark. The anchor
+            // is then always >= the greatest effective time the kernel
+            // has acted on (the boot comment's invariant), while the
+            // write stays throttled to one per interval of movement.
+            // The in-memory mark advances only after the durable write
+            // succeeds, so a failed write is retried on the next call
+            // even if the clock has not moved.
+            let ceiling = anchor_ceiling(effective);
             let mut state = self.state.lock().expect("kernel state mutex poisoned");
-            state.time_high_water_ms = effective;
-            if effective >= persisted + TIME_ANCHOR_PERSIST_INTERVAL_MS {
-                self.db_run(|db, ws| db.record_time_high_water(ws, effective))?;
-                state.time_high_water_persisted_ms = effective;
+            if ceiling != persisted {
+                self.db_run(|db, ws| db.record_time_high_water(ws, ceiling))?;
+                state.time_high_water_persisted_ms = ceiling;
             }
+            state.time_high_water_ms = effective;
         }
         Ok(effective)
     }
@@ -1817,6 +1845,9 @@ impl AuthorityKernel {
         let now = self.effective_now_sync()?;
         // Idempotent across terminate retries: the vault forgets
         // destroyed subjects, so the kernel remembers the affected list.
+        // Entries are (affected_subjects, committed): a retry after a
+        // failed durable transition finds the entry uncommitted and
+        // reruns the durable work instead of reporting success.
         let affected_subjects: Vec<String> = {
             let mut guard = self.state.lock().expect("kernel state mutex poisoned");
             let KernelMutable {
@@ -1827,32 +1858,41 @@ impl AuthorityKernel {
             } = &mut *guard;
             match vault.end_session(sessions, subject, now) {
                 Ok(receipt) => {
-                    destroyed.insert(subject.to_string(), receipt.affected_subjects.clone());
+                    destroyed.insert(
+                        subject.to_string(),
+                        (receipt.affected_subjects.clone(), false),
+                    );
                     receipt.affected_subjects
                 }
                 Err(_) => {
-                    if let Some(remembered) = destroyed.get(subject).cloned() {
-                        // Idempotent retry: the durable destroy+revoke
-                        // already applied; nothing left to do.
-                        return Ok(SessionEndReport {
-                            subject: subject.to_string(),
-                            affected_subjects: remembered,
-                        });
+                    if let Some((remembered, committed)) = destroyed.get(subject).cloned() {
+                        if committed {
+                            // Idempotent retry: the durable destroy+revoke
+                            // already applied; nothing left to do.
+                            return Ok(SessionEndReport {
+                                subject: subject.to_string(),
+                                affected_subjects: remembered,
+                            });
+                        }
+                        // A previous attempt failed before the durable
+                        // transition committed: rerun it now.
+                        remembered
+                    } else {
+                        // Post-restart: the vault holds no private key, but
+                        // the hydrated registry may still have active
+                        // descendants whose authority dies with this subject.
+                        let descendants = sessions.active_descendants_inclusive(subject, now);
+                        if descendants.is_empty() {
+                            return Err(KernelError::Unavailable(format!(
+                                "unknown session identity {subject}"
+                            )));
+                        }
+                        for descendant in &descendants {
+                            sessions.deactivate(descendant);
+                        }
+                        destroyed.insert(subject.to_string(), (descendants.clone(), false));
+                        descendants
                     }
-                    // Post-restart: the vault holds no private key, but
-                    // the hydrated registry may still have active
-                    // descendants whose authority dies with this subject.
-                    let descendants = sessions.active_descendants_inclusive(subject, now);
-                    if descendants.is_empty() {
-                        return Err(KernelError::Unavailable(format!(
-                            "unknown session identity {subject}"
-                        )));
-                    }
-                    for descendant in &descendants {
-                        sessions.deactivate(descendant);
-                    }
-                    destroyed.insert(subject.to_string(), descendants.clone());
-                    descendants
                 }
             }
         };
@@ -1911,6 +1951,11 @@ impl AuthorityKernel {
         })?;
         {
             let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            // The durable transition committed: a later retry is a true
+            // idempotent no-op.
+            if let Some(entry) = state.destroyed.get_mut(subject) {
+                entry.1 = true;
+            }
             for id in &lease_ids {
                 state.revocations.revoke(id);
             }
@@ -2000,9 +2045,16 @@ impl AuthorityKernel {
                 .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
             let checkpoints = db.kernel_audit_checkpoints(ws).await?;
             let generations = db.kernel_key_generations(ws).await?;
+            let killed = db.killed_key_generation_ids(ws).await?;
             let mut host_keys: HashMap<String, VerifyingKey> = HashMap::new();
             for g in &generations {
                 if g.role != "host" {
+                    continue;
+                }
+                if killed.contains(&g.key_id) {
+                    // Fail closed: a checkpoint signed by a killed host
+                    // generation must not verify — otherwise the
+                    // compromise-response kill has no effect here.
                     continue;
                 }
                 let bytes = hex::decode(&g.verifying_key_hex).map_err(|e| {
@@ -2569,5 +2621,37 @@ impl SessionIdentityAuthority for AuthorityKernelClient {
         Box::pin(
             async move { blocking(move || kernel.destroy_session_identity_sync(&subject)).await },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The write-ahead invariant: the persisted anchor is always >= the
+    /// decision time, a multiple of the interval, and less than one
+    /// full interval ahead (so the boot rollback check is unaffected).
+    #[test]
+    fn anchor_ceiling_never_lags() {
+        for t in [
+            0,
+            1,
+            29_999,
+            30_000,
+            30_001,
+            1_700_000_000_000,
+            i64::MAX / 2,
+        ] {
+            let c = anchor_ceiling(t);
+            assert!(c >= t, "ceiling {c} lags t={t}");
+            assert_eq!(c % TIME_ANCHOR_PERSIST_INTERVAL_MS, 0);
+            assert!(
+                c - t < TIME_ANCHOR_PERSIST_INTERVAL_MS,
+                "ceiling {c} too far ahead of {t}"
+            );
+        }
+        // Exact boundaries are fixed points.
+        assert_eq!(anchor_ceiling(60_000), 60_000);
+        assert_eq!(anchor_ceiling(60_001), 90_000);
     }
 }

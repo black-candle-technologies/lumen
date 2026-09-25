@@ -163,6 +163,42 @@ async fn rotate_kill_purge_happy_path() {
     );
 }
 
+/// Killing a host generation fails closed at audit verification: the
+/// boot checkpoints were signed by the pre-rotation host key, so once
+/// that generation is killed the chain must no longer verify.
+#[tokio::test]
+async fn killed_host_generation_fails_audit_verification() {
+    let kernel = AuthorityKernelClient::open(config_with_authority(Some(true)))
+        .await
+        .expect("open");
+
+    // Sanity: the audit chain verifies before the kill.
+    kernel
+        .verify_kernel_audit()
+        .await
+        .expect("audit verifies pre-kill");
+
+    let report = kernel
+        .rotate_issuer_keys("test rotation", &actor())
+        .await
+        .expect("rotate");
+
+    let killed = kernel
+        .kill_key_generation(&report.old_host_key_id, "host", "compromise", &actor())
+        .await
+        .expect("kill old host generation");
+    assert!(killed);
+
+    let err = kernel
+        .verify_kernel_audit()
+        .await
+        .expect_err("checkpoints from a killed host generation must not verify");
+    assert!(
+        format!("{err:?}").contains("unknown key generation"),
+        "expected unknown-key-generation failure, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn purge_retains_generation_with_live_lease_refs() {
     let kernel = AuthorityKernelClient::open(config_with_authority(Some(true)))

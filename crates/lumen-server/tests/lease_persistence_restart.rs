@@ -567,18 +567,30 @@ async fn restart_one_shot_replay_rejected() {
 /// tolerate it (pre-migration leases, spec §7): unknown is counted, not
 /// treated as tamper, so the open succeeds.
 ///
+/// The forged lease uses a live session subject: the boot self-check
+/// treats a live lease naming an unknown/inactive session as corruption
+/// (fail the open), so the unknown-*generation* path is only reachable
+/// with a registered subject.
+///
 /// Note: the forged document must be *stored* (`verify_lease` only
 /// resolves generations for documents that match the kernel's record —
 /// an unstored forgery fails earlier as "unknown lease").
 #[tokio::test]
 async fn unknown_issuer_generation_fails_closed() {
     let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    // Live session subject for the forgery (see doc comment).
+    let info = h
+        .kernel
+        .start_session_identity(None)
+        .await
+        .expect("start session identity");
     let now = now_ms();
     let mut core_doc = CoreLeaseDocument {
         protocol_version: LEASE_PROTOCOL_VERSION,
         lease_id: format!("forged-{}", uuid::Uuid::new_v4()),
         parent_id: None,
-        subject: "ed25519:forged-subject".to_string(),
+        subject: info.subject.clone(),
         issuer_key_id: "does-not-exist".to_string(),
         issued_at_ms: now,
         scope: ResourceScope::default(),
@@ -599,7 +611,6 @@ async fn unknown_issuer_generation_fails_closed() {
     core_doc.sign(&SigningKey::from_bytes(&[0x5au8; 32]));
     let host_doc = to_host_doc(&core_doc);
 
-    let h = open_kernel(&env, HashMap::new(), None).await;
     let db = Database::connect(&env.db_path).await.expect("db connect");
     db.insert_kernel_lease(&env.workspace, &core_doc)
         .await

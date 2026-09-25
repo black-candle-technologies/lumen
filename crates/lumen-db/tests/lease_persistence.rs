@@ -466,6 +466,75 @@ async fn expire_kernel_sessions_destroys_only_old_sessions() {
 }
 
 #[tokio::test]
+async fn expire_kernel_sessions_destroys_descendant_subtree() {
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    // Parent is TTL-expired; child was created recently and grandchild
+    // even later — all must go, or the hydration pass would fail the
+    // open on the dangling child.
+    db.insert_kernel_session(&ws, "ed25519:old-parent", None, &vk_hex(31), 0)
+        .await
+        .unwrap();
+    db.insert_kernel_session(
+        &ws,
+        "ed25519:young-child",
+        Some("ed25519:old-parent"),
+        &vk_hex(32),
+        900_000,
+    )
+    .await
+    .unwrap();
+    db.insert_kernel_session(
+        &ws,
+        "ed25519:young-grandchild",
+        Some("ed25519:young-child"),
+        &vk_hex(33),
+        950_000,
+    )
+    .await
+    .unwrap();
+    // An unrelated young session must survive.
+    db.insert_kernel_session(&ws, "ed25519:other", None, &vk_hex(34), 900_000)
+        .await
+        .unwrap();
+
+    let mut destroyed = db
+        .expire_kernel_sessions(&ws, 100_000, 999_999)
+        .await
+        .unwrap();
+    destroyed.sort();
+    assert_eq!(
+        destroyed,
+        vec![
+            "ed25519:old-parent".to_string(),
+            "ed25519:young-child".to_string(),
+            "ed25519:young-grandchild".to_string(),
+        ]
+    );
+
+    for subject in [
+        "ed25519:old-parent",
+        "ed25519:young-child",
+        "ed25519:young-grandchild",
+    ] {
+        let row = db.kernel_session(&ws, subject).await.unwrap().unwrap();
+        assert!(!row.active, "{subject} must be destroyed");
+        assert_eq!(row.destroyed_at_ms, Some(999_999));
+    }
+    let other = db
+        .kernel_session(&ws, "ed25519:other")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(other.active);
+
+    // Only the unrelated session hydrates as active.
+    let active = db.active_kernel_sessions(&ws).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].subject, "ed25519:other");
+}
+
+#[tokio::test]
 async fn destroy_sessions_and_revoke_is_atomic() {
     let db = test_db().await;
     let ws = test_workspace(&db).await;
