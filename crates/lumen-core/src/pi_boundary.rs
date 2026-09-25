@@ -724,6 +724,16 @@ impl AuditLog {
         self.inner.lock().map(|e| e.len()).unwrap_or(0)
     }
 
+    /// Fetch the event recorded at `sequence`, if present.
+    pub fn get(&self, sequence: u64) -> Option<AuditEvent> {
+        self.inner
+            .lock()
+            .ok()?
+            .iter()
+            .find(|e| e.sequence == sequence)
+            .cloned()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1083,6 +1093,13 @@ impl LocalKernel {
         Ok(())
     }
 
+    /// Record an audit event and return the sequence number assigned to it.
+    ///
+    /// Callers that need to identify the event they just recorded (for
+    /// example, a verdict response's `audit_sequence`) must use this return
+    /// value: inferring the sequence from the log's global length afterwards
+    /// races with concurrent evaluations and can attribute another
+    /// evaluation's event to this one.
     fn audit(
         &self,
         actor: AuditActor,
@@ -1091,7 +1108,7 @@ impl LocalKernel {
         action_digest: &str,
         decision: Option<&PolicyDecision>,
         detail: impl Into<String>,
-    ) {
+    ) -> Option<u64> {
         let event = AuditEvent {
             version: AUDIT_EVENT_VERSION,
             event_id: Uuid::new_v4(),
@@ -1106,7 +1123,7 @@ impl LocalKernel {
             prev_hash: String::new(),
             hash: String::new(),
         };
-        let _ = self.audit.append(event);
+        self.audit.append(event).ok()
     }
 
     /// Resolve and validate the lease chain (leaf → root), enforcing
@@ -1170,6 +1187,18 @@ impl LocalKernel {
                 leaf = Some(record);
             }
             previous = Some(record);
+        }
+        // The submitted chain must terminate at a root lease: accepting a
+        // truncated chain would skip the ancestor revocation, expiry, and
+        // narrowing checks that the loop above performs on the full chain.
+        if previous
+            .expect("non-empty chain checked above")
+            .parent
+            .is_some()
+        {
+            return Err(DenyReason::invalid_envelope(
+                "lease chain does not terminate at a root lease".to_string(),
+            ));
         }
         Ok(leaf.expect("non-empty chain checked above").clone())
     }
@@ -1281,11 +1310,27 @@ impl LocalKernel {
 
 impl Kernel for LocalKernel {
     fn evaluate(&self, envelope: &ActionEnvelope) -> Result<PolicyDecision, KernelError> {
+        Ok(self.evaluate_with_verdict_sequence(envelope)?.0)
+    }
+}
+
+impl LocalKernel {
+    /// Evaluate an action and return the audit sequence assigned to this
+    /// evaluation's verdict event.
+    ///
+    /// The sequence comes from the exact audit append for this verdict, so
+    /// concurrent evaluations cannot cause it to identify another action's
+    /// event. A verdict with no durable audit event fails closed instead of
+    /// succeeding silently.
+    pub fn evaluate_with_verdict_sequence(
+        &self,
+        envelope: &ActionEnvelope,
+    ) -> Result<(PolicyDecision, u64), KernelError> {
         let digest = envelope.digest().unwrap_or_else(|_| "none".to_string());
         let actor = AuditActor::Session {
             session_id: envelope.session_id.clone(),
         };
-        self.audit(
+        let _ = self.audit(
             actor.clone(),
             AuditEventKind::ActionProposed,
             &envelope.session_id,
@@ -1319,8 +1364,9 @@ impl Kernel for LocalKernel {
                     &digest,
                     Some(&decision),
                     detail,
-                );
-                Ok(decision)
+                )
+                .ok_or_else(|| KernelError::Internal("audit log unavailable".to_string()))
+                .map(|sequence| (decision, sequence))
             }
             Err(reason) => {
                 let decision = PolicyDecision::deny(reason);
@@ -1337,8 +1383,9 @@ impl Kernel for LocalKernel {
                     &digest,
                     Some(&decision),
                     detail,
-                );
-                Ok(decision)
+                )
+                .ok_or_else(|| KernelError::Internal("audit log unavailable".to_string()))
+                .map(|sequence| (decision, sequence))
             }
         }
     }
@@ -1554,7 +1601,7 @@ async fn serve_connection(
         })
         .unwrap_or(false);
     if !peer_ok {
-        kernel.audit(
+        let _ = kernel.audit(
             AuditActor::Kernel,
             AuditEventKind::TransportRejected,
             "",
@@ -1566,9 +1613,19 @@ async fn serve_connection(
     }
 
     let (reader, mut writer) = stream.into_split();
+    // Bound the inbound record BEFORE any allocation: `take` caps the byte
+    // stream at KERNEL_MAX_RECORD_BYTES + 1, so `next_line` can never grow
+    // its internal buffer past the limit even when the peer never sends a
+    // newline. (Without this, the length check below runs only after the
+    // complete line is already allocated, letting a peer exhaust kernel
+    // memory first.)
+    let bounded = {
+        use tokio::io::AsyncReadExt;
+        reader.take(KERNEL_MAX_RECORD_BYTES as u64 + 1)
+    };
     let mut lines = {
         use tokio::io::AsyncBufReadExt;
-        tokio::io::BufReader::new(reader).lines()
+        tokio::io::BufReader::new(bounded).lines()
     };
 
     loop {
@@ -1580,7 +1637,7 @@ async fn serve_connection(
         if line.len() > KERNEL_MAX_RECORD_BYTES {
             let response = KernelWireResponse::err("record_too_large", "record exceeds 1 MiB");
             let _ = write_response(&mut writer, &response).await;
-            kernel.audit(
+            let _ = kernel.audit(
                 AuditActor::Kernel,
                 AuditEventKind::TransportRejected,
                 "",
@@ -1611,7 +1668,7 @@ async fn serve_connection(
             request.credential.as_bytes(),
             expected_credential.as_bytes(),
         ) {
-            kernel.audit(
+            let _ = kernel.audit(
                 AuditActor::Kernel,
                 AuditEventKind::TransportRejected,
                 &request.envelope.session_id,
@@ -1627,9 +1684,8 @@ async fn serve_connection(
             .envelope
             .digest()
             .unwrap_or_else(|_| "none".to_string());
-        match kernel.evaluate(&request.envelope) {
-            Ok(decision) => {
-                let sequence = kernel.audit_log().len().saturating_sub(1) as u64;
+        match kernel.evaluate_with_verdict_sequence(&request.envelope) {
+            Ok((decision, sequence)) => {
                 let response = KernelWireResponse::ok(decision, sequence, action_digest);
                 let _ = write_response(&mut writer, &response).await;
             }
@@ -1693,9 +1749,8 @@ impl InProcessKernel {
             });
         }
         let action_digest = envelope.digest().unwrap_or_else(|_| "none".to_string());
-        match self.kernel.evaluate(envelope) {
-            Ok(decision) => {
-                let sequence = self.kernel.audit_log().len().saturating_sub(1) as u64;
+        match self.kernel.evaluate_with_verdict_sequence(envelope) {
+            Ok((decision, sequence)) => {
                 Ok(KernelWireResponse::ok(decision, sequence, action_digest))
             }
             Err(e) => Err(WireError {
@@ -2004,6 +2059,83 @@ mod tests {
         );
         let decision2 = kernel.evaluate(&envelope2).expect("evaluate");
         assert!(!decision2.is_allow());
+    }
+
+    #[test]
+    fn truncated_lease_chain_is_rejected() {
+        let (kernel, root) = test_kernel();
+        let child = kernel
+            .issue_child_lease(
+                root,
+                "session-child",
+                vec!["/tmp/lumen-leased/sub".to_string()],
+                vec!["read".to_string()],
+                now_ms() + 1_000_000,
+            )
+            .expect("issue child");
+        // The child is still valid, but the submitted chain does not
+        // terminate at a root lease: accepting it would bypass ancestor
+        // revocation, expiry, and narrowing.
+        let envelope = test_envelope("session-child", "/tmp/lumen-leased/sub/f.txt", vec![child]);
+        let decision = kernel.evaluate(&envelope).expect("evaluate");
+        assert!(
+            !decision.is_allow(),
+            "truncated lease chain must not produce an allow"
+        );
+    }
+
+    #[test]
+    fn verdict_sequences_are_per_evaluation_under_concurrency() {
+        let (kernel, _lease) = test_kernel();
+        // One root lease per thread so subjects stay distinct; the point is
+        // the audit log, which is shared.
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let kernel = kernel.clone();
+                std::thread::spawn(move || {
+                    let lease = kernel
+                        .issue_root_lease(
+                            format!("session-{i}"),
+                            vec!["/tmp/lumen-leased".to_string()],
+                            vec!["read".to_string()],
+                            now_ms() + 3_600_000,
+                        )
+                        .expect("issue root lease");
+                    let envelope = test_envelope(
+                        &format!("session-{i}"),
+                        "/tmp/lumen-leased/a.txt",
+                        vec![lease],
+                    );
+                    let digest = envelope.digest().unwrap_or_else(|_| "none".to_string());
+                    let (decision, sequence) = kernel
+                        .evaluate_with_verdict_sequence(&envelope)
+                        .expect("evaluate");
+                    assert!(decision.is_allow());
+                    (digest, sequence)
+                })
+            })
+            .collect();
+        let results: Vec<(String, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Every returned sequence must identify its own evaluation's verdict
+        // event — never a concurrent evaluation's.
+        for (digest, sequence) in &results {
+            let event = kernel
+                .audit_log()
+                .get(*sequence)
+                .expect("verdict sequence must exist in the log");
+            assert_eq!(
+                &event.action_digest, digest,
+                "sequence {sequence} points at another evaluation's event"
+            );
+            assert!(
+                matches!(event.kind, AuditEventKind::PolicyAllowed),
+                "sequence {sequence} is not a verdict event"
+            );
+        }
+        let mut sequences: Vec<u64> = results.iter().map(|(_, s)| *s).collect();
+        sequences.sort_unstable();
+        sequences.dedup();
+        assert_eq!(sequences.len(), results.len(), "sequences must be distinct");
     }
 
     #[test]

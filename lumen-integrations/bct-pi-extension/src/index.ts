@@ -20,12 +20,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
+import { effectiveReadCap, truncateUtf8Bytes } from "./read-limits.js";
 import { evaluateAction, type ActionEnvelope } from "./kernel-client.js";
 
 const TOOL_VERSION = "1";
 const ACTION_TTL_MS = 60_000;
-const MAX_READ_BYTES = 64 * 1024;
 
 function kernelConfig() {
 	const socketPath = process.env.LUMEN_KERNEL_SOCKET;
@@ -93,7 +93,6 @@ const readFileTool = defineTool({
 		const { socketPath, credential } = kernelConfig();
 		const path = params.path as string;
 		const requestedMax = params.max_bytes as number | undefined;
-		const cap = Math.min(requestedMax ?? MAX_READ_BYTES, MAX_READ_BYTES);
 
 		const envelope = buildEnvelope("bct.read_file", { path }, path);
 		const response = await evaluateAction(socketPath, credential, envelope);
@@ -116,13 +115,49 @@ const readFileTool = defineTool({
 					`Action digest: ${response.action_digest ?? "unknown"}`,
 			);
 		}
+		// The wire is untrusted JSON: fail closed on any decision string the
+		// client does not explicitly handle.
+		const decisionKind = decision.decision as string;
+		if (decisionKind !== "allow") {
+			throw new Error(
+				`Lumen kernel returned unexpected decision '${decisionKind}'; refusing to read`,
+			);
+		}
+
+		// The byte cap comes from the kernel's TruncateOutput obligation:
+		// the kernel authorized at most this many bytes. Fail closed when
+		// the obligation is absent instead of falling back to a local
+		// constant that could exceed the authorization.
+		const cap = effectiveReadCap(decision.obligations, requestedMax);
+
+		// The kernel authorized `path` lexically, but readFile follows
+		// symlinks: `/leased/escape/etc/passwd` (where `escape` -> `/`)
+		// would expose an unleased file. Resolve first and refuse when
+		// canonicalization changes the path, so the bytes read are the
+		// bytes the kernel authorized.
+		let resolved: string;
+		try {
+			resolved = await realpath(path);
+		} catch (err) {
+			throw new Error(
+				`Lumen kernel allowed ${path} but it cannot be resolved: ${String(err)}`,
+			);
+		}
+		if (resolved !== path) {
+			throw new Error(
+				`Refusing to read ${path}: it traverses a symlink (resolves to ${resolved}); ` +
+					"kernel authorization is lexical and cannot cover the target",
+			);
+		}
 
 		// Allowed: perform the read inside the Pi process. (Phase 0 mediates
 		// reads kernel-side for authorization; phase 2 executes even reads
 		// inside the sandbox.)
-		const raw = await readFile(path, "utf8");
-		const truncated = raw.length > cap;
-		const text = truncated ? raw.slice(0, cap) : raw;
+		const raw = await readFile(resolved, "utf8");
+		// Truncate on UTF-8 byte boundaries: `cap` is a byte limit, and
+		// slicing the JS string could split a multi-byte character or hand
+		// back more bytes than authorized.
+		const { text, truncated } = truncateUtf8Bytes(raw, cap);
 		return {
 			content: [
 				{

@@ -38,7 +38,7 @@ export interface ActionEnvelope {
 export type PolicyDecision =
 	| { version: number; decision: "allow"; obligations: Array<{ type: string; [k: string]: unknown }> }
 	| { version: number; decision: "deny"; reason: { code: string; detail: string } }
-	| { version: number; decision: "pending"; approval_id: string; reason: string };
+	| { version: number; decision: "pending_approval"; approval_id: string; reason: string };
 
 export interface KernelWireResponse {
 	protocol: string;
