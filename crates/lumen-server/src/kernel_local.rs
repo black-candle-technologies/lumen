@@ -464,13 +464,41 @@ impl KernelClient for LocalKernelClient {
             .issued
             .lock()
             .unwrap()
-            .remove(session_subject)
+            .get(session_subject)
+            .cloned()
             .unwrap_or_default();
         Box::pin(async move {
+            let mut unrevoked: Vec<LeaseId> = Vec::new();
+            let mut first_error: Option<KernelError> = None;
             for id in ids {
-                kernel
-                    .revoke_lease(id)
-                    .map_err(|e| KernelError::Unavailable(format!("revoke lease {id}: {e}")))?;
+                if first_error.is_some() {
+                    // Stop at the first failure: everything after it is
+                    // unattempted and stays tracked for a later retry.
+                    unrevoked.push(id);
+                    continue;
+                }
+                if let Err(e) = kernel.revoke_lease(id) {
+                    first_error = Some(KernelError::Unavailable(format!("revoke lease {id}: {e}")));
+                    unrevoked.push(id);
+                }
+                // Revoking an already-revoked id succeeds, so a retried
+                // id can never double-revoke: only ids that are NOT
+                // confirmed revoked stay tracked below.
+            }
+            // Retain the un-revoked ids until revocation succeeds: a
+            // later call retries exactly these. Only a fully successful
+            // pass clears the subject's entry, so a failed revocation
+            // never silently drops lease ids.
+            {
+                let mut issued = self.issued.lock().unwrap();
+                if unrevoked.is_empty() {
+                    issued.remove(session_subject);
+                } else {
+                    issued.insert(session_subject.to_string(), unrevoked);
+                }
+            }
+            if let Some(err) = first_error {
+                return Err(err);
             }
             Ok(())
         })
@@ -689,5 +717,94 @@ mod tests {
             .await
             .expect_err("verify_lease must be honestly unwired");
         assert!(matches!(err, KernelError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_revoke_retains_lease_ids_for_retry() {
+        let client = LocalKernelClient::new(test_kernel());
+        let real = client
+            .issue_session_lease(
+                "sess-revoke",
+                vec!["/leased".into()],
+                vec!["read".into()],
+                now_ms() + 3_600_000,
+            )
+            .expect("issue lease");
+        // A lease id the kernel never saw: revoke_lease fails on it.
+        let bogus = LeaseId::new();
+        client
+            .issued
+            .lock()
+            .unwrap()
+            .insert("sess-revoke".to_string(), vec![bogus, real]);
+
+        let err = client
+            .revoke_session("sess-revoke")
+            .await
+            .expect_err("revoke must fail on the unknown lease");
+        assert!(err.to_string().contains("revoke lease"), "got: {err}");
+
+        // The failed revocation drops nothing: both ids stay tracked
+        // so a later call can retry them.
+        assert_eq!(client.issued_for("sess-revoke"), vec![bogus, real]);
+
+        // The real lease is still live kernel-side: the failed pass did
+        // not half-revoke it.
+        let env = read_envelope("sess-revoke", vec![real.to_string()], "/leased/a.txt");
+        let decision = client.decide(&env).await.expect("decide must not error");
+        assert!(
+            matches!(decision.decision, Decision::Allow { .. }),
+            "real lease must still allow, got {:?}",
+            decision.decision
+        );
+
+        // Partial success: the real lease revokes and leaves tracking;
+        // the bogus one stays retained for the next retry.
+        client
+            .issued
+            .lock()
+            .unwrap()
+            .insert("sess-revoke".to_string(), vec![real, bogus]);
+        let err = client
+            .revoke_session("sess-revoke")
+            .await
+            .expect_err("revoke must still fail on the unknown lease");
+        assert!(err.to_string().contains("revoke lease"), "got: {err}");
+        assert_eq!(client.issued_for("sess-revoke"), vec![bogus]);
+
+        // The real lease really is revoked kernel-side now.
+        let decision = client.decide(&env).await.expect("decide must not error");
+        assert!(
+            matches!(decision.decision, Decision::Deny { .. }),
+            "revoked lease must deny, got {:?}",
+            decision.decision
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_revoke_clears_tracked_lease_ids() {
+        let client = LocalKernelClient::new(test_kernel());
+        let lease = client
+            .issue_session_lease(
+                "sess-revoke-ok",
+                vec!["/leased".into()],
+                vec!["read".into()],
+                now_ms() + 3_600_000,
+            )
+            .expect("issue lease");
+        assert_eq!(client.issued_for("sess-revoke-ok"), vec![lease]);
+
+        client
+            .revoke_session("sess-revoke-ok")
+            .await
+            .expect("revoke");
+        // A fully successful pass clears the subject's entry.
+        assert!(client.issued_for("sess-revoke-ok").is_empty());
+
+        // And revoking again is a harmless no-op.
+        client
+            .revoke_session("sess-revoke-ok")
+            .await
+            .expect("re-revoke");
     }
 }

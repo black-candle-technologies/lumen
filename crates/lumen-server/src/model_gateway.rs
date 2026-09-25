@@ -7,8 +7,10 @@
 //! - supports cancellation, timeout, bounded retry budgets, and provider
 //!   outage handling,
 //! - redacts provider payloads before anything reaches the audit log,
-//! - quarantines the spend pool when usage comes back unknown (no new
-//!   spend until reconciliation).
+//! - quarantines the spend pool when usage comes back unknown -- or when
+//!   an attempt's spend is unknowable (timeout, mid-flight cancellation)
+//!   -- with no new spend until reconciliation. Timeouts and
+//!   cancellations are never retried: the attempt may already have spent.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -95,8 +97,9 @@ pub struct ModelRequest {
     pub cancel: CancellationToken,
 }
 
-/// Raw completion from a provider adapter. Token counts may be absent;
-/// the gateway treats unknown usage as a quarantine trigger, not as zero.
+/// Raw completion from a provider adapter. Token counts and cost may be
+/// absent; the gateway treats unknown usage as a quarantine trigger, not
+/// as zero.
 #[derive(Debug, Clone)]
 pub struct ProviderCompletion {
     pub content: String,
@@ -160,8 +163,11 @@ pub struct NormalizedUsage {
     pub output_tokens: u64,
     pub cost_micros: u64,
     pub latency_ms: u64,
-    /// False when the provider did not report usage: the spend pool is
-    /// quarantined and `cost_micros` is a conservative estimate, not a bill.
+    /// False when the provider did not report full usage (token counts
+    /// AND cost): the spend pool has been conservatively charged the
+    /// request ceiling and quarantined, and `cost_micros` is that
+    /// ceiling debit -- an estimate, not a bill. A missing cost is
+    /// unknown usage, never zero cost.
     pub usage_known: bool,
 }
 
@@ -189,11 +195,22 @@ pub trait SpendPool: Send + Sync {
     fn try_reserve(&self, micros: u64) -> bool;
     /// Commit a reservation after success.
     fn commit(&self, micros: u64);
-    /// Release a reservation after failure/cancellation.
+    /// Release a reservation for an attempt that provably spent nothing
+    /// (hard failure before provider work, pre-attempt cancellation,
+    /// exhausted transient retries). Attempts that may have incurred
+    /// provider spend (unknown usage, provider/gateway timeout,
+    /// mid-flight cancellation) use [`SpendPool::commit_unknown`]
+    /// instead: releasing them would book the attempt as known-zero
+    /// spend.
     fn release(&self, micros: u64);
-    /// Quarantine the pool: no new spend until `reconcile`.
-    fn quarantine(&self);
-    /// Reconcile unknown usage and lift the quarantine.
+    /// Conservatively commit `micros` (the request ceiling) and
+    /// quarantine the pool: the attempt's spend is unknown, so the
+    /// worst case is charged until [`SpendPool::reconcile`] reports the
+    /// actual. No new spend is permitted while quarantined.
+    fn commit_unknown(&self, micros: u64);
+    /// Reconcile unknown usage and lift the quarantine. Reverses the
+    /// conservative debit from `commit_unknown` before charging the
+    /// actual spend, so the ceiling is never double-counted.
     fn reconcile(&self, actual_micros: u64);
     fn quarantined(&self) -> bool;
 }
@@ -209,6 +226,11 @@ struct PoolState {
     balance_micros: u64,
     reserved_micros: u64,
     quarantined: bool,
+    /// Amount conservatively committed by `commit_unknown` (the request
+    /// ceiling of the unknown attempt). `reconcile` reverses exactly
+    /// this before charging the actual spend, so the ceiling is never
+    /// double-counted.
+    quarantined_micros: u64,
 }
 
 impl MemorySpendPool {
@@ -218,6 +240,7 @@ impl MemorySpendPool {
                 balance_micros,
                 reserved_micros: 0,
                 quarantined: false,
+                quarantined_micros: 0,
             }),
         }
     }
@@ -252,12 +275,27 @@ impl SpendPool for MemorySpendPool {
         state.reserved_micros = state.reserved_micros.saturating_sub(micros);
     }
 
-    fn quarantine(&self) {
-        self.state.lock().unwrap().quarantined = true;
+    fn commit_unknown(&self, micros: u64) {
+        let mut state = self.state.lock().unwrap();
+        // The reservation converts into a conservative charge: the
+        // attempt may have spent up to the ceiling, so the ceiling is
+        // what the pool books until reconciliation.
+        state.reserved_micros = state.reserved_micros.saturating_sub(micros);
+        state.balance_micros = state.balance_micros.saturating_sub(micros);
+        state.quarantined_micros = state.quarantined_micros.saturating_add(micros);
+        state.quarantined = true;
     }
 
     fn reconcile(&self, actual_micros: u64) {
         let mut state = self.state.lock().unwrap();
+        // Reverse the conservative debit first, then charge the actual
+        // spend: net effect is `balance -= actual`, never
+        // `balance -= ceiling + actual`. When the actual is below the
+        // ceiling the over-held difference is credited back.
+        state.balance_micros = state
+            .balance_micros
+            .saturating_add(state.quarantined_micros);
+        state.quarantined_micros = 0;
         state.balance_micros = state.balance_micros.saturating_sub(actual_micros);
         state.quarantined = false;
     }
@@ -437,18 +475,24 @@ impl ModelGateway {
             match tokio::time::timeout(self.config.attempt_timeout, attempt_future).await {
                 Ok(Ok(completion)) => {
                     self.record_success(&request.provider);
-                    pool.release(ceiling);
-                    let usage_known =
-                        completion.input_tokens.is_some() && completion.output_tokens.is_some();
-                    // Unknown usage quarantines the pool: no new spend
+                    // Usage is known only when the provider reported
+                    // token counts AND cost. A missing cost is unknown
+                    // usage, not zero cost: committing it as zero would
+                    // under-bill the spend pool, so the ceiling is
+                    // conservatively committed and the pool quarantined
                     // until the host reconciles out of band.
-                    if !usage_known {
-                        pool.quarantine();
-                    }
-                    let cost_micros = completion.cost_micros.unwrap_or(0);
-                    if usage_known {
-                        pool.commit(cost_micros);
-                    }
+                    let usage_known = completion.input_tokens.is_some()
+                        && completion.output_tokens.is_some()
+                        && completion.cost_micros.is_some();
+                    let cost_micros = if usage_known {
+                        let cost = completion.cost_micros.unwrap_or(0);
+                        pool.release(ceiling);
+                        pool.commit(cost);
+                        cost
+                    } else {
+                        pool.commit_unknown(ceiling);
+                        ceiling
+                    };
                     let usage = NormalizedUsage {
                         provider: request.provider.clone(),
                         model: request.model.clone(),
@@ -472,7 +516,14 @@ impl ModelGateway {
                     });
                 }
                 Ok(Err(ProviderError::Cancelled)) => {
-                    pool.release(ceiling);
+                    // Cancelled mid-flight: the provider may already have
+                    // done (and billed) the work, so spend is unknown.
+                    // Conservatively commit the ceiling and quarantine --
+                    // no new spend until the host reconciles -- instead
+                    // of releasing the attempt as known-zero spend, and
+                    // never retry a cancelled attempt (a retry could
+                    // double-spend).
+                    pool.commit_unknown(ceiling);
                     return Err(GatewayError::Cancelled);
                 }
                 Ok(Err(ProviderError::Transient(message))) => {
@@ -494,31 +545,30 @@ impl ModelGateway {
                     });
                 }
                 Ok(Err(ProviderError::Timeout)) => {
-                    last_error = "provider timed out".to_string();
+                    // A provider-reported timeout may still have incurred
+                    // spend on the provider side. Conservatively commit
+                    // the ceiling and quarantine instead of retrying: a
+                    // retry could double-spend, and releasing without
+                    // quarantine would treat the attempt as known-zero
+                    // spend.
                     self.record_failure(&request.provider);
-                    pool.release(ceiling);
-                    if attempt < self.config.max_attempts && pool.try_reserve(ceiling) {
-                        tokio::time::sleep(self.config.retry_backoff).await;
-                        continue;
-                    }
+                    pool.commit_unknown(ceiling);
                     return Err(GatewayError::ProviderFailed {
                         attempts: attempt,
-                        last: last_error.clone(),
+                        last: "provider timed out".to_string(),
                     });
                 }
                 Err(_) => {
-                    // Attempt timed out: same bounded-retry rule as a
-                    // transient provider failure.
-                    last_error = "attempt timed out".to_string();
+                    // The gateway's own attempt timeout fired: the
+                    // attempt's spend is unknowable, so the same
+                    // conservative-commit-and-quarantine rule applies as
+                    // for a provider timeout. No retry: the timed-out
+                    // attempt may already have spent.
                     self.record_failure(&request.provider);
-                    pool.release(ceiling);
-                    if attempt < self.config.max_attempts && pool.try_reserve(ceiling) {
-                        tokio::time::sleep(self.config.retry_backoff).await;
-                        continue;
-                    }
+                    pool.commit_unknown(ceiling);
                     return Err(GatewayError::ProviderFailed {
                         attempts: attempt,
-                        last: last_error.clone(),
+                        last: "attempt timed out".to_string(),
                     });
                 }
             }
@@ -554,6 +604,7 @@ pub enum MockProviderOutcome {
     },
     Transient(String),
     Hard(String),
+    Timeout,
     Hang,
 }
 
@@ -616,6 +667,7 @@ impl ProviderAdapter for MockProviderAdapter {
                 }),
                 MockProviderOutcome::Transient(message) => Err(ProviderError::Transient(message)),
                 MockProviderOutcome::Hard(message) => Err(ProviderError::Hard(message)),
+                MockProviderOutcome::Timeout => Err(ProviderError::Timeout),
                 MockProviderOutcome::Hang => {
                     cancel.cancelled().await;
                     Err(ProviderError::Cancelled)
@@ -704,12 +756,16 @@ mod tests {
             output_tokens: None,
             cost_micros: None,
         }]);
+        let before = pool.balance();
         let response = gateway
             .complete(&request(), &policy(), pool.as_ref())
             .await
             .unwrap();
         assert!(!response.usage.usage_known);
         assert!(pool.quarantined());
+        // Unknown usage conservatively commits the request ceiling:
+        // the attempt may have spent up to the ceiling.
+        assert_eq!(pool.balance(), before - 1000);
 
         // No new spend while quarantined.
         let (gateway2, _, _) = test_gateway(vec![]);
@@ -719,9 +775,137 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, GatewayError::BudgetDenied(_)));
 
-        // Reconciliation lifts the quarantine.
+        // Reconciliation reverses the ceiling debit, books the actual,
+        // and lifts the quarantine -- never double-counting.
         pool.reconcile(7);
         assert!(!pool.quarantined());
+        assert_eq!(pool.balance(), before - 7);
+    }
+
+    #[tokio::test]
+    async fn missing_cost_is_unknown_usage_not_zero_cost() {
+        // Tokens reported but no cost: usage is unknown, not zero.
+        // Booking this as zero would under-bill the spend pool, so the
+        // ceiling is conservatively committed instead.
+        let (gateway, _, pool) = test_gateway(vec![MockProviderOutcome::Ok {
+            content: "x".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cost_micros: None,
+        }]);
+        let before = pool.balance();
+        let response = gateway
+            .complete(&request(), &policy(), pool.as_ref())
+            .await
+            .unwrap();
+        assert!(!response.usage.usage_known);
+        // The usage record carries the conservative ceiling debit,
+        // flagged as an estimate rather than a bill.
+        assert_eq!(response.usage.cost_micros, 1000);
+        assert!(pool.quarantined());
+        assert_eq!(pool.balance(), before - 1000);
+
+        // Reconciliation books the true cost and lifts the quarantine.
+        pool.reconcile(9);
+        assert!(!pool.quarantined());
+        assert_eq!(pool.balance(), before - 9);
+    }
+
+    #[tokio::test]
+    async fn provider_timeout_quarantines_without_retry() {
+        let config = GatewayConfig {
+            max_attempts: 3,
+            ..GatewayConfig::default()
+        };
+        let vault = Arc::new(CredentialVault::new());
+        vault.insert("acme", SecretString::new("sk-test"));
+        let mut gateway = ModelGateway::new(config, vault);
+        let adapter = Arc::new(MockProviderAdapter::new(
+            "acme",
+            vec![MockProviderOutcome::Timeout],
+        ));
+        gateway.register_adapter(adapter.clone());
+        let pool = MemorySpendPool::new(1_000_000);
+
+        let err = gateway
+            .complete(&request(), &policy(), &pool)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GatewayError::ProviderFailed { attempts: 1, ref last } if last == "provider timed out"),
+            "unexpected error: {err:?}"
+        );
+        // No retry: the timed-out attempt may already have spent on the
+        // provider side, and a retry could double-spend. The ceiling is
+        // conservatively committed.
+        assert_eq!(adapter.calls(), 1);
+        assert!(pool.quarantined());
+        assert_eq!(pool.balance(), 1_000_000 - 1000);
+
+        // The host reconciles the true spend out of band: the ceiling
+        // debit is reversed, the actual booked, never double-counted.
+        pool.reconcile(500);
+        assert!(!pool.quarantined());
+        assert_eq!(pool.balance(), 1_000_000 - 500);
+    }
+
+    #[tokio::test]
+    async fn gateway_attempt_timeout_quarantines_without_retry() {
+        let config = GatewayConfig {
+            attempt_timeout: Duration::from_millis(50),
+            max_attempts: 3,
+            ..GatewayConfig::default()
+        };
+        let vault = Arc::new(CredentialVault::new());
+        vault.insert("acme", SecretString::new("sk-test"));
+        let mut gateway = ModelGateway::new(config, vault);
+        let adapter = Arc::new(MockProviderAdapter::new(
+            "acme",
+            vec![MockProviderOutcome::Hang],
+        ));
+        gateway.register_adapter(adapter.clone());
+        let pool = MemorySpendPool::new(1_000_000);
+
+        let err = gateway
+            .complete(&request(), &policy(), &pool)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GatewayError::ProviderFailed { attempts: 1, ref last } if last == "attempt timed out"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(adapter.calls(), 1);
+        assert!(pool.quarantined());
+    }
+
+    #[tokio::test]
+    async fn midflight_cancellation_quarantines_pool() {
+        let (gateway, adapter, pool) = test_gateway(vec![MockProviderOutcome::Hang]);
+        let req = request();
+        let cancel = req.cancel.clone();
+        let pool_for_task = Arc::clone(&pool);
+        let handle = tokio::spawn(async move {
+            gateway
+                .complete(&req, &policy(), pool_for_task.as_ref())
+                .await
+        });
+        // Wait for the attempt to start, then cancel mid-flight.
+        for _ in 0..100 {
+            if adapter.calls() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(adapter.calls(), 1);
+        cancel.cancel();
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(matches!(err, GatewayError::Cancelled));
+        // The cancelled attempt may have incurred provider spend:
+        // conservatively commit the ceiling and quarantine the pool;
+        // never retry a cancelled attempt.
+        assert_eq!(adapter.calls(), 1);
+        assert!(pool.quarantined());
+        assert_eq!(pool.balance(), 1_000_000 - 1000);
     }
 
     #[tokio::test]

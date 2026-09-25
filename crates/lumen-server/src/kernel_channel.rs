@@ -48,7 +48,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::Semaphore,
 };
@@ -140,8 +140,15 @@ impl ChannelResponse {
 #[derive(Debug, Clone)]
 pub struct KernelChannelConfig {
     /// Filesystem path of the Unix socket. The operator owns the parent
-    /// directory; the socket file itself is created mode 0600.
+    /// directory; the socket file itself is parent-owned, group
+    /// `sandbox_gid`, mode 0620 (group members may only connect).
     pub socket_path: PathBuf,
+    /// Group that may `connect(2)` to the socket. A Pi child mapped to
+    /// the dedicated sandbox identity has gid 0 -> `sandbox_gid` in its
+    /// user namespace, so group write is its connect path; a 1:1
+    /// fallback child connects as the owner. Must be the same gid the
+    /// Pi sandbox is configured with.
+    pub sandbox_gid: u32,
     /// Maximum bytes read for one request line. Larger input is
     /// rejected before parsing: no unbounded allocation from the peer.
     pub max_request_bytes: usize,
@@ -161,6 +168,7 @@ impl Default for KernelChannelConfig {
     fn default() -> Self {
         Self {
             socket_path: PathBuf::from("/run/lumen/kernel.sock"),
+            sandbox_gid: 65534,
             max_request_bytes: 1024 * 1024,
             request_timeout: Duration::from_secs(30),
             max_connections: 64,
@@ -216,7 +224,32 @@ impl KernelChannel {
         // the operator owns this path, so removing it is safe.
         let _ = std::fs::remove_file(&config.socket_path);
         let listener = UnixListener::bind(&config.socket_path)?;
-        std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
+        // Parent-owned, group-mediated socket: it stays owned by the
+        // supervisor's uid, group `sandbox_gid`, mode 0620. A 1:1
+        // fallback child connects as the owner; a dedicated-map child
+        // (gid 0 -> `sandbox_gid` in its user namespace) connects via
+        // group write, which is all `connect(2)` needs. No child-side
+        // chown: a dedicated-map child has no privilege over this
+        // supervisor-owned inode, so it could never take ownership.
+        //
+        // A non-root supervisor cannot chown to an arbitrary group --
+        // but it also cannot map the dedicated sandbox uid, so the
+        // owner-only fallback mode is exactly right there. Only a root
+        // supervisor that *can* chown but fails must fail closed.
+        let uid = unsafe { libc::getuid() };
+        let socket_cstr = std::ffi::CString::new(config.socket_path.as_os_str().as_encoded_bytes())
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("socket path is not a valid C string: {e}"),
+                )
+            })?;
+        let group_ok = unsafe { libc::chown(socket_cstr.as_ptr(), uid, config.sandbox_gid) } == 0;
+        if !group_ok && uid == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mode = if group_ok { 0o620 } else { 0o600 };
+        std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(mode))?;
 
         let shared = Arc::new(ChannelShared {
             semaphore: Arc::new(Semaphore::new(config.max_connections)),
@@ -267,6 +300,11 @@ struct ChannelShared {
 /// Serve one connection: exactly one request line in, one response line
 /// out, then close. Every error path responds with a typed error (or
 /// nothing, if the peer vanished) and never touches the sandbox.
+///
+/// The request line is read through [`read_bounded_line`]: the size
+/// bound is enforced *during* the read, so a peer that streams an
+/// unbounded line (or never sends a newline) cannot grow the buffer
+/// past `max_bytes + 1` before the size check runs.
 async fn handle_connection(shared: &Arc<ChannelShared>, stream: UnixStream) {
     // Capture peer credentials before splitting: the halves do not
     // expose them on all platforms.
@@ -278,21 +316,22 @@ async fn handle_connection(shared: &Arc<ChannelShared>, stream: UnixStream) {
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut line = Vec::new();
 
     // One line, bounded, with a deadline: a peer that trickles bytes
-    // forever cannot hold the connection open.
-    let head: Result<(), ChannelResponse> = async {
-        let n = tokio::time::timeout(
+    // forever cannot hold the connection open, and a peer that floods
+    // bytes cannot grow the buffer past the bound (enforced inside
+    // `read_bounded_line`, during the read).
+    let head: Result<Vec<u8>, ChannelResponse> = async {
+        let line = tokio::time::timeout(
             shared.config.request_timeout,
-            reader.read_until(b'\n', &mut line),
+            read_bounded_line(&mut reader, shared.config.max_request_bytes),
         )
         .await
         .map_err(|_| {
             ChannelResponse::error("timeout", "request line read timed out".to_string(), None)
         })?
         .map_err(|e| ChannelResponse::error("io", format!("request read failed: {e}"), None))?;
-        if n == 0 {
+        if line.is_empty() {
             return Err(ChannelResponse::error(
                 "empty",
                 "peer closed without sending a request".to_string(),
@@ -310,12 +349,12 @@ async fn handle_connection(shared: &Arc<ChannelShared>, stream: UnixStream) {
                 None,
             ));
         }
-        Ok(())
+        Ok(line)
     }
     .await;
 
     let response = match head {
-        Ok(()) => serve_request(shared, &line, peer_pid).await,
+        Ok(line) => serve_request(shared, &line, peer_pid).await,
         Err(e) => e,
     };
 
@@ -325,6 +364,22 @@ async fn handle_connection(shared: &Arc<ChannelShared>, stream: UnixStream) {
     // about a failed write.
     let _ = write_half.write_all(&bytes).await;
     let _ = write_half.shutdown().await;
+}
+
+/// Read one `\n`-terminated line, enforcing `max_bytes` *during* the
+/// read: `take(max_bytes + 1)` caps how much `read_until` can pull
+/// from the peer, so the returned buffer never exceeds `max_bytes + 1`
+/// bytes even if the peer never sends a newline. Callers still check
+/// `line.len() > max_bytes` to reject the over-long line; that check
+/// can no longer observe an unbounded allocation.
+async fn read_bounded_line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut limited = reader.take(max_bytes as u64 + 1);
+    limited.read_until(b'\n', &mut line).await?;
+    Ok(line)
 }
 
 /// Parse, authenticate, and mediate one request line.
@@ -380,21 +435,103 @@ async fn serve_request(
     }
 
     let digest = request.envelope.digest().ok();
-    let outcome = match tokio::time::timeout(
-        shared.config.request_timeout,
-        shared
-            .pipeline
-            .execute_envelope(&request.envelope, &session.subject),
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
+    // Mediation runs in a detached task: if the deadline elapses, the
+    // task is left running to completion -- its audit and completion
+    // records still land -- while the channel replies `Uncertain`
+    // immediately. Cancelling the future instead would drop in-flight
+    // commit/audit writes and lose the records the timeout is meant to
+    // protect.
+    let pipeline = Arc::clone(&shared.pipeline);
+    let envelope = request.envelope;
+    let subject = session.subject.clone();
+    let mediation =
+        tokio::spawn(async move { pipeline.execute_envelope(&envelope, &subject).await });
+    let outcome = match tokio::time::timeout(shared.config.request_timeout, mediation).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(join_error)) => {
+            // The mediation task panicked: it may have panicked before,
+            // during, or after the commit, so the effect is unknown --
+            // mapping this to `Fault` would wrongly assert the effect
+            // did NOT commit. Report `Uncertain` (fail closed) so the
+            // client reconciles by action digest instead of blindly
+            // retrying and double-executing.
+            mediation_panic_outcome(digest.as_deref(), join_error)
+        }
         Err(_) => {
-            return ChannelResponse::error("timeout", "mediation timed out".to_string(), digest);
+            // Deadline elapsed: the detached task keeps running, so its
+            // records still land. A plain timeout error would invite the
+            // extension to blindly retry and double-execute; report
+            // `Uncertain` instead so the client reconciles by digest.
+            mediation_timeout_outcome(digest.as_deref(), shared.config.request_timeout)
         }
     };
 
     map_outcome(outcome, digest)
+}
+
+/// Build the outcome for a mediation task that panicked.
+///
+/// A panic may have landed before, during, or after the effect commit,
+/// so the effect state is unknown -- the same unknown-effect state as a
+/// timeout. This is the same [`ToolOutcome::Uncertain`] the pipeline
+/// itself produces, so the client must reconcile by action digest
+/// (re-query, never re-submit) rather than retry the action.
+fn mediation_panic_outcome(
+    digest: Option<&str>,
+    join_error: tokio::task::JoinError,
+) -> ToolOutcome {
+    ToolOutcome::Uncertain {
+        result: serde_json::Value::Null,
+        usage: ResourceUsage {
+            cpu_ms: 0,
+            memory_bytes_max: 0,
+            egress_bytes: 0,
+        },
+        reason: format!(
+            "mediation task failed: {join_error}; the effect may have committed \
+             -- reconcile by action digest, do not blindly retry"
+        ),
+        action_digest: digest.unwrap_or_default().to_string(),
+        // No staged audit ref exists: the mediation never got far
+        // enough to produce one (or its handle was lost to the panic).
+        // The digest alone keys reconciliation.
+        staged_audit_ref: AuditRef {
+            event_id: String::new(),
+            chain_hash: String::new(),
+        },
+    }
+}
+
+/// Build the outcome for a mediation that exceeded its deadline.
+///
+/// The detached mediation task is left running, but the deadline may
+/// have fired while the commit or its audit write was in flight, so
+/// the effect may already have landed. Cancellation is not proof the
+/// effect did not happen: this is the same unknown-effect state as the
+/// pipeline's own [`ToolOutcome::Uncertain`], so the client must
+/// reconcile by action digest (re-query, never re-submit) rather than
+/// retry the action.
+fn mediation_timeout_outcome(digest: Option<&str>, timeout: Duration) -> ToolOutcome {
+    ToolOutcome::Uncertain {
+        result: serde_json::Value::Null,
+        usage: ResourceUsage {
+            cpu_ms: 0,
+            memory_bytes_max: 0,
+            egress_bytes: 0,
+        },
+        reason: format!(
+            "mediation timed out after {timeout:?}; the effect may have committed \
+             -- reconcile by action digest, do not blindly retry"
+        ),
+        action_digest: digest.unwrap_or_default().to_string(),
+        // No staged audit ref exists: the mediation never got far
+        // enough to produce one (or its handle was lost to the
+        // timeout). The digest alone keys reconciliation.
+        staged_audit_ref: AuditRef {
+            event_id: String::new(),
+            chain_hash: String::new(),
+        },
+    }
 }
 
 /// Render a pipeline outcome as the channel response.
@@ -504,5 +641,71 @@ mod tests {
         // The staged audit ref is attached for reconciliation.
         assert_eq!(response.audit_ref, Some(staged_ref));
         assert_eq!(response.action_digest.as_deref(), Some("digest-1"));
+    }
+
+    #[test]
+    fn mediation_timeout_maps_to_uncertain_not_a_timeout_error() {
+        let outcome = mediation_timeout_outcome(Some("digest-9"), Duration::from_secs(30));
+        let (reason, action_digest) = match &outcome {
+            ToolOutcome::Uncertain {
+                reason,
+                action_digest,
+                ..
+            } => (reason.clone(), action_digest.clone()),
+            other => panic!("mediation timeout must map to Uncertain, got {other:?}"),
+        };
+        assert_eq!(action_digest, "digest-9");
+        assert!(reason.contains("timed out"), "got: {reason}");
+        assert!(
+            reason.contains("may have committed"),
+            "the client must be warned the effect may have landed: {reason}"
+        );
+
+        // Rendered on the wire as the reconciliation error, never as a
+        // plain "timeout": no decision, no result, digest attached.
+        let response = map_outcome(outcome, Some("digest-9".to_string()));
+        let error = response
+            .error
+            .expect("timeout outcome must render a channel error");
+        assert_eq!(error.code, "effect_uncertain");
+        assert_ne!(error.code, "timeout");
+        assert!(error.detail.contains("digest-9"));
+        assert!(response.decision.is_none());
+        assert!(response.result.is_none());
+        assert_eq!(response.action_digest.as_deref(), Some("digest-9"));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_caps_allocation_during_read() {
+        // A peer that streams 10x the bound without ever sending a
+        // newline: the old unbounded `read_until` buffered all of it
+        // before the size check ran. The bounded read must stop at
+        // max+1 bytes.
+        let data = vec![b'x'; 640];
+        let mut reader = BufReader::new(&data[..]);
+        let line = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert_eq!(line.len(), 65, "read must stop at max+1 bytes");
+        assert!(!line.ends_with(b"\n"));
+
+        // A well-formed short line still reads fully, newline included.
+        let data = b"{\"a\":1}\n";
+        let mut reader = BufReader::new(&data[..]);
+        let line = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert_eq!(line, b"{\"a\":1}\n");
+
+        // A line of exactly max bytes + newline is read in full so the
+        // caller's `line.len() > max` check rejects it as too large.
+        let mut data = vec![b'y'; 64];
+        data.push(b'\n');
+        let mut reader = BufReader::new(&data[..]);
+        let line = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert_eq!(line.len(), 65);
+        assert!(line.len() > 64);
+
+        // EOF with no data reads as empty (the "peer closed" path).
+        let data: &[u8] = b"";
+        let mut reader = BufReader::new(data);
+        let line = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert!(line.is_empty());
     }
 }

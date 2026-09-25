@@ -176,14 +176,34 @@ impl SandboxRunner for DriverSandboxRunner {
             let map_err =
                 |e: lumen_sandboxd::SandboxError| SandboxError::Failed(format!("driver: {e}"));
             let handle = driver.prepare(&spec).await.map_err(map_err)?;
-            driver.start(&handle).await.map_err(map_err)?;
-            // `stream_collect`, not the frozen `stream`: its future is
-            // `Send`, so this stage future can run in spawned tasks.
-            let (chunks, _stats) = driver.stream_collect(&handle).await.map_err(map_err)?;
-            let result = driver.run_result(&handle).map_err(map_err)?;
-            Ok(Box::new(DriverStagedExecution::from_completed(
-                &chunks, &result, None,
-            )) as Box<dyn StagedExecution>)
+            // The run exists from here on: it must be destroyed on EVERY
+            // path — post-prepare failures (start/stream/result) and
+            // success alike — or microVM resources, netns UIDs and run IDs
+            // leak until the driver reconciles them.
+            let staged: Result<Box<dyn StagedExecution>, SandboxError> = async {
+                driver.start(&handle).await.map_err(map_err)?;
+                // `stream_collect`, not the frozen `stream`: its future is
+                // `Send`, so this stage future can run in spawned tasks.
+                let (chunks, _stats) = driver.stream_collect(&handle).await.map_err(map_err)?;
+                let result = driver.run_result(&handle).map_err(map_err)?;
+                Ok(Box::new(DriverStagedExecution::from_completed(
+                    &chunks, &result, None,
+                )) as Box<dyn StagedExecution>)
+            }
+            .await;
+            // Destroy unconditionally. A destroy failure must not mask the
+            // stage error, but on the success path it is itself a stage
+            // failure: the run's resources were not reclaimed.
+            match (staged, driver.destroy(&handle).await) {
+                (staged, Ok(())) => staged,
+                (Err(stage_err), Err(destroy_err)) => Err(match stage_err {
+                    SandboxError::Failed(msg) => SandboxError::Failed(format!(
+                        "{msg}; driver destroy also failed: {destroy_err}"
+                    )),
+                    other => other,
+                }),
+                (Ok(_), Err(destroy_err)) => Err(map_err(destroy_err)),
+            }
         })
     }
 }

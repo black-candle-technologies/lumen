@@ -165,21 +165,55 @@ struct DriverInner {
     live: Mutex<std::collections::HashMap<String, LiveRun>>,
 }
 
-/// Monotonic UID allocator. On startup it skips past UIDs still referenced
-/// by non-destroyed runs, so a restart never reuses a live UID.
+/// UID allocator with release. UIDs still referenced by non-destroyed
+/// runs (found at startup) are marked in-use, so a restart never reuses
+/// a live UID. Released UIDs are handed out again, so a long-lived
+/// driver never exhausts the pool on a per-action run model.
 struct UidPool {
+    start: u32,
     end: u32,
-    next: u32,
+    in_use: std::collections::HashSet<u32>,
 }
 
 impl UidPool {
     fn alloc(&mut self) -> Option<u32> {
-        if self.next > self.end {
-            return None;
-        }
-        let uid = self.next;
-        self.next += 1;
+        let uid = (self.start..=self.end).find(|uid| !self.in_use.contains(uid))?;
+        self.in_use.insert(uid);
         Some(uid)
+    }
+
+    fn release(&mut self, uid: u32) {
+        self.in_use.remove(&uid);
+    }
+
+    fn mark_used(&mut self, uid: u32) {
+        if (self.start..=self.end).contains(&uid) {
+            self.in_use.insert(uid);
+        }
+    }
+}
+
+/// Returns a freshly allocated UID to the pool on drop, unless
+/// disarmed. Used in `prepare_inner`: the run record owns the UID once
+/// it is durably created, so a prepare failure before that point must
+/// not leak the allocation.
+struct UidAllocGuard<'a> {
+    pool: &'a Mutex<UidPool>,
+    uid: u32,
+    disarmed: bool,
+}
+
+impl<'a> UidAllocGuard<'a> {
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for UidAllocGuard<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.pool.lock().unwrap().release(self.uid);
+        }
     }
 }
 
@@ -202,23 +236,21 @@ impl Driver {
         store: RunStore,
         backend: Arc<dyn VmBackend>,
     ) -> Result<Self, SandboxdError> {
-        // Rebuild the UID cursor past any UID still referenced by a
-        // non-destroyed run (crash safety: never reuse a live UID).
-        let mut next = config.uid_pool.start;
+        // Mark UIDs still referenced by non-destroyed runs as in-use,
+        // so a restart never reuses a live UID (crash safety).
+        let mut uid_pool = UidPool {
+            start: config.uid_pool.start,
+            end: config.uid_pool.end,
+            in_use: std::collections::HashSet::new(),
+        };
         for run in store.all_runs()? {
             if run.state != RunState::Destroyed {
-                next = next.max(run.artifacts.uid.saturating_add(1));
+                uid_pool.mark_used(run.artifacts.uid);
             }
-        }
-        if next < config.uid_pool.start {
-            next = config.uid_pool.start;
         }
         Ok(Self {
             inner: Arc::new(DriverInner {
-                uid_pool: Mutex::new(UidPool {
-                    end: config.uid_pool.end,
-                    next,
-                }),
+                uid_pool: Mutex::new(uid_pool),
                 config,
                 store,
                 backend,
@@ -578,6 +610,13 @@ impl Driver {
             pool.alloc()
                 .ok_or_else(|| SandboxdError::Host("UID pool exhausted".into()))?
         };
+        // If prepare fails before the run record durably owns this UID,
+        // the guard returns it to the pool instead of leaking it.
+        let uid_guard = UidAllocGuard {
+            pool: &self.inner.uid_pool,
+            uid,
+            disarmed: false,
+        };
 
         let artifacts = Self::artifact_paths(&self.inner.config, &self.inner.store, run_id, uid)?;
 
@@ -590,6 +629,9 @@ impl Driver {
             .inner
             .store
             .create(run_id, spec, spec_digest, artifacts.clone())?;
+        // The record now owns the UID: `destroy` releases it, and a
+        // crash is covered by the startup `mark_used` sweep.
+        uid_guard.disarm();
         self.inner.store.set_provenance(run_id, provenance)?;
 
         self.inner.live.lock().unwrap().insert(
@@ -1326,6 +1368,13 @@ impl Driver {
     }
 
     async fn destroy_inner(&self, run_id: &str) -> Result<(), SandboxdError> {
+        self.destroy_inner_at(run_id, Path::new("/sys/fs/cgroup"))
+            .await
+    }
+
+    /// `destroy_inner` with an injectable cgroup fs root (tests point it
+    /// at a tempdir; production uses `/sys/fs/cgroup`).
+    async fn destroy_inner_at(&self, run_id: &str, cgroup_fs: &Path) -> Result<(), SandboxdError> {
         // Idempotent: destroying a destroyed (or never-created) run is a no-op.
         let record = match self.inner.store.load(run_id) {
             Ok(r) => r,
@@ -1361,11 +1410,45 @@ impl Driver {
             let _ = ns.shutdown().await;
         }
         // Belt and braces: cgroup kill, then network teardown, then fs.
-        let cgroup_fs = Path::new("/sys/fs/cgroup");
-        let _ = cgroups::kill(cgroup_fs, &record.artifacts.cgroup_path);
-        let _ = cgroups::remove(cgroup_fs, &record.artifacts.cgroup_path);
+        // The kill/remove results decide whether the teardown is
+        // VERIFIED, and everything identity-critical hangs off that:
+        // `remove` fails while processes remain, so its success proves
+        // the cgroup is empty and gone -- no run process can still hold
+        // the UID. An absent leaf means the VM never spawned, or a
+        // previous destroy already tore it down.
+        //
+        // The cgroup leaf is created by the jailer at VM spawn and only
+        // ever removed here: if it is absent, no run process ever
+        // existed (or a previous destroy already tore it down).
+        let cgroup_absent = !cgroup_fs.join(&record.artifacts.cgroup_path).exists();
+        let cgroup_killed = cgroups::kill(cgroup_fs, &record.artifacts.cgroup_path).is_ok();
+        // `remove` fails while processes remain, so success proves the
+        // cgroup is empty and gone: no run process can still hold the UID.
+        let cgroup_removed = cgroups::remove(cgroup_fs, &record.artifacts.cgroup_path).is_ok();
+        let teardown_verified = cgroup_absent || (cgroup_killed && cgroup_removed);
         let plan = self.plan_from_artifacts(&record.artifacts);
         let _ = self.inner.backend.teardown_network(&plan).await;
+        if !teardown_verified {
+            // Identity-critical teardown is UNCERTAIN: a run process may
+            // still hold the UID. Do not remove the run dir -- the
+            // Destroying state inside it is what makes a later destroy()
+            // retry instead of leaking -- do not release the UID, and
+            // return an error so the caller knows destruction is
+            // incomplete. A retained UID is a loud operational signal
+            // (pool exhaustion, the stderr note, the journaled note);
+            // aliasing a still-live UID across runs would be silent
+            // (cross-run signaling, file ownership confusion).
+            let msg = format!(
+                "cgroup teardown uncertain (killed={cgroup_killed}, removed={cgroup_removed}); \
+                 UID {} retained for retry",
+                record.artifacts.uid,
+            );
+            let _ = self.inner.store.note(run_id, msg.clone());
+            eprintln!("sandboxd: run {run_id}: {msg}");
+            return Err(SandboxdError::Host(format!(
+                "destroy incomplete for run {run_id}: {msg}"
+            )));
+        }
         let run_dir = self.inner.store.run_dir(run_id);
         match std::fs::remove_dir_all(&run_dir) {
             Ok(()) => {}
@@ -1404,6 +1487,14 @@ impl Driver {
         // "No state file" IS the Destroyed state: a subsequent load fails
         // with NotFound and destroy stays idempotent. We do not attempt a
         // Destroyed transition because there is nowhere to persist it.
+        //
+        // Teardown is verified (see above), so no run process can hold
+        // the UID: return it to the pool.
+        self.inner
+            .uid_pool
+            .lock()
+            .unwrap()
+            .release(record.artifacts.uid);
         Ok(())
     }
 }
@@ -2618,6 +2709,196 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn uid_pool_releases_and_reuses_uids() {
+        let mut pool = UidPool {
+            start: 1000,
+            end: 1001,
+            in_use: std::collections::HashSet::new(),
+        };
+        assert_eq!(pool.alloc(), Some(1000));
+        assert_eq!(pool.alloc(), Some(1001));
+        // Pool exhausted: no third UID.
+        assert_eq!(pool.alloc(), None);
+        // Releasing one makes it available again (lowest free first).
+        pool.release(1000);
+        assert_eq!(pool.alloc(), Some(1000));
+        assert_eq!(pool.alloc(), None);
+        // Releasing an unknown UID is a harmless no-op.
+        pool.release(9999);
+        assert_eq!(pool.alloc(), None);
+    }
+
+    #[test]
+    fn uid_alloc_guard_returns_uid_on_drop() {
+        let pool = Mutex::new(UidPool {
+            start: 1000,
+            end: 1000,
+            in_use: std::collections::HashSet::new(),
+        });
+        let uid = pool.lock().unwrap().alloc().unwrap();
+        assert_eq!(uid, 1000);
+        // Dropped without disarm: the UID goes back to the pool.
+        {
+            let _guard = UidAllocGuard {
+                pool: &pool,
+                uid,
+                disarmed: false,
+            };
+        }
+        assert!(pool.lock().unwrap().in_use.is_empty());
+        // Disarmed: the UID stays checked out (the run record owns it).
+        let uid = pool.lock().unwrap().alloc().unwrap();
+        {
+            let guard = UidAllocGuard {
+                pool: &pool,
+                uid,
+                disarmed: false,
+            };
+            guard.disarm();
+        }
+        assert_eq!(pool.lock().unwrap().in_use.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn destroy_releases_uid_when_cgroup_absent() {
+        let (img_store, image_digest) = fake_image();
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_config(&img_store, &state);
+        let script = Arc::new(Mutex::new(MockScript::default()));
+        let (driver, _keep) = test_driver(cfg, script);
+
+        let handle = driver
+            .prepare(&test_spec(&image_digest))
+            .await
+            .expect("prepare");
+        assert_eq!(driver.inner.uid_pool.lock().unwrap().in_use.len(), 1);
+        driver.destroy(&handle).await.expect("destroy");
+        // The cgroup leaf never existed under the mock backend, so no
+        // run process could hold the UID: it is released for reuse.
+        assert!(
+            driver.inner.uid_pool.lock().unwrap().in_use.is_empty(),
+            "UID must be released when the cgroup is absent"
+        );
+        // Destroy stays idempotent.
+        driver.destroy(&handle).await.expect("second destroy");
+    }
+
+    /// An unverifiable cgroup teardown must NOT delete the run state and
+    /// must fail loudly: the Destroying record survives, the UID stays
+    /// checked out, and a later destroy() retries to completion.
+    #[tokio::test]
+    async fn destroy_uncertain_teardown_keeps_state_and_retries() {
+        let (img_store, image_digest) = fake_image();
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_config(&img_store, &state);
+        let script = Arc::new(Mutex::new(MockScript::default()));
+        let (driver, _keep) = test_driver(cfg, script);
+
+        let handle = driver
+            .prepare(&test_spec(&image_digest))
+            .await
+            .expect("prepare");
+        let run_id = Driver::run_key(&handle);
+        let uid = *driver
+            .inner
+            .uid_pool
+            .lock()
+            .unwrap()
+            .in_use
+            .iter()
+            .next()
+            .expect("prepare checks out a UID");
+
+        // Fake a cgroup fs where the leaf exists but holds a process, so
+        // `remove` fails and the teardown cannot be verified. (`kill`
+        // also fails: write_one opens cgroup.kill without create.)
+        let cgroup_fs = tempfile::tempdir().unwrap();
+        let record = driver.inner.store.load(&run_id).unwrap();
+        let leaf = cgroup_fs.path().join(&record.artifacts.cgroup_path);
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), "12345").unwrap();
+
+        let err = driver
+            .destroy_inner_at(&run_id, cgroup_fs.path())
+            .await
+            .expect_err("uncertain teardown must fail loudly");
+        assert!(
+            format!("{err:?}").contains("destroy incomplete"),
+            "unexpected error: {err:?}"
+        );
+        // The run dir and its Destroying state survive for the retry...
+        assert!(
+            driver.inner.store.run_dir(&run_id).exists(),
+            "run dir must survive uncertain teardown"
+        );
+        let record = driver.inner.store.load(&run_id).unwrap();
+        assert_eq!(record.state, RunState::Destroying);
+        // ...and the UID stays checked out (no cross-run aliasing).
+        assert!(
+            driver.inner.uid_pool.lock().unwrap().in_use.contains(&uid),
+            "UID must stay checked out while teardown is uncertain"
+        );
+
+        // The "process" exits and the kernel reaps the leaf: the retry
+        // sees an absent leaf and verifies the teardown.
+        std::fs::remove_dir_all(&leaf).unwrap();
+        driver
+            .destroy_inner_at(&run_id, cgroup_fs.path())
+            .await
+            .expect("retry after the leaf is reaped");
+        assert!(
+            !driver.inner.uid_pool.lock().unwrap().in_use.contains(&uid),
+            "UID must be released after verified teardown"
+        );
+        // The state file is gone ("no state file" IS Destroyed) and a
+        // further destroy is a no-op.
+        assert!(!driver.inner.store.run_dir(&run_id).exists());
+        driver.destroy(&handle).await.expect("post-retry destroy");
+    }
+
+    /// A prepare that fails AFTER the UID is allocated but BEFORE the
+    /// run record durably owns it must return the UID to the pool: the
+    /// `UidAllocGuard` in `prepare_inner` fires on the `?` unwind. A bad
+    /// pod_cidr makes `plan_net` (inside `artifact_paths`) fail exactly
+    /// in that window.
+    #[tokio::test]
+    async fn prepare_failure_returns_uid_to_pool() {
+        let (img_store, image_digest) = fake_image();
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(&img_store, &state);
+        cfg.net.pod_cidr = "not-a-cidr".to_string();
+        let script = Arc::new(Mutex::new(MockScript::default()));
+        let (driver, _keep) = test_driver(cfg, script);
+
+        driver
+            .prepare(&test_spec(&image_digest))
+            .await
+            .expect_err("bad pod_cidr must fail prepare");
+        assert!(
+            driver.inner.uid_pool.lock().unwrap().in_use.is_empty(),
+            "a UID abandoned by a failed prepare must not leak"
+        );
+    }
+
+    #[test]
+    fn uid_pool_mark_used_skips_live_uids() {
+        let mut pool = UidPool {
+            start: 1000,
+            end: 1002,
+            in_use: std::collections::HashSet::new(),
+        };
+        // A UID held by a non-destroyed run (e.g. found at startup)
+        // is never handed out.
+        pool.mark_used(1001);
+        assert_eq!(pool.alloc(), Some(1000));
+        assert_eq!(pool.alloc(), Some(1002));
+        assert_eq!(pool.alloc(), None);
+        // Out-of-range marks are ignored.
+        pool.mark_used(9999);
+        assert_eq!(pool.alloc(), None);
+    }
+
     fn test_key() -> SigningKey {
         SigningKey::from_bytes(&[0x42; 32])
     }
@@ -2940,8 +3221,9 @@ mod tests {
     #[test]
     fn uid_pool_skips_live_uids() {
         let mut pool = UidPool {
+            start: 1000,
             end: 1002,
-            next: 1000,
+            in_use: std::collections::HashSet::new(),
         };
         assert_eq!(pool.alloc(), Some(1000));
         assert_eq!(pool.alloc(), Some(1001));

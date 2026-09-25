@@ -21,8 +21,9 @@ use lumen_server::{
     ACTION_ENVELOPE_VERSION, ACTION_START_DEADLINE_SECS, ActionEnvelope, ChannelDecision,
     ChannelDeps, ChannelFuture, ChannelRequest, ChannelResponse, ChannelSession,
     ChannelSessionResolver, EffectClass, FailCommitSandbox, KERNEL_CHANNEL_PROTOCOL, KernelChannel,
-    KernelChannelConfig, MockKernelClient, MockSandboxRunner, MockVerdict, SandboxRunner,
-    SessionId, deadline_rfc3339, default_catalog,
+    KernelChannelConfig, MockKernelClient, MockSandboxRunner, MockVerdict, Obligation,
+    SandboxError, SandboxFuture, SandboxRunner, SessionId, StagedExecution, deadline_rfc3339,
+    default_catalog,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,27 @@ async fn serve(
     verify_peer_pid: bool,
     max_request_bytes: usize,
 ) -> Harness {
+    serve_with_timeout(
+        name,
+        kernel,
+        sandbox,
+        child_pid,
+        verify_peer_pid,
+        max_request_bytes,
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn serve_with_timeout(
+    name: &str,
+    kernel: MockKernelClient,
+    sandbox: Arc<MockSandboxRunner>,
+    child_pid: Option<u32>,
+    verify_peer_pid: bool,
+    max_request_bytes: usize,
+    request_timeout: Duration,
+) -> Harness {
     let dir = std::env::temp_dir().join(format!(
         "lumen-ch-{}-{}-{}",
         name,
@@ -86,8 +108,9 @@ async fn serve(
     let kernel = Arc::new(kernel);
     let config = KernelChannelConfig {
         socket_path: socket.clone(),
+        sandbox_gid: 65534,
         max_request_bytes,
-        request_timeout: Duration::from_secs(10),
+        request_timeout,
         max_connections: 8,
         verify_peer_pid,
     };
@@ -178,6 +201,36 @@ fn allow_harness_args() -> (
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn socket_is_parent_owned_group_mediated() {
+    use std::os::unix::fs::MetadataExt;
+    let (kernel, sandbox, child_pid, verify_peer_pid, max_request_bytes) = allow_harness_args();
+    let h = serve(
+        "sockown",
+        kernel,
+        sandbox,
+        child_pid,
+        verify_peer_pid,
+        max_request_bytes,
+    )
+    .await;
+    let meta = std::fs::metadata(&h.socket).unwrap();
+    let is_root = unsafe { libc::getuid() } == 0;
+    if is_root {
+        // Parent-owned, group `sandbox_gid`, connect-only for the
+        // group: a dedicated-map child dials via group write, a 1:1
+        // fallback child as the owner.
+        assert_eq!(meta.uid(), 0);
+        assert_eq!(meta.gid(), 65534);
+        assert_eq!(meta.mode() & 0o777, 0o620);
+    } else {
+        // A non-root supervisor cannot chown to the sandbox gid -- but
+        // it also cannot map the dedicated uid, so the owner-only
+        // fallback mode is exactly right.
+        assert_eq!(meta.mode() & 0o777, 0o600);
+    }
+}
 
 #[tokio::test]
 async fn allow_roundtrip_returns_result_usage_and_audit_ref() {
@@ -454,6 +507,7 @@ async fn commit_failure_records_no_completion_claim() {
     let sandbox: Arc<dyn SandboxRunner> = Arc::new(FailCommitSandbox::new());
     let config = KernelChannelConfig {
         socket_path: socket.clone(),
+        sandbox_gid: 65534,
         max_request_bytes: 1024 * 1024,
         request_timeout: Duration::from_secs(10),
         max_connections: 8,
@@ -485,4 +539,230 @@ async fn commit_failure_records_no_completion_claim() {
     let log = kernel.audit_log();
     let kinds: Vec<&str> = log.iter().map(|(event, _)| event.kind.as_str()).collect();
     assert_eq!(kinds, vec!["tool_staged"]);
+}
+
+/// Sandbox whose `stage` never resolves: mediation always exceeds the
+/// channel deadline.
+struct HangingSandbox;
+
+impl SandboxRunner for HangingSandbox {
+    fn stage<'a>(
+        &'a self,
+        _envelope: &'a ActionEnvelope,
+        _lease_id: &'a str,
+        _obligations: &'a [Obligation],
+    ) -> SandboxFuture<'a, Box<dyn StagedExecution>> {
+        Box::pin(async move {
+            std::future::pending::<Result<Box<dyn StagedExecution>, SandboxError>>().await
+        })
+    }
+}
+
+fn test_socket_dir(name: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "lumen-ch-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("kernel.sock");
+    (dir, socket)
+}
+
+/// A mediation that exceeds the channel deadline must surface as
+/// `effect_uncertain` (reconcile by action digest), never as a plain
+/// `timeout` error: the effect may have committed while the deadline
+/// fired, and a plain timeout invites the extension to blindly retry
+/// and double-execute.
+#[tokio::test]
+async fn mediation_timeout_is_uncertain_not_a_plain_timeout() {
+    let (_dir, socket) = test_socket_dir("medtimeout");
+    let subject = "lumen-session:medtimeout".to_string();
+    let credential = "cred-medtimeout".to_string();
+
+    let mut sessions = HashMap::new();
+    sessions.insert(
+        credential.clone(),
+        ChannelSession {
+            session_id: SessionId::new(),
+            subject: subject.clone(),
+            child_pid: Some(std::process::id()),
+        },
+    );
+    let kernel = Arc::new(MockKernelClient::new().with_verdict(MockVerdict::Allow));
+    let sandbox: Arc<dyn SandboxRunner> = Arc::new(HangingSandbox);
+    let config = KernelChannelConfig {
+        socket_path: socket.clone(),
+        sandbox_gid: 65534,
+        max_request_bytes: 1024 * 1024,
+        request_timeout: Duration::from_millis(300),
+        max_connections: 8,
+        verify_peer_pid: true,
+    };
+    let deps = ChannelDeps {
+        catalog: Arc::new(default_catalog()),
+        kernel: kernel.clone(),
+        sandbox,
+        sessions: Arc::new(FakeResolver {
+            sessions: Mutex::new(sessions),
+        }),
+    };
+    let _channel = KernelChannel::serve(config, deps).await.unwrap();
+
+    let envelope = valid_envelope(&subject);
+    let expected_digest = envelope.digest().unwrap();
+    let response = roundtrip(&socket, &request_line(&credential, &envelope)).await;
+
+    let error = response.error.unwrap();
+    assert_eq!(
+        error.code, "effect_uncertain",
+        "mediation timeout must not be a plain timeout error: {error:?}"
+    );
+    assert!(response.decision.is_none());
+    assert!(response.result.is_none());
+    assert_eq!(
+        response.action_digest.as_deref(),
+        Some(expected_digest.as_str()),
+        "the digest keys reconciliation"
+    );
+    assert!(
+        error.detail.contains("may have committed"),
+        "got: {}",
+        error.detail
+    );
+    assert!(error.detail.contains(&expected_digest));
+    // The pipeline ran exactly once: the detached task is left
+    // running, never retried, and the client is told to reconcile by
+    // digest rather than resubmit the action.
+    assert_eq!(kernel.decisions_made(), 1);
+}
+
+/// A peer that floods the channel without ever sending a newline must
+/// be rejected at the bound without the server waiting for the rest
+/// of the stream, a newline, or EOF. (The unbounded `read_until`
+/// this replaces would have blocked here until the peer finished or
+/// closed, after buffering everything.)
+#[tokio::test]
+async fn newline_less_flood_is_rejected_at_the_bound() {
+    let (kernel, sandbox, child_pid, verify, _) = allow_harness_args();
+    let h = serve("flood", kernel, sandbox, child_pid, verify, 64).await;
+
+    let stream = UnixStream::connect(&h.socket).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    // 16 KiB, no trailing newline, write side left open: the server
+    // must answer from the first max+1 bytes alone.
+    write_half.write_all(&vec![b'x'; 16 * 1024]).await.unwrap();
+    let mut reader = BufReader::new(read_half);
+    let mut out = Vec::new();
+    reader.read_until(b'\n', &mut out).await.unwrap();
+    assert!(!out.is_empty(), "channel closed without a response line");
+    let response: ChannelResponse = serde_json::from_slice(&out).unwrap();
+
+    let error = response.error.unwrap();
+    assert_eq!(error.code, "too_large");
+    assert_eq!(h.kernel.decisions_made(), 0);
+    assert_eq!(h.sandbox.call_count(), 0);
+}
+
+/// Sandbox wrapper that stalls `stage` past the channel's request
+/// timeout, then delegates to the mock. The detached mediation task
+/// must still run to completion after the channel replies: its
+/// audit/completion records must land even though the client already
+/// received `effect_uncertain`.
+struct SlowSandbox {
+    inner: MockSandboxRunner,
+    delay: Duration,
+}
+
+impl SandboxRunner for SlowSandbox {
+    fn stage<'a>(
+        &'a self,
+        envelope: &'a ActionEnvelope,
+        lease_id: &'a str,
+        obligations: &'a [Obligation],
+    ) -> SandboxFuture<'a, Box<dyn StagedExecution>> {
+        let runner = self.inner.clone();
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            runner.stage(envelope, lease_id, obligations).await
+        })
+    }
+}
+
+/// A mediation that exceeds the channel deadline must keep running in
+/// its detached task: the client gets `effect_uncertain` at the
+/// deadline, but the sandbox commit (and its audit/completion
+/// records) still land afterwards. Cancelling the future would drop
+/// those records.
+#[tokio::test]
+async fn mediation_timeout_does_not_cancel_mediation() {
+    let (_dir, socket) = test_socket_dir("medslow");
+    let subject = "lumen-session:medslow".to_string();
+    let credential = "cred-medslow".to_string();
+
+    let mut sessions = HashMap::new();
+    sessions.insert(
+        credential.clone(),
+        ChannelSession {
+            session_id: SessionId::new(),
+            subject: subject.clone(),
+            child_pid: Some(std::process::id()),
+        },
+    );
+    let kernel = Arc::new(MockKernelClient::new().with_verdict(MockVerdict::Allow));
+    let inner = MockSandboxRunner::new();
+    let sandbox: Arc<dyn SandboxRunner> = Arc::new(SlowSandbox {
+        inner: inner.clone(),
+        delay: Duration::from_secs(2),
+    });
+    let config = KernelChannelConfig {
+        socket_path: socket.clone(),
+        sandbox_gid: 65534,
+        max_request_bytes: 1024 * 1024,
+        request_timeout: Duration::from_millis(300),
+        max_connections: 8,
+        verify_peer_pid: true,
+    };
+    let deps = ChannelDeps {
+        catalog: Arc::new(default_catalog()),
+        kernel: kernel.clone(),
+        sandbox,
+        sessions: Arc::new(FakeResolver {
+            sessions: Mutex::new(sessions),
+        }),
+    };
+    let _channel = KernelChannel::serve(config, deps).await.unwrap();
+
+    let envelope = valid_envelope(&subject);
+    let response = roundtrip(&socket, &request_line(&credential, &envelope)).await;
+
+    // The channel replies `effect_uncertain` at the deadline...
+    let error = response.error.expect("timeout must produce an error");
+    assert_eq!(
+        error.code, "effect_uncertain",
+        "mediation timeout must not be a plain timeout error: {error:?}"
+    );
+
+    // ...but the detached mediation task keeps running to completion:
+    // the sandbox commit (and its audit/completion records) still land
+    // after the reply was sent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if inner.committed_count() == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached mediation task never completed after the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Exactly one mediation ran: the timeout neither retried nor
+    // cancelled it.
+    assert_eq!(kernel.decisions_made(), 1);
+    assert_eq!(inner.call_count(), 1);
 }

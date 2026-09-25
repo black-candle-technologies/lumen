@@ -555,6 +555,19 @@ pub struct RestartReport {
     pub revoke_error: Option<String>,
 }
 
+/// Termination lifecycle of a session. The `Active` -> `Terminating`
+/// transition happens atomically under the session lock, so racing
+/// `terminate()` calls cannot both perform the teardown: the first
+/// caller flips the state and does the work, concurrent callers wait
+/// for its report, and later callers either get the stored report or
+/// retry a failed lease revocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TerminationState {
+    Active,
+    Terminating,
+    Terminated,
+}
+
 /// Report produced by [`SessionHandle::terminate`].
 #[derive(Debug, Clone)]
 pub struct TerminationReport {
@@ -598,7 +611,15 @@ struct SessionInner {
     last_activity: Instant,
     created_at: Instant,
     malformed_count: u32,
-    terminated: bool,
+    termination: TerminationState,
+    /// The first termination's report, stored when the first
+    /// `terminate_inner` call completes. Later (idempotent) callers
+    /// receive this report verbatim once lease revocation has
+    /// succeeded; while revocation is still failing, each later call
+    /// retries it and the stored report is updated to the retry's
+    /// outcome -- a failed revocation is never silently kept, and a
+    /// success is never synthesized.
+    termination_report: Option<TerminationReport>,
     event_tx: broadcast::Sender<SupervisorEvent>,
     stderr_tail: VecDeque<String>,
     /// Per-session kernel channel credential (hex). `None` when the
@@ -707,7 +728,7 @@ impl SupervisorInner {
         };
         let child = {
             let mut inner = session.lock().await;
-            if inner.terminated
+            if !matches!(inner.termination, TerminationState::Active)
                 || matches!(
                     inner.status,
                     SessionStatus::Interrupted { .. } | SessionStatus::Terminated
@@ -723,6 +744,11 @@ impl SupervisorInner {
             inner.shutdown_tx.take();
             inner.child.clone()
         };
+        // A faulted session must no longer authenticate on the kernel
+        // channel: revoke its credential (the resolver also rejects
+        // non-Running sessions; this closes the window before that
+        // check and honors the "removed at termination" contract).
+        self.revoke_channel_credential(id);
         if let Some(child) = child {
             let _ = child.lock().await.start_kill();
         }
@@ -740,6 +766,22 @@ impl SupervisorInner {
 #[derive(Clone)]
 pub struct SessionSupervisor {
     inner: Arc<SupervisorInner>,
+}
+
+/// The report a termination waiter may return: only one stored while
+/// the state is [`TerminationState::Terminated`]. During a late retry
+/// the state flips back to `Terminating` while the previous (failed)
+/// report is still stored; that stale report must not be mistaken for
+/// the retry's outcome, so there is nothing to return yet.
+fn settled_report(
+    state: TerminationState,
+    report: &Option<TerminationReport>,
+) -> Option<TerminationReport> {
+    if state == TerminationState::Terminated {
+        report.clone()
+    } else {
+        None
+    }
 }
 
 impl SessionSupervisor {
@@ -794,7 +836,7 @@ impl SessionSupervisor {
                 inner_session.status.clone(),
                 inner_session.last_activity.elapsed(),
                 inner_session.created_at.elapsed(),
-                inner_session.terminated,
+                !matches!(inner_session.termination, TerminationState::Active),
             )
         };
         if terminated || !matches!(status, SessionStatus::Running | SessionStatus::Paused) {
@@ -857,6 +899,14 @@ impl SessionSupervisor {
         // filesystem policy. Any setup failure aborts the spawn — Pi
         // never runs unsandboxed (fail closed).
         let tmp_dir = inner.config.session_dir.join("pi-tmp").join(id.to_string());
+        // Per-session HOME and Landlock write directory: each Pi child
+        // gets its own writable tree, so sessions can never read or
+        // write each other's state.
+        let session_home_dir = inner
+            .config
+            .session_dir
+            .join("sessions")
+            .join(id.to_string());
         let extra_ref: Vec<(&str, &str)> =
             extra_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
         configure_child(
@@ -864,7 +914,7 @@ impl SessionSupervisor {
             &inner.config.pi_sandbox,
             &PiSandboxPaths {
                 pi_binary: &inner.config.pi_binary,
-                session_dir: &inner.config.session_dir,
+                session_dir: &session_home_dir,
                 tmp_dir: &tmp_dir,
                 socket_dir: socket_dir.as_deref(),
             },
@@ -973,7 +1023,8 @@ impl SessionSupervisor {
             last_activity: Instant::now(),
             created_at: Instant::now(),
             malformed_count: 0,
-            terminated: false,
+            termination: TerminationState::Active,
+            termination_report: None,
             event_tx,
             stderr_tail: VecDeque::new(),
             channel_credential,
@@ -1338,7 +1389,10 @@ impl SessionSupervisor {
                 let (expected, current) = match entry {
                     Some(session) => {
                         let guard = session.lock().await;
-                        (guard.terminated, guard.generation == generation)
+                        (
+                            !matches!(guard.termination, TerminationState::Active),
+                            guard.generation == generation,
+                        )
                     }
                     None => (true, false),
                 };
@@ -1376,19 +1430,103 @@ impl SessionSupervisor {
         session: &Arc<tokio::sync::Mutex<SessionInner>>,
         _reason: &str,
     ) -> TerminationReport {
-        // Idempotent: the first caller wins; later callers get the report
-        // of an already-terminated session.
-        let already = { session.lock().await.terminated };
-        let session_id = { session.lock().await.id };
-        if already {
-            return TerminationReport {
+        // Idempotent, race-free, and retrying: the Active -> Terminating
+        // transition below happens under ONE lock acquisition, so racing
+        // callers cannot both perform the teardown. Exactly one caller
+        // does the work; concurrent callers wait for its report; later
+        // callers get the stored report verbatim once revocation has
+        // succeeded, or retry the revocation while it is still failing.
+        // A synthesized "success" would mask a failed lease revocation,
+        // so it is never manufactured here.
+        enum Action {
+            Teardown(SessionId),
+            WaitForReport(SessionId),
+            RetryRevocation(SessionId),
+            ReturnReport(TerminationReport),
+        }
+        let action = {
+            let mut guard = session.lock().await;
+            match guard.termination {
+                TerminationState::Terminating => Action::WaitForReport(guard.id),
+                TerminationState::Terminated => match guard.termination_report.clone() {
+                    Some(report) if report.leases_revoked => Action::ReturnReport(report),
+                    // The last revocation failed: this later call retries
+                    // it instead of returning the stale failure. The
+                    // retry is serialized through Terminating so
+                    // concurrent later-callers wait rather than
+                    // double-revoking.
+                    Some(_) => {
+                        guard.termination = TerminationState::Terminating;
+                        Action::RetryRevocation(guard.id)
+                    }
+                    // Unreachable: Terminated always stores a report.
+                    // Wait rather than invent one.
+                    None => Action::WaitForReport(guard.id),
+                },
+                TerminationState::Active => {
+                    guard.termination = TerminationState::Terminating;
+                    Action::Teardown(guard.id)
+                }
+            }
+        };
+        match action {
+            Action::ReturnReport(report) => report,
+            Action::WaitForReport(id) => Self::await_termination_report(inner, session, id).await,
+            Action::RetryRevocation(id) => Self::retry_lease_revocation(inner, session, id).await,
+            Action::Teardown(id) => Self::perform_termination(inner, session, id).await,
+        }
+    }
+
+    /// Revoke the session's leases kernel-side, mapping the outcome to
+    /// an optional error string. Shared by the teardown and the retry
+    /// path so both classify failures identically.
+    async fn revoke_leases(inner: &Arc<SupervisorInner>, subject: &str) -> Option<String> {
+        match inner.kernel.revoke_session(subject).await {
+            Ok(()) => None,
+            Err(KernelError::Unavailable(message)) => {
+                Some(format!("kernel unavailable: {message}"))
+            }
+            Err(e) => Some(e.to_string()),
+        }
+    }
+
+    /// Retry a lease revocation that a previous termination failed to
+    /// complete. Runs only for LATER `terminate()` calls -- callers
+    /// concurrent with the first teardown wait for its report instead.
+    /// The stored report is updated to the retry's outcome, so every
+    /// subsequent caller sees the latest truth.
+    async fn retry_lease_revocation(
+        inner: &Arc<SupervisorInner>,
+        session: &Arc<tokio::sync::Mutex<SessionInner>>,
+        session_id: SessionId,
+    ) -> TerminationReport {
+        let subject = { session.lock().await.binding.session_subject.clone() };
+        let revoke_error = Self::revoke_leases(inner, &subject).await;
+        let mut guard = session.lock().await;
+        let mut report = guard
+            .termination_report
+            .clone()
+            .unwrap_or(TerminationReport {
                 session_id,
-                leases_revoked: true,
+                leases_revoked: false,
                 revoke_error: None,
                 identity_destroyed: true,
-            };
-        }
+            });
+        report.leases_revoked = revoke_error.is_none();
+        report.revoke_error = revoke_error;
+        guard.termination_report = Some(report.clone());
+        guard.termination = TerminationState::Terminated;
+        report
+    }
 
+    /// The one caller that won the Active -> Terminating transition
+    /// performs the full teardown: signal shutdown, reap the child,
+    /// revoke leases, destroy the identity, persist the terminal state.
+    async fn perform_termination(
+        inner: &Arc<SupervisorInner>,
+        session: &Arc<tokio::sync::Mutex<SessionInner>>,
+        session_id: SessionId,
+    ) -> TerminationReport {
         // 1. Arm the exit notification BEFORE signaling shutdown. The
         //    exit monitor uses `notify_one`, which stores a permit when
         //    no waiter is registered: an exit observed before this point
@@ -1397,12 +1535,17 @@ impl SessionSupervisor {
         let notified = exit_notified.notified();
         tokio::pin!(notified);
         // 2. Signal the writer to drop stdin (orderly Pi shutdown: Pi
-        //    disposes the active runtime on stdin EOF).
+        //    disposes the active runtime on stdin EOF). The Terminating
+        //    state (set atomically by the caller) is the in-flight
+        //    marker; no separate flag is needed.
         {
-            let mut guard = session.lock().await;
-            guard.terminated = true;
-            guard.shutdown_tx.take();
+            session.lock().await.shutdown_tx.take();
         }
+        // 2b. Revoke the kernel-channel credential immediately: the
+        //    session is terminating, so no further channel request may
+        //    authenticate -- even in the window before the status flips
+        //    to Terminated below.
+        inner.revoke_channel_credential(&session_id);
         // 3. Wait for the exit monitor to observe the child; kill on
         //    grace expiry. Either way the child is reaped with a bounded
         //    wait: a killed-but-unwaited child would linger as a zombie.
@@ -1419,17 +1562,14 @@ impl SessionSupervisor {
             let _ = tokio::time::timeout(Duration::from_secs(2), guard.wait()).await;
         }
 
-        // 3. Revoke the session's leases kernel-side. A revoke failure is
-        //    recorded, not retried here: the identity is still destroyed
-        //    locally so no new authority can be minted from it.
+        // 3. Revoke the session's leases kernel-side, via the shared
+        //    helper so the teardown and the retry path classify
+        //    failures identically. A revoke failure is recorded, not
+        //    fatal here: the identity is still destroyed locally so no
+        //    new authority can be minted from it, and a later
+        //    terminate() retries the revocation.
         let subject = { session.lock().await.binding.session_subject.clone() };
-        let revoke_error = match inner.kernel.revoke_session(&subject).await {
-            Ok(()) => None,
-            Err(KernelError::Unavailable(message)) => {
-                Some(format!("kernel unavailable: {message}"))
-            }
-            Err(e) => Some(e.to_string()),
-        };
+        let revoke_error = Self::revoke_leases(inner, &subject).await;
 
         // 4. Destroy the session identity (zeroized on drop).
         let identity_destroyed = {
@@ -1449,11 +1589,58 @@ impl SessionSupervisor {
                 .update_status(&guard.id, SessionStatus::Terminated, Some(now_ms()));
         }
 
-        TerminationReport {
+        let report = TerminationReport {
             session_id,
             leases_revoked: revoke_error.is_none(),
             revoke_error,
             identity_destroyed,
+        };
+        // Store the report and flip to Terminated atomically: every
+        // later caller sees this exact outcome, and a failed lease
+        // revocation is retried (not hidden) by the next terminate().
+        {
+            let mut guard = session.lock().await;
+            guard.termination_report = Some(report.clone());
+            guard.termination = TerminationState::Terminated;
+        }
+        report
+    }
+
+    /// Wait for an in-flight termination to store its report. The state
+    /// must be [`TerminationState::Terminated`] before the stored report
+    /// is returned: a late retry flips Terminated back to Terminating
+    /// while the previous (failed) report is still stored, and a waiter
+    /// must not mistake that stale report for the retry's outcome.
+    /// The first caller's waits are all bounded (`shutdown_grace` +
+    /// the 2s reap + the revoke RPC), so this deadline is generous; it
+    /// exists only so a stuck first caller cannot hang us forever. The
+    /// fallback reports the unknown honestly -- it never claims the
+    /// revocation succeeded.
+    async fn await_termination_report(
+        inner: &Arc<SupervisorInner>,
+        session: &Arc<tokio::sync::Mutex<SessionInner>>,
+        session_id: SessionId,
+    ) -> TerminationReport {
+        let deadline = inner.config.shutdown_grace + Duration::from_secs(10);
+        let start = Instant::now();
+        loop {
+            {
+                let guard = session.lock().await;
+                if let Some(report) = settled_report(guard.termination, &guard.termination_report) {
+                    return report;
+                }
+            }
+            if start.elapsed() >= deadline {
+                return TerminationReport {
+                    session_id,
+                    leases_revoked: false,
+                    revoke_error: Some(
+                        "termination did not store a report within the expected bound".to_string(),
+                    ),
+                    identity_destroyed: false,
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -1463,7 +1650,8 @@ impl SessionSupervisor {
         let session = self.inner.session(id).await?;
         let terminated = {
             let guard = session.lock().await;
-            guard.terminated && matches!(guard.status, SessionStatus::Terminated)
+            matches!(guard.termination, TerminationState::Terminated)
+                && matches!(guard.status, SessionStatus::Terminated)
         };
         if !terminated {
             return Err(SupervisorError::Interrupted(
@@ -1492,9 +1680,12 @@ impl ChannelSessionResolver for SessionSupervisor {
             }?;
             let session = { self.inner.sessions.lock().unwrap().get(&id).cloned() }?;
             let guard = session.lock().await;
-            // Only live sessions authenticate. Termination revokes the
-            // credential first, but the check stays: fail closed.
-            if guard.terminated {
+            // The kernel channel authenticates Running sessions only: a
+            // Paused, Interrupted, or Terminated session has no live Pi
+            // child under supervision, so its channel requests must not
+            // authenticate. Termination also revokes the credential, but
+            // the check stays: fail closed.
+            if !matches!(guard.status, SessionStatus::Running) {
                 return None;
             }
             let child_pid = match guard.child.as_ref() {
@@ -1534,7 +1725,8 @@ impl SessionSupervisor {
 ///
 /// The binding (owner, subject) is read live from the supervisor: a
 /// restart replaces the session identity, and stale handle clones must
-/// not keep serving the old subject.#[derive(Clone)]
+/// not keep serving the old subject.
+#[derive(Clone)]
 pub struct SessionHandle {
     supervisor: SessionSupervisor,
     id: SessionId,
@@ -2356,6 +2548,179 @@ mod tests {
         assert_eq!(store.saves(), 0);
         assert!(store.list_by_owner("acct-test").unwrap().is_empty());
         assert!(supervisor.list_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn kernel_channel_authenticates_running_sessions_only() {
+        // The channel must be configured for a credential to be minted.
+        let mut config = test_config();
+        let socket_dir = std::env::temp_dir().join(format!("lumen-chtest-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        config.channel_socket_path = Some(socket_dir.join("kernel.sock"));
+        let (supervisor, _kernel) = supervisor(config);
+        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let credential = supervisor
+            .test_channel_credential_hex(&handle.id())
+            .expect("channel credential minted");
+        let resolver = supervisor.channel_resolver();
+
+        // Running: authenticates.
+        let resolved = resolver
+            .resolve_session(&credential)
+            .await
+            .expect("running session must authenticate");
+        assert_eq!(resolved.session_id, handle.id());
+
+        // Paused: must NOT authenticate -- no live Pi child is under
+        // supervision while paused.
+        handle.pause().await.unwrap();
+        assert_eq!(handle.status().await.unwrap(), SessionStatus::Paused);
+        assert!(
+            resolver.resolve_session(&credential).await.is_none(),
+            "paused session must not authenticate on the kernel channel"
+        );
+
+        // Resumed: authenticates again.
+        handle.resume().await.unwrap();
+        assert!(resolver.resolve_session(&credential).await.is_some());
+
+        // Terminated: must NOT authenticate.
+        handle.terminate().await.unwrap();
+        assert!(
+            resolver.resolve_session(&credential).await.is_none(),
+            "terminated session must not authenticate on the kernel channel"
+        );
+
+        std::fs::remove_dir_all(&socket_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn termination_report_is_preserved_verbatim_across_idempotent_calls() {
+        let (supervisor, kernel) = supervisor(test_config());
+        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+
+        // The kernel cannot revoke: the first termination records the
+        // failure, and the next (idempotent) call retries it -- still
+        // failing, so it returns the same failed report, never a
+        // synthesized "success".
+        kernel.fail_revoke(true);
+        let first = handle.terminate().await.unwrap();
+        assert!(!first.leases_revoked);
+        assert!(first.revoke_error.is_some(), "revocation must have failed");
+        assert!(first.identity_destroyed);
+
+        let second = handle.terminate().await.unwrap();
+        assert_eq!(second.session_id, first.session_id);
+        assert_eq!(second.leases_revoked, first.leases_revoked);
+        assert_eq!(second.revoke_error, first.revoke_error);
+        assert_eq!(second.identity_destroyed, first.identity_destroyed);
+
+        // Once the kernel recovers, the next terminate() retries the
+        // revocation and the stored report flips to success; later
+        // calls then return that success verbatim.
+        kernel.fail_revoke(false);
+        let third = handle.terminate().await.unwrap();
+        assert!(third.leases_revoked, "retry must have revoked the leases");
+        assert_eq!(third.revoke_error, None);
+        assert!(third.identity_destroyed);
+
+        let fourth = handle.terminate().await.unwrap();
+        assert_eq!(fourth.session_id, third.session_id);
+        assert!(fourth.leases_revoked);
+        assert_eq!(fourth.revoke_error, None);
+        assert_eq!(fourth.identity_destroyed, third.identity_destroyed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminate_calls_return_the_same_report() {
+        let (supervisor, kernel) = supervisor(test_config());
+        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        kernel.fail_revoke(true);
+
+        // Two racing terminate() calls: one performs the termination,
+        // the other must observe the SAME failed-revocation report --
+        // either by waiting for it or by finding it stored. Neither may
+        // see a synthesized success.
+        let (r1, r2) = tokio::join!(handle.terminate(), handle.terminate());
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        assert!(!r1.leases_revoked);
+        assert!(r1.revoke_error.is_some());
+        assert_eq!(r2.leases_revoked, r1.leases_revoked);
+        assert_eq!(r2.revoke_error, r1.revoke_error);
+        assert_eq!(r2.identity_destroyed, r1.identity_destroyed);
+
+        kernel.fail_revoke(false);
+    }
+
+    #[test]
+    fn settled_report_requires_terminated_state() {
+        let report = TerminationReport {
+            session_id: SessionId::new(),
+            leases_revoked: false,
+            revoke_error: Some("revoke failed".to_string()),
+            identity_destroyed: true,
+        };
+        let stored = Some(report.clone());
+        // Terminated: the stored report is the waiter's answer.
+        let got = settled_report(TerminationState::Terminated, &stored).unwrap();
+        assert!(!got.leases_revoked);
+        assert_eq!(got.revoke_error, report.revoke_error);
+        // Terminating with the stale failed report stored (a late retry
+        // is in flight): the waiter must keep waiting, not return the
+        // stale failure as the retry's outcome.
+        assert!(settled_report(TerminationState::Terminating, &stored).is_none());
+        // Active with no report: nothing to return.
+        assert!(settled_report(TerminationState::Active, &None).is_none());
+        // Terminated without a report (defensive): nothing to invent.
+        assert!(settled_report(TerminationState::Terminated, &None).is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_late_terminate_calls_share_one_revocation_retry() {
+        let (supervisor, kernel) = supervisor(test_config());
+        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        kernel.fail_revoke(true);
+        let first = handle.terminate().await.unwrap();
+        assert!(!first.leases_revoked);
+
+        // Two racing LATER calls (after the failed termination): exactly
+        // one performs the revocation retry, the other waits for it.
+        // Both must see the success -- neither a stale failure nor a
+        // synthesized report.
+        kernel.fail_revoke(false);
+        let (r1, r2) = tokio::join!(handle.terminate(), handle.terminate());
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        assert!(r1.leases_revoked && r1.revoke_error.is_none());
+        assert!(r2.leases_revoked && r2.revoke_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn sessions_get_per_session_home_directories() {
+        let mut config = test_config();
+        let base = std::env::temp_dir().join(format!("lumen-sessdir-{}", Uuid::new_v4()));
+        config.session_dir = base.clone();
+        let (supervisor, _kernel) = supervisor(config);
+
+        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let home = base.join("sessions").join(handle.id().to_string());
+        assert!(
+            home.is_dir(),
+            "per-session HOME/Landlock write dir must exist: {}",
+            home.display()
+        );
+
+        // A second session gets its own tree: sessions can never read
+        // or write each other's state.
+        let handle2 = supervisor.spawn_session(&owner().await).await.unwrap();
+        let home2 = base.join("sessions").join(handle2.id().to_string());
+        assert_ne!(home, home2);
+        assert!(home2.is_dir());
+
+        handle.terminate().await.unwrap();
+        handle2.terminate().await.unwrap();
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

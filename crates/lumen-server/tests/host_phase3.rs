@@ -75,6 +75,7 @@ async fn phase3_vertical_slice() {
         "acme-large",
         "acme",
         60_000,
+        1,
     ))]);
     let profile = TaskProfile {
         task_class: "codegen".to_string(),
@@ -90,7 +91,14 @@ async fn phase3_vertical_slice() {
         max_output_tokens: 1000,
     };
     let pool = MemorySpendPool::new(1_000_000);
-    let decision = apply_recommendation(&recommendation, "acme-small", &policy, &pool, now_ms());
+    let decision = apply_recommendation(
+        &recommendation,
+        "acme-small",
+        &policy,
+        &pool,
+        profile.sequence,
+        now_ms(),
+    );
     let ModelSwitchDecision::Switch { model, .. } = decision else {
         panic!("expected the host to approve the model switch");
     };

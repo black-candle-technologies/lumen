@@ -42,7 +42,9 @@ pub enum SizeBucket {
 
 /// A Jev model recommendation. Advisory only: carries no authority, no
 /// lease, no budget. Expires quickly so a stale recommendation cannot be
-/// replayed into a later decision.
+/// replayed into a later decision; the host additionally bounds the TTL
+/// ([`MAX_RECOMMENDATION_TTL_MS`]) and requires `sequence` to match the
+/// task profile it answered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JevRecommendation {
     pub model: String,
@@ -52,6 +54,11 @@ pub struct JevRecommendation {
     pub expires_at_ms: i64,
     pub sequence: u64,
 }
+
+/// Maximum recommendation TTL the host will honor (5 minutes). A
+/// recommendation that lives longer widens the replay window for a stale
+/// model switch, so the host rejects it outright.
+pub const MAX_RECOMMENDATION_TTL_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Error)]
 pub enum JevError {
@@ -82,7 +89,8 @@ pub enum ModelSwitchDecision {
 
 /// Host-side application of a Jev recommendation.
 ///
-/// Checks, in order: recommendation freshness, current-model churn,
+/// Checks, in order: recommendation freshness, TTL bound, sequence
+/// ordering against the task profile the host sent, current-model churn,
 /// lease policy (model/provider classes), and budget headroom for one
 /// request ceiling. Every rejection names its reason.
 pub fn apply_recommendation(
@@ -90,11 +98,22 @@ pub fn apply_recommendation(
     current_model: &str,
     policy: &ModelPolicy,
     pool: &dyn SpendPool,
+    expected_sequence: u64,
     now_ms: i64,
 ) -> ModelSwitchDecision {
     if recommendation.expires_at_ms <= now_ms {
         return ModelSwitchDecision::Keep {
             reason: "jev recommendation expired".to_string(),
+        };
+    }
+    if recommendation.expires_at_ms - now_ms > MAX_RECOMMENDATION_TTL_MS {
+        return ModelSwitchDecision::Keep {
+            reason: "jev recommendation TTL exceeds maximum".to_string(),
+        };
+    }
+    if recommendation.sequence != expected_sequence {
+        return ModelSwitchDecision::Keep {
+            reason: "jev recommendation sequence mismatch (stale or replayed)".to_string(),
         };
     }
     if recommendation.model.trim().is_empty() || recommendation.provider.trim().is_empty() {
@@ -144,13 +163,14 @@ impl MockJevRouter {
         model: impl Into<String>,
         provider: impl Into<String>,
         ttl_ms: i64,
+        sequence: u64,
     ) -> JevRecommendation {
         JevRecommendation {
             model: model.into(),
             provider: provider.into(),
             reason: "mock classification".to_string(),
             expires_at_ms: now_ms() + ttl_ms,
-            sequence: 0,
+            sequence,
         }
     }
 }
@@ -200,10 +220,18 @@ mod tests {
             "acme-large",
             "acme",
             60_000,
+            1,
         ))]);
         let pool = MemorySpendPool::new(1_000_000);
         let rec = router.recommend(&profile()).await.unwrap();
-        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, now_ms());
+        let decision = apply_recommendation(
+            &rec,
+            "acme-small",
+            &policy(),
+            &pool,
+            profile().sequence,
+            now_ms(),
+        );
         assert!(matches!(
             decision,
             ModelSwitchDecision::Switch { model, .. } if model == "acme-large"
@@ -213,8 +241,8 @@ mod tests {
     #[test]
     fn host_rejects_recommendation_outside_policy() {
         let pool = MemorySpendPool::new(1_000_000);
-        let rec = MockJevRouter::recommend_model("evil-model", "evil-provider", 60_000);
-        let decision = apply_recommendation(&rec, "acme-large", &policy(), &pool, now_ms());
+        let rec = MockJevRouter::recommend_model("evil-model", "evil-provider", 60_000, 1);
+        let decision = apply_recommendation(&rec, "acme-large", &policy(), &pool, 1, now_ms());
         assert!(matches!(
             decision,
             ModelSwitchDecision::Keep { reason } if reason.contains("not permitted")
@@ -224,9 +252,9 @@ mod tests {
     #[test]
     fn host_rejects_expired_recommendation() {
         let pool = MemorySpendPool::new(1_000_000);
-        let mut rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000);
+        let mut rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000, 1);
         rec.expires_at_ms = now_ms() - 1;
-        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, now_ms());
+        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, 1, now_ms());
         assert!(matches!(
             decision,
             ModelSwitchDecision::Keep { reason } if reason.contains("expired")
@@ -236,8 +264,8 @@ mod tests {
     #[test]
     fn host_rejects_switch_without_budget_headroom() {
         let pool = MemorySpendPool::new(10); // less than the 1000 ceiling
-        let rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000);
-        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, now_ms());
+        let rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000, 1);
+        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, 1, now_ms());
         assert!(matches!(
             decision,
             ModelSwitchDecision::Keep { reason } if reason.contains("budget")
@@ -245,10 +273,50 @@ mod tests {
     }
 
     #[test]
+    fn host_rejects_recommendation_with_excessive_ttl() {
+        let pool = MemorySpendPool::new(1_000_000);
+        // Well beyond the host's TTL bound (with margin so the check
+        // cannot flake on clock skew between the two now_ms() calls).
+        let rec = MockJevRouter::recommend_model(
+            "acme-large",
+            "acme",
+            MAX_RECOMMENDATION_TTL_MS + 60_000,
+            1,
+        );
+        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, 1, now_ms());
+        assert!(matches!(
+            decision,
+            ModelSwitchDecision::Keep { reason } if reason.contains("TTL exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn host_accepts_recommendation_at_max_ttl_boundary() {
+        let pool = MemorySpendPool::new(1_000_000);
+        let rec =
+            MockJevRouter::recommend_model("acme-large", "acme", MAX_RECOMMENDATION_TTL_MS, 1);
+        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, 1, now_ms());
+        assert!(matches!(decision, ModelSwitchDecision::Switch { .. }));
+    }
+
+    #[test]
+    fn host_rejects_stale_or_replayed_sequence() {
+        let pool = MemorySpendPool::new(1_000_000);
+        // Recommendation answering an older task profile, replayed
+        // against a newer one.
+        let rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000, 1);
+        let decision = apply_recommendation(&rec, "acme-small", &policy(), &pool, 2, now_ms());
+        assert!(matches!(
+            decision,
+            ModelSwitchDecision::Keep { reason } if reason.contains("sequence mismatch")
+        ));
+    }
+
+    #[test]
     fn host_avoids_churn_on_same_model() {
         let pool = MemorySpendPool::new(1_000_000);
-        let rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000);
-        let decision = apply_recommendation(&rec, "acme-large", &policy(), &pool, now_ms());
+        let rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000, 1);
+        let decision = apply_recommendation(&rec, "acme-large", &policy(), &pool, 1, now_ms());
         assert!(matches!(
             decision,
             ModelSwitchDecision::Keep { reason } if reason.contains("already on")
@@ -259,7 +327,7 @@ mod tests {
     fn recommendation_carries_no_authority_fields() {
         // Type-level guard: serializing a recommendation must not leak
         // anything that looks like a grant.
-        let rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000);
+        let rec = MockJevRouter::recommend_model("acme-large", "acme", 60_000, 1);
         let serialized = serde_json::to_string(&rec).unwrap();
         for forbidden in ["lease", "signature", "budget", "secret", "token"] {
             assert!(

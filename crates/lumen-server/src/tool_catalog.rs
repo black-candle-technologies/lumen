@@ -67,7 +67,9 @@ pub enum ProjectionKind {
     FsWrite,
     /// `{command, cwd?, timeout_ms?}` -> effects=[Execute]
     ShellRun,
-    /// `{url, method?, max_bytes?}` -> hosts=[url], effects=[Network]
+    /// `{url, method?, max_bytes?}` -> hosts=[scheme://host:port],
+    /// effects=[Network]. The destination is projected -- never the full
+    /// URL -- so kernel policy rules match destinations.
     HttpFetch,
 }
 
@@ -218,22 +220,97 @@ impl Catalog {
                     tool: name.to_string(),
                     reason: "missing validated field 'url'".to_string(),
                 })?;
-                let scheme_end = url.find("://").ok_or_else(|| CatalogError::Decode {
+                // Project the destination, not the full URL: kernel
+                // policy rules match `scheme://host:port` destinations,
+                // and a rule for a destination must cover every path on
+                // it.
+                let dest = project_http_dest(url).map_err(|reason| CatalogError::Decode {
                     tool: name.to_string(),
-                    reason: "url must be absolute with scheme".to_string(),
+                    reason,
                 })?;
-                let scheme = &url[..scheme_end];
-                if scheme != "https" && scheme != "http" {
-                    return Err(CatalogError::Decode {
-                        tool: name.to_string(),
-                        reason: "url scheme must be http or https".to_string(),
-                    });
-                }
-                resources.hosts.push(url.to_string());
+                resources.hosts.push(dest);
             }
         }
         Ok((resources, def.effects.clone()))
     }
+}
+
+/// Project an HTTP fetch URL onto the kernel's network resource shape:
+/// `scheme://host:port`.
+///
+/// Deliberately hand-written rather than via the `url` crate: the
+/// projection must be fail-closed, and WHATWG parsing is more liberal
+/// than this policy wants (it would silently accept an empty port or
+/// strip userinfo instead of rejecting the URL). Every ambiguity below
+/// is an explicit rejection, not a normalization.
+///
+/// Policy rules match destinations, so the path, query, and fragment
+/// must not leak into the projected host: a rule allowing
+/// `https://example.com:443` has to cover `https://example.com/anything`.
+/// This also matches what `kernel_local::parse_network_dest` accepts --
+/// anything else fails that conversion, fail closed.
+fn project_http_dest(url: &str) -> Result<String, String> {
+    let scheme_end = url
+        .find("://")
+        .ok_or_else(|| "url must be absolute with scheme".to_string())?;
+    let scheme = &url[..scheme_end];
+    if scheme != "https" && scheme != "http" {
+        return Err("url scheme must be http or https".to_string());
+    }
+    let after_scheme = &url[scheme_end + 3..];
+    // The authority ends at the first path, query, or fragment
+    // delimiter; none of those belong in the projected destination.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Credentials in the URL cannot be expressed in the projected
+    // destination: fail closed rather than silently dropping them.
+    if authority.contains('@') {
+        return Err("url must not contain userinfo".to_string());
+    }
+    let (host, port): (&str, u16) = if let Some(bracketed) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal, e.g. `[::1]:8443`.
+        let end = bracketed
+            .find(']')
+            .ok_or_else(|| "unclosed IPv6 bracket in url".to_string())?;
+        let host = &authority[..end + 2]; // keep the brackets
+        let rest = &authority[end + 2..];
+        let port = match rest.strip_prefix(':') {
+            Some(p) if !p.is_empty() => p
+                .parse::<u16>()
+                .map_err(|_| "url port out of range".to_string())?,
+            Some(_) => return Err("empty port in url".to_string()),
+            None if rest.is_empty() => default_http_port(scheme),
+            None => return Err("unexpected characters after IPv6 host".to_string()),
+        };
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') && !p.is_empty() => {
+                let port = p
+                    .parse::<u16>()
+                    .map_err(|_| "url port out of range".to_string())?;
+                (h, port)
+            }
+            // Any other colon means an unbracketed IPv6 literal or a
+            // malformed authority: fail closed rather than misparse it.
+            _ if authority.contains(':') => {
+                return Err("IPv6 host must be bracketed".to_string());
+            }
+            _ => (authority, default_http_port(scheme)),
+        }
+    };
+    if host.is_empty() {
+        return Err("url must have a host".to_string());
+    }
+    // Hostnames are case-insensitive: normalize so policy matching is
+    // stable regardless of how Pi cased the URL.
+    Ok(format!("{scheme}://{}:{port}", host.to_lowercase()))
+}
+
+fn default_http_port(scheme: &str) -> u16 {
+    if scheme == "https" { 443 } else { 80 }
 }
 
 /// Build the default v1 BCT tool catalog: filesystem read/write, shell,
@@ -1103,6 +1180,55 @@ mod tests {
     }
 
     #[test]
+    fn project_http_dest_projects_scheme_host_port() {
+        // Path, query, and fragment are stripped: the policy matches
+        // destinations, not URLs.
+        assert_eq!(
+            project_http_dest("https://example.com/a/b?x=1#frag").unwrap(),
+            "https://example.com:443"
+        );
+        // Host case is normalized for stable policy matching.
+        assert_eq!(
+            project_http_dest("https://EXAMPLE.com/").unwrap(),
+            "https://example.com:443"
+        );
+        // Explicit ports are preserved, including non-default ones.
+        assert_eq!(
+            project_http_dest("http://example.com:8080/x").unwrap(),
+            "http://example.com:8080"
+        );
+        // Bracketed IPv6 literals work, with and without a port.
+        assert_eq!(
+            project_http_dest("https://[::1]:8443/").unwrap(),
+            "https://[::1]:8443"
+        );
+        assert_eq!(
+            project_http_dest("http://[::1]/").unwrap(),
+            "http://[::1]:80"
+        );
+    }
+
+    #[test]
+    fn project_http_dest_fails_closed() {
+        // Credentials must never be silently dropped from the URL.
+        assert!(project_http_dest("https://user:pass@example.com/").is_err());
+        assert!(project_http_dest("https://user@example.com/").is_err());
+        // Unbracketed IPv6 is ambiguous: reject, don't misparse.
+        assert!(project_http_dest("https://::1/").is_err());
+        assert!(project_http_dest("https://::1:8443/").is_err());
+        // Unclosed bracket.
+        assert!(project_http_dest("https://[::1/").is_err());
+        // Empty or out-of-range ports are rejected, not defaulted.
+        assert!(project_http_dest("https://example.com:/").is_err());
+        assert!(project_http_dest("https://example.com:99999/").is_err());
+        // Wrong or missing scheme.
+        assert!(project_http_dest("ftp://example.com/").is_err());
+        assert!(project_http_dest("example.com/").is_err());
+        // Missing host.
+        assert!(project_http_dest("https:///path").is_err());
+    }
+
+    #[test]
     fn default_catalog_pins_versions() {
         let catalog = default_catalog();
         let tool_ref = catalog.tool_ref("bct.fs.read").unwrap();
@@ -1151,7 +1277,8 @@ mod tests {
             )
             .unwrap();
         let (resources, effects) = catalog.project("bct.http.fetch", &args).unwrap();
-        assert_eq!(resources.hosts, vec!["https://example.com/x".to_string()]);
+        // The full URL is never projected: policy matches destinations.
+        assert_eq!(resources.hosts, vec!["https://example.com:443".to_string()]);
         assert_eq!(effects, vec![EffectClass::Network]);
 
         // Relative paths rejected even though the schema passed.
@@ -1159,6 +1286,61 @@ mod tests {
             .decode("bct.fs.read", &serde_json::json!({"path": "relative/x"}))
             .unwrap();
         assert!(catalog.project("bct.fs.read", &args).is_err());
+    }
+
+    #[test]
+    fn http_fetch_projects_destination_not_full_url() {
+        let catalog = default_catalog();
+        let cases = [
+            // Path, query, and fragment are stripped: a policy rule for
+            // the destination covers every path on it.
+            (
+                "https://example.com/a/b?x=1#frag",
+                "https://example.com:443",
+            ),
+            ("http://example.com/", "http://example.com:80"),
+            ("https://example.com", "https://example.com:443"),
+            // Explicit ports are preserved.
+            ("https://example.com:8443/x", "https://example.com:8443"),
+            ("http://example.com:8080", "http://example.com:8080"),
+            // Bracketed IPv6 literals.
+            ("https://[::1]:8443/x", "https://[::1]:8443"),
+            ("https://[::1]/x", "https://[::1]:443"),
+            // Host case is normalized for stable policy matching.
+            ("https://EXAMPLE.com/x", "https://example.com:443"),
+        ];
+        for (url, expected) in cases {
+            let args = catalog
+                .decode("bct.http.fetch", &serde_json::json!({"url": url}))
+                .unwrap();
+            let (resources, _) = catalog.project("bct.http.fetch", &args).unwrap();
+            assert_eq!(
+                resources.hosts,
+                vec![expected.to_string()],
+                "wrong projection for url: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_fetch_rejects_unprojectable_urls() {
+        let catalog = default_catalog();
+        for url in [
+            "https://user:pass@example.com/x", // userinfo not expressible
+            "https://example.com:/x",          // empty port
+            "https://[::1/x",                  // unclosed IPv6 bracket
+            "https://::1/x",                   // unbracketed IPv6 literal
+            "https://example.com:99999/x",     // port out of range
+            "https:///x",                      // empty host
+        ] {
+            let args = catalog
+                .decode("bct.http.fetch", &serde_json::json!({"url": url}))
+                .unwrap();
+            assert!(
+                catalog.project("bct.http.fetch", &args).is_err(),
+                "url should be rejected: {url}"
+            );
+        }
     }
 
     #[tokio::test]
