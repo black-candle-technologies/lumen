@@ -803,6 +803,16 @@ pub fn validate_chain(
             if !sessions.is_subject_live(&parent.subject, now_ms) {
                 return Err(LeaseError::SubjectInactive(parent.subject.clone()));
             }
+            // Holder liveness: the lease holder's own session (and its
+            // whole ancestry) must be live too. A delegated lease for a
+            // destroyed or TTL-expired session must stop authorizing even
+            // while the issuing parent session remains live — otherwise a
+            // lost revocation row becomes an authorization bypass
+            // (CWE-613): the dead session's envelopes would still
+            // validate against its live parent's chain.
+            if !sessions.is_subject_live(&doc.subject, now_ms) {
+                return Err(LeaseError::SubjectInactive(doc.subject.clone()));
+            }
             doc.verify_signature(&key)?;
             if doc.depth != parent.depth + 1 {
                 return Err(LeaseError::DepthViolation(doc.depth, parent.depth_limit));
@@ -2903,6 +2913,106 @@ mod tests {
         )
         .expect_err("TTL-expired session must not authorize");
         assert!(matches!(err, LeaseError::SubjectInactive(_)), "got {err:?}");
+    }
+
+    /// A delegated chain for a destroyed holder session fails closed: the
+    /// holder's own session liveness is enforced for delegated leases, not
+    /// just the issuing parent's. Without the holder check, a destroyed
+    /// session's envelopes would still validate while its parent session
+    /// stays live — an authorization bypass (CWE-613) whenever the
+    /// revocation row was lost between session destroy and durable
+    /// revoke.
+    #[test]
+    fn delegated_chain_rejects_destroyed_holder_session() {
+        use rand::rngs::OsRng;
+        let (keys, session_key, session_vk) = test_keys();
+        let child_key = SigningKey::generate(&mut OsRng);
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk, 0);
+        sessions.register(
+            "ed25519:child-session".to_string(),
+            Some("ed25519:parent-session".to_string()),
+            child_key.verifying_key(),
+            0,
+        );
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let mut params = root_params(parent_scope());
+        params.lease_nonce = "holder-liveness-root".to_string();
+        let root = mint_root_lease(params, &keys, &sessions, &ledger, &nonces, 100).unwrap();
+        // Narrower child scope: pinned tool version, sub-path — the same
+        // narrowing shape `child_mint_narrowing` uses.
+        let r = FakeResolver::default();
+        let mut child_scope = ResourceScope::default();
+        child_scope.tools.insert(
+            "fs.read".to_string(),
+            semver::VersionReq::parse("=1.2.3").unwrap(),
+        );
+        child_scope.paths.push(PathGrant {
+            root: CanonicalPath::parse("/workspace/src", &r, false).unwrap(),
+            rights: PathRights::READ,
+        });
+        child_scope.effects.push(EffectClass::Read);
+        let child = mint_child_lease(
+            &root,
+            ChildLeaseParams {
+                lease_id: "lease-holder-liveness".to_string(),
+                subject: "ed25519:child-session".to_string(),
+                scope: child_scope,
+                limits: LeaseLimits {
+                    not_before_ms: 0,
+                    expires_at_ms: 500_000,
+                    budget: Budget::new().set(BudgetDimension::Executions, 10),
+                    max_executions: None,
+                    single_use: false,
+                },
+                depth_limit: 4,
+                lease_nonce: "holder-liveness-child".to_string(),
+                issued_at_ms: 200,
+            },
+            &session_key,
+            &sessions,
+            &RevocationIndex::new(),
+            &ledger,
+            &nonces,
+            200,
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert(root.lease_id.clone(), root.clone());
+        map.insert(child.lease_id.clone(), child.clone());
+        let revocations = RevocationIndex::new();
+        let one_shot = HashSet::new();
+        let chain_ids = vec![child.lease_id.clone(), root.lease_id.clone()];
+        // While the holder session is live, the delegated chain validates.
+        validate_chain(
+            &map,
+            &chain_ids,
+            &revocations,
+            &sessions,
+            &issuer_resolver(&keys),
+            &one_shot,
+            300,
+        )
+        .expect("delegated chain validates while holder session is live");
+        // Destroy the holder session WITHOUT revoking the lease: the lost
+        // revocation row (crash between session destroy and durable
+        // revoke). The issuing parent session stays live.
+        sessions.deactivate("ed25519:child-session");
+        let err = validate_chain(
+            &map,
+            &chain_ids,
+            &revocations,
+            &sessions,
+            &issuer_resolver(&keys),
+            &one_shot,
+            300,
+        )
+        .expect_err("destroyed holder session must not authorize");
+        assert!(
+            matches!(err, LeaseError::SubjectInactive(ref s) if s == "ed25519:child-session"),
+            "got {err:?}"
+        );
     }
 
     /// Session TTL: a record past `max_lifetime_ms` is not a live
