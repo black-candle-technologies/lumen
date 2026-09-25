@@ -481,12 +481,14 @@ async fn budget_reserve_debit_release_ledger() {
     // Releasing twice is a conflict.
     assert!(db.release_kernel_budget(&ws, &r2, 400).await.is_err());
 
-    // Conservation: caps(100) = reserved_out(30) + consumed(10) + remaining(60).
+    // Conservation: the debit moved 10 from reserved_out to consumed, so
+    // caps(100) = reserved_out(20) + consumed(10) + remaining(70). Counting
+    // the debit in both would have reported 60.
     let remaining = db
         .kernel_budget_remaining(&ws, "lease-root-1")
         .await
         .unwrap();
-    assert_eq!(remaining.get(BudgetDimension::Executions), 60);
+    assert_eq!(remaining.get(BudgetDimension::Executions), 70);
 
     // Direct debit against the lease's own caps.
     let five = Budget::new().set(BudgetDimension::Executions, 5);
@@ -497,7 +499,7 @@ async fn budget_reserve_debit_release_ledger() {
         .kernel_budget_remaining(&ws, "lease-root-1")
         .await
         .unwrap();
-    assert_eq!(remaining.get(BudgetDimension::Executions), 55);
+    assert_eq!(remaining.get(BudgetDimension::Executions), 65);
 
     // One active reservation left (child-1's).
     let active = db.active_kernel_reservations(&ws).await.unwrap();
@@ -676,7 +678,7 @@ async fn audit_chain_seal_checkpoint_verify() {
     // Checkpoint over the tip, signed by the host key.
     let link = checkpoint_link(&keys, e1.sequence, &e1.hash);
     db.checkpoint_kernel_audit(&ws, &link, 3_000).await.unwrap();
-    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id)
+    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, e1.sequence)
         .await
         .unwrap();
 
@@ -695,7 +697,7 @@ async fn audit_chain_seal_checkpoint_verify() {
         .await
         .unwrap();
     assert!(
-        db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id)
+        db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, e1.sequence)
             .await
             .is_err()
     );
@@ -754,9 +756,18 @@ async fn audit_gaps_and_tamper_are_impossible_or_visible() {
         .is_err()
     );
 
-    // The intact chain still verifies.
+    // The intact chain still verifies, anchored by a host checkpoint over
+    // the tip: verification requires host-key evidence, not just a
+    // recomputable hash chain.
     let keys = KernelKeys::generate();
-    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id)
+    let events = db
+        .kernel_audit_events(&ws, &KernelAuditQuery::default())
+        .await
+        .unwrap();
+    let tip = events.last().unwrap();
+    let link = checkpoint_link(&keys, tip.sequence, &tip.hash);
+    db.checkpoint_kernel_audit(&ws, &link, 4_000).await.unwrap();
+    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, tip.sequence)
         .await
         .unwrap();
 }
@@ -913,7 +924,9 @@ async fn one_shot_consume_audits_atomically() {
             .unwrap()
     );
     let keys = KernelKeys::generate();
-    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id)
+    let link = checkpoint_link(&keys, e1.sequence, &e1.hash);
+    db.checkpoint_kernel_audit(&ws, &link, 3_000).await.unwrap();
+    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, e1.sequence)
         .await
         .unwrap();
 }
@@ -963,9 +976,15 @@ async fn concurrent_audit_appends_stay_gapless() {
     for (idx, e) in events.iter().enumerate() {
         assert_eq!(e.sequence, idx as u64, "audit seq must be gapless");
     }
-    // The hash chain verifies end to end after the write storm.
+    // The hash chain verifies end to end after the write storm, anchored
+    // by a host checkpoint over the tip.
     let keys = KernelKeys::generate();
-    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id)
+    let tip = events.last().unwrap();
+    let link = checkpoint_link(&keys, tip.sequence, &tip.hash);
+    db.checkpoint_kernel_audit(&ws, &link, 99_999)
+        .await
+        .unwrap();
+    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, tip.sequence)
         .await
         .unwrap();
 }
@@ -1146,4 +1165,464 @@ async fn execution_reservation_durable_lifecycle() {
 
     let all = db.all_kernel_executions(&ws).await.unwrap();
     assert_eq!(all.len(), 2);
+}
+
+#[tokio::test]
+async fn budget_debit_moves_reserved_to_consumed_once() {
+    // Finding 5: a reservation debit must move `actual` from the parent's
+    // reserved_out into its consumed — counting it in both shrinks the
+    // parent's remaining twice and can reject valid reservations.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    db.insert_kernel_lease(&ws, &root).await.unwrap();
+    db.register_kernel_budget(
+        &ws,
+        "lease-root-1",
+        &Budget::new().set(BudgetDimension::Executions, 100),
+        100,
+    )
+    .await
+    .unwrap();
+    let child = mint_child(&fx, &root, "lease-child-1", "child-nonce-1");
+    db.insert_kernel_lease(&ws, &child).await.unwrap();
+
+    let thirty = Budget::new().set(BudgetDimension::Executions, 30);
+    let r = db
+        .reserve_kernel_budget(&ws, "lease-root-1", "lease-child-1", &thirty, 200)
+        .await
+        .unwrap();
+    let ten = Budget::new().set(BudgetDimension::Executions, 10);
+    db.debit_kernel_budget(&ws, &r, &ten, "k1", 300)
+        .await
+        .unwrap();
+
+    // 100 - reserved_out(20) - consumed(10): the debit is counted once.
+    let remaining = db
+        .kernel_budget_remaining(&ws, "lease-root-1")
+        .await
+        .unwrap();
+    assert_eq!(remaining.get(BudgetDimension::Executions), 70);
+
+    // Release returns only the unspent remainder; the spent 10 stays
+    // consumed, so the parent ends at 90, not 100.
+    let returned = db.release_kernel_budget(&ws, &r, 400).await.unwrap();
+    assert_eq!(returned.get(BudgetDimension::Executions), 20);
+    let remaining = db
+        .kernel_budget_remaining(&ws, "lease-root-1")
+        .await
+        .unwrap();
+    assert_eq!(remaining.get(BudgetDimension::Executions), 90);
+}
+
+#[tokio::test]
+async fn child_lease_debit_posts_to_reservation_and_parent() {
+    // Finding 6: spending through debit_kernel_lease on a reservation-backed
+    // child must land on the reservation ledger and the parent's books in
+    // the same transaction. Otherwise release_kernel_budget refunds spend
+    // that already happened and the budget is double-spent.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    db.insert_kernel_lease(&ws, &root).await.unwrap();
+    db.register_kernel_budget(&ws, "lease-root-1", &root.limits.budget, 100)
+        .await
+        .unwrap();
+    let child = mint_child(&fx, &root, "lease-child-1", "child-nonce-1");
+    let reservation_id = db.mint_kernel_child_lease(&ws, &child, 200).await.unwrap();
+
+    // The child spends 6 of its 10 directly against its own caps.
+    let six = Budget::new().set(BudgetDimension::Executions, 6);
+    db.debit_kernel_lease(&ws, "lease-child-1", &six, "child-spend-1", 300)
+        .await
+        .unwrap();
+
+    // The spend is on the reservation ledger...
+    let reservations = db.active_kernel_reservations(&ws).await.unwrap();
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].id, reservation_id);
+    assert_eq!(reservations[0].consumed.get(BudgetDimension::Executions), 6);
+    // ...and on the parent's books: 100 - reserved_out(4) - consumed(6).
+    let remaining = db
+        .kernel_budget_remaining(&ws, "lease-root-1")
+        .await
+        .unwrap();
+    assert_eq!(remaining.get(BudgetDimension::Executions), 90);
+    // The child's own caps still bound it: 4 left.
+    let child_remaining = db
+        .kernel_budget_remaining(&ws, "lease-child-1")
+        .await
+        .unwrap();
+    assert_eq!(child_remaining.get(BudgetDimension::Executions), 4);
+
+    // Release refunds only the unspent 4; the 6 spent stays consumed on the
+    // parent. Conservation: 94 + 6 = 100.
+    let returned = db
+        .release_kernel_budget(&ws, &reservation_id, 400)
+        .await
+        .unwrap();
+    assert_eq!(returned.get(BudgetDimension::Executions), 4);
+    let remaining = db
+        .kernel_budget_remaining(&ws, "lease-root-1")
+        .await
+        .unwrap();
+    assert_eq!(remaining.get(BudgetDimension::Executions), 94);
+}
+
+#[tokio::test]
+async fn execution_lease_references_are_workspace_scoped() {
+    // Finding 3: kernel_executions.lease_id and kernel_lease_caps.lease_id
+    // must reference the lease in the SAME workspace (composite FK), so a
+    // row can never name a lease from another workspace.
+    let db = test_db().await;
+    let ws_a = test_workspace(&db).await;
+    let ws_b = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    db.insert_kernel_lease(&ws_a, &root).await.unwrap();
+
+    // An execution row whose workspace differs from its lease's workspace
+    // fails closed at the SQL layer.
+    let exec = ExecutionReservation {
+        id: "exec_xws_1".to_string(),
+        lease_id: "lease-root-1".to_string(),
+        action_id: "action-1".to_string(),
+        held: Budget::new().set(BudgetDimension::Executions, 1),
+        state: ExecutionState::Held,
+        idempotency_key: "nonce-xws-1".to_string(),
+        created_at_ms: 200,
+        completed_at_ms: None,
+        actual: None,
+    };
+    let err = db.insert_kernel_execution(&ws_b, &exec).await.unwrap_err();
+    assert!(
+        err.to_string().contains("FOREIGN KEY"),
+        "expected FK failure, got: {err}"
+    );
+
+    // A caps row under the wrong workspace is rejected instead of
+    // permanently shadowing the correct one (first write wins).
+    let caps = sqlx::query(
+        "INSERT INTO kernel_lease_caps(lease_id,workspace_id,caps_json,recorded_at_ms)
+         VALUES('lease-root-1',?,'{}',100)",
+    )
+    .bind(ws_b.to_string())
+    .execute(db.pool())
+    .await;
+    assert!(caps.is_err(), "cross-workspace caps must fail");
+
+    // Positive controls: same-workspace rows still land.
+    db.insert_kernel_execution(&ws_a, &exec).await.unwrap();
+    db.record_kernel_lease_caps(&ws_a, "lease-root-1", &root.limits.budget, 100)
+        .await
+        .unwrap();
+    assert!(
+        db.kernel_lease_caps(&ws_a, "lease-root-1")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn audit_verify_requires_checkpoint_anchor() {
+    // Finding 7: verification requires a valid host-key checkpoint reaching
+    // the caller's trusted anchor. A store writer that strips checkpoints
+    // (or never had them) cannot produce a verifying log.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let keys = KernelKeys::generate();
+
+    let _e0 = db
+        .append_kernel_audit_event(
+            &ws,
+            &audit_params(
+                AuditEventKind::PolicyAllowed,
+                digest(0).as_str(),
+                Some("allow"),
+                1_000,
+                json!({}),
+            ),
+        )
+        .await
+        .unwrap();
+    let e1 = db
+        .append_kernel_audit_event(
+            &ws,
+            &audit_params(
+                AuditEventKind::PolicyDenied,
+                digest(1).as_str(),
+                Some("deny"),
+                2_000,
+                json!({}),
+            ),
+        )
+        .await
+        .unwrap();
+
+    // No checkpoints: nothing reaches the anchor, not even anchor 0.
+    assert!(
+        db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, 0)
+            .await
+            .is_err()
+    );
+
+    // Checkpoint the tip: the anchor is satisfied exactly.
+    let link = checkpoint_link(&keys, e1.sequence, &e1.hash);
+    db.checkpoint_kernel_audit(&ws, &link, 3_000).await.unwrap();
+    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, e1.sequence)
+        .await
+        .unwrap();
+    // An anchor beyond the last signed checkpoint fails closed.
+    assert!(
+        db.verify_kernel_audit(
+            &ws,
+            &keys.host_verifying(),
+            &keys.host_key_id,
+            e1.sequence + 1
+        )
+        .await
+        .is_err()
+    );
+
+    // Events appended after the checkpoint still verify against the old
+    // anchor...
+    let e2 = db
+        .append_kernel_audit_event(
+            &ws,
+            &audit_params(
+                AuditEventKind::ToolExecuted,
+                digest(2).as_str(),
+                None,
+                3_000,
+                json!({}),
+            ),
+        )
+        .await
+        .unwrap();
+    db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, e1.sequence)
+        .await
+        .unwrap();
+    // ...but a caller anchoring at the new tip fails until it checkpoints.
+    assert!(
+        db.verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, e2.sequence)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn lease_chain_fails_closed_past_hop_limit() {
+    // Finding 4: a chain that does not terminate at a root within 128 hops
+    // is an error, never a silently truncated chain.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    let scope_json = serde_json::to_string(&root.scope).unwrap();
+    let limits_json = serde_json::to_string(&root.limits).unwrap();
+    let ws_str = ws.to_string();
+
+    // 129 links: walking 128 hops from the leaf never reaches the root.
+    // Inserted root-first so the composite parent FK is satisfied.
+    // (Parent cycles are unconstructible: the no-update trigger plus the
+    // immediate parent FK only admit insertion-ordered DAGs, so the hop
+    // limit is the only non-termination case.)
+    for i in (0..129).rev() {
+        let lease_id = format!("deep-{i}");
+        let parent: Option<String> = if i == 128 {
+            None
+        } else {
+            Some(format!("deep-{}", i + 1))
+        };
+        sqlx::query(
+            "INSERT INTO kernel_leases(lease_id,workspace_id,parent_id,subject,issuer_key_id,
+             issued_at_ms,protocol_version,scope_digest,scope_json,limits_json,depth,depth_limit,
+             lease_nonce,signature,document_digest,created_at)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&lease_id)
+        .bind(&ws_str)
+        .bind(parent)
+        .bind("test-subject")
+        .bind("test-issuer")
+        .bind(0_i64)
+        .bind(1_i64)
+        .bind("c".repeat(64))
+        .bind(&scope_json)
+        .bind(&limits_json)
+        .bind(i as i64)
+        .bind(200_i64)
+        .bind(format!("deep-nonce-{i}"))
+        .bind("a".repeat(128))
+        .bind("d".repeat(64))
+        .bind(0_i64)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let err = db.kernel_lease_chain(&ws, "deep-0").await.unwrap_err();
+    assert!(
+        err.to_string().contains("128 hops"),
+        "expected hop-limit error, got: {err}"
+    );
+    // A chain that terminates exactly at the hop limit still loads.
+    let chain = db.kernel_lease_chain(&ws, "deep-1").await.unwrap();
+    assert_eq!(chain.len(), 128);
+    assert_eq!(chain[0].lease_id, "deep-1");
+    assert!(chain[127].parent_id.is_none());
+}
+
+#[tokio::test]
+async fn reservation_guard_freezes_held_and_released_rows() {
+    // Finding 1: held_json is immutable after issuance, and a released row
+    // is frozen entirely — release_kernel_budget computes the receipt from
+    // held/consumed, so mutating either corrupts parent balances.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    db.insert_kernel_lease(&ws, &root).await.unwrap();
+    db.register_kernel_budget(
+        &ws,
+        "lease-root-1",
+        &Budget::new().set(BudgetDimension::Executions, 100),
+        100,
+    )
+    .await
+    .unwrap();
+    let child = mint_child(&fx, &root, "lease-child-1", "child-nonce-1");
+    db.insert_kernel_lease(&ws, &child).await.unwrap();
+    let ws_str = ws.to_string();
+
+    let r = db
+        .reserve_kernel_budget(
+            &ws,
+            "lease-root-1",
+            "lease-child-1",
+            &Budget::new().set(BudgetDimension::Executions, 30),
+            200,
+        )
+        .await
+        .unwrap();
+
+    // Raising the hold after issuance is rejected.
+    let bump = sqlx::query(
+        "UPDATE kernel_reservations SET held_json='{\"executions\":999}'
+         WHERE workspace_id=? AND reservation_id=?",
+    )
+    .bind(&ws_str)
+    .bind(&r)
+    .execute(db.pool())
+    .await;
+    assert!(bump.is_err(), "held_json must be immutable");
+
+    // The debit path's own write — consumed on an active row — still works.
+    let ten = Budget::new().set(BudgetDimension::Executions, 10);
+    db.debit_kernel_budget(&ws, &r, &ten, "k-guard-1", 300)
+        .await
+        .unwrap();
+
+    // After release the row is frozen: consumed and released_at_ms cannot
+    // change (only released -> active was blocked before).
+    let returned = db.release_kernel_budget(&ws, &r, 400).await.unwrap();
+    assert_eq!(returned.get(BudgetDimension::Executions), 20);
+    let frozen = sqlx::query(
+        "UPDATE kernel_reservations SET consumed_json='{}'
+         WHERE workspace_id=? AND reservation_id=?",
+    )
+    .bind(&ws_str)
+    .bind(&r)
+    .execute(db.pool())
+    .await;
+    assert!(frozen.is_err(), "released consumed_json must be frozen");
+    let frozen_ts = sqlx::query(
+        "UPDATE kernel_reservations SET released_at_ms=999
+         WHERE workspace_id=? AND reservation_id=?",
+    )
+    .bind(&ws_str)
+    .bind(&r)
+    .execute(db.pool())
+    .await;
+    assert!(frozen_ts.is_err(), "released released_at_ms must be frozen");
+}
+
+#[tokio::test]
+async fn lease_debits_table_has_kernel_constraints() {
+    // Finding 2: kernel_lease_debits carries the same integrity constraints
+    // as the other kernel tables (STRICT, json_valid, non-empty key,
+    // non-negative timestamp, workspace + lease FKs). Append-only rows
+    // cannot be repaired later.
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "lease-root-1", "root-nonce-1");
+    db.insert_kernel_lease(&ws, &root).await.unwrap();
+    let ws_str = ws.to_string();
+
+    // Malformed JSON amounts are rejected.
+    let bad_json = sqlx::query(
+        "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
+         amounts_json,debited_at_ms) VALUES(?,?,'lease-root-1','not-json',1)",
+    )
+    .bind(&ws_str)
+    .bind("k-bad-json")
+    .execute(db.pool())
+    .await;
+    assert!(bad_json.is_err(), "amounts_json must be valid JSON");
+
+    // Negative timestamps are rejected.
+    let bad_ts = sqlx::query(
+        "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
+         amounts_json,debited_at_ms) VALUES(?,?,'lease-root-1','{}',-1)",
+    )
+    .bind(&ws_str)
+    .bind("k-bad-ts")
+    .execute(db.pool())
+    .await;
+    assert!(bad_ts.is_err(), "debited_at_ms must be non-negative");
+
+    // Empty idempotency keys are rejected.
+    let bad_key = sqlx::query(
+        "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
+         amounts_json,debited_at_ms) VALUES(?,?,'lease-root-1','{}',1)",
+    )
+    .bind(&ws_str)
+    .bind("")
+    .execute(db.pool())
+    .await;
+    assert!(bad_key.is_err(), "idempotency_key must be non-empty");
+
+    // Unknown leases and unknown workspaces are rejected.
+    let bad_lease = sqlx::query(
+        "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
+         amounts_json,debited_at_ms) VALUES(?,?,'lease-missing','{}',1)",
+    )
+    .bind(&ws_str)
+    .bind("k-bad-lease")
+    .execute(db.pool())
+    .await;
+    assert!(bad_lease.is_err(), "lease_id_link must reference a lease");
+    let bad_ws = sqlx::query(
+        "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
+         amounts_json,debited_at_ms) VALUES(?,?,'lease-root-1','{}',1)",
+    )
+    .bind("ws-does-not-exist")
+    .bind("k-bad-ws")
+    .execute(db.pool())
+    .await;
+    assert!(bad_ws.is_err(), "workspace_id must reference a workspace");
+
+    // A well-formed row still lands.
+    sqlx::query(
+        "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
+         amounts_json,debited_at_ms) VALUES(?,?,'lease-root-1','{}',1)",
+    )
+    .bind(&ws_str)
+    .bind("k-good")
+    .execute(db.pool())
+    .await
+    .unwrap();
 }

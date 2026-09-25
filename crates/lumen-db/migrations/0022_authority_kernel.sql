@@ -106,8 +106,10 @@ CREATE TRIGGER kernel_budget_accounts_no_delete BEFORE DELETE ON kernel_budget_a
 
 -- ---------------------------------------------------------------------------
 -- Reservations: holds carved out of a parent account for a child lease.
--- Identity columns immutable; state machine active -> released only;
--- held/consumed move only via the transactional debit path.
+-- Identity columns and held_json are immutable; state machine active ->
+-- released only; consumed moves only via the transactional debit path.
+-- Released rows are frozen entirely: the release receipt (held minus
+-- consumed) must stay a pure function of issuance-time values.
 -- ---------------------------------------------------------------------------
 CREATE TABLE kernel_reservations(
  reservation_id TEXT NOT NULL,
@@ -132,8 +134,11 @@ WHEN (
  OR NEW.parent_lease_id!=OLD.parent_lease_id
  OR NEW.child_lease_id!=OLD.child_lease_id
  OR NEW.created_at_ms!=OLD.created_at_ms
+ OR NEW.held_json!=OLD.held_json
  OR NEW.state NOT IN('active','released')
  OR (OLD.state='released' AND NEW.state='active')
+ OR (OLD.state='released' AND (NEW.consumed_json!=OLD.consumed_json
+     OR NEW.released_at_ms IS NOT OLD.released_at_ms))
  OR (NEW.state='released' AND NEW.released_at_ms IS NULL)
  OR (NEW.state='active' AND NEW.released_at_ms IS NOT NULL)
 )
@@ -164,15 +169,15 @@ CREATE INDEX kernel_debits_reservation_idx ON kernel_debits(reservation_id);
 /* Direct debits against a lease's own caps (root-lease spend), kept separate
    from reservation debits so idempotency keys cannot collide across kinds. */
 CREATE TABLE kernel_lease_debits(
-    workspace_id TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL CHECK(length(idempotency_key)>0),
     lease_id_link TEXT NOT NULL,
-    amounts_json TEXT NOT NULL,
-    debited_at_ms INTEGER NOT NULL,
+    amounts_json TEXT NOT NULL CHECK(json_valid(amounts_json)),
+    debited_at_ms INTEGER NOT NULL CHECK(debited_at_ms>=0),
     PRIMARY KEY(workspace_id,idempotency_key),
     FOREIGN KEY(workspace_id, lease_id_link)
-      REFERENCES kernel_leases(workspace_id, lease_id)
-);
+      REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
+) STRICT;
 CREATE TRIGGER kernel_lease_debits_no_update BEFORE UPDATE ON kernel_lease_debits BEGIN SELECT RAISE(ABORT,'lease debits are immutable');END;
 CREATE TRIGGER kernel_lease_debits_no_delete BEFORE DELETE ON kernel_lease_debits BEGIN SELECT RAISE(ABORT,'lease debits are immutable');END;
 CREATE INDEX kernel_lease_debits_lease_idx ON kernel_lease_debits(workspace_id,lease_id_link);

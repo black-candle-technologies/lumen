@@ -161,6 +161,10 @@ impl Database {
     }
 
     /// Load a full chain, leaf first, following parent links (max 128 hops).
+    ///
+    /// Fails closed when traversal does not reach a root within 128 hops
+    /// (a cycle, or a chain deeper than the protocol supports): returning a
+    /// truncated chain would let a caller validate against the wrong anchor.
     pub async fn kernel_lease_chain(
         &self,
         workspace_id: &WorkspaceId,
@@ -179,10 +183,12 @@ impl Database {
             chain.push(doc);
             match parent {
                 Some(p) => current = p,
-                None => break,
+                None => return Ok(chain),
             }
         }
-        Ok(chain)
+        Err(RepositoryError::InvalidKernelLeaseState(format!(
+            "lease chain for {leaf_id} exceeds 128 hops"
+        )))
     }
 
     // ------------------------------------------------------------------
@@ -446,8 +452,8 @@ impl Database {
             return Err(RepositoryError::KernelDebitConflict);
         }
         let row = sqlx::query(
-            "SELECT parent_lease_id,held_json,consumed_json,state FROM kernel_reservations
-             WHERE workspace_id=? AND reservation_id=?",
+            "SELECT parent_lease_id,child_lease_id,held_json,consumed_json,state
+             FROM kernel_reservations WHERE workspace_id=? AND reservation_id=?",
         )
         .bind(ws(workspace_id))
         .bind(reservation_id)
@@ -458,6 +464,7 @@ impl Database {
             return Err(RepositoryError::KernelReservationConflict);
         }
         let parent_lease_id: String = row.get("parent_lease_id");
+        let child_lease_id: String = row.get("child_lease_id");
         let held = parse_budget(row.get::<String, _>("held_json").as_str())?;
         let consumed = parse_budget(row.get::<String, _>("consumed_json").as_str())?;
         let available = held.saturating_sub(&consumed);
@@ -489,28 +496,50 @@ impl Database {
         .bind(reservation_id)
         .execute(&mut *tx)
         .await?;
-        let acct = sqlx::query(
-            "SELECT consumed_json FROM kernel_budget_accounts
-             WHERE workspace_id=? AND lease_id=?",
-        )
-        .bind(ws(workspace_id))
-        .bind(&parent_lease_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let acct_consumed = parse_budget(acct.get::<String, _>("consumed_json").as_str())?;
-        let acct_new = acct_consumed
-            .checked_add(actual)
-            .ok_or_else(|| insufficient("account consumed overflow"))?;
-        sqlx::query(
-            "UPDATE kernel_budget_accounts SET consumed_json=?,updated_at=?
-             WHERE workspace_id=? AND lease_id=?",
-        )
-        .bind(budget_json(&acct_new)?)
-        .bind(now_ms)
-        .bind(ws(workspace_id))
-        .bind(&parent_lease_id)
-        .execute(&mut *tx)
-        .await?;
+        // The spend moves from the parent's reserved_out to its consumed,
+        // counted exactly once (see post_parent_debit_tx).
+        post_parent_debit_tx(&mut tx, workspace_id, &parent_lease_id, actual, now_ms).await?;
+        // Mirror the spend into the child's own budget account when the
+        // mint flow registered one: otherwise the child's remaining would
+        // overstate its budget after a reservation-side debit, weakening
+        // the child's own caps.
+        if child_lease_id != parent_lease_id
+            && let Some(child_acct) = sqlx::query(
+                "SELECT caps_json,reserved_out_json,consumed_json FROM kernel_budget_accounts
+                 WHERE workspace_id=? AND lease_id=?",
+            )
+            .bind(ws(workspace_id))
+            .bind(&child_lease_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let child_caps = parse_budget(child_acct.get::<String, _>("caps_json").as_str())?;
+            let child_reserved =
+                parse_budget(child_acct.get::<String, _>("reserved_out_json").as_str())?;
+            let child_consumed =
+                parse_budget(child_acct.get::<String, _>("consumed_json").as_str())?;
+            let child_remaining = child_caps
+                .saturating_sub(&child_reserved)
+                .saturating_sub(&child_consumed);
+            if !child_remaining.covers(actual) {
+                return Err(insufficient(&format!(
+                    "child lease {child_lease_id} cannot cover debit"
+                )));
+            }
+            let child_new = child_consumed
+                .checked_add(actual)
+                .ok_or_else(|| insufficient("child account consumed overflow"))?;
+            sqlx::query(
+                "UPDATE kernel_budget_accounts SET consumed_json=?,updated_at=?
+                 WHERE workspace_id=? AND lease_id=?",
+            )
+            .bind(budget_json(&child_new)?)
+            .bind(now_ms)
+            .bind(ws(workspace_id))
+            .bind(&child_lease_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(DebitReceipt {
             reservation_id: reservation_id.to_string(),
@@ -520,6 +549,12 @@ impl Database {
     }
 
     /// Debit spend directly against a lease's own caps (root-lease spend).
+    ///
+    /// When the lease is a reservation-backed child, the spend is posted to
+    /// the reservation ledger atomically as well: the active reservation's
+    /// consumed grows and the parent's reserved_out/consumed move with it.
+    /// Without this, release_kernel_budget would refund spend that already
+    /// happened, double-spending the parent's budget.
     pub async fn debit_kernel_lease(
         &self,
         workspace_id: &WorkspaceId,
@@ -570,6 +605,29 @@ impl Database {
                 "lease {lease_id} cannot cover direct debit"
             )));
         }
+        // A reservation-backed child also spends against its reservation:
+        // check the reservation's available hold before writing anything, so
+        // a desynchronized ledger fails closed instead of half-applying.
+        let child_reservation = sqlx::query(
+            "SELECT reservation_id,parent_lease_id,held_json,consumed_json
+             FROM kernel_reservations
+             WHERE workspace_id=? AND child_lease_id=? AND state='active'
+             ORDER BY created_at_ms LIMIT 1",
+        )
+        .bind(ws(workspace_id))
+        .bind(lease_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(res) = &child_reservation {
+            let held = parse_budget(res.get::<String, _>("held_json").as_str())?;
+            let res_consumed = parse_budget(res.get::<String, _>("consumed_json").as_str())?;
+            let available = held.saturating_sub(&res_consumed);
+            if !available.covers(actual) {
+                return Err(insufficient(&format!(
+                    "reservation for child lease {lease_id} cannot cover direct debit"
+                )));
+            }
+        }
         sqlx::query(
             "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
              amounts_json,debited_at_ms) VALUES(?,?,?,?,?)",
@@ -594,6 +652,28 @@ impl Database {
         .bind(lease_id)
         .execute(&mut *tx)
         .await?;
+        // Post the child's spend to the reservation ledger in the same
+        // transaction: the reservation's consumed grows, and the parent's
+        // reserved_out shrinks by `actual` while its consumed grows by
+        // `actual` (counted exactly once — see post_parent_debit_tx).
+        if let Some(res) = &child_reservation {
+            let reservation_id: String = res.get("reservation_id");
+            let parent_lease_id: String = res.get("parent_lease_id");
+            let res_consumed = parse_budget(res.get::<String, _>("consumed_json").as_str())?;
+            let res_new = res_consumed
+                .checked_add(actual)
+                .ok_or_else(|| insufficient("reservation consumed overflow"))?;
+            sqlx::query(
+                "UPDATE kernel_reservations SET consumed_json=?
+                 WHERE workspace_id=? AND reservation_id=?",
+            )
+            .bind(budget_json(&res_new)?)
+            .bind(ws(workspace_id))
+            .bind(&reservation_id)
+            .execute(&mut *tx)
+            .await?;
+            post_parent_debit_tx(&mut tx, workspace_id, &parent_lease_id, actual, now_ms).await?;
+        }
         tx.commit().await?;
         Ok(DebitReceipt {
             reservation_id: lease_id.to_string(),
@@ -604,6 +684,11 @@ impl Database {
 
     /// Release a reservation: the unspent held amount returns to the parent.
     /// Returns the amount returned. Only on explicit revocation/expiry.
+    ///
+    /// Conservation: each debit already moved its actual from the parent's
+    /// reserved_out to consumed, so release subtracts only the unspent
+    /// remainder (held − consumed) from reserved_out; the spent part stays
+    /// consumed on the parent's books exactly once.
     pub async fn release_kernel_budget(
         &self,
         workspace_id: &WorkspaceId,
@@ -646,7 +731,12 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         let reserved_out = parse_budget(acct.get::<String, _>("reserved_out_json").as_str())?;
-        let new_reserved = reserved_out.saturating_sub(&held);
+        // Only the unspent remainder of the hold returns: every debit
+        // already moved its actual from reserved_out to consumed, so
+        // subtracting the full hold would release the spent part a second
+        // time.
+        let unspent = held.saturating_sub(&consumed);
+        let new_reserved = reserved_out.saturating_sub(&unspent);
         sqlx::query(
             "UPDATE kernel_budget_accounts SET reserved_out_json=?,updated_at=?
              WHERE workspace_id=? AND lease_id=?",
@@ -1002,14 +1092,26 @@ impl Database {
     }
 
     /// Verify the workspace's audit chain and every checkpoint against the
-    /// host verifying key. Each checkpoint must be anchored to a real event
-    /// (matching sequence and hash) and carry a valid host-key signature.
-    /// Reports the first break found.
+    /// host verifying key, requiring a trusted checkpoint anchor. Each
+    /// checkpoint must be anchored to a real event (matching sequence and
+    /// hash) and carry a valid host-key signature. Reports the first break
+    /// found.
+    ///
+    /// `min_checkpoint_seq` is the caller's trusted minimum signed
+    /// through-sequence: the host asserts it has signed a checkpoint
+    /// covering at least this event. Verification fails closed when no
+    /// checkpoint that is both anchored to the chain and signed by the host
+    /// key reaches the anchor — so a store writer that rewrites events and
+    /// strips checkpoints cannot produce a verifying log. Events appended
+    /// after the newest checkpoint still verify (the log grows between
+    /// checkpoints); raise the anchor after each checkpoint to bind recent
+    /// history to host-key evidence.
     pub async fn verify_kernel_audit(
         &self,
         workspace_id: &WorkspaceId,
         host_key: &ed25519_dalek::VerifyingKey,
         expected_key_id: &str,
+        min_checkpoint_seq: u64,
     ) -> Result<(), RepositoryError> {
         let events = self
             .kernel_audit_events(workspace_id, &KernelAuditQuery::default())
@@ -1017,6 +1119,7 @@ impl Database {
         verify_event_chain(&events)
             .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
         let checkpoints = self.kernel_audit_checkpoints(workspace_id).await?;
+        let mut anchored_through: Option<u64> = None;
         for link in &checkpoints {
             let anchored = events
                 .iter()
@@ -1029,8 +1132,15 @@ impl Database {
             }
             link.verify(host_key, expected_key_id)
                 .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
+            anchored_through =
+                Some(anchored_through.map_or(link.through_seq, |max| max.max(link.through_seq)));
         }
-        Ok(())
+        match anchored_through {
+            Some(through) if through >= min_checkpoint_seq => Ok(()),
+            _ => Err(RepositoryError::KernelAuditBreak(format!(
+                "no valid checkpoint reaches trusted anchor seq {min_checkpoint_seq}"
+            ))),
+        }
     }
 }
 
@@ -1288,6 +1398,49 @@ async fn register_budget_tx(
     if res.rows_affected() == 0 {
         return Err(RepositoryError::KernelReservationConflict);
     }
+    Ok(())
+}
+
+/// Move `actual` from a parent account's reserved_out into its consumed,
+/// atomically. A reservation debit reclassifies the spend: it was reserved
+/// at reserve time and is consumed now. Shrinking reserved_out by `actual`
+/// while growing consumed by `actual` keeps the parent's remaining balance
+/// (caps − reserved_out − consumed) exact — counting the spend in both
+/// would shrink it twice. Shared by [`Database::debit_kernel_budget`] and
+/// the child-lease post-through in [`Database::debit_kernel_lease`].
+async fn post_parent_debit_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    parent_lease_id: &str,
+    actual: &Budget,
+    now_ms: i64,
+) -> Result<(), RepositoryError> {
+    let acct = sqlx::query(
+        "SELECT reserved_out_json,consumed_json FROM kernel_budget_accounts
+         WHERE workspace_id=? AND lease_id=?",
+    )
+    .bind(ws(workspace_id))
+    .bind(parent_lease_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let reserved_out = parse_budget(acct.get::<String, _>("reserved_out_json").as_str())?;
+    let acct_consumed = parse_budget(acct.get::<String, _>("consumed_json").as_str())?;
+    let reserved_new = reserved_out.saturating_sub(actual);
+    let acct_new = acct_consumed
+        .checked_add(actual)
+        .ok_or_else(|| insufficient("account consumed overflow"))?;
+    sqlx::query(
+        "UPDATE kernel_budget_accounts
+         SET reserved_out_json=?,consumed_json=?,updated_at=?
+         WHERE workspace_id=? AND lease_id=?",
+    )
+    .bind(budget_json(&reserved_new)?)
+    .bind(budget_json(&acct_new)?)
+    .bind(now_ms)
+    .bind(ws(workspace_id))
+    .bind(parent_lease_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

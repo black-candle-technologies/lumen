@@ -11,7 +11,7 @@
 CREATE TABLE kernel_executions(
  id TEXT PRIMARY KEY CHECK(length(id)>0),
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
- lease_id TEXT NOT NULL REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ lease_id TEXT NOT NULL,
  action_id TEXT NOT NULL CHECK(length(action_id)>0),
  held_json TEXT NOT NULL CHECK(json_valid(held_json)),
  state TEXT NOT NULL CHECK(state IN('held','settled','released')),
@@ -19,7 +19,11 @@ CREATE TABLE kernel_executions(
  created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
  completed_at_ms INTEGER NULL CHECK(completed_at_ms IS NULL OR completed_at_ms>=0),
  actual_json TEXT NULL CHECK(actual_json IS NULL OR json_valid(actual_json)),
- UNIQUE(workspace_id, idempotency_key)
+ UNIQUE(workspace_id, idempotency_key),
+ /* The lease must live in the same workspace as the execution row: the
+    composite FK makes cross-workspace lease references fail closed. */
+ FOREIGN KEY(workspace_id, lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_executions_update_guard BEFORE UPDATE ON kernel_executions
 WHEN (
@@ -46,10 +50,15 @@ CREATE INDEX kernel_executions_lease_idx ON kernel_executions(workspace_id, leas
 -- Recorded budget caps per lease (first write wins): the caps snapshot boot
 -- reconciliation rehydrates the in-memory ledger from. Immutable.
 CREATE TABLE kernel_lease_caps(
- lease_id TEXT PRIMARY KEY REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ lease_id TEXT PRIMARY KEY,
  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
  caps_json TEXT NOT NULL CHECK(json_valid(caps_json)),
- recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+ recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+ /* The lease must live in the same workspace as the caps row: a caps row
+    written under the wrong workspace would otherwise permanently shadow
+    the correct one (first write wins, no updates). */
+ FOREIGN KEY(workspace_id, lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TRIGGER kernel_lease_caps_no_update BEFORE UPDATE ON kernel_lease_caps BEGIN SELECT RAISE(ABORT,'lease caps are immutable');END;
 CREATE TRIGGER kernel_lease_caps_no_delete BEFORE DELETE ON kernel_lease_caps BEGIN SELECT RAISE(ABORT,'lease caps are immutable');END;
