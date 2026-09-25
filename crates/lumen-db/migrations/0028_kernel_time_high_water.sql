@@ -1,4 +1,4 @@
--- 0026_kernel_time_high_water.sql: durable monotonic time anchor for
+-- 0028_kernel_time_high_water.sql: durable monotonic time anchor for
 -- lease persistence.
 --
 -- Lease liveness, purge eligibility, and the boot re-validation

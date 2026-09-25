@@ -1659,7 +1659,7 @@ impl Database {
     }
 
     // ------------------------------------------------------------------
-    // Monotonic time anchor (migration 0026)
+    // Monotonic time anchor (migration 0028)
     // ------------------------------------------------------------------
 
     /// The greatest effective time the kernel has acted on, or 0 when the
