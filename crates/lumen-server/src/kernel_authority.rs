@@ -1230,16 +1230,27 @@ impl AuthorityKernel {
         // Durable replay gate: the nonce row commits before evaluation,
         // so a crash between gate and decision still fails closed on
         // retry (the retry sees the replay, not a fresh envelope).
-        let nonce_key = format!("{}:{}", frozen.action_id, frozen.nonce);
-        let nonce_ttl = frozen.expires_at_ms.saturating_sub(now).max(1);
-        let _ = self.db_run(|db, ws| db.purge_kernel_nonces(ws, now))?;
-        let fresh = self.db_run(|db, ws| {
-            db.record_kernel_nonce(ws, &nonce_key, now, now.saturating_add(nonce_ttl))
-        })?;
-        if !fresh {
-            let reason = DenyReason::replay_detected(format!("envelope nonce replay: {nonce_key}"));
-            let _ = self.audit_decision(&frozen, "deny", &reason);
-            return to_host_decision(&FrozenDecision::deny(reason), envelope);
+        //
+        // The gate is skipped for envelopes without a lease chain: those
+        // cannot reach authorization (they deny or fall back to a pending
+        // VHL approval), and the approval fallback must not consume the
+        // nonce — the approved re-presentation of the verbatim envelope
+        // carries the same nonce and must still pass this gate when the
+        // one-shot lease is presented. This mirrors `authorize_envelope`,
+        // which skips its in-memory nonce check on the lease-less path.
+        if !frozen.lease_chain.is_empty() {
+            let nonce_key = format!("{}:{}", frozen.action_id, frozen.nonce);
+            let nonce_ttl = frozen.expires_at_ms.saturating_sub(now).max(1);
+            let _ = self.db_run(|db, ws| db.purge_kernel_nonces(ws, now))?;
+            let fresh = self.db_run(|db, ws| {
+                db.record_kernel_nonce(ws, &nonce_key, now, now.saturating_add(nonce_ttl))
+            })?;
+            if !fresh {
+                let reason =
+                    DenyReason::replay_detected(format!("envelope nonce replay: {nonce_key}"));
+                let _ = self.audit_decision(&frozen, "deny", &reason);
+                return to_host_decision(&FrozenDecision::deny(reason), envelope);
+            }
         }
 
         // Evaluate against the real kernel. The resolver and one-shot
@@ -2294,6 +2305,7 @@ fn to_host_lease(doc: &CoreLeaseDocument) -> LeaseDocument {
         depth_limit: doc.depth_limit,
         lease_nonce: doc.lease_nonce.clone(),
         signature: doc.signature.clone(),
+        approved_action_digest: doc.approved_action_digest.clone(),
     }
 }
 
@@ -2326,9 +2338,7 @@ fn to_core_lease(lease: &LeaseDocument) -> Result<CoreLeaseDocument, String> {
         depth_limit: lease.depth_limit,
         lease_nonce: lease.lease_nonce.clone(),
         signature: lease.signature.clone(),
-        // The host lease document predates the approved-action digest;
-        // it is not present to convert.
-        approved_action_digest: None,
+        approved_action_digest: lease.approved_action_digest.clone(),
     })
 }
 
@@ -2552,18 +2562,20 @@ impl AuthorityKernelClient {
             let new_state = if approved { "approved" } else { "denied" };
             kernel
                 .db_run(|db, ws| {
-                    db.vhl_transition(
+                    // Decisions go through vhl_record_decision: it writes the
+                    // vhl_decisions row atomically with the requested →
+                    // approved/denied transition. vhl_transition only allows
+                    // the post-decision approved → minted / minted → consumed
+                    // edges, so it cannot record a decision.
+                    db.vhl_record_decision(
                         ws,
                         &approval_id,
-                        "requested",
                         new_state,
-                        Some(now),
-                        Some(&decided_by),
+                        &decided_by,
                         None,
-                        None,
-                        None,
-                        None,
-                        None,
+                        "",
+                        now,
+                        "requested",
                     )
                 })
                 .map_err(|e| KernelError::Unavailable(format!("approval decision failed: {e}")))

@@ -845,45 +845,39 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
         }
     }
 
-    /// Handle one Pi tool request. Exactly one kernel `decide` per call;
-    /// deny/pending are terminal renders, never retried.
-    pub async fn handle(
+    /// Build the canonical envelope for one Pi tool request without
+    /// executing it. The host is the envelope authority: resources and
+    /// effects come from the host projection, never from Pi.
+    ///
+    /// Exposed so tests (and the VHL one-shot flow) can retain the exact
+    /// envelope the human approved and re-present it verbatim after the
+    /// one-shot lease is minted: one-shot leases are bound to the exact
+    /// approved action digest, so a freshly built envelope (new nonce)
+    /// would not match. The caller sets `lease_chain` on the returned
+    /// envelope before re-presenting it via [`Self::execute_envelope`].
+    pub fn build_envelope(
         &self,
         request: &PiToolRequest,
         session_subject: &str,
         lease_chain: &[String],
-    ) -> ToolOutcome {
+    ) -> Result<ActionEnvelope, String> {
         // 1. Strict argument decoding. Unknown tools and malformed
         //    arguments never reach the kernel.
-        let args = match self.catalog.decode(&request.tool, &request.arguments) {
-            Ok(args) => args,
-            Err(e) => {
-                return ToolOutcome::InvalidRequest {
-                    reason: e.to_string(),
-                };
-            }
-        };
-        let (resources, effects) = match self.catalog.project(&request.tool, &args) {
-            Ok(projected) => projected,
-            Err(e) => {
-                return ToolOutcome::InvalidRequest {
-                    reason: e.to_string(),
-                };
-            }
-        };
-        let tool_ref = match self.catalog.tool_ref(&request.tool) {
-            Ok(tool_ref) => tool_ref,
-            Err(e) => {
-                return ToolOutcome::InvalidRequest {
-                    reason: e.to_string(),
-                };
-            }
-        };
+        let args = self
+            .catalog
+            .decode(&request.tool, &request.arguments)
+            .map_err(|e| e.to_string())?;
+        let (resources, effects) = self
+            .catalog
+            .project(&request.tool, &args)
+            .map_err(|e| e.to_string())?;
+        let tool_ref = self
+            .catalog
+            .tool_ref(&request.tool)
+            .map_err(|e| e.to_string())?;
 
-        // 2. Build the canonical envelope. The host is the envelope
-        //    authority on this path: resources and effects come from the
-        //    host projection, never from Pi.
-        let envelope = ActionEnvelope {
+        // 2. Build the canonical envelope.
+        Ok(ActionEnvelope {
             protocol_version: ACTION_ENVELOPE_VERSION,
             action_id: Uuid::new_v4().to_string(),
             session_id: session_subject.to_string(),
@@ -895,6 +889,22 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
             nonce: Uuid::new_v4().to_string(),
             expires_at: deadline_rfc3339(ACTION_START_DEADLINE_SECS),
             expected_effects: effects,
+        })
+    }
+
+    /// Handle one Pi tool request. Exactly one kernel `decide` per call;
+    /// deny/pending are terminal renders, never retried.
+    pub async fn handle(
+        &self,
+        request: &PiToolRequest,
+        session_subject: &str,
+        lease_chain: &[String],
+    ) -> ToolOutcome {
+        let envelope = match self.build_envelope(request, session_subject, lease_chain) {
+            Ok(envelope) => envelope,
+            Err(reason) => {
+                return ToolOutcome::InvalidRequest { reason };
+            }
         };
         self.execute_envelope(&envelope, session_subject).await
     }

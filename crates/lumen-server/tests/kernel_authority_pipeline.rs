@@ -437,10 +437,14 @@ async fn one_shot_mint_is_atomic_and_single_use() {
     let subject = info.subject.clone();
 
     // No lease: authorize → pending approval, zero execution.
-    let outcome = f
+    // Build the envelope once and retain it: the one-shot lease is bound
+    // to the exact approved action digest, so the post-mint authorization
+    // must re-present this verbatim envelope (not a freshly built one).
+    let envelope = f
         .pipeline
-        .handle(&read_request(&f.leased_file), &subject, &[])
-        .await;
+        .build_envelope(&read_request(&f.leased_file), &subject, &[])
+        .expect("build envelope");
+    let outcome = f.pipeline.execute_envelope(&envelope, &subject).await;
     let approval_id = match outcome {
         ToolOutcome::PendingApproval {
             approval_request_id,
@@ -511,28 +515,21 @@ async fn one_shot_mint_is_atomic_and_single_use() {
         "minted approval leaves the pending set"
     );
 
-    // The minted lease authorizes its exact action once.
-    let outcome = f
-        .pipeline
-        .handle(
-            &read_request(&f.leased_file),
-            &subject,
-            std::slice::from_ref(&lease.lease_id),
-        )
-        .await;
+    // The minted lease authorizes its exact action once. Re-present the
+    // verbatim approved envelope with the lease attached: the lease is
+    // bound to the exact approved action digest, so a fresh envelope
+    // (new nonce) would not match.
+    let mut presented = envelope.clone();
+    presented.lease_chain = vec![lease.lease_id.clone()];
+    let outcome = f.pipeline.execute_envelope(&presented, &subject).await;
     assert!(
         matches!(outcome, ToolOutcome::Completed { .. }),
         "one-shot lease authorizes its action, got {outcome:?}"
     );
-    // Second use of the single-use lease: consumed.
-    let outcome = f
-        .pipeline
-        .handle(
-            &read_request(&f.leased_file),
-            &subject,
-            std::slice::from_ref(&lease.lease_id),
-        )
-        .await;
+    // Second presentation of the same envelope: the action nonce is
+    // already consumed, so the replay is denied. The single-use lease
+    // cannot authorize a second execution.
+    let outcome = f.pipeline.execute_envelope(&presented, &subject).await;
     assert!(
         matches!(outcome, ToolOutcome::Denied { .. }),
         "single-use lease is consumed after one use, got {outcome:?}"
@@ -562,11 +559,13 @@ async fn one_shot_durable_failure_rolls_back_cleanly() {
         .expect("start session identity");
     let subject = info.subject.clone();
 
-    // Authorize → pending approval.
-    let outcome = f
+    // Authorize → pending approval. Retain the envelope: the retried
+    // mint's lease is bound to its exact digest.
+    let envelope = f
         .pipeline
-        .handle(&read_request(&f.leased_file), &subject, &[])
-        .await;
+        .build_envelope(&read_request(&f.leased_file), &subject, &[])
+        .expect("build envelope");
+    let outcome = f.pipeline.execute_envelope(&envelope, &subject).await;
     let approval_id = match outcome {
         ToolOutcome::PendingApproval {
             approval_request_id,
@@ -646,15 +645,10 @@ async fn one_shot_durable_failure_rolls_back_cleanly() {
     assert!(lease.limits.single_use);
     assert_eq!(lease.subject, subject);
 
-    // The retried lease works.
-    let outcome = f
-        .pipeline
-        .handle(
-            &read_request(&f.leased_file),
-            &subject,
-            std::slice::from_ref(&lease.lease_id),
-        )
-        .await;
+    // The retried lease works: re-present the verbatim approved envelope.
+    let mut presented = envelope.clone();
+    presented.lease_chain = vec![lease.lease_id.clone()];
+    let outcome = f.pipeline.execute_envelope(&presented, &subject).await;
     assert!(
         matches!(outcome, ToolOutcome::Completed { .. }),
         "retried lease authorizes, got {outcome:?}"
@@ -687,7 +681,10 @@ async fn one_shot_mint_survives_kernel_restart() {
     // lease against a *different* tempdir would deny on a scope mismatch
     // and the test would pass for the wrong reason. `f` (and its kernel)
     // still drops here: simulated crash.
-    let (subject, lease_id, approval_id, grant_nonce, leased_file, _file_dir) = {
+    //
+    // The approved envelope is retained and re-presented verbatim after
+    // the restart: the one-shot lease is bound to its exact digest.
+    let (subject, lease_id, approval_id, grant_nonce, envelope, _file_dir) = {
         let f =
             fixture_with_db_and_workspace(vhl_keys.clone(), Some(db_path.clone()), Some(workspace))
                 .await;
@@ -698,10 +695,11 @@ async fn one_shot_mint_survives_kernel_restart() {
             .expect("start session identity");
         let subject = info.subject.clone();
 
-        let outcome = f
+        let envelope = f
             .pipeline
-            .handle(&read_request(&f.leased_file), &subject, &[])
-            .await;
+            .build_envelope(&read_request(&f.leased_file), &subject, &[])
+            .expect("build envelope");
+        let outcome = f.pipeline.execute_envelope(&envelope, &subject).await;
         let approval_id = match outcome {
             ToolOutcome::PendingApproval {
                 approval_request_id,
@@ -752,7 +750,7 @@ async fn one_shot_mint_survives_kernel_restart() {
             lease.lease_id.clone(),
             approval_id,
             grant.nonce.clone(),
-            f.leased_file.clone(),
+            envelope,
             f.dir,
         )
     };
@@ -774,35 +772,28 @@ async fn one_shot_mint_survives_kernel_restart() {
 
     // The one-shot authorizes exactly once after the restart: the retired
     // issuer generation still verifies, the session is hydrated from
-    // `kernel_sessions`, and the action digest matches the stable leased
-    // file. (It is NOT denied as an "old-issuer" lease — retired
-    // generations verify by design since lease persistence landed.)
-    let outcome = f2
-        .pipeline
-        .handle(
-            &read_request(&leased_file),
-            &subject,
-            std::slice::from_ref(&lease_id),
-        )
-        .await;
+    // `kernel_sessions`, and the action digest matches the retained
+    // verbatim envelope. (It is NOT denied as an "old-issuer" lease —
+    // retired generations verify by design since lease persistence
+    // landed.)
+    let mut presented = envelope.clone();
+    presented.lease_chain = vec![lease_id.clone()];
+    let outcome = f2.pipeline.execute_envelope(&presented, &subject).await;
     assert!(
         matches!(outcome, ToolOutcome::Completed { .. }),
         "one-shot authorizes once after restart, got {outcome:?}"
     );
 
-    // And only once: the durable consumption record denies the replay.
-    let outcome = f2
-        .pipeline
-        .handle(
-            &read_request(&leased_file),
-            &subject,
-            std::slice::from_ref(&lease_id),
-        )
-        .await;
+    // And only once: the second presentation of the verbatim envelope is
+    // denied. The action nonce was consumed by the first authorization,
+    // so this is a replay denial; the durable one-shot consumption record
+    // (checked directly against the store below) is the backstop that
+    // survives even if the in-memory nonce set is lost.
+    let outcome = f2.pipeline.execute_envelope(&presented, &subject).await;
     match outcome {
         ToolOutcome::Denied { reason } => assert!(
-            reason.contains("consumed"),
-            "expected the consumed-one-shot denial, got: {reason}"
+            reason.contains("replay"),
+            "expected the replay denial, got: {reason}"
         ),
         other => panic!("replayed one-shot must be denied, got {other:?}"),
     }

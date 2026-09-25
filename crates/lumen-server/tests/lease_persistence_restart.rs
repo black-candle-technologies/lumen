@@ -51,10 +51,10 @@ use lumen_core::session_identity::session_address;
 use lumen_db::Database;
 use lumen_db::lease::KernelAuditQuery;
 use lumen_server::{
-    AuthorityDb, AuthorityKernelClient, AuthorityKernelConfig, Catalog, CatalogError, EffectClass,
-    KernelClient, KernelError, LeaseDocument, LeaseLimits as HostLeaseLimits, MockSandboxRunner,
-    OneShotGrant, PiToolRequest, ProjectionKind, SessionIdentityAuthority, ToolDef, ToolOutcome,
-    ToolPipeline, now_ms,
+    ActionEnvelope, AuthorityDb, AuthorityKernelClient, AuthorityKernelConfig, Catalog,
+    CatalogError, EffectClass, KernelClient, KernelError, LeaseDocument, LeaseLimits as HostLeaseLimits,
+    MockSandboxRunner, OneShotGrant, PiToolRequest, ProjectionKind, SessionIdentityAuthority,
+    ToolDef, ToolOutcome, ToolPipeline, now_ms,
 };
 
 /// Stub operator authority: allows or denies every `KeyManagement`
@@ -198,17 +198,25 @@ async fn mint_root(
 }
 
 /// Drive `decide` (via the pipeline) with no covering lease; expect the
-/// kernel to emit a pending VHL approval request. Returns its id.
-async fn decide_pending(h: &KernelHandles, leased_file: &str, subject: &str) -> String {
-    let outcome = h
+/// kernel to emit a pending VHL approval request. Returns its id and the
+/// exact envelope that was approved, so the caller can re-present it
+/// verbatim after the one-shot lease is minted (the lease is bound to the
+/// envelope's exact digest).
+async fn decide_pending(
+    h: &KernelHandles,
+    leased_file: &str,
+    subject: &str,
+) -> (String, ActionEnvelope) {
+    let envelope = h
         .pipeline
-        .handle(&read_request(leased_file), subject, &[])
-        .await;
+        .build_envelope(&read_request(leased_file), subject, &[])
+        .expect("build envelope");
+    let outcome = h.pipeline.execute_envelope(&envelope, subject).await;
     match outcome {
         ToolOutcome::PendingApproval {
             approval_request_id,
             ..
-        } => approval_request_id,
+        } => (approval_request_id, envelope),
         other => panic!("expected PendingApproval, got {other:?}"),
     }
 }
@@ -251,14 +259,14 @@ async fn mint_one_shot(
     leased_file: &str,
     vhl_signing: &SigningKey,
     vhl_key_id: &str,
-) -> (String, LeaseDocument) {
+) -> (String, LeaseDocument, ActionEnvelope) {
     let info = h
         .kernel
         .start_session_identity(None)
         .await
         .expect("start session identity");
     let subject = info.subject.clone();
-    let approval_id = decide_pending(h, leased_file, &subject).await;
+    let (approval_id, envelope) = decide_pending(h, leased_file, &subject).await;
     let view = h
         .kernel
         .pending_approvals()
@@ -282,7 +290,7 @@ async fn mint_one_shot(
         .await
         .expect("mint one-shot lease");
     assert!(lease.limits.single_use, "one-shot lease is single-use");
-    (subject, lease)
+    (subject, lease, envelope)
 }
 
 /// Core → host lease conversion (mirrors the kernel's private
@@ -308,6 +316,7 @@ fn to_host_doc(core: &CoreLeaseDocument) -> LeaseDocument {
         depth_limit: core.depth_limit,
         lease_nonce: core.lease_nonce.clone(),
         signature: core.signature.clone(),
+        approved_action_digest: core.approved_action_digest.clone(),
     }
 }
 
@@ -513,23 +522,20 @@ async fn restart_one_shot_replay_rejected() {
     let mut vhl_keys = HashMap::new();
     vhl_keys.insert(vhl_key_id.to_string(), vhl_signing.verifying_key());
 
-    let (subject, lease) = {
+    let (subject, lease, envelope) = {
         let h = open_kernel(&env, vhl_keys.clone(), None).await;
-        let (subject, lease) = mint_one_shot(&h, &env.leased_file, &vhl_signing, vhl_key_id).await;
-        // Consume it once, pre-restart.
-        let outcome = h
-            .pipeline
-            .handle(
-                &read_request(&env.leased_file),
-                &subject,
-                std::slice::from_ref(&lease.lease_id),
-            )
-            .await;
+        let (subject, lease, envelope) =
+            mint_one_shot(&h, &env.leased_file, &vhl_signing, vhl_key_id).await;
+        // Consume it once, pre-restart: re-present the verbatim approved
+        // envelope with the lease attached.
+        let mut presented = envelope.clone();
+        presented.lease_chain = vec![lease.lease_id.clone()];
+        let outcome = h.pipeline.execute_envelope(&presented, &subject).await;
         assert!(
             matches!(outcome, ToolOutcome::Completed { .. }),
             "one-shot must authorize its exact action once, got {outcome:?}"
         );
-        (subject, lease)
+        (subject, lease, envelope)
     };
 
     let h2 = open_kernel(&env, vhl_keys, None).await;
@@ -543,19 +549,18 @@ async fn restart_one_shot_replay_rejected() {
     );
     drop(db);
 
-    // Replay post-restart: denied via the durable record.
-    let outcome = h2
-        .pipeline
-        .handle(
-            &read_request(&env.leased_file),
-            &subject,
-            std::slice::from_ref(&lease.lease_id),
-        )
-        .await;
+    // Replay post-restart: denied. The durable nonce record survived the
+    // restart, so the verbatim re-presentation is a durable replay denial.
+    // (The durable one-shot consumption record is the backstop verified
+    // directly against the store above; it would deny with "consumed" once
+    // the nonce TTL lapses.)
+    let mut presented = envelope.clone();
+    presented.lease_chain = vec![lease.lease_id.clone()];
+    let outcome = h2.pipeline.execute_envelope(&presented, &subject).await;
     match outcome {
         ToolOutcome::Denied { reason } => assert!(
-            reason.contains("consumed"),
-            "expected the consumed-one-shot denial, got: {reason}"
+            reason.contains("replay"),
+            "expected the replay denial, got: {reason}"
         ),
         other => panic!("replayed one-shot must be denied, got {other:?}"),
     }
@@ -926,7 +931,7 @@ async fn pending_vhl_restart() {
             .await
             .expect("start session identity");
         let subject = info.subject.clone();
-        let approval_id = decide_pending(&h, &env.leased_file, &subject).await;
+        let (approval_id, _envelope) = decide_pending(&h, &env.leased_file, &subject).await;
         let view = h
             .kernel
             .pending_approvals()
@@ -978,8 +983,9 @@ async fn pending_vhl_restart() {
     }
 
     // Re-propose the same action post-restart: fresh request, fresh cache
-    // entry.
-    let new_approval_id = decide_pending(&h2, &env.leased_file, &subject).await;
+    // entry. Retain the envelope: the minted one-shot is bound to its
+    // exact digest.
+    let (new_approval_id, envelope) = decide_pending(&h2, &env.leased_file, &subject).await;
     assert_ne!(
         new_approval_id, old_approval_id,
         "re-proposal must mint a fresh request id"
@@ -1025,19 +1031,15 @@ async fn pending_vhl_restart() {
     );
     drop(db);
 
-    // It verifies and authorizes its exact action.
+    // It verifies and authorizes its exact action: re-present the verbatim
+    // approved envelope with the lease attached.
     h2.kernel
         .verify_lease(&lease)
         .await
         .expect("minted one-shot must verify");
-    let outcome = h2
-        .pipeline
-        .handle(
-            &read_request(&env.leased_file),
-            &subject,
-            std::slice::from_ref(&lease.lease_id),
-        )
-        .await;
+    let mut presented = envelope.clone();
+    presented.lease_chain = vec![lease.lease_id.clone()];
+    let outcome = h2.pipeline.execute_envelope(&presented, &subject).await;
     assert!(
         matches!(outcome, ToolOutcome::Completed { .. }),
         "minted one-shot must authorize, got {outcome:?}"

@@ -276,6 +276,9 @@ pub struct LeaseDocument {
     pub lease_nonce: String,
     /// Hex-encoded Ed25519 signature over the canonical signing bytes.
     pub signature: String,
+    /// For one-shot leases: the exact approved action digest the lease is
+    /// bound to. `None` for standing leases.
+    pub approved_action_digest: Option<String>,
 }
 
 /// Result of [`KernelClient::verify_lease`].
@@ -683,6 +686,7 @@ impl KernelClient for MockKernelClient {
                 depth_limit: 0,
                 lease_nonce: grant.nonce.clone(),
                 signature: "mock-signature".to_string(),
+                approved_action_digest: Some(grant.action_digest.clone()),
             };
             self.issue_lease(lease.clone());
             Ok(lease)
@@ -1108,6 +1112,7 @@ mod tests {
             depth_limit: 3,
             lease_nonce: "n".to_string(),
             signature: "sig".to_string(),
+            approved_action_digest: None,
         };
         assert!(kernel.verify_lease(&lease).await.is_err());
         kernel.issue_lease(lease.clone());
