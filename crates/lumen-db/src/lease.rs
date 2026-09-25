@@ -150,7 +150,7 @@ impl Database {
     ) -> Result<Option<LeaseDocument>, RepositoryError> {
         let row = sqlx::query(
             "SELECT lease_id,parent_id,subject,issuer_key_id,issued_at_ms,protocol_version,
-             scope_json,limits_json,depth,depth_limit,lease_nonce,signature
+             scope_json,limits_json,depth,depth_limit,lease_nonce,signature,approved_action_digest
              FROM kernel_leases WHERE workspace_id=? AND lease_id=?",
         )
         .bind(ws(workspace_id))
@@ -1284,8 +1284,8 @@ async fn insert_lease_tx(
     sqlx::query(
         "INSERT INTO kernel_leases(lease_id,workspace_id,parent_id,subject,issuer_key_id,
          issued_at_ms,protocol_version,scope_digest,scope_json,limits_json,depth,depth_limit,
-         lease_nonce,signature,document_digest,created_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         lease_nonce,signature,document_digest,created_at,approved_action_digest)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&doc.lease_id)
     .bind(ws(workspace_id))
@@ -1303,6 +1303,7 @@ async fn insert_lease_tx(
     .bind(&doc.signature)
     .bind(&document_digest)
     .bind(doc.issued_at_ms)
+    .bind(doc.approved_action_digest.as_deref())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1460,6 +1461,11 @@ fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseDocument, Reposito
         depth_limit: r.get::<i64, _>("depth_limit") as u32,
         lease_nonce: r.get("lease_nonce"),
         signature: r.get("signature"),
+        // NULL marks a standing lease or a legacy one-shot row minted before
+        // digest binding. Legacy one-shot rows fail closed at authorization:
+        // the kernel denies any single-use lease whose recorded digest does
+        // not match the presented action, and NULL never matches.
+        approved_action_digest: r.get("approved_action_digest"),
     })
 }
 
