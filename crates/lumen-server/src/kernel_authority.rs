@@ -410,9 +410,9 @@ impl AuthorityKernel {
     /// max-guarded so concurrent advances cannot regress it.
     fn effective_now_sync(&self) -> Result<i64, KernelError> {
         let wall = now_ms();
-        let (mark, persisted) = {
+        let mark = {
             let state = self.state.lock().expect("kernel state mutex poisoned");
-            (state.time_high_water_ms, state.time_high_water_persisted_ms)
+            state.time_high_water_ms
         };
         let effective = wall.max(mark);
         if effective > mark {
@@ -425,11 +425,16 @@ impl AuthorityKernel {
             // even if the clock has not moved.
             let ceiling = anchor_ceiling(effective);
             let mut state = self.state.lock().expect("kernel state mutex poisoned");
-            if ceiling != persisted {
+            // Re-read under the second lock: another thread may have
+            // advanced (and persisted) further in the window between the
+            // two locks. Persist only when this thread's ceiling exceeds
+            // the current durable mark, and max-guard the in-memory mark
+            // so a concurrent advance can never regress it.
+            if ceiling > state.time_high_water_persisted_ms {
                 self.db_run(|db, ws| db.record_time_high_water(ws, ceiling))?;
                 state.time_high_water_persisted_ms = ceiling;
             }
-            state.time_high_water_ms = effective;
+            state.time_high_water_ms = state.time_high_water_ms.max(effective);
         }
         Ok(effective)
     }
@@ -626,24 +631,24 @@ impl AuthorityKernel {
         };
 
         // 3. Session TTL: destroy-transition every session older than the
-        //    max lifetime, and revoke its leases durably (spec §6.3).
-        let expired = self.db_run(|db, ws| db.expire_kernel_sessions(ws, ttl, now))?;
-        for subject in &expired {
-            let ids = self.db_run(|db, ws| db.kernel_lease_ids_for_subject(ws, subject))?;
-            self.db_run(|db, ws| {
-                db.destroy_sessions_and_revoke(
-                    ws,
-                    std::slice::from_ref(subject),
-                    &ids,
-                    now,
-                    "session TTL expired",
-                )
-            })?;
+        //    max lifetime, and revoke its leases durably (spec §6.3). The
+        //    expiry and the revocations commit in ONE transaction: a crash
+        //    between them would leave destroyed sessions with live,
+        //    unrevoked leases, and the next boot's re-validation
+        //    self-check would fail the open on `SubjectInactive` (the
+        //    expiry finds nothing — the rows are already inactive — so the
+        //    leases would never be revoked).
+        let (expired, revoked_ids) = self.db_run(|db, ws| {
+            db.expire_kernel_sessions_and_revoke(ws, ttl, now, "session TTL expired")
+        })?;
+        {
             let mut state = self.state.lock().expect("kernel state mutex poisoned");
-            for id in &ids {
+            for id in &revoked_ids {
                 state.revocations.revoke(id);
             }
-            state.sessions.deactivate(subject);
+            for subject in &expired {
+                state.sessions.deactivate(subject);
+            }
         }
 
         // 4. Hydrate the session registry from active rows
@@ -791,6 +796,11 @@ impl AuthorityKernel {
         //      were recorded, so no verifying key exists. They are NOT
         //      treated as tamper, but they also never authorize — any
         //      decision path re-validates and fails closed on them.
+        //    - Legacy pre-migration leases (subject has no
+        //      `kernel_sessions` row: sessions were not durably recorded
+        //      before migration 0025): counted, open proceeds. Like
+        //      unknown-generation leases they never authorize — decision
+        //      paths re-validate and fail closed on `SubjectInactive`.
         //    - AlreadyConsumed / KilledIssuerGeneration: counted as
         //      verified_ok for the self-check's liveness purpose (a
         //      consumed one-shot or a killed generation is a *decided*
@@ -798,11 +808,66 @@ impl AuthorityKernel {
         //    - Anything else (signature mismatch against a known
         //      generation, unknown session key, inactive session,
         //      revocation, chain break): tamper or corruption evidence —
-        //      fails the open. There is no legacy class for unknown
-        //      *session* keys: sessions are always recorded at creation,
-        //      so a live lease naming an unknown session is corruption,
-        //      not migration.
+        //      fails the open. A live lease naming a subject WITH a
+        //      session row that is inactive is corruption (or crash
+        //      residue the repair pass below missed), not migration:
+        //      sessions are always recorded at creation once migration
+        //      0025 has run.
+        //
+        //    Crash-residue repair (before the lease fetch): a crash in the
+        //    pre-atomicity window between the session destroy transition
+        //    and the lease revocation leaves live leases for destroyed
+        //    sessions. Those leases must never authorize, so they are
+        //    durably revoked here; without the repair the self-check
+        //    would fail the open on `SubjectInactive` and the kernel
+        //    would stay down until the database is repaired by hand.
+        let repaired_ids = self.db_run(|db, ws| {
+            db.revoke_leases_for_inactive_sessions(
+                ws,
+                now,
+                "boot repair: session destroyed without revocation",
+            )
+        })?;
+        {
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            for id in &repaired_ids {
+                state.revocations.revoke(id);
+            }
+        }
+        if !repaired_ids.is_empty() {
+            self.audit_event_sync(
+                "kernel",
+                AuditEventKind::ActionProposed,
+                "kernel",
+                "kernel.session.residue_repaired",
+                None,
+                now,
+                serde_json::json!({
+                    "host_kind": "kernel.session.residue_repaired",
+                    "revoked_leases": repaired_ids.len(),
+                    "at_ms": now,
+                }),
+            )
+            .map(|_| ())?;
+        }
         let leases = self.db_run(|db, ws| db.kernel_live_leases(ws, now))?;
+        // Preserve the total live-lease count for the audit BEFORE the
+        // legacy filter below narrows the re-validation set: the audit
+        // must record every live lease, not just the ones we re-walk.
+        let total_live_leases = leases.len() as u64;
+        let session_subjects = self.db_run(|db, ws| db.kernel_session_subjects(ws))?;
+        let mut legacy_leases: u64 = 0;
+        let leases: Vec<_> = leases
+            .into_iter()
+            .filter(|lease| {
+                if session_subjects.contains(&lease.subject) {
+                    true
+                } else {
+                    legacy_leases += 1;
+                    false
+                }
+            })
+            .collect();
         let mut verified_ok: u64 = 0;
         let mut unknown_generation: u64 = 0;
         {
@@ -864,9 +929,10 @@ impl AuthorityKernel {
             now,
             serde_json::json!({
                 "host_kind": "kernel.restart.revalidation",
-                "live_leases": leases.len(),
+                "live_leases": total_live_leases,
                 "verified_ok": verified_ok,
                 "unknown_generation": unknown_generation,
+                "legacy_leases": legacy_leases,
                 "tamper_failures": 0,
                 "at_ms": now,
             }),

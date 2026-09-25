@@ -1485,6 +1485,13 @@ impl Database {
     /// and the hydration pass would otherwise reject the dangling child
     /// and fail the open until the database is manually repaired.
     /// Returns every destroyed subject (expired roots and descendants).
+    ///
+    /// NOTE: this commits the destroy transitions on its own. Prefer
+    /// [`Database::expire_kernel_sessions_and_revoke`] when the expired
+    /// subjects' leases must be revoked too: the destroy and the
+    /// revocations commit in ONE transaction, so a crash can never leave
+    /// destroyed sessions with live, unrevoked leases (which would fail
+    /// the next boot's re-validation self-check).
     pub async fn expire_kernel_sessions(
         &self,
         workspace_id: &WorkspaceId,
@@ -1516,6 +1523,86 @@ impl Database {
         .fetch_all(self.pool())
         .await?;
         Ok(subjects)
+    }
+
+    /// Atomic session-TTL expiry: select the expired subtree, collect the
+    /// lease ids for those subjects, destroy-transition the sessions, and
+    /// revoke the leases — all in ONE transaction. Either every destroy
+    /// transition and every revocation commits, or none do. A crash
+    /// between expiry and revocation would otherwise leave destroyed
+    /// sessions with live, unrevoked leases; the next boot's expiry finds
+    /// nothing (the rows are already inactive), the leases stay live, and
+    /// the re-validation self-check fails the open on `SubjectInactive`
+    /// until the database is repaired by hand.
+    /// Returns `(destroyed subjects, revoked lease ids)`.
+    pub async fn expire_kernel_sessions_and_revoke(
+        &self,
+        workspace_id: &WorkspaceId,
+        ttl_ms: i64,
+        now_ms: i64,
+        reason: &str,
+    ) -> Result<(Vec<String>, Vec<String>), RepositoryError> {
+        // Overflow-safe expiry cutoff computed in Rust: `created_at_ms <=
+        // now_ms - ttl_ms` (SQLite integer arithmetic wraps on overflow,
+        // so `created_at_ms + ttl_ms` must not be computed in SQL).
+        let cutoff = now_ms.saturating_sub(ttl_ms);
+        let mut tx = self.pool().begin().await?;
+        let subjects: Vec<String> = sqlx::query_scalar(
+            "WITH RECURSIVE expired_subtree(subject) AS (
+                 SELECT subject FROM kernel_sessions
+                 WHERE workspace_id=? AND active=1 AND created_at_ms<=?
+                 UNION
+                 SELECT ks.subject FROM kernel_sessions ks
+                 JOIN expired_subtree e ON ks.parent_subject=e.subject
+                 WHERE ks.workspace_id=? AND ks.active=1
+             )
+             SELECT subject FROM expired_subtree",
+        )
+        .bind(ws(workspace_id))
+        .bind(cutoff)
+        .bind(ws(workspace_id))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut lease_ids: Vec<String> = Vec::new();
+        if !subjects.is_empty() {
+            use sqlx::QueryBuilder;
+            let mut qb: QueryBuilder<sqlx::Sqlite> =
+                QueryBuilder::new("SELECT lease_id FROM kernel_leases WHERE workspace_id=");
+            qb.push_bind(ws(workspace_id));
+            qb.push(" AND subject IN (");
+            let mut separated = qb.separated(", ");
+            for subject in &subjects {
+                separated.push_bind(subject);
+            }
+            separated.push_unseparated(") ORDER BY issued_at_ms");
+            lease_ids = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+            let mut qb: QueryBuilder<sqlx::Sqlite> =
+                QueryBuilder::new("UPDATE kernel_sessions SET active=0,destroyed_at_ms=");
+            qb.push_bind(now_ms);
+            qb.push(" WHERE workspace_id=");
+            qb.push_bind(ws(workspace_id));
+            qb.push(" AND active=1 AND subject IN (");
+            let mut separated = qb.separated(", ");
+            for subject in &subjects {
+                separated.push_bind(subject);
+            }
+            separated.push_unseparated(")");
+            qb.build().execute(&mut *tx).await?;
+        }
+        for lease_id in &lease_ids {
+            sqlx::query(
+                "INSERT OR IGNORE INTO kernel_revocations(lease_id,workspace_id,revoked_at_ms,reason)
+                 VALUES(?,?,?,?)",
+            )
+            .bind(lease_id)
+            .bind(ws(workspace_id))
+            .bind(now_ms)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok((subjects, lease_ids))
     }
 
     /// Destroy the named sessions AND revoke the named leases in ONE
@@ -1561,6 +1648,72 @@ impl Database {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Boot repair for the pre-atomicity crash window: durably revoke
+    /// every live (unexpired, unrevoked) lease whose subject has a
+    /// *destroyed* session row, in ONE transaction. A crash between the
+    /// session destroy transition and the lease revocation leaves exactly
+    /// this residue; without the repair the next boot's re-validation
+    /// self-check fails the open on `SubjectInactive` and the kernel
+    /// stays down until the database is repaired by hand. A destroyed
+    /// session's leases must never authorize, so revoking them here is
+    /// fail-closed. Returns the revoked lease ids.
+    pub async fn revoke_leases_for_inactive_sessions(
+        &self,
+        workspace_id: &WorkspaceId,
+        now_ms: i64,
+        reason: &str,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let mut tx = self.pool().begin().await?;
+        let lease_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT l.lease_id FROM kernel_leases l
+             JOIN kernel_sessions s
+               ON s.workspace_id = l.workspace_id AND s.subject = l.subject
+             WHERE l.workspace_id = ?
+               AND s.active = 0
+               AND json_extract(l.limits_json, '$.expires_at_ms') > ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM kernel_revocations r
+                 WHERE r.workspace_id = l.workspace_id AND r.lease_id = l.lease_id
+               )
+             ORDER BY l.issued_at_ms, l.lease_id",
+        )
+        .bind(ws(workspace_id))
+        .bind(now_ms)
+        .fetch_all(&mut *tx)
+        .await?;
+        for lease_id in &lease_ids {
+            sqlx::query(
+                "INSERT OR IGNORE INTO kernel_revocations(lease_id,workspace_id,revoked_at_ms,reason)
+                 VALUES(?,?,?,?)",
+            )
+            .bind(lease_id)
+            .bind(ws(workspace_id))
+            .bind(now_ms)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(lease_ids)
+    }
+
+    /// Every subject with a `kernel_sessions` row (active or destroyed).
+    /// Used at boot to distinguish legacy pre-migration leases (subject
+    /// has no session row: sessions were not recorded before migration
+    /// 0025) from corruption (subject has a row). One query, not one per
+    /// lease.
+    pub async fn kernel_session_subjects(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<HashSet<String>, RepositoryError> {
+        let subjects: Vec<String> =
+            sqlx::query_scalar("SELECT subject FROM kernel_sessions WHERE workspace_id=?")
+                .bind(ws(workspace_id))
+                .fetch_all(self.pool())
+                .await?;
+        Ok(subjects.into_iter().collect())
     }
 
     // ------------------------------------------------------------------
