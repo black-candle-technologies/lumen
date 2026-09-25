@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use lumen_db::Database;
-use lumen_integrations::sandbox::{SandboxBackend, SystemSandbox};
+use lumen_integrations::sandbox::{SandboxBackend, SandboxReport, SystemSandbox};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -44,6 +44,33 @@ fn check(name: &str, passed: bool, detail: String) -> HealthCheck {
         passed,
         detail,
     }
+}
+
+/// The sandbox health check. The verdict mirrors `serve`'s gate
+/// (`Config::validate_sandbox`): a backend name alone is not enough — e.g.
+/// on Linux without a usable bubblewrap install the backend reports
+/// `linux-bubblewrap` with `SandboxStrength::Unavailable`, which must fail
+/// the check when the configuration requires kernel-enforced sandboxing.
+fn sandbox_check(config: &Config, report: &SandboxReport) -> HealthCheck {
+    let result = config.validate_sandbox(report);
+    let passed = result.is_ok();
+    check(
+        "sandbox",
+        passed,
+        format!(
+            "backend={} strength={:?}{}{}",
+            report.backend(),
+            report.strength(),
+            report
+                .detail()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default(),
+            match &result {
+                Ok(()) => String::new(),
+                Err(error) => format!(" [fails required sandbox strength: {error}]"),
+            },
+        ),
+    )
 }
 
 /// Run all health checks. The database is connected by the caller; this
@@ -115,22 +142,7 @@ pub async fn collect(config: &Config, database: &Database) -> Result<HealthRepor
     }
 
     // Sandbox backend: the real detected backend, not an assumption.
-    let sandbox = SystemSandbox::detect();
-    let report = sandbox.report();
-    let backend_ok = report.backend() != "unknown";
-    checks.push(check(
-        "sandbox",
-        backend_ok,
-        format!(
-            "backend={} strength={:?}{}",
-            report.backend(),
-            report.strength(),
-            report
-                .detail()
-                .map(|detail| format!(" ({detail})"))
-                .unwrap_or_default()
-        ),
-    ));
+    checks.push(sandbox_check(config, &SystemSandbox::detect().report()));
 
     // Admission store: readable and listing works.
     match crate::plugin_admission::list(config) {
@@ -237,5 +249,59 @@ mod tests {
             (Some("127.0.0.1".into()), Some(8080))
         );
         assert_eq!(parse_host_port("not a url"), (None, None));
+    }
+
+    fn test_config() -> Config {
+        Config::parse(
+            r#"[database]
+path = "ignored.sqlite3"
+[model]
+endpoint = "http://127.0.0.1:8080/v1/"
+model = "local-model"
+[runtime]
+data_directory = "/tmp/lumen-health-test"
+[workspace]
+id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
+name = "Default"
+path = "workspace"
+[bootstrap_admin]
+provider = "local"
+subject = "operator"
+"#,
+        )
+        .expect("test config parses")
+    }
+
+    #[test]
+    fn sandbox_check_fails_when_strength_unavailable() {
+        use lumen_integrations::sandbox::SandboxStrength;
+
+        let config = test_config();
+        // The reported scenario: the backend name looks fine
+        // (`linux-bubblewrap`) but the detected strength is Unavailable
+        // (no usable bubblewrap install). Health must fail here, exactly
+        // like `serve` does.
+        let report = SandboxReport::new(
+            "linux-bubblewrap",
+            SandboxStrength::Unavailable,
+            Some("bwrap probe failed: setting up uid map: Permission denied".into()),
+        );
+        let check = sandbox_check(&config, &report);
+        assert!(
+            !check.passed,
+            "health must fail when sandbox strength is unavailable"
+        );
+        assert!(check.detail.contains("linux-bubblewrap"));
+        assert!(check.detail.contains("unavailable"));
+    }
+
+    #[test]
+    fn sandbox_check_passes_when_kernel_enforced() {
+        use lumen_integrations::sandbox::SandboxStrength;
+
+        let config = test_config();
+        let report = SandboxReport::new("linux-bubblewrap", SandboxStrength::KernelEnforced, None);
+        let check = sandbox_check(&config, &report);
+        assert!(check.passed, "health must pass: {check:?}");
     }
 }
