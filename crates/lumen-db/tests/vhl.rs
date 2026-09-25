@@ -192,19 +192,17 @@ async fn state_machine_is_forward_only() {
     db.vhl_insert_request(&ws, &request).await.expect("insert");
     let id = &request.request_id;
 
-    // requested → approved
-    db.vhl_transition(
+    // requested → approved goes through vhl_record_decision, which writes
+    // the decision row atomically: vhl_transition rejects decision edges.
+    db.vhl_record_decision(
         &ws,
         id,
-        "requested",
         "approved",
-        Some(NOW_MS),
-        Some("human"),
-        Some("ok"),
+        "human",
         Some("att-1"),
-        None,
-        None,
-        None,
+        "ok",
+        NOW_MS,
+        "requested",
     )
     .await
     .expect("requested→approved");
@@ -276,8 +274,10 @@ async fn illegal_skip_transition_is_rejected_by_trigger() {
     let ws = test_workspace(&db).await;
     let request = test_request("nonce-skip");
     db.vhl_insert_request(&ws, &request).await.expect("insert");
-    // requested → consumed skips decision and mint: the SQL trigger aborts
-    // and the conflict surfaces as a semantic error, not a raw DB fault.
+    // requested → consumed skips decision and mint: the transition guard
+    // rejects non-mint/consume edges before the SQL trigger is even
+    // reached, and the conflict surfaces as a semantic error, not a raw
+    // DB fault.
     let err = db
         .vhl_transition(
             &ws,
@@ -627,18 +627,17 @@ async fn approval_lease_reference_is_workspace_scoped() {
     db.vhl_insert_request(&ws_a, &request)
         .await
         .expect("insert");
-    db.vhl_transition(
+    // Decisions go through vhl_record_decision (atomic with the decision
+    // row); vhl_transition only performs the post-decision edges.
+    db.vhl_record_decision(
         &ws_a,
         &request.request_id,
-        "requested",
         "approved",
-        Some(NOW_MS),
-        Some("human"),
-        Some("ok"),
+        "human",
         Some("att-1"),
-        None,
-        None,
-        None,
+        "ok",
+        NOW_MS,
+        "requested",
     )
     .await
     .expect("requested→approved");
@@ -686,4 +685,58 @@ async fn approval_lease_reference_is_workspace_scoped() {
     )
     .await
     .expect("same-workspace lease reference");
+}
+
+#[tokio::test]
+async fn vhl_transition_rejects_decision_edges() {
+    let db = Database::connect_in_memory().await.expect("connect");
+    let ws = test_workspace(&db).await;
+    let request = test_request("nonce-no-decision-bypass");
+    db.vhl_insert_request(&ws, &request).await.expect("insert");
+    let id = &request.request_id;
+
+    // requested → approved through vhl_transition would skip the
+    // vhl_decisions row: the API rejects the edge with a conflict, and
+    // the request stays undecided.
+    let err = db
+        .vhl_transition(
+            &ws,
+            id,
+            "requested",
+            "approved",
+            Some(NOW_MS),
+            Some("human"),
+            Some("ok"),
+            Some("att-1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("decision edge must be rejected");
+    assert!(
+        matches!(err, lumen_db::RepositoryError::VhlStateConflict),
+        "got {err:?}"
+    );
+    let row = db.vhl_request(&ws, id).await.expect("get").expect("row");
+    assert_eq!(row.state, "requested");
+
+    // The same decision through vhl_record_decision succeeds: the
+    // transition and the decision row land atomically.
+    db.vhl_record_decision(
+        &ws,
+        id,
+        "approved",
+        "human",
+        Some("att-1"),
+        "ok",
+        NOW_MS,
+        "requested",
+    )
+    .await
+    .expect("decision records");
+    let row = db.vhl_request(&ws, id).await.expect("get").expect("row");
+    assert_eq!(row.state, "approved");
+    assert_eq!(row.decided_by.as_deref(), Some("human"));
+    assert_eq!(row.attestation_id.as_deref(), Some("att-1"));
 }

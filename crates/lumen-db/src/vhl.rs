@@ -135,10 +135,17 @@ impl Database {
         }))
     }
 
-    /// Atomically transition a request. The compare-and-swap on the current
-    /// state (plus the SQL trigger's forward-only guard) makes concurrent or
-    /// repeated decisions fail closed with `VhlStateConflict` instead of
-    /// silently winning twice.
+    /// Atomically transition a request along a post-decision edge. The
+    /// compare-and-swap on the current state (plus the SQL trigger's
+    /// forward-only guard) makes concurrent or repeated transitions fail
+    /// closed with `VhlStateConflict` instead of silently winning twice.
+    ///
+    /// Only the `approved → minted` and `minted → consumed` edges are
+    /// allowed here. Recording a decision (`requested → approved/denied`)
+    /// must go through [`Self::vhl_record_decision`], which writes the
+    /// `vhl_decisions` row atomically with the transition — this method
+    /// cannot, so permitting a decision edge here would silently skip the
+    /// decision row the module documents as atomic.
     #[allow(clippy::too_many_arguments)]
     pub async fn vhl_transition(
         &self,
@@ -154,6 +161,12 @@ impl Database {
         minted_at_ms: Option<i64>,
         consumed_at_ms: Option<i64>,
     ) -> Result<(), RepositoryError> {
+        if !matches!(
+            (expected_state, new_state),
+            ("approved", "minted") | ("minted", "consumed")
+        ) {
+            return Err(RepositoryError::VhlStateConflict);
+        }
         let rows = sqlx::query(
             "UPDATE vhl_approval_requests SET state=?,decided_at_ms=COALESCE(?,decided_at_ms), \
             decided_by=COALESCE(?,decided_by),decision_reason=COALESCE(?,decision_reason), \
