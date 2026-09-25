@@ -605,6 +605,7 @@ async fn unknown_issuer_generation_fails_closed() {
         depth_limit: 4,
         lease_nonce: format!("forged-nonce-{}", uuid::Uuid::new_v4()),
         signature: String::new(),
+        approved_action_digest: None,
     };
     // Well-formed signature, but from a throwaway key no generation
     // records: the failure must be key *resolution*, not signature math.
@@ -664,7 +665,7 @@ async fn pre_migration_lease_without_session_row_is_legacy_not_tamper() {
     .await
     .expect("record legacy generation");
     // The subject never had a session row: this is the pre-0025 data
-    // state (kernel_leases existed since 0022; kernel_sessions is 0025).
+    // state (kernel_leases existed since 0022; kernel_sessions is 0027).
     let legacy_subject = "ed25519:legacy-no-session-row";
     let mut core_doc = CoreLeaseDocument {
         protocol_version: LEASE_PROTOCOL_VERSION,
@@ -685,6 +686,7 @@ async fn pre_migration_lease_without_session_row_is_legacy_not_tamper() {
         depth_limit: 4,
         lease_nonce: format!("legacy-nonce-{}", uuid::Uuid::new_v4()),
         signature: String::new(),
+        approved_action_digest: None,
     };
     core_doc.sign(&legacy_signing);
     db.insert_kernel_lease(&env.workspace, &core_doc)
