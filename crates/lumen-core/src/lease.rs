@@ -2655,6 +2655,8 @@ mod tests {
         );
         assert!(!d.is_allow());
         assert_deny_code(&d, "scope_exceeded");
+    }
+
     /// A root lease minted under a retired generation validates through the
     /// resolver (spec §4.1: retirement no longer invalidates outstanding
     /// leases).

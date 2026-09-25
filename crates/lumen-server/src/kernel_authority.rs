@@ -97,11 +97,10 @@ use lumen_core::identity::{PrincipalId, WorkspaceId};
 use lumen_core::kernel_audit::{AuditLink, verify_event_chain};
 use lumen_core::lease::{
     AuthorizeParams, CanonicalAction, DEFAULT_SESSION_MAX_LIFETIME_MS, IssuerKeyResolver,
-    KernelKeys, LeaseDocument as CoreLeaseDocument, LeaseError,
-    LeaseLimits as CoreLeaseLimits, LeaseResolver, OneShotGrant as CoreOneShotGrant,
-    OneShotTracker, RevocationIndex, RootLeaseParams, SessionRegistry, VhlRequest,
-    authorize_envelope, mint_one_shot_lease, mint_root_lease, validate_chain,
-};
+    KernelKeys, LeaseDocument as CoreLeaseDocument, LeaseError, LeaseLimits as CoreLeaseLimits,
+    LeaseResolver, OneShotGrant as CoreOneShotGrant, OneShotTracker, RevocationIndex,
+    RootLeaseParams, SessionRegistry, VhlRequest, authorize_envelope, mint_one_shot_lease,
+    mint_root_lease, validate_chain,
 };
 use lumen_core::nonce::NonceStore;
 use lumen_core::operator::{AuthorityRequest, OperatorAuthorityPort, OperatorOperation};
