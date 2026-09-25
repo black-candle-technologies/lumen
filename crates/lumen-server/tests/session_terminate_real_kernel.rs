@@ -101,13 +101,16 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
     let handle = supervisor.spawn_session(&owner).await.unwrap();
     let subject = handle.binding().await.unwrap().session_subject.clone();
 
-    // A real kernel lease for this session's subject.
+    // A real kernel lease for this session's subject. One expiry for both
+    // leases: separate now_ms() calls can straddle a millisecond boundary,
+    // and the kernel rejects a child whose expiry exceeds its parent's.
+    let lease_expiry_ms = now_ms() + 3_600_000;
     let lease = kernel
         .issue_session_lease(
             &subject,
             vec!["/tmp".into()],
             vec!["read".into()],
-            now_ms() + 3_600_000,
+            lease_expiry_ms,
         )
         .expect("issue real lease");
 
@@ -121,7 +124,7 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
             &child_subject,
             vec!["/tmp".into()],
             vec!["read".into()],
-            now_ms() + 3_600_000,
+            lease_expiry_ms,
         )
         .expect("issue real child lease");
     let mut child_env = read_envelope(&child_subject, &child_lease.to_string());
@@ -142,12 +145,26 @@ async fn terminate_revokes_real_kernel_leases_and_destroys_identity() {
         "child lease must authorize before parent termination"
     );
 
+    // The session holds a live identity before termination...
+    assert!(
+        handle.has_identity().await.unwrap(),
+        "session must hold an identity before termination"
+    );
+
     // Terminate: the supervisor must revoke kernel-side and destroy the identity.
     let report = handle.terminate().await.unwrap();
     assert!(report.leases_revoked, "report: {report:?}");
     assert!(report.identity_destroyed, "report: {report:?}");
     assert!(report.revoke_error.is_none(), "report: {report:?}");
     assert_eq!(handle.status().await.unwrap(), SessionStatus::Terminated);
+
+    // ...and it is gone afterward. This checks destruction directly: the
+    // report's identity_destroyed flag is also true when no identity
+    // existed, so it cannot prove destruction on its own.
+    assert!(
+        !handle.has_identity().await.unwrap(),
+        "identity must be destroyed by termination"
+    );
 
     // The SAME lease is now dead kernel-side: decide denies as revoked.
     let decision = kernel

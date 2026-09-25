@@ -1766,6 +1766,16 @@ impl SessionHandle {
         Ok(session.lock().await.status.clone())
     }
 
+    /// Whether the session currently holds a live (undestroyed) identity.
+    /// Observability for tests: termination must move this from `true` to
+    /// `false`. The termination report's `identity_destroyed` flag alone
+    /// cannot prove destruction, since it is also `true` when the session
+    /// had no identity to remove.
+    pub async fn has_identity(&self) -> Result<bool, SupervisorError> {
+        let session = self.supervisor.inner.session(&self.id).await?;
+        Ok(session.lock().await.identity.is_some())
+    }
+
     /// Subscribe to the session's event stream.
     pub async fn subscribe(&self) -> Result<broadcast::Receiver<SupervisorEvent>, SupervisorError> {
         let session = self.supervisor.inner.session(&self.id).await?;
