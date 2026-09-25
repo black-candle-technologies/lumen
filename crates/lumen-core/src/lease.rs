@@ -499,6 +499,19 @@ pub trait IssuerKeyResolver {
     fn is_generation_killed(&self, key_id: &str) -> bool;
 }
 
+/// [`IssuerKeyResolver`] over the live [`KernelKeys`]: the current
+/// generation only, never killed. Hosts with rotation history use the
+/// generation snapshot instead.
+impl IssuerKeyResolver for KernelKeys {
+    fn issuer_verifying_key(&self, key_id: &str) -> Option<VerifyingKey> {
+        (key_id == self.issuer_key_id).then(|| self.issuer_verifying())
+    }
+
+    fn is_generation_killed(&self, _key_id: &str) -> bool {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Issuance
 // ---------------------------------------------------------------------------
