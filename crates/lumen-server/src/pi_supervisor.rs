@@ -675,29 +675,43 @@ enum ReadRecordError {
 }
 
 /// Read until LF (inclusive), stopping early when the cap is exceeded.
+/// Read until LF (inclusive), stopping early when the cap is exceeded.
+///
+/// Bytes after the first LF are left in the [`BufReader`]'s buffer for the
+/// next call: a single underlying read commonly contains several Pi records,
+/// and consuming them out of the buffer would silently drop responses and
+/// `agent_settled` events.
 async fn read_until_lf(
     reader: &mut BufReader<impl tokio::io::AsyncRead + Unpin>,
     buf: &mut Vec<u8>,
     max_bytes: usize,
 ) -> Result<usize, ReadRecordError> {
-    use tokio::io::AsyncReadExt;
-    let mut chunk = [0u8; 8192];
+    use tokio::io::AsyncBufReadExt;
     loop {
-        let n = reader
-            .read(&mut chunk)
-            .await
-            .map_err(|_| ReadRecordError::Io)?;
-        if n == 0 {
-            return Ok(buf.len());
+        let available = reader.fill_buf().await.map_err(|_| ReadRecordError::Io)?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF
         }
-        for &byte in &chunk[..n] {
-            buf.push(byte);
-            if buf.len() > max_bytes {
-                return Err(ReadRecordError::TooLong(buf.len()));
-            }
-            if byte == b'\n' {
-                return Ok(buf.len());
-            }
+        // Take up to and including the first LF; only `consume` that span
+        // so any trailing records stay buffered.
+        let upto = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(available.len());
+        let ends_record = available[upto - 1] == b'\n';
+        // Enforce the cap incrementally: a peer that never sends LF must
+        // not grow `buf` without bound.
+        if buf.len() + upto > max_bytes {
+            let take = (max_bytes + 1).saturating_sub(buf.len()).min(upto).max(1);
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Err(ReadRecordError::TooLong(buf.len()));
+        }
+        buf.extend_from_slice(&available[..upto]);
+        reader.consume(upto);
+        if ends_record {
+            return Ok(buf.len());
         }
     }
 }
@@ -857,6 +871,40 @@ mod tests {
         assert!(
             matches!(err, SupervisorError::Spawn(_)),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_loop_preserves_records_after_first_newline() {
+        // Two records in a single write: one underlying read returns both,
+        // so a reader that discards the post-LF tail would lose the second
+        // record (and the round trip would hang waiting for agent_settled).
+        let (mut writer, reader) = tokio::io::duplex(65536);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        writer
+            .write_all(
+                b"{\"type\":\"response\",\"id\":\"r1\",\"command\":\"get_state\",\"success\":true}\n{\"type\":\"agent_settled\"}\n",
+            )
+            .await
+            .unwrap();
+        drop(writer); // EOF after the burst.
+        let reader_task =
+            tokio::spawn(async move { read_loop(reader, events_tx, 1024 * 1024, 10, 7).await });
+        reader_task.await.unwrap();
+        let mut saw_response = false;
+        let mut saw_settled = false;
+        let mut saw_end = false;
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                SupervisorEvent::Response(_) => saw_response = true,
+                SupervisorEvent::Bridge(BridgeEvent::AgentSettled { .. }) => saw_settled = true,
+                SupervisorEvent::StreamEnded { generation: 7 } => saw_end = true,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_response && saw_settled && saw_end,
+            "response, agent_settled, and stream end must all arrive"
         );
     }
 }
