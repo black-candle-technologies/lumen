@@ -2019,7 +2019,7 @@ fn standing_mint_audit_failure_is_retryable() {
         h.ledger.active_reservations().is_empty(),
         "the parent budget reservation must be released"
     );
-    let (_, reserved_out, _) = h
+    let (_, reserved_out, _, _) = h
         .ledger
         .account_summary(&parent_id)
         .expect("parent account survives");
