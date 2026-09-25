@@ -88,6 +88,11 @@ jobs:
       - run: >
           cargo test --workspace --exclude lumen-acceptance --exclude lumen-desktop --
           --skip fuel_deadline_and_cancellation_interrupt_guest_code
+      # The no-default-features configuration is materially different
+      # (default features pull in model-client, native-secrets, and
+      # wasm-host): the sandbox gate must keep covering it, or a
+      # minimal-feature build can regress silently.
+      - run: bash scripts/verify-linux-plugin-sandbox.sh
 
   discord-feature-tests:
     runs-on: ubuntu-latest
