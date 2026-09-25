@@ -382,6 +382,18 @@ fn to_host_obligation(ob: &FrozenObligation) -> Obligation {
             kind: "require_sandbox_profile".to_string(),
             params: serde_json::json!({ "profile": profile }),
         },
+        FrozenObligation::SettleBudget {
+            reservation_id,
+            lease_id,
+            action_id,
+        } => Obligation {
+            kind: "settle_budget".to_string(),
+            params: serde_json::json!({
+                "reservation_id": reservation_id,
+                "lease_id": lease_id,
+                "action_id": action_id,
+            }),
+        },
     }
 }
 
