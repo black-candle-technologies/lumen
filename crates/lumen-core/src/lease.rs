@@ -33,8 +33,8 @@ use uuid::Uuid;
 use crate::{
     budget::{Budget, BudgetDimension, BudgetError, BudgetLedger, ExecutionReservation},
     canonical::{
-        CanonicalPath, EffectClass, NetworkDestination, PathGrant, PathResolver, PathRights,
-        ResourceScope, ScopeSubsetError, SecretRef, ToolName,
+        CanonicalPath, EffectClass, HostPattern, NetworkDestination, PathGrant, PathResolver,
+        PathRights, PortSet, ResourceScope, ScopeSubsetError, SecretRef, ToolName,
     },
     nonce::{NonceError, NonceStore},
     pi_boundary::{
@@ -44,7 +44,11 @@ use crate::{
 };
 
 /// Contract version for [`LeaseDocument`].
-pub const LEASE_PROTOCOL_VERSION: u32 = 1;
+///
+/// v1 was frozen by Phase 0. Phase 1 added `approved_action_digest` (the
+/// exact VHL-approved action digest carried by single-use leases), so the
+/// contract is v2; v1 documents are rejected, fail closed.
+pub const LEASE_PROTOCOL_VERSION: u32 = 2;
 
 /// Limits carried by a lease: time bounds, budget caps, execution caps.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +81,12 @@ pub struct LeaseDocument {
     pub depth: u32,
     pub depth_limit: u32,
     pub lease_nonce: String,
+    /// For single-use (VHL approval) leases: the exact action digest the
+    /// human approved, bound at mint time. `None` for standing leases.
+    /// Covered by the issuer signature so a compromised store cannot
+    /// rebind an approval to a different action.
+    #[serde(default)]
+    pub approved_action_digest: Option<String>,
     /// Hex-encoded Ed25519 signature over the canonical signing bytes.
     pub signature: String,
 }
@@ -95,6 +105,7 @@ struct LeaseSigningView<'a> {
     depth: u32,
     depth_limit: u32,
     lease_nonce: &'a str,
+    approved_action_digest: &'a Option<String>,
 }
 
 impl LeaseDocument {
@@ -111,6 +122,7 @@ impl LeaseDocument {
             depth: self.depth,
             depth_limit: self.depth_limit,
             lease_nonce: &self.lease_nonce,
+            approved_action_digest: &self.approved_action_digest,
         }
     }
 
@@ -455,6 +467,7 @@ pub fn mint_root_lease(
         depth: 0,
         depth_limit: params.depth_limit,
         lease_nonce: params.lease_nonce,
+        approved_action_digest: None,
         signature: String::new(),
     };
     ledger.register_lease(&doc.lease_id, &params.limits.budget)?;
@@ -541,6 +554,7 @@ pub fn mint_child_lease(
         depth: child_depth,
         depth_limit: params.depth_limit,
         lease_nonce: params.lease_nonce,
+        approved_action_digest: None,
         signature: String::new(),
     };
     // Reservation, not comparison: the child's maximum is held against the
@@ -755,6 +769,84 @@ impl OneShotGrant {
     }
 }
 
+/// Validate a [`NetworkResource`] host *before* it is interpolated into a
+/// URL authority. The host becomes the URL's authority component, so it
+/// must not contain authority-breaking characters: `/`, `?`, and `#`
+/// would truncate or redirect the parse, `@` would smuggle userinfo
+/// (`x@b.com` authorizing `b.com`), and `:` would smuggle a port or be
+/// misread. A colon is only allowed inside a valid bracketed IPv6 literal;
+/// a bare IPv6 literal is bracketed here so it parses as one host.
+fn validate_network_host(host: &str) -> Result<String, LeaseError> {
+    let bad_envelope = |detail: String| LeaseError::BadEnvelope(detail);
+    if host.is_empty() {
+        return Err(bad_envelope("network host is empty".to_string()));
+    }
+    if host.contains(&['/', '?', '#', '@'][..]) {
+        return Err(bad_envelope(format!(
+            "network host {host:?} contains a reserved character"
+        )));
+    }
+    if let Some(inner) = host.strip_prefix('[') {
+        let inner = inner.strip_suffix(']').ok_or_else(|| {
+            bad_envelope(format!("network host {host:?} has an unbalanced bracket"))
+        })?;
+        inner.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            bad_envelope(format!(
+                "network host {host:?} is not a valid bracketed IPv6 literal"
+            ))
+        })?;
+        return Ok(host.to_string());
+    }
+    if host.contains(':') {
+        host.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            bad_envelope(format!(
+                "network host {host:?} contains ':' but is not an IPv6 literal"
+            ))
+        })?;
+        return Ok(format!("[{host}]"));
+    }
+    Ok(host.to_string())
+}
+
+/// Convert one [`NetworkResource`] to its canonical destination, refusing
+/// any declaration that does not round-trip exactly.
+///
+/// After parsing, the normalized host must equal the declared host
+/// (modulo brackets, case, and IDNA) and the port must match exactly: the
+/// kernel authorizes precisely the declared destination, never a
+/// normalized reinterpretation of it.
+fn network_destination_from_resource(
+    nr: &crate::pi_boundary::NetworkResource,
+) -> Result<NetworkDestination, LeaseError> {
+    let host = validate_network_host(&nr.host)?;
+    let rendered = format!("{}://{}:{}", nr.scheme, host, nr.port);
+    let dest = NetworkDestination::parse(&rendered, &[])
+        .map_err(|e| LeaseError::BadEnvelope(e.to_string()))?;
+    // Post-parse agreement: strip the brackets the URL form requires and
+    // compare canonical patterns.
+    let declared = nr
+        .host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&nr.host);
+    let expected =
+        HostPattern::parse(declared).map_err(|e| LeaseError::BadEnvelope(e.to_string()))?;
+    if dest.host != expected {
+        return Err(LeaseError::BadEnvelope(format!(
+            "network host {:?} parsed as {}",
+            nr.host,
+            dest.host.canonical_form()
+        )));
+    }
+    if dest.ports != PortSet::single(nr.port) {
+        return Err(LeaseError::BadEnvelope(format!(
+            "network port {} did not survive parsing",
+            nr.port
+        )));
+    }
+    Ok(dest)
+}
+
 /// The canonicalized resources of one action, derived from its envelope.
 /// This is what a one-shot lease's scope is built from, and what the
 /// authorizer checks against the covering lease.
@@ -799,17 +891,7 @@ impl CanonicalAction {
         }
         let mut destinations = Vec::new();
         for nr in &env.resources.network {
-            // Bracket IPv6 literals so the destination parses as one host.
-            let host = if nr.host.contains(':') && !nr.host.starts_with('[') {
-                format!("[{}]", nr.host)
-            } else {
-                nr.host.clone()
-            };
-            let rendered = format!("{}://{}:{}", nr.scheme, host, nr.port);
-            destinations.push(
-                NetworkDestination::parse(&rendered, &[])
-                    .map_err(|e| LeaseError::BadEnvelope(e.to_string()))?,
-            );
+            destinations.push(network_destination_from_resource(nr)?);
         }
         let mut secrets = Vec::new();
         for s in &env.resources.secrets {
@@ -918,6 +1000,10 @@ pub fn mint_one_shot_lease(
         depth: 0,
         depth_limit: 1,
         lease_nonce: format!("oneshot:{}", grant.nonce),
+        // The lease embodies the human's approval of one exact action
+        // envelope (arguments and inputs included), not just its
+        // structural scope. `authorize_envelope` re-checks this digest.
+        approved_action_digest: Some(action.digest.clone()),
         signature: String::new(),
     };
     ledger.register_lease(&doc.lease_id, &budget)?;
@@ -1033,7 +1119,12 @@ fn deny_reason_for_chain_error(e: &LeaseError) -> DenyReason {
 ///
 /// This is the kernel's policy decision point (the rebuild's analogue of the
 /// old trust-gate evaluation): structural checks only, no natural-language
-/// interpretation. There is no default allow.
+/// interpretation. There is no default allow. The leaf lease is bound to
+/// the envelope's session id; one-shot leases are additionally bound to
+/// the exact approved action digest; and the exact action scope must be
+/// covered by the leaf. Single-use consumption is the final step of the
+/// allow transition — after a successful budget reservation — so a denied
+/// authorization never consumes single-use authority.
 ///
 /// The decision carries no action digest or timestamp itself; the binding to
 /// the envelope happens at the wire layer
@@ -1090,19 +1181,47 @@ pub fn authorize_envelope(
         Err(e) => return PolicyDecision::deny(deny_reason_for_chain_error(&e)),
     };
     let leaf = chain.leaf;
-    // Single-use leases are consumed exactly once, at authorization time.
-    if leaf.limits.single_use
-        && let Err(e) = consume_single_use(&leaf, one_shot, now_ms)
-    {
-        let reason = match e {
-            LeaseError::AlreadyConsumed(id) => {
-                DenyReason::replay_detected(format!("one-shot lease {id} already consumed"))
-            }
-            _ => DenyReason::invalid_envelope(format!("one-shot lease: {e}")),
-        };
-        return PolicyDecision::deny(reason);
+    // The leaf lease is a capability for its subject session only: an
+    // envelope presented by any other session is denied here, at the
+    // phase-1 policy entry point. This also closes the cross-session
+    // authority-denial primitive: another session cannot even reach the
+    // consumption step with a lease id it has learned.
+    if leaf.subject != env.session_id {
+        return PolicyDecision::deny(DenyReason::subject_mismatch(format!(
+            "leaf lease subject {} does not match envelope session {}",
+            leaf.subject, env.session_id
+        )));
     }
-    // The action's exact scope must be covered by the leaf lease.
+    // One-shot leases are bound to the exact approved action digest, not
+    // just its structural scope. A VHL approval covers the envelope the
+    // human saw — arguments and inputs included — so a different envelope
+    // that merely fits the same scope (benign arguments approved,
+    // hostile arguments presented) is denied here. The lease link is
+    // excluded from the comparison: it is necessarily empty at approval
+    // time and is filled in when the action is presented for
+    // authorization. A one-shot lease minted before digest binding
+    // (`approved_action_digest` unset) fails closed.
+    if leaf.limits.single_use {
+        let mut presented = env.clone();
+        presented.lease_chain = Vec::new();
+        let presented_digest = match presented.digest() {
+            Ok(d) => d,
+            Err(e) => {
+                return PolicyDecision::deny(DenyReason::invalid_envelope(format!(
+                    "cannot digest presented action: {e}"
+                )));
+            }
+        };
+        if leaf.approved_action_digest.as_deref() != Some(presented_digest.as_str()) {
+            return PolicyDecision::deny(DenyReason::scope_exceeded(
+                "one-shot lease is not bound to the presented action".to_string(),
+            ));
+        }
+    }
+    // The action's exact scope must be covered by the leaf lease. This
+    // runs before the budget reservation and single-use consumption so a
+    // denied envelope can never burn the human approval behind a one-shot
+    // lease or leak a budget hold.
     if let Err(e) = action.exact_scope().is_subset_of(&leaf.scope) {
         return PolicyDecision::deny(DenyReason::scope_exceeded(format!(
             "action not covered by lease: {e}"
@@ -1114,8 +1233,7 @@ pub fn authorize_envelope(
     // execution — a standing lease with a finite budget actually depletes.
     // The reservation id travels in the Allow obligations: the dispatcher
     // must settle it after execution, or release it when dispatch never
-    // happened or failed before any effect. This is the last fallible step,
-    // so a denied authorization can never leak a hold.
+    // happened or failed before any effect.
     let need = Budget::new().set(BudgetDimension::Executions, 1);
     let reservation = match ledger.reserve_execution(
         &leaf.lease_id,
@@ -1131,6 +1249,25 @@ pub fn authorize_envelope(
             )));
         }
     };
+    // Single-use consumption is the final step of the allow transition:
+    // it runs only after the session binding, the one-shot digest
+    // binding, the exact-scope check, and a successful budget
+    // reservation. A denied authorization never consumes single-use
+    // authority. If consumption loses a concurrent race at this point,
+    // the budget hold is released and the envelope is denied — fail
+    // closed, no leaked hold, no burned approval.
+    if leaf.limits.single_use
+        && let Err(e) = consume_single_use(&leaf, one_shot, now_ms)
+    {
+        let _ = ledger.release_execution(&reservation.id, now_ms);
+        let reason = match e {
+            LeaseError::AlreadyConsumed(id) => {
+                DenyReason::replay_detected(format!("one-shot lease {id} already consumed"))
+            }
+            _ => DenyReason::invalid_envelope(format!("one-shot lease: {e}")),
+        };
+        return PolicyDecision::deny(reason);
+    }
     PolicyDecision::allow(vec![execution_settlement_obligation(
         &reservation,
         &leaf.lease_id,
@@ -1692,5 +1829,418 @@ mod tests {
         );
         assert!(!d3.is_allow());
         ledger.check_invariants().unwrap();
+    }
+
+    // ---- Regression tests: findings 5-7, Lane's one-shot ordering ----
+    // ---- (comment 4099747053), and the one-shot digest binding        ----
+    // ---- (Codex P1 4096473878)                                        ----
+
+    /// Build an envelope declaring a single network resource for `host`.
+    fn envelope_with_network_host(host: &str) -> crate::pi_boundary::ActionEnvelope {
+        crate::pi_boundary::ActionEnvelope {
+            version: crate::pi_boundary::ACTION_ENVELOPE_VERSION,
+            action_id: Uuid::new_v4(),
+            session_id: "ed25519:parent-session".to_string(),
+            tool: crate::pi_boundary::ToolRef {
+                name: "net.fetch".to_string(),
+                version: "1.2.3".to_string(),
+            },
+            arguments: [("n".to_string(), serde_json::json!(1))]
+                .into_iter()
+                .collect(),
+            inputs: vec![],
+            resources: crate::pi_boundary::ResourceSet {
+                paths: vec![],
+                network: vec![crate::pi_boundary::NetworkResource {
+                    scheme: "https".to_string(),
+                    host: host.to_string(),
+                    port: 443,
+                }],
+                secrets: vec![],
+            },
+            expected_effects: crate::pi_boundary::EffectClasses {
+                file_read: false,
+                file_write: false,
+                network_egress: true,
+                network_ingress: false,
+                process_spawn: false,
+            },
+            lease_chain: vec![],
+            nonce: "net-nonce".to_string(),
+            expires_at_ms: 500_000,
+        }
+    }
+
+    #[test]
+    fn network_resource_rejects_authority_smuggling() {
+        let r = FakeResolver::default();
+        // Benign declarations round-trip to exactly the declared host/port.
+        for host in [
+            "example.com",
+            "93.184.216.34",
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "EXAMPLE.com",
+        ] {
+            let env = envelope_with_network_host(host);
+            let action = CanonicalAction::from_envelope(&env, &r, false)
+                .unwrap_or_else(|e| panic!("host {host:?} should parse: {e}"));
+            assert_eq!(action.destinations.len(), 1);
+            assert_eq!(action.destinations[0].ports, PortSet::single(443));
+        }
+        // Authority smuggling is rejected at the boundary, never normalized.
+        for host in [
+            "x@b.com",
+            "b.com#",
+            "b.com?x=1",
+            "b.com/",
+            "a.com:8443",
+            "[::1",
+            "[1.2.3.4]",
+            "2001:db8::1]:443",
+            "",
+        ] {
+            let env = envelope_with_network_host(host);
+            assert!(
+                CanonicalAction::from_envelope(&env, &r, false).is_err(),
+                "host {host:?} must be rejected"
+            );
+        }
+    }
+
+    /// Mint a one-shot lease for one exact fs.read action, mirroring
+    /// `one_shot_grant_flow`. Returns the envelope (verbatim, as the
+    /// dispatcher would present it), the lease map, the one-shot lease id,
+    /// and the authorizer inputs.
+    #[allow(clippy::type_complexity)]
+    fn one_shot_fixture() -> (
+        crate::pi_boundary::ActionEnvelope,
+        HashMap<String, LeaseDocument>,
+        String,
+        KernelKeys,
+        SessionRegistry,
+        BudgetLedger,
+    ) {
+        use rand::rngs::OsRng;
+        let (keys, _, session_vk) = test_keys();
+        let vhl_key = SigningKey::generate(&mut OsRng);
+        let mut sessions = SessionRegistry::new();
+        sessions.register("ed25519:parent-session".to_string(), None, session_vk);
+        let ledger = BudgetLedger::new();
+        let nonces = NonceStore::new();
+        let r = FakeResolver::default();
+        let mut env = crate::pi_boundary::ActionEnvelope {
+            version: crate::pi_boundary::ACTION_ENVELOPE_VERSION,
+            action_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440099").unwrap(),
+            session_id: "ed25519:parent-session".to_string(),
+            tool: crate::pi_boundary::ToolRef {
+                name: "fs.read".to_string(),
+                version: "1.2.3".to_string(),
+            },
+            // The frozen contract requires integer-only arguments.
+            arguments: [("n".to_string(), serde_json::json!(1))]
+                .into_iter()
+                .collect(),
+            inputs: vec![],
+            resources: crate::pi_boundary::ResourceSet {
+                paths: vec![crate::pi_boundary::PathResource {
+                    path: "/workspace/README.md".to_string(),
+                    rights: crate::pi_boundary::PathRights::Read,
+                }],
+                network: vec![],
+                secrets: vec![],
+            },
+            expected_effects: crate::pi_boundary::EffectClasses {
+                file_read: true,
+                file_write: false,
+                network_egress: false,
+                network_ingress: false,
+                process_spawn: false,
+            },
+            lease_chain: vec![],
+            nonce: "fixture-nonce-a".to_string(),
+            expires_at_ms: 500_000,
+        };
+        let action = CanonicalAction::from_envelope(&env, &r, false).unwrap();
+        let mut grant = OneShotGrant {
+            approval_id: "appr-fixture".to_string(),
+            action_digest: action.digest.clone(),
+            session_subject: "ed25519:parent-session".to_string(),
+            signer_key_id: "vhl-human-1".to_string(),
+            nonce: "grant-nonce-fixture".to_string(),
+            created_at_ms: 100,
+            expires_at_ms: 10_000,
+            signature: String::new(),
+        };
+        grant.sign(&vhl_key);
+        let one_shot = mint_one_shot_lease(
+            &grant,
+            &vhl_key.verifying_key(),
+            &action,
+            &keys,
+            &sessions,
+            &ledger,
+            &nonces,
+            200,
+        )
+        .unwrap();
+        // The lease carries the approved digest, covered by the issuer
+        // signature.
+        assert_eq!(
+            one_shot.approved_action_digest.as_deref(),
+            Some(action.digest.as_str())
+        );
+        one_shot.verify_signature(&keys.issuer_verifying()).unwrap();
+        let one_shot_lease_id = one_shot.lease_id.clone();
+        env.lease_chain = vec![crate::pi_boundary::LeaseId::from_uuid(
+            one_shot_lease_id.parse().expect("one-shot id is a UUID"),
+        )];
+        let mut map = HashMap::new();
+        map.insert(one_shot_lease_id.clone(), one_shot);
+        (env, map, one_shot_lease_id, keys, sessions, ledger)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_fixture(
+        env: &crate::pi_boundary::ActionEnvelope,
+        map: &HashMap<String, LeaseDocument>,
+        sessions: &SessionRegistry,
+        keys: &KernelKeys,
+        tracker: &mut HashSet<String>,
+        nonces: &mut NonceStore,
+        ledger: &BudgetLedger,
+        outbox: &mut Vec<VhlRequest>,
+    ) -> PolicyDecision {
+        authorize_envelope(
+            env,
+            &FakeResolver::default(),
+            map,
+            &RevocationIndex::new(),
+            sessions,
+            keys,
+            tracker,
+            nonces,
+            ledger,
+            outbox,
+            &AuthorizeParams {
+                now_ms: 300,
+                case_insensitive_fs: false,
+                allow_approval_fallback: false,
+                approval_ttl_ms: 0,
+            },
+        )
+    }
+
+    fn assert_deny_code(decision: &PolicyDecision, code: &str) {
+        match &decision.outcome {
+            DecisionOutcome::Deny { reason } => {
+                assert_eq!(reason.code, code, "unexpected deny reason: {reason:?}")
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authorize_envelope_binds_leaf_to_session() {
+        let (env, map, one_shot_id, keys, sessions, ledger) = one_shot_fixture();
+        let mut tracker = HashSet::new();
+        let mut nonces = NonceStore::new();
+        let mut outbox: Vec<VhlRequest> = vec![];
+        // Same valid chain, but presented by a different session: denied at
+        // the session binding, before any consumption step is reachable.
+        let mut intruder = env.clone();
+        intruder.session_id = "ed25519:intruder-session".to_string();
+        intruder.nonce = "intruder-nonce".to_string();
+        let d = authorize_fixture(
+            &intruder,
+            &map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(!d.is_allow());
+        assert_deny_code(&d, "subject_mismatch");
+        assert!(
+            !tracker.contains(&one_shot_id),
+            "a cross-session presentation must not burn the one-shot grant"
+        );
+        // The legitimate session presents the verbatim approved envelope
+        // (the nonce the human approved) and is allowed.
+        let d2 = authorize_fixture(
+            &env,
+            &map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(d2.is_allow(), "legitimate session denied: {:?}", d2.outcome);
+        assert!(tracker.contains(&one_shot_id));
+    }
+
+    #[test]
+    fn one_shot_lease_rejects_tampered_arguments() {
+        let (env, map, one_shot_id, keys, sessions, ledger) = one_shot_fixture();
+        let mut tracker = HashSet::new();
+        let mut nonces = NonceStore::new();
+        let mut outbox: Vec<VhlRequest> = vec![];
+        // Same tool, resources, and effects — but different arguments than
+        // the human approved. The structural scope still covers this
+        // envelope; only the digest binding denies it.
+        let mut tampered = env.clone();
+        tampered.arguments = [("n".to_string(), serde_json::json!(2))]
+            .into_iter()
+            .collect();
+        tampered.nonce = "tampered-nonce".to_string();
+        let d = authorize_fixture(
+            &tampered,
+            &map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(!d.is_allow());
+        assert_deny_code(&d, "scope_exceeded");
+        assert!(
+            !tracker.contains(&one_shot_id),
+            "a digest-mismatched envelope must not burn the one-shot grant"
+        );
+        // The verbatim approved envelope still authorizes afterwards.
+        let d2 = authorize_fixture(
+            &env,
+            &map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(
+            d2.is_allow(),
+            "verbatim approved action denied: {:?}",
+            d2.outcome
+        );
+        assert!(tracker.contains(&one_shot_id));
+    }
+
+    #[test]
+    fn one_shot_lease_survives_scope_denied_authorization() {
+        let (env, map, one_shot_id, keys, sessions, ledger) = one_shot_fixture();
+        let mut tracker = HashSet::new();
+        let mut nonces = NonceStore::new();
+        let mut outbox: Vec<VhlRequest> = vec![];
+        // An out-of-scope action presented against the one-shot lease is
+        // denied without consuming the grant. (The digest binding fires
+        // first for a differing envelope; either way the deny precedes
+        // consumption.)
+        let mut bad = env.clone();
+        bad.resources.paths = vec![crate::pi_boundary::PathResource {
+            path: "/etc/passwd".to_string(),
+            rights: crate::pi_boundary::PathRights::Read,
+        }];
+        bad.nonce = "bad-scope-nonce".to_string();
+        let d = authorize_fixture(
+            &bad,
+            &map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(!d.is_allow());
+        assert_deny_code(&d, "scope_exceeded");
+        assert!(
+            !tracker.contains(&one_shot_id),
+            "a denied envelope must not burn the one-shot grant"
+        );
+        // The exact approved action still authorizes afterwards.
+        let d2 = authorize_fixture(
+            &env,
+            &map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(
+            d2.is_allow(),
+            "approved action denied after scope-denied attempt: {:?}",
+            d2.outcome
+        );
+        assert!(tracker.contains(&one_shot_id));
+    }
+
+    #[test]
+    fn one_shot_lease_survives_budget_denied_authorization() {
+        let (env, map, one_shot_id, keys, sessions, ledger) = one_shot_fixture();
+        // Exhaust the one-shot's single execution directly on the ledger,
+        // so the authorize-time reservation fails after the digest and
+        // scope checks have passed.
+        let need = Budget::new().set(BudgetDimension::Executions, 1);
+        ledger
+            .reserve_execution(&one_shot_id, "some-other-action", &need, "prior-hold", 200)
+            .unwrap();
+        let mut tracker = HashSet::new();
+        let mut nonces = NonceStore::new();
+        let mut outbox: Vec<VhlRequest> = vec![];
+        let d = authorize_fixture(
+            &env,
+            &map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(!d.is_allow());
+        assert_deny_code(&d, "scope_exceeded");
+        assert!(
+            !tracker.contains(&one_shot_id),
+            "a budget-denied envelope must not burn the one-shot grant"
+        );
+    }
+
+    #[test]
+    fn one_shot_lease_without_digest_fails_closed() {
+        let (env, map, _one_shot_id, keys, sessions, ledger) = one_shot_fixture();
+        // A one-shot lease minted before digest binding (no approved
+        // digest recorded) cannot authorize: fail closed, never consume.
+        let mut legacy = map.values().next().unwrap().clone();
+        legacy.approved_action_digest = None;
+        // Re-sign so the chain validates and the test exercises the digest
+        // binding itself, not signature verification.
+        let sig = keys.issuer_sign(&legacy.signing_bytes().unwrap());
+        legacy.signature = hex::encode(sig.to_bytes());
+        let mut legacy_map = HashMap::new();
+        legacy_map.insert(legacy.lease_id.clone(), legacy);
+        let mut tracker = HashSet::new();
+        let mut nonces = NonceStore::new();
+        let mut outbox: Vec<VhlRequest> = vec![];
+        let d = authorize_fixture(
+            &env,
+            &legacy_map,
+            &sessions,
+            &keys,
+            &mut tracker,
+            &mut nonces,
+            &ledger,
+            &mut outbox,
+        );
+        assert!(!d.is_allow());
+        assert_deny_code(&d, "scope_exceeded");
     }
 }

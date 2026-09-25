@@ -47,8 +47,12 @@ use uuid::Uuid;
 
 /// Version of the [`ActionEnvelope`] contract frozen by Phase 0.
 pub const ACTION_ENVELOPE_VERSION: u32 = 1;
-/// Version of the [`PolicyDecision`] contract frozen by Phase 0.
-pub const POLICY_DECISION_VERSION: u32 = 1;
+/// Version of the [`PolicyDecision`] contract.
+///
+/// v1 was frozen by Phase 0. Phase 1 added the `SettleBudget` obligation
+/// variant, so the contract is v2 per ADR-0004 (new version + new fixtures
+/// for every protocol change; v1 shapes still parse).
+pub const POLICY_DECISION_VERSION: u32 = 2;
 /// Version of the PiBridge contract frozen by Phase 0.
 pub const PIBRIDGE_VERSION: u32 = 1;
 /// Version of the [`AuditEvent`] contract frozen by Phase 0.

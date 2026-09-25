@@ -503,27 +503,86 @@ pub fn redact_details(value: &mut Value) {
     }
 }
 
+/// Split a key into lowercase word segments on separators and camelCase
+/// boundaries, so `accessToken` → ["access", "token"] and `api-key` →
+/// ["api", "key"]. Glued compounds (`authtoken`) stay one segment and do
+/// not match — a deliberate miss in favor of not redacting usage counters
+/// like `max_tokens`.
+fn key_segments(key: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut prev_was_lower = false;
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() && prev_was_lower && !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            current.push(ch.to_ascii_lowercase());
+            prev_was_lower = ch.is_ascii_lowercase();
+        } else {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            prev_was_lower = false;
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
 fn is_secret_key(key: &str) -> bool {
-    let lower = key.to_lowercase();
-    [
-        "secret",
+    // High-signal substrings: near-zero false-positive rate, and they catch
+    // glued compounds like `client_secret_value`.
+    const SECRET_SUBSTRINGS: &[&str] = &["secret", "passwd", "passphrase"];
+    // Whole-word segments: `token` matches `access_token` but not
+    // `max_tokens`/`input_tokens`; `auth` matches `auth` but not `author`.
+    const SECRET_WORDS: &[&str] = &[
         "password",
-        "passwd",
         "token",
-        "api_key",
-        "apikey",
-        "cookie",
+        "authorization",
+        "auth",
+        "bearer",
         "credential",
-    ]
-    .iter()
-    .any(|pat| lower.contains(pat))
+        "credentials",
+        "cookie",
+        "cookies",
+        "key",
+        "keys",
+        "apikey",
+        "private",
+        "signing",
+    ];
+    let lower = key.to_lowercase();
+    if SECRET_SUBSTRINGS.iter().any(|pat| lower.contains(pat)) {
+        return true;
+    }
+    key_segments(key)
+        .iter()
+        .any(|seg| SECRET_WORDS.contains(&seg.as_str()))
 }
 
 fn looks_like_secret_value(s: &str) -> bool {
-    // Heuristic: sk-… shaped bearer tokens. Key-name redaction covers the
-    // rest; values under innocent keys are left alone unless they look like
-    // credentials.
-    s.starts_with("sk-") && s.len() > 8
+    // Heuristic: sk-… shaped keys, HTTP auth schemes, and PEM blocks.
+    // Key-name redaction covers the rest; values under innocent keys are
+    // left alone unless they look like credentials.
+    if s.starts_with("sk-") && s.len() > 8 {
+        return true;
+    }
+    // `Bearer <token>` / `Basic <credentials>`, any letter case.
+    if s.get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+        || s.get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("basic "))
+    {
+        return true;
+    }
+    // PEM-encoded key material.
+    if s.trim_start().starts_with("-----BEGIN ") {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -731,5 +790,97 @@ mod tests {
         for s in ["kernel", "ed25519:abc", "riley"] {
             assert_eq!(actor_to_string(&parse_actor(s).unwrap()), s);
         }
+    }
+
+    #[test]
+    fn secret_key_redaction_covers_credential_names() {
+        // Previously missed names are now redacted.
+        for key in [
+            "private_key",
+            "authorization",
+            "auth",
+            "signing_key",
+            "bearer",
+            "session_key",
+            "passphrase",
+            "client_secret_value",
+            "api_key",
+            "apikey",
+            "accessToken",
+            "refresh_token",
+            "id_token",
+            "password",
+            "cookie",
+            "credential",
+        ] {
+            assert!(is_secret_key(key), "key {key:?} must be treated as secret");
+        }
+        // Usage counters and innocuous names are NOT redacted.
+        for key in [
+            "max_tokens",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "author",
+            "monkey",
+            "keyboard",
+            "note",
+            "lease_id",
+        ] {
+            assert!(
+                !is_secret_key(key),
+                "key {key:?} must not be treated as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_value_redaction_covers_auth_schemes_and_pem() {
+        assert!(looks_like_secret_value("sk-abcdef123456"));
+        assert!(looks_like_secret_value("Bearer eyJhbGciOiJIUzI1NiJ9"));
+        assert!(looks_like_secret_value("bearer eyJhbGciOiJIUzI1NiJ9"));
+        assert!(looks_like_secret_value("Basic dXNlcjpwYXNz"));
+        assert!(looks_like_secret_value(
+            "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----"
+        ));
+        assert!(looks_like_secret_value(
+            "\n  -----BEGIN RSA PRIVATE KEY-----\n..."
+        ));
+        assert!(!looks_like_secret_value("ok"));
+        assert!(!looks_like_secret_value("Bearer"));
+        assert!(!looks_like_secret_value(""));
+    }
+
+    #[test]
+    fn redaction_applies_end_to_end() {
+        let mut log = test_log();
+        let digest = "ef12fc688bf209abc99880f536068f00b051c504230654cf3f69f5173b80ed07";
+        let e = log
+            .append(
+                "kernel",
+                AuditEventKind::PolicyAllowed,
+                "ed25519:session-1",
+                digest,
+                Some("allow"),
+                1000,
+                json!({
+                    "private_key": "whatever",
+                    "authorization": "Bearer abc123",
+                    "max_tokens": 100,
+                    "input_tokens": 10,
+                    "note": "Bearer of good news",
+                    "pem_blob": "-----BEGIN PRIVATE KEY-----\nabc",
+                }),
+            )
+            .unwrap();
+        let detail: Value = serde_json::from_str(&e.detail).unwrap();
+        assert_eq!(detail["private_key"], json!("[REDACTED]"));
+        assert_eq!(detail["authorization"], json!("[REDACTED]"));
+        // Usage counters survive; the Bearer-looking note is redacted by
+        // value heuristics (fail closed: it looks like a credential).
+        assert_eq!(detail["max_tokens"], json!(100));
+        assert_eq!(detail["input_tokens"], json!(10));
+        assert_eq!(detail["note"], json!("[REDACTED]"));
+        assert_eq!(detail["pem_blob"], json!("[REDACTED]"));
     }
 }

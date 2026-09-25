@@ -23,9 +23,10 @@ use std::{
     fmt, io,
     net::IpAddr,
     path::{Component, Path, PathBuf},
+    sync::LazyLock,
 };
 
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -499,11 +500,17 @@ impl HostPattern {
 
     /// Classify private/loopback/link-local networks. Used by policy, not by
     /// the subset proof itself.
+    ///
+    /// An [`HostPattern::IpRange`] is classified by its
+    /// least-trusted possible address: a range that merely *contains* a
+    /// loopback, private, or otherwise restricted address is reported as
+    /// that class, so a spanning CIDR such as `0.0.0.0/0` can never be
+    /// mistaken for [`NetworkClass::Public`].
     pub fn network_class(&self) -> NetworkClass {
         match self {
             Self::DnsName(_) | Self::DnsWildcard(_) => NetworkClass::Dns,
             Self::Ip(ip) => classify_ip(*ip),
-            Self::IpRange(net) => classify_ip(net.addr()),
+            Self::IpRange(net) => classify_net(*net),
         }
     }
 
@@ -518,6 +525,13 @@ impl HostPattern {
 }
 
 /// Coarse network classification for policy decisions.
+///
+/// [`NetworkClass::Restricted`] covers addresses that must never be treated
+/// as ordinary public *or* private space: unspecified (`0.0.0.0/8`, `::`),
+/// limited broadcast (`255.255.255.255`), reserved Class E (`240.0.0.0/4`),
+/// and documentation/benchmark ranges. Policy checks must deny `Restricted`
+/// alongside the other non-public classes — it is not a weaker form of
+/// `Public`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkClass {
     Dns,
@@ -526,30 +540,63 @@ pub enum NetworkClass {
     Loopback,
     LinkLocal,
     Multicast,
+    Restricted,
 }
 
+/// Fail-closed single-address classification: special-purpose ranges are
+/// recognized before the `Public` fallback, and IPv4-mapped IPv6 addresses
+/// are classified by their embedded IPv4 address (so `::ffff:10.0.0.1` is
+/// `Private`, not `Public`).
 fn classify_ip(ip: IpAddr) -> NetworkClass {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            if o[0] == 127 {
+            if o[0] == 0 {
+                // 0.0.0.0/8: "this network" (RFC 1122). Many clients treat
+                // 0.0.0.0 as localhost — never Public.
+                NetworkClass::Restricted
+            } else if v4.is_broadcast() {
+                NetworkClass::Restricted
+            } else if o[0] == 127 {
                 NetworkClass::Loopback
             } else if o[0] == 10
                 || (o[0] == 172 && (16..32).contains(&o[1]))
                 || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 100 && (64..128).contains(&o[1]))
             {
+                // The last arm is RFC 6598 shared/CGNAT space: not globally
+                // routable, so it classifies with private space.
                 NetworkClass::Private
             } else if o[0] == 169 && o[1] == 254 {
                 NetworkClass::LinkLocal
-            } else if o[0] >= 224 {
+            } else if o[0] >= 224 && o[0] < 240 {
                 NetworkClass::Multicast
+            } else if o[0] >= 240
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                || (o[0] == 198 && (18..20).contains(&o[1]))
+            {
+                // 240.0.0.0/4 (reserved Class E), TEST-NET-1/2/3
+                // (documentation), 198.18.0.0/15 (benchmarking): none of
+                // these is routable public space.
+                NetworkClass::Restricted
             } else {
                 NetworkClass::Public
             }
         }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() {
+            if v6.is_unspecified() {
+                NetworkClass::Restricted
+            } else if v6.is_loopback() {
                 NetworkClass::Loopback
+            } else if let Some(v4) = v6.to_ipv4_mapped() {
+                // ::ffff:0:0/96 — classify the embedded IPv4 address.
+                classify_ip(IpAddr::V4(v4))
+            } else if v6.segments()[..6] == [0, 0, 0, 0, 0, 0] {
+                // Deprecated IPv4-compatible ::/96 range (RFC 4291 §2.5.5.1):
+                // :: and ::1 were handled above; the rest is not public.
+                NetworkClass::Restricted
             } else if v6.is_multicast() {
                 NetworkClass::Multicast
             } else {
@@ -558,12 +605,92 @@ fn classify_ip(ip: IpAddr) -> NetworkClass {
                     NetworkClass::Private
                 } else if (seg[0] & 0xffc0) == 0xfe80 {
                     NetworkClass::LinkLocal
+                } else if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+                    // 2001:db8::/32 documentation range.
+                    NetworkClass::Restricted
                 } else {
                     NetworkClass::Public
                 }
             }
         }
     }
+}
+
+/// Special-purpose ranges, ordered most-restricted first. [`classify_net`]
+/// returns the class of the first overlapping entry, so a spanning range
+/// (e.g. `0.0.0.0/0`) is classified by its least-trusted possible address.
+static SPECIAL_NETS: LazyLock<Vec<(IpNet, NetworkClass)>> = LazyLock::new(|| {
+    let mut table = Vec::new();
+    let mut add = |cidr: &str, class: NetworkClass| {
+        table.push((cidr.parse::<IpNet>().expect("static CIDR parses"), class));
+    };
+    add("127.0.0.0/8", NetworkClass::Loopback);
+    add("::1/128", NetworkClass::Loopback);
+    // The whole IPv4 space embedded as ::ffff:0:0/96: its least-trusted
+    // address is loopback (::ffff:127.0.0.1).
+    add("::ffff:0:0/96", NetworkClass::Loopback);
+    add("0.0.0.0/8", NetworkClass::Restricted);
+    add("::/128", NetworkClass::Restricted);
+    add("255.255.255.255/32", NetworkClass::Restricted);
+    add("240.0.0.0/4", NetworkClass::Restricted);
+    add("192.0.2.0/24", NetworkClass::Restricted);
+    add("198.51.100.0/24", NetworkClass::Restricted);
+    add("203.0.113.0/24", NetworkClass::Restricted);
+    add("198.18.0.0/15", NetworkClass::Restricted);
+    add("2001:db8::/32", NetworkClass::Restricted);
+    add("10.0.0.0/8", NetworkClass::Private);
+    add("172.16.0.0/12", NetworkClass::Private);
+    add("192.168.0.0/16", NetworkClass::Private);
+    add("100.64.0.0/10", NetworkClass::Private);
+    add("fc00::/7", NetworkClass::Private);
+    add("169.254.0.0/16", NetworkClass::LinkLocal);
+    add("fe80::/10", NetworkClass::LinkLocal);
+    add("224.0.0.0/4", NetworkClass::Multicast);
+    add("ff00::/8", NetworkClass::Multicast);
+    table
+});
+
+/// Two CIDR ranges overlap iff one contains the other's network address
+/// (prefixes are aligned, so this is exact).
+fn nets_overlap(a: IpNet, b: IpNet) -> bool {
+    match (a, b) {
+        (IpNet::V4(a4), IpNet::V4(b4)) => a4.contains(&b4.network()) || b4.contains(&a4.network()),
+        (IpNet::V6(a6), IpNet::V6(b6)) => a6.contains(&b6.network()) || b6.contains(&a6.network()),
+        _ => false,
+    }
+}
+
+/// If the whole IPv6 range sits inside `::ffff:0:0/96`, map it into IPv4
+/// space so it classifies by its embedded addresses (e.g.
+/// `::ffff:10.0.0.0/104` → `10.0.0.0/8` → `Private`).
+fn unwrap_mapped_range(net: Ipv6Net) -> Option<Ipv4Net> {
+    if net.prefix_len() < 96 {
+        return None;
+    }
+    let lo = net.network().to_ipv4_mapped()?;
+    // Both endpoints map (checked via `lo` and the broadcast below), so the
+    // aligned range is fully inside ::ffff:0:0/96.
+    let _ = net.broadcast().to_ipv4_mapped()?;
+    Ipv4Net::new(lo, net.prefix_len() - 96).ok()
+}
+
+/// Fail-closed range classification: the range's class is the class of its
+/// least-trusted possible address. A range that merely *contains* a
+/// loopback, private, link-local, multicast, or restricted address is
+/// reported as that class — it can never be mistaken for `Public`.
+fn classify_net(net: IpNet) -> NetworkClass {
+    let net = match net {
+        IpNet::V6(v6) => unwrap_mapped_range(v6)
+            .map(IpNet::V4)
+            .unwrap_or(IpNet::V6(v6)),
+        v4 => v4,
+    };
+    for (special, class) in SPECIAL_NETS.iter() {
+        if nets_overlap(net, *special) {
+            return *class;
+        }
+    }
+    classify_ip(net.addr())
 }
 
 /// A set of ports, normalized to sorted non-overlapping ranges.
@@ -662,7 +789,8 @@ pub struct NetworkDestination {
     pub host: HostPattern,
     pub ports: PortSet,
     /// Uppercased HTTP methods. Only meaningful for http/https/ws/wss;
-    /// ignored otherwise.
+    /// ignored otherwise. Empty means *unrestricted* (any method): an
+    /// unrestricted child is only covered by an unrestricted parent.
     pub methods: BTreeSet<String>,
 }
 
@@ -677,11 +805,17 @@ impl NetworkDestination {
         if scheme.is_empty() {
             return Err(CanonicalError::BadDestination(input.to_string()));
         }
-        let host_str = url
-            .host_str()
-            .ok_or_else(|| CanonicalError::BadDestination(input.to_string()))?;
-        let host = HostPattern::parse(host_str)
-            .map_err(|_| CanonicalError::BadDestination(input.to_string()))?;
+        // Use the typed host: `host_str()` returns IPv6 literals with
+        // brackets (`[::1]`), which would misparse as a DNS name and hide
+        // loopback/private literals from `network_class()` and the subset
+        // proof.
+        let host = match url.host() {
+            Some(url::Host::Ipv4(v4)) => HostPattern::Ip(IpAddr::V4(v4)),
+            Some(url::Host::Ipv6(v6)) => HostPattern::Ip(IpAddr::V6(v6)),
+            Some(url::Host::Domain(d)) => HostPattern::parse(d)
+                .map_err(|_| CanonicalError::BadDestination(input.to_string()))?,
+            None => return Err(CanonicalError::BadDestination(input.to_string())),
+        };
         let port = url.port_or_known_default().ok_or_else(|| {
             CanonicalError::BadDestination(format!(
                 "{input}: unknown scheme, explicit port required"
@@ -713,11 +847,20 @@ impl NetworkDestination {
         if !self.ports.is_subset_of(&parent.ports) {
             return Err(CanonicalError::Incomparable);
         }
-        if self.methods_apply()
-            && parent.methods_apply()
-            && !self.methods.is_subset(&parent.methods)
-        {
-            return Err(CanonicalError::Incomparable);
+        if self.methods_apply() && parent.methods_apply() {
+            // An empty method set is the unrestricted set, not the empty
+            // set: a child that may use any method is only covered by a
+            // parent that also allows any method. A restricted child is
+            // covered by an unrestricted parent or a parent whose allowlist
+            // is a superset.
+            let covered = if self.methods.is_empty() {
+                parent.methods.is_empty()
+            } else {
+                parent.methods.is_empty() || self.methods.is_subset(&parent.methods)
+            };
+            if !covered {
+                return Err(CanonicalError::Incomparable);
+            }
         }
         Ok(())
     }
@@ -1344,5 +1487,199 @@ mod tests {
             HostPattern::parse("example.com").unwrap().network_class(),
             NetworkClass::Dns
         );
+    }
+
+    #[test]
+    fn network_class_special_addresses_fail_closed() {
+        // IPv4-mapped IPv6 unwraps to the embedded address.
+        assert_eq!(
+            HostPattern::parse("::ffff:10.0.0.1")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Private
+        );
+        assert_eq!(
+            HostPattern::parse("::ffff:127.0.0.1")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Loopback
+        );
+        assert_eq!(
+            HostPattern::parse("::ffff:8.8.8.8")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Public
+        );
+        // "This network" and limited broadcast are never Public.
+        assert_eq!(
+            HostPattern::parse("0.0.0.0").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+        assert_eq!(
+            HostPattern::parse("0.1.2.3").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+        assert_eq!(
+            HostPattern::parse("255.255.255.255")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Restricted
+        );
+        // Shared (CGNAT) space is not publicly routable.
+        assert_eq!(
+            HostPattern::parse("100.64.0.1").unwrap().network_class(),
+            NetworkClass::Private
+        );
+        assert_eq!(
+            HostPattern::parse("100.127.255.255")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Private
+        );
+        // Reserved and documentation ranges.
+        assert_eq!(
+            HostPattern::parse("240.0.0.1").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+        assert_eq!(
+            HostPattern::parse("192.0.2.1").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+        assert_eq!(
+            HostPattern::parse("::").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+        // Unchanged: genuine public and v6 special addresses.
+        assert_eq!(
+            HostPattern::parse("::1").unwrap().network_class(),
+            NetworkClass::Loopback
+        );
+        assert_eq!(
+            HostPattern::parse("fe80::1").unwrap().network_class(),
+            NetworkClass::LinkLocal
+        );
+        assert_eq!(
+            HostPattern::parse("ff02::1").unwrap().network_class(),
+            NetworkClass::Multicast
+        );
+        assert_eq!(
+            HostPattern::parse("fd00::1").unwrap().network_class(),
+            NetworkClass::Private
+        );
+        assert_eq!(
+            HostPattern::parse("2001:db8::1").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+        assert_eq!(
+            HostPattern::parse("2001:4860:4860::8888")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Public
+        );
+    }
+
+    #[test]
+    fn network_class_range_uses_least_trusted_address() {
+        // A range spanning restricted addresses is never Public.
+        assert_eq!(
+            HostPattern::parse("0.0.0.0/0").unwrap().network_class(),
+            NetworkClass::Loopback
+        );
+        assert_eq!(
+            HostPattern::parse("::/0").unwrap().network_class(),
+            NetworkClass::Loopback
+        );
+        assert_eq!(
+            HostPattern::parse("0.0.0.0/8").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+        assert_eq!(
+            HostPattern::parse("127.0.0.0/8").unwrap().network_class(),
+            NetworkClass::Loopback
+        );
+        assert_eq!(
+            HostPattern::parse("10.0.0.0/8").unwrap().network_class(),
+            NetworkClass::Private
+        );
+        // IPv4-mapped IPv6 ranges unwrap: ::ffff:10.0.0.0/104 is 10/8.
+        assert_eq!(
+            HostPattern::parse("::ffff:10.0.0.0/104")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Private
+        );
+        assert_eq!(
+            HostPattern::parse("::ffff:0.0.0.0/96")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Loopback
+        );
+        // Genuinely public ranges stay Public.
+        assert_eq!(
+            HostPattern::parse("93.184.216.0/24")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Public
+        );
+        assert_eq!(
+            HostPattern::parse("2001:4860::/32")
+                .unwrap()
+                .network_class(),
+            NetworkClass::Public
+        );
+        // Documentation ranges are Restricted even as ranges.
+        assert_eq!(
+            HostPattern::parse("2001:db8::/32").unwrap().network_class(),
+            NetworkClass::Restricted
+        );
+    }
+
+    #[test]
+    fn ipv6_destination_parses_as_ip_not_dns() {
+        // Regression: Url::host_str() keeps the brackets, which used to
+        // fall through to a DnsName("[::1]") and hide loopback/private
+        // literals from network_class() and the subset proof.
+        let loopback = NetworkDestination::parse("https://[::1]:443/x", &[]).unwrap();
+        assert_eq!(loopback.host, HostPattern::Ip("::1".parse().unwrap()));
+        assert_eq!(loopback.host.network_class(), NetworkClass::Loopback);
+
+        let ula = NetworkDestination::parse("https://[fd00::1]/", &[]).unwrap();
+        assert_eq!(ula.host.network_class(), NetworkClass::Private);
+
+        // An IpRange grant covers the IPv6 action (no DnsIpMix).
+        let grant = NetworkDestination {
+            scheme: "https".to_string(),
+            host: HostPattern::parse("fd00::/8").unwrap(),
+            ports: PortSet::single(443),
+            methods: BTreeSet::new(),
+        };
+        assert!(ula.is_subset_of(&grant).is_ok());
+        assert!(loopback.is_subset_of(&grant).is_err());
+
+        let v4 = NetworkDestination::parse("https://93.184.216.34:8443/", &[]).unwrap();
+        assert_eq!(v4.host, HostPattern::Ip("93.184.216.34".parse().unwrap()));
+    }
+
+    #[test]
+    fn method_subset_treats_empty_as_unrestricted() {
+        let dest =
+            |methods: &[&str]| NetworkDestination::parse("https://example.com/", methods).unwrap();
+        let unrestricted = dest(&[]);
+        let get_only = dest(&["GET"]);
+        let get_post = dest(&["GET", "POST"]);
+
+        // Unrestricted child: only an unrestricted parent covers it.
+        assert!(unrestricted.is_subset_of(&dest(&[])).is_ok());
+        assert!(unrestricted.is_subset_of(&get_only).is_err());
+        // Restricted child: covered by unrestricted or wider parents.
+        assert!(get_only.is_subset_of(&dest(&[])).is_ok());
+        assert!(get_only.is_subset_of(&get_only).is_ok());
+        assert!(get_only.is_subset_of(&get_post).is_ok());
+        assert!(get_post.is_subset_of(&get_only).is_err());
+        // Methods are ignored for non-HTTP schemes.
+        let dns_child = NetworkDestination::parse("dns://example.com:53/", &[]).unwrap();
+        let mut dns_parent = dns_child.clone();
+        dns_parent.methods.insert("GET".to_string());
+        assert!(dns_child.is_subset_of(&dns_parent).is_ok());
     }
 }

@@ -27,6 +27,8 @@ pub enum StoreError {
     NotFound(String),
     #[error("duplicate: {0}")]
     Duplicate(String),
+    #[error("lease chain for {0} exceeds 128 hops without reaching a root")]
+    ChainTooDeep(String),
     #[error("budget error: {0}")]
     Budget(#[from] BudgetError),
     #[error("backend error: {0}")]
@@ -39,6 +41,11 @@ pub trait LeaseStore: Send + Sync {
     async fn insert_lease(&self, doc: &LeaseDocument) -> Result<(), StoreError>;
     async fn get_lease(&self, id: &str) -> Result<Option<LeaseDocument>, StoreError>;
     /// Load a full chain, leaf first, following parent links.
+    ///
+    /// Fails closed: if 128 hops pass without reaching a root (a cycle or
+    /// a chain longer than the walk limit), this returns
+    /// [`StoreError::ChainTooDeep`] rather than a truncated chain whose
+    /// last element still has a parent.
     async fn get_chain(&self, leaf_id: &str) -> Result<Vec<LeaseDocument>, StoreError> {
         let mut chain = Vec::new();
         let mut current = leaf_id.to_string();
@@ -51,10 +58,10 @@ pub trait LeaseStore: Send + Sync {
             chain.push(doc);
             match parent {
                 Some(p) => current = p,
-                None => break,
+                None => return Ok(chain),
             }
         }
-        Ok(chain)
+        Err(StoreError::ChainTooDeep(leaf_id.to_string()))
     }
 }
 
@@ -100,8 +107,11 @@ pub trait BudgetStore: Send + Sync {
     async fn insert_reservation(&self, reservation: &Reservation) -> Result<(), StoreError>;
     async fn get_reservation(&self, id: &str) -> Result<Option<Reservation>, StoreError>;
     async fn update_reservation(&self, reservation: &Reservation) -> Result<(), StoreError>;
-    /// Active reservations whose child lease is dead (expired or revoked):
-    /// the crash-safe reconciliation set.
+    /// All reservations still in the active state: the crash-safe
+    /// reconciliation set. Child-lease liveness (expired or revoked) is
+    /// decided by the reconciler against the lease store; this method does
+    /// not filter on it, because boot reconciliation must rehydrate holds
+    /// for live children as well as release holds for dead ones.
     async fn active_reservations(&self) -> Result<Vec<Reservation>, StoreError>;
     async fn insert_debit(
         &self,
@@ -407,5 +417,126 @@ impl BudgetStore for MemoryStores {
             .values()
             .cloned()
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::{Budget, ReservationState};
+    use crate::canonical::ResourceScope;
+    use crate::lease::{LEASE_PROTOCOL_VERSION, LeaseLimits};
+
+    fn doc(id: &str, parent: Option<&str>) -> LeaseDocument {
+        LeaseDocument {
+            protocol_version: LEASE_PROTOCOL_VERSION,
+            lease_id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            subject: "ed25519:session".to_string(),
+            issuer_key_id: "kernel-issuer".to_string(),
+            issued_at_ms: 0,
+            scope: ResourceScope::default(),
+            limits: LeaseLimits {
+                not_before_ms: 0,
+                expires_at_ms: 1_000_000,
+                budget: Budget::new(),
+                max_executions: None,
+                single_use: false,
+            },
+            depth: 0,
+            depth_limit: 4,
+            lease_nonce: format!("nonce-{id}"),
+            approved_action_digest: None,
+            signature: String::new(),
+        }
+    }
+
+    fn reservation(id: &str, state: ReservationState) -> Reservation {
+        Reservation {
+            id: id.to_string(),
+            child_lease_id: format!("child-{id}"),
+            parent_lease_id: "parent".to_string(),
+            held: Budget::new(),
+            consumed: Budget::new(),
+            state,
+            created_at_ms: 0,
+            released_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_chain_returns_full_chain_leaf_first() {
+        let store = MemoryStores::default();
+        store.insert_lease(&doc("root", None)).await.unwrap();
+        store.insert_lease(&doc("mid", Some("root"))).await.unwrap();
+        store.insert_lease(&doc("leaf", Some("mid"))).await.unwrap();
+        let chain = store.get_chain("leaf").await.unwrap();
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].lease_id, "leaf");
+        assert_eq!(chain[2].lease_id, "root");
+        assert!(chain[2].parent_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_chain_fails_closed_on_cycle() {
+        let store = MemoryStores::default();
+        store.insert_lease(&doc("a", Some("b"))).await.unwrap();
+        store.insert_lease(&doc("b", Some("a"))).await.unwrap();
+        let err = store.get_chain("a").await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::ChainTooDeep(_)),
+            "cyclic chain must fail closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chain_fails_closed_past_hop_limit() {
+        let store = MemoryStores::default();
+        let mut parent: Option<String> = None;
+        for i in 0..130 {
+            let id = format!("lease-{i:03}");
+            store
+                .insert_lease(&doc(&id, parent.as_deref()))
+                .await
+                .unwrap();
+            parent = Some(id);
+        }
+        // 129 links exceed the 128-hop walk: fail closed, no partial chain.
+        let err = store.get_chain("lease-129").await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::ChainTooDeep(_)),
+            "over-long chain must fail closed, got {err:?}"
+        );
+        // Exactly 128 links still resolve.
+        let chain = store.get_chain("lease-127").await.unwrap();
+        assert_eq!(chain.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn active_reservations_returns_all_active() {
+        let store = MemoryStores::default();
+        store
+            .insert_reservation(&reservation("r1", ReservationState::Active))
+            .await
+            .unwrap();
+        store
+            .insert_reservation(&reservation("r2", ReservationState::Released))
+            .await
+            .unwrap();
+        store
+            .insert_reservation(&reservation("r3", ReservationState::Active))
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = store
+            .active_reservations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        // The contract is all active reservations (the reconciler decides
+        // child liveness itself); released rows are excluded.
+        assert_eq!(ids, vec!["r1".to_string(), "r3".to_string()]);
     }
 }
