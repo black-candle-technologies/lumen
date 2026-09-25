@@ -292,7 +292,7 @@ subject = "operator"
             "health must fail when sandbox strength is unavailable"
         );
         assert!(check.detail.contains("linux-bubblewrap"));
-        assert!(check.detail.contains("unavailable"));
+        assert!(check.detail.contains("Unavailable"));
     }
 
     #[test]

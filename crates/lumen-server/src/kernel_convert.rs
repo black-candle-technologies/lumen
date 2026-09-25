@@ -187,7 +187,7 @@ pub(crate) fn to_frozen_envelope(env: &ActionEnvelope) -> Result<FrozenEnvelope,
             // Unreachable: rejected above. Kept to stay exhaustive if new
             // variants are added without updating the rejection list.
             EffectClass::SecretUse | EffectClass::MessageSend => {
-                return Err(EnvelopeError::UnsupportedEffect(format!("{class:?}")).into())
+                return Err(EnvelopeError::UnsupportedEffect(format!("{class:?}")).into());
             }
         }
     }
@@ -305,9 +305,7 @@ fn to_host_obligation(ob: &FrozenObligation) -> Obligation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_client::{
-        ACTION_ENVELOPE_VERSION, ResourceSet, ToolRef, deadline_rfc3339,
-    };
+    use crate::kernel_client::{ACTION_ENVELOPE_VERSION, ResourceSet, ToolRef, deadline_rfc3339};
 
     fn envelope_with_effects(effects: Vec<EffectClass>) -> ActionEnvelope {
         ActionEnvelope {
