@@ -1886,6 +1886,8 @@ mod tests {
         let mut dns_parent = dns_child.clone();
         dns_parent.methods.insert("GET".to_string());
         assert!(dns_child.is_subset_of(&dns_parent).is_ok());
+    }
+
     /// The canonical destination decoder is the exact inverse of the
     /// encoder: every host kind, port shape, and method allowlist
     /// round-trips, and the re-encoded form is byte-identical.

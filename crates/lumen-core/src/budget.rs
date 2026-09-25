@@ -109,6 +109,21 @@ impl Budget {
         Some(Budget(out))
     }
 
+    /// `self - other`, or `None` when any dimension would underflow.
+    pub fn checked_sub(&self, other: &Budget) -> Option<Budget> {
+        let mut out = self.0.clone();
+        for (d, v) in &other.0 {
+            let cur = out.get(d).copied().unwrap_or(0);
+            let diff = cur.checked_sub(*v)?;
+            if diff == 0 {
+                out.remove(d);
+            } else {
+                out.insert(*d, diff);
+            }
+        }
+        Some(Budget(out))
+    }
+
     pub fn saturating_sub(&self, other: &Budget) -> Budget {
         let mut out = self.0.clone();
         for (d, v) in &other.0 {
@@ -1075,7 +1090,6 @@ mod tests {
             Err(BudgetError::RollbackFailed(_, _))
         ));
     }
-
 
     #[test]
     fn register_lease_rejects_duplicate_ids() {
