@@ -1895,7 +1895,7 @@ impl Database {
     ) -> Result<Vec<LeaseDocument>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT lease_id,parent_id,subject,issuer_key_id,issued_at_ms,protocol_version,
-             scope_json,limits_json,depth,depth_limit,lease_nonce,signature
+             scope_json,limits_json,depth,depth_limit,lease_nonce,signature,approved_action_digest
              FROM kernel_leases l
              WHERE l.workspace_id=?
                AND json_extract(l.limits_json,'$.expires_at_ms')>?
