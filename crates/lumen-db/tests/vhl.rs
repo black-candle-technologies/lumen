@@ -2,6 +2,7 @@
 //! approval state machine, append-only decisions, challenge lifecycle, and
 //! the replay guards that reuse the 0022 nonce/one-shot tables.
 
+use lumen_core::canonical::PathRights;
 use lumen_core::identity::WorkspaceId;
 use lumen_core::vhl::{
     ApprovalKind, ApprovalView, VhlApprovalRequest, VhlCourierMessage, VhlRequestState,
@@ -38,6 +39,7 @@ fn test_request(nonce: &str) -> VhlApprovalRequest {
             action_digest: "a".repeat(64),
             session_subject: "ed25519:test-session".to_string(),
             paths: vec!["/workspace/README.md".to_string()],
+            path_rights: vec![PathRights::READ],
             destinations: vec![],
             secrets: vec![],
             effects: vec!["Read".to_string()],
@@ -614,4 +616,74 @@ async fn one_shot_use_is_single_use() {
             .expect("reclaim"),
         "second consumption is a replay"
     );
+}
+
+#[tokio::test]
+async fn approval_lease_reference_is_workspace_scoped() {
+    let db = Database::connect_in_memory().await.expect("connect");
+    let ws_a = test_workspace(&db).await;
+    let ws_b = test_workspace(&db).await;
+    let request = test_request("nonce-xws-lease");
+    db.vhl_insert_request(&ws_a, &request)
+        .await
+        .expect("insert");
+    db.vhl_transition(
+        &ws_a,
+        &request.request_id,
+        "requested",
+        "approved",
+        Some(NOW_MS),
+        Some("human"),
+        Some("ok"),
+        Some("att-1"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("requested→approved");
+
+    // The lease lives in workspace B. Attaching it to workspace A's
+    // approval must fail closed at the composite foreign key — the old
+    // unscoped `REFERENCES kernel_leases(lease_id)` let this through.
+    insert_lease(&db, &ws_b, "lease-in-b").await;
+    let err = db
+        .vhl_transition(
+            &ws_a,
+            &request.request_id,
+            "approved",
+            "minted",
+            None,
+            None,
+            None,
+            None,
+            Some("lease-in-b"),
+            Some(NOW_MS),
+            None,
+        )
+        .await
+        .expect_err("cross-workspace lease reference must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("FOREIGN KEY") || msg.contains("foreign key"),
+        "expected a foreign-key violation, got {msg}"
+    );
+
+    // The same-workspace association still works.
+    insert_lease(&db, &ws_a, "lease-in-a").await;
+    db.vhl_transition(
+        &ws_a,
+        &request.request_id,
+        "approved",
+        "minted",
+        None,
+        None,
+        None,
+        None,
+        Some("lease-in-a"),
+        Some(NOW_MS),
+        None,
+    )
+    .await
+    .expect("same-workspace lease reference");
 }

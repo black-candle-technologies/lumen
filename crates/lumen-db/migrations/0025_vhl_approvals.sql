@@ -33,11 +33,18 @@ CREATE TABLE vhl_approval_requests(
  decided_by TEXT NULL CHECK(decided_by IS NULL OR length(decided_by)>0),
  decision_reason TEXT NULL,
  attestation_id TEXT NULL CHECK(attestation_id IS NULL OR length(attestation_id)>0),
- lease_id TEXT NULL REFERENCES kernel_leases(lease_id) ON DELETE RESTRICT,
+ lease_id TEXT NULL,
  minted_at_ms INTEGER NULL CHECK(minted_at_ms IS NULL OR minted_at_ms>=0),
  consumed_at_ms INTEGER NULL CHECK(consumed_at_ms IS NULL OR consumed_at_ms>=0),
- UNIQUE(workspace_id, nonce)
-) STRICT;
+ UNIQUE(workspace_id, nonce),
+ /* Like 0022's other authority records, the lease reference is scoped to
+    the workspace: the composite FK makes a cross-workspace lease
+    association fail closed at the SQL layer instead of letting durable
+    approval state point at another tenant's lease. NULL lease_id (no mint
+    yet) satisfies the FK, per SQL semantics. */
+ FOREIGN KEY(workspace_id, lease_id)
+   REFERENCES kernel_leases(workspace_id, lease_id) ON DELETE RESTRICT
+ ) STRICT;
 CREATE INDEX vhl_approval_requests_subject_idx ON vhl_approval_requests(workspace_id, session_subject);
 CREATE INDEX vhl_approval_requests_state_idx ON vhl_approval_requests(workspace_id, state);
 CREATE INDEX vhl_approval_requests_digest_idx ON vhl_approval_requests(workspace_id, action_digest);
