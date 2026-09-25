@@ -681,7 +681,13 @@ async fn one_shot_mint_survives_kernel_restart() {
     let workspace = WorkspaceId::new();
 
     // Phase 1: mint a one-shot lease.
-    let (subject, lease_id, approval_id, grant_nonce) = {
+    // The fixture's tempdir is moved out of the block so the leased file
+    // path stays stable (and the file keeps existing) across the restart:
+    // the one-shot grant binds the exact action digest, so presenting the
+    // lease against a *different* tempdir would deny on a scope mismatch
+    // and the test would pass for the wrong reason. `f` (and its kernel)
+    // still drops here: simulated crash.
+    let (subject, lease_id, approval_id, grant_nonce, leased_file, _file_dir) = {
         let f =
             fixture_with_db_and_workspace(vhl_keys.clone(), Some(db_path.clone()), Some(workspace))
                 .await;
@@ -746,6 +752,8 @@ async fn one_shot_mint_survives_kernel_restart() {
             lease.lease_id.clone(),
             approval_id,
             grant.nonce.clone(),
+            f.leased_file.clone(),
+            f.dir,
         )
     };
 
@@ -764,20 +772,40 @@ async fn one_shot_mint_survives_kernel_restart() {
     drop(conn);
     drop(db);
 
-    // But it's not usable: the restarted kernel has fresh issuer keys,
-    // and old-issuer leases are invalid by design.
+    // The one-shot authorizes exactly once after the restart: the retired
+    // issuer generation still verifies, the session is hydrated from
+    // `kernel_sessions`, and the action digest matches the stable leased
+    // file. (It is NOT denied as an "old-issuer" lease — retired
+    // generations verify by design since lease persistence landed.)
     let outcome = f2
         .pipeline
         .handle(
-            &read_request(&f2.leased_file),
+            &read_request(&leased_file),
             &subject,
             std::slice::from_ref(&lease_id),
         )
         .await;
     assert!(
-        matches!(outcome, ToolOutcome::Denied { .. }),
-        "old-issuer lease rejected after restart, got {outcome:?}"
+        matches!(outcome, ToolOutcome::Completed { .. }),
+        "one-shot authorizes once after restart, got {outcome:?}"
     );
+
+    // And only once: the durable consumption record denies the replay.
+    let outcome = f2
+        .pipeline
+        .handle(
+            &read_request(&leased_file),
+            &subject,
+            std::slice::from_ref(&lease_id),
+        )
+        .await;
+    match outcome {
+        ToolOutcome::Denied { reason } => assert!(
+            reason.contains("consumed"),
+            "expected the consumed-one-shot denial, got: {reason}"
+        ),
+        other => panic!("replayed one-shot must be denied, got {other:?}"),
+    }
 
     // The grant nonce is still burned: replay is rejected even though the
     // in-memory nonce set was lost in the crash (the durable nonce gate

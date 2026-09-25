@@ -582,6 +582,113 @@ async fn destroy_sessions_and_revoke_is_atomic() {
 }
 
 #[tokio::test]
+async fn expire_kernel_sessions_and_revoke_is_atomic() {
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    // Lease for the TTL-expired subject (mint_root uses
+    // "ed25519:parent-session" as the subject).
+    let doc = mint_root(&fx, "lease-exp", "nonce-exp", 100, 1_000_000);
+    db.insert_kernel_lease(&ws, &doc).await.unwrap();
+    // Old session (TTL-expired) with a young child: the whole subtree
+    // must go, and every lease in it must be revoked in the same
+    // transaction.
+    db.insert_kernel_session(&ws, "ed25519:parent-session", None, &vk_hex(41), 0)
+        .await
+        .unwrap();
+    db.insert_kernel_session(
+        &ws,
+        "ed25519:young-child",
+        Some("ed25519:parent-session"),
+        &vk_hex(42),
+        900_000,
+    )
+    .await
+    .unwrap();
+    // An unrelated young session must survive.
+    db.insert_kernel_session(&ws, "ed25519:other", None, &vk_hex(43), 900_000)
+        .await
+        .unwrap();
+
+    let (mut destroyed, revoked) = db
+        .expire_kernel_sessions_and_revoke(&ws, 100_000, 999_999, "session TTL expired")
+        .await
+        .unwrap();
+    destroyed.sort();
+    assert_eq!(
+        destroyed,
+        vec![
+            "ed25519:parent-session".to_string(),
+            "ed25519:young-child".to_string(),
+        ]
+    );
+    assert_eq!(revoked, vec!["lease-exp".to_string()]);
+
+    for subject in ["ed25519:parent-session", "ed25519:young-child"] {
+        let row = db.kernel_session(&ws, subject).await.unwrap().unwrap();
+        assert!(!row.active, "{subject} must be destroyed");
+        assert_eq!(row.destroyed_at_ms, Some(999_999));
+    }
+    let other = db
+        .kernel_session(&ws, "ed25519:other")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(other.active);
+    assert!(db.is_kernel_revoked(&ws, "lease-exp").await.unwrap());
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kernel_revocations WHERE workspace_id=? AND reason='session TTL expired'",
+    )
+    .bind(ws.to_string())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn revoke_leases_for_inactive_sessions_repairs_crash_residue() {
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    // Simulate the pre-atomicity crash window: the session destroy
+    // transition committed, but the lease revocation never did.
+    let doc = mint_root(&fx, "lease-residue", "nonce-residue", 100, 1_000_000);
+    db.insert_kernel_lease(&ws, &doc).await.unwrap();
+    db.insert_kernel_session(&ws, "ed25519:parent-session", None, &vk_hex(51), 100)
+        .await
+        .unwrap();
+    assert!(
+        db.destroy_kernel_session(&ws, "ed25519:parent-session", 5_000)
+            .await
+            .unwrap()
+    );
+    assert!(!db.is_kernel_revoked(&ws, "lease-residue").await.unwrap());
+
+    // A lease for a live session must NOT be touched by the repair.
+    let mut live_doc = mint_root(&fx, "lease-live", "nonce-live", 100, 1_000_000);
+    live_doc.subject = "ed25519:live-session".to_string();
+    db.insert_kernel_lease(&ws, &live_doc).await.unwrap();
+    db.insert_kernel_session(&ws, "ed25519:live-session", None, &vk_hex(52), 100)
+        .await
+        .unwrap();
+
+    let repaired = db
+        .revoke_leases_for_inactive_sessions(&ws, 999_999, "boot repair")
+        .await
+        .unwrap();
+    assert_eq!(repaired, vec!["lease-residue".to_string()]);
+    assert!(db.is_kernel_revoked(&ws, "lease-residue").await.unwrap());
+    assert!(!db.is_kernel_revoked(&ws, "lease-live").await.unwrap());
+    // Idempotent: a second pass repairs nothing.
+    let repaired = db
+        .revoke_leases_for_inactive_sessions(&ws, 999_999, "boot repair")
+        .await
+        .unwrap();
+    assert!(repaired.is_empty());
+}
+
+#[tokio::test]
 async fn kill_list_is_idempotent_and_append_only() {
     let db = test_db().await;
     let ws = test_workspace(&db).await;

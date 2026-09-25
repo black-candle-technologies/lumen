@@ -637,6 +637,130 @@ async fn unknown_issuer_generation_fails_closed() {
     assert_unknown_generation(&err, "does-not-exist");
 }
 
+/// Pre-migration legacy lease: a live root lease whose subject has no
+/// `kernel_sessions` row (sessions were not durably recorded before
+/// migration 0025). The boot re-validation self-check must count it as
+/// legacy and let the open succeed — NOT fail the open on
+/// `SubjectInactive`. The lease itself must still fail closed at decision
+/// time: it never authorizes.
+#[tokio::test]
+async fn pre_migration_lease_without_session_row_is_legacy_not_tamper() {
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    // A recorded (not killed) issuer generation, so the lease is not
+    // UnknownIssuerGeneration: the only thing "legacy" about it is the
+    // missing session row.
+    let legacy_signing = SigningKey::from_bytes(&[0x5bu8; 32]);
+    let legacy_issuer_id = "legacy-issuer-gen";
+    let now = now_ms();
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    db.record_kernel_key_generation(
+        &env.workspace,
+        legacy_issuer_id,
+        "issuer",
+        &hex::encode(legacy_signing.verifying_key().to_bytes()),
+        now,
+    )
+    .await
+    .expect("record legacy generation");
+    // The subject never had a session row: this is the pre-0025 data
+    // state (kernel_leases existed since 0022; kernel_sessions is 0025).
+    let legacy_subject = "ed25519:legacy-no-session-row";
+    let mut core_doc = CoreLeaseDocument {
+        protocol_version: LEASE_PROTOCOL_VERSION,
+        lease_id: uuid::Uuid::new_v4().to_string(),
+        parent_id: None,
+        subject: legacy_subject.to_string(),
+        issuer_key_id: legacy_issuer_id.to_string(),
+        issued_at_ms: now,
+        scope: ResourceScope::default(),
+        limits: CoreLeaseLimits {
+            not_before_ms: now,
+            expires_at_ms: now + 3_600_000,
+            budget: Budget::new(),
+            max_executions: None,
+            single_use: false,
+        },
+        depth: 0,
+        depth_limit: 4,
+        lease_nonce: format!("legacy-nonce-{}", uuid::Uuid::new_v4()),
+        signature: String::new(),
+    };
+    core_doc.sign(&legacy_signing);
+    db.insert_kernel_lease(&env.workspace, &core_doc)
+        .await
+        .expect("insert legacy lease");
+    drop(db);
+    drop(h);
+
+    // The open succeeds: the legacy lease is counted, not treated as
+    // tamper evidence.
+    let h2 = open_kernel(&env, HashMap::new(), None).await;
+    // ...but the lease itself never authorizes: the decision-time
+    // `validate_chain` fails closed on the unknown/inactive subject.
+    // (The diagnostic `verify_lease` only checks crypto + revocation;
+    // authorization is what matters.)
+    let outcome = h2
+        .pipeline
+        .handle(
+            &read_request(&env.leased_file),
+            legacy_subject,
+            &[core_doc.lease_id.clone()],
+        )
+        .await;
+    match outcome {
+        ToolOutcome::Denied { reason } => assert!(
+            reason.contains("not active") || reason.contains("inactive"),
+            "expected the inactive-subject denial, got: {reason}"
+        ),
+        other => panic!("legacy lease must be denied at authorization, got {other:?}"),
+    }
+}
+
+/// Crash-residue repair: a session destroyed without its leases revoked
+/// (the pre-atomicity crash window) must not wedge the next boot. The
+/// boot repair pass durably revokes the residue leases, the open
+/// succeeds, and the residue lease stays denied.
+#[tokio::test]
+async fn crash_residue_repair_unblocks_boot() {
+    let env = restart_env();
+    let (subject, lease) = {
+        let h = open_kernel(&env, HashMap::new(), None).await;
+        let (subject, lease) = mint_root(&h.kernel, "t-residue", 3_600_000).await;
+        // Sanity: the lease verifies before the simulated crash.
+        h.kernel
+            .verify_lease(&lease)
+            .await
+            .expect("lease verifies pre-crash");
+        (subject, lease)
+    };
+    // Simulate the crash: destroy transition committed, revocation lost.
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    assert!(
+        db.destroy_kernel_session(&env.workspace, &subject, now_ms())
+            .await
+            .expect("destroy session")
+    );
+    drop(db);
+
+    // Without the repair this open failed on SubjectInactive; with it the
+    // residue lease is revoked and the boot succeeds.
+    let h2 = open_kernel(&env, HashMap::new(), None).await;
+    let db = Database::connect(&env.db_path).await.expect("db connect");
+    assert!(
+        db.is_kernel_revoked(&env.workspace, &lease.lease_id)
+            .await
+            .expect("revocation check"),
+        "boot repair must durably revoke the residue lease"
+    );
+    drop(db);
+    // The residue lease stays denied: its session is destroyed.
+    h2.kernel
+        .verify_lease(&lease)
+        .await
+        .expect_err("residue lease must stay denied");
+}
+
 /// §8.12 — killing an issuer generation fails closed for its outstanding
 /// leases immediately, durably (the kill survives the restart), without
 /// disturbing other generations. Pre-kill, the lease verifies — which
