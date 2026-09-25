@@ -61,7 +61,7 @@ use crate::lease::{
 };
 use crate::nonce::NonceStore;
 use crate::{
-    canonical::{EffectClass, ResourceScope},
+    canonical::{EffectClass, PathRights, ResourceScope},
     pi_boundary::{self, ActionEnvelope, canonical_digest, canonical_json},
     session_identity::{SessionEndReceipt, SessionIdentityError, SessionIdentityVault},
 };
@@ -471,6 +471,13 @@ pub struct ApprovalView {
     /// attestation `msg_hash` for the same reason.
     pub session_subject: String,
     pub paths: Vec<String>,
+    /// Declared rights per path, parallel to `paths` (same length, same
+    /// order), copied from the canonical action. The standing-lease mint
+    /// reconstructs each path's own rights from here — never an aggregate
+    /// derived from the global effects, which would widen read-only paths
+    /// to write whenever any path in the action is written. Covered by the
+    /// attestation `msg_hash` like every other view field.
+    pub path_rights: Vec<PathRights>,
     pub destinations: Vec<String>,
     pub secrets: Vec<String>,
     pub effects: Vec<String>,
@@ -486,6 +493,17 @@ fn effect_names(effects: &[EffectClass]) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// Human-readable label for the declared rights on one approved path,
+/// shown in the approval summary the human reviews.
+fn path_rights_label(rights: &PathRights) -> &'static str {
+    match (rights.read, rights.write) {
+        (true, true) => "read+write",
+        (true, false) => "read",
+        (false, true) => "write",
+        (false, false) => "none",
+    }
 }
 
 impl ApprovalView {
@@ -513,6 +531,15 @@ impl ApprovalView {
         .map_err(|e| VhlError::Encoding(e.to_string()))?;
         let tool = format!("{}@{}", action.tool_name.as_str(), action.tool_version);
         let paths: Vec<String> = action.paths.iter().map(|p| p.canonical_form()).collect();
+        // Per-path rights travel with the paths, in the same order. The two
+        // vectors must stay parallel — a mismatch is a construction bug and
+        // fails closed here rather than widening authority later.
+        let path_rights: Vec<PathRights> = action.path_rights.clone();
+        if paths.len() != path_rights.len() {
+            return Err(VhlError::Encoding(
+                "canonical action paths/path_rights length mismatch".to_string(),
+            ));
+        }
         let destinations: Vec<String> = action
             .destinations
             .iter()
@@ -534,8 +561,11 @@ impl ApprovalView {
             "LUMEN APPROVAL REQUEST\n{banner}\naction digest: {}\ntool: {tool}\n",
             action.digest
         );
-        for path in &paths {
-            summary.push_str(&format!("path: {path}\n"));
+        for (path, rights) in paths.iter().zip(path_rights.iter()) {
+            summary.push_str(&format!(
+                "path: {path} [{rights}]\n",
+                rights = path_rights_label(rights)
+            ));
         }
         for destination in &destinations {
             summary.push_str(&format!("destination: {destination}\n"));
@@ -558,6 +588,7 @@ impl ApprovalView {
             action_digest: action.digest.clone(),
             session_subject: envelope.session_id.clone(),
             paths,
+            path_rights,
             destinations,
             secrets,
             effects,
@@ -2195,9 +2226,7 @@ impl<V: VhlVerifier> VhlAuthority<V> {
     /// destinations, and secrets are re-parsed through the canonicalizers —
     /// never trusted as raw strings.
     fn standing_scope(&self, request: &VhlApprovalRequest) -> Result<ResourceScope, VhlError> {
-        use crate::canonical::{
-            CanonicalPath, NetworkDestination, PathGrant, PathRights, SecretRef,
-        };
+        use crate::canonical::{CanonicalPath, NetworkDestination, PathGrant, SecretRef};
 
         let mut scope = ResourceScope::default();
         let tool_name = request.view.tool.split('@').next().unwrap_or("");
@@ -2210,24 +2239,36 @@ impl<V: VhlVerifier> VhlAuthority<V> {
             semver::VersionReq::parse(&format!("={version}"))
                 .map_err(|e: semver::Error| VhlError::Encoding(e.to_string()))?,
         );
-        // Path rights mirror the one-shot's exact_scope derivation: read
-        // when the action reads or executes, write when it writes.
-        let effects = &request.view.effects;
-        let rights = PathRights {
-            read: effects.iter().any(|e| e == "Read" || e == "Execute"),
-            write: effects.iter().any(|e| e == "Write"),
-        };
+        // Per-path rights come from the approved view itself — never an
+        // aggregate derived from the global effects, which would widen
+        // read-only paths to write whenever any path in the action is
+        // written. The two vectors are parallel by construction
+        // (see ApprovalView::from_action); a mismatch fails closed.
+        if request.view.paths.len() != request.view.path_rights.len() {
+            return Err(VhlError::Encoding(
+                "approved view paths/path_rights length mismatch".to_string(),
+            ));
+        }
         let resolver = StrictNoFsResolver;
-        for path in &request.view.paths {
+        for (path, rights) in request
+            .view
+            .paths
+            .iter()
+            .zip(request.view.path_rights.iter())
+        {
             let canonical = CanonicalPath::parse(path, &resolver, false)
                 .map_err(|e| VhlError::Encoding(e.to_string()))?;
             scope.paths.push(PathGrant {
                 root: canonical,
-                rights,
+                rights: *rights,
             });
         }
         for destination in &request.view.destinations {
-            let parsed = NetworkDestination::parse(destination, &[])
+            // Destinations are stored in canonical `net:` form; decode with
+            // the inverse parser. The URL parser would reject them outright,
+            // and even where it parsed it would drop the approved port set
+            // and method allowlist the human actually approved.
+            let parsed = NetworkDestination::parse_canonical_form(destination)
                 .map_err(|e| VhlError::Encoding(e.to_string()))?;
             scope.destinations.push(parsed);
         }

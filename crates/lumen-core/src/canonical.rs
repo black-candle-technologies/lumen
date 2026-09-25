@@ -741,6 +741,33 @@ impl PortSet {
         Self { ranges, any: false }
     }
 
+    /// Build from `(start, end)` ranges without expanding them into
+    /// individual ports. Ranges are sorted, validated, and merged
+    /// (adjacent ranges coalesce), so the result is normalized exactly
+    /// like [`Self::from_ports`].
+    pub fn from_ranges(ranges: &[(u16, u16)]) -> Result<Self, CanonicalError> {
+        let mut sorted: Vec<(u16, u16)> = ranges.to_vec();
+        for (start, end) in &sorted {
+            if start > end {
+                return Err(CanonicalError::BadPort(format!("{start}-{end}")));
+            }
+        }
+        sorted.sort_unstable();
+        let mut merged: Vec<(u16, u16)> = Vec::new();
+        for (start, end) in sorted {
+            match merged.last_mut() {
+                Some(last) if start <= last.1.wrapping_add(1) => {
+                    last.1 = last.1.max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        Ok(Self {
+            ranges: merged,
+            any: false,
+        })
+    }
+
     pub fn contains(&self, port: u16) -> bool {
         self.any || self.ranges.iter().any(|(s, e)| *s <= port && port <= *e)
     }
@@ -835,6 +862,184 @@ impl NetworkDestination {
 
     fn methods_apply(&self) -> bool {
         matches!(self.scheme.as_str(), "http" | "https" | "ws" | "wss")
+    }
+
+    /// Inverse of [`Self::canonical_form`]: decode a `net:` canonical string
+    /// back into a destination. Fails closed on any malformed input.
+    ///
+    /// The standing-lease mint uses this — the URL parser ([`Self::parse`])
+    /// rejects canonical `net:` strings outright, and even where it parsed
+    /// it would drop the approved port set and method allowlist the human
+    /// actually approved.
+    pub fn parse_canonical_form(input: &str) -> Result<Self, CanonicalError> {
+        let bad = || CanonicalError::BadDestination(input.to_string());
+        let rest = input.strip_prefix("net:").ok_or_else(bad)?;
+        let (scheme, rest) = rest.split_once("://").ok_or_else(bad)?;
+        // URI scheme syntax (RFC 3986 §3.1); the encoder lowercases, so the
+        // decoder requires the canonical lowercase spelling.
+        let mut scheme_bytes = scheme.bytes();
+        match scheme_bytes.next() {
+            Some(b) if b.is_ascii_lowercase() => {}
+            _ => return Err(bad()),
+        }
+        if !scheme_bytes.all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.')
+        }) {
+            return Err(bad());
+        }
+        // The host form is `{kind}:{value}` where kind selects how far the
+        // value extends: DNS names never contain ':', but IPv6 literals do,
+        // so ip:/iprange: values run to the `:ports:` marker instead.
+        let (kind, after_kind) = rest.split_once(':').ok_or_else(bad)?;
+        let (host_value, rest) = match kind {
+            "dns" | "dnswild" => after_kind.split_once(':').ok_or_else(bad)?,
+            "ip" | "iprange" => {
+                let idx = after_kind.find(":ports:").ok_or_else(bad)?;
+                (&after_kind[..idx], &after_kind[idx + 1..])
+            }
+            _ => return Err(bad()),
+        };
+        let host = Self::parse_canonical_host(kind, host_value, input)?;
+        let ports_and_methods = rest.strip_prefix("ports:").ok_or_else(bad)?;
+        let (ports_list, methods_list) = match ports_and_methods.split_once(':') {
+            Some((ports, methods)) => (ports, Some(methods)),
+            None => (ports_and_methods, None),
+        };
+        let ports = Self::parse_canonical_ports(ports_list, input)?;
+        let methods = match methods_list {
+            None => BTreeSet::new(),
+            Some(list) => {
+                // The encoder only emits a method allowlist for HTTP-family
+                // schemes; anything else is not encoder output.
+                if !matches!(scheme, "http" | "https" | "ws" | "wss") {
+                    return Err(bad());
+                }
+                let mut set = BTreeSet::new();
+                for method in list.split(',') {
+                    // Canonical spelling: the encoder uppercases method
+                    // tokens (RFC 9110 `token`, restricted to the uppercase
+                    // spelling the encoder emits), so the decoder requires
+                    // the same. Anything else is not encoder output.
+                    if method.is_empty() || !Self::is_canonical_method(method) {
+                        return Err(bad());
+                    }
+                    set.insert(method.to_string());
+                }
+                set
+            }
+        };
+        let decoded = Self {
+            scheme: scheme.to_string(),
+            host,
+            ports,
+            methods,
+        };
+        // Strict canonicity: the decoded destination must re-encode to the
+        // exact input bytes. This catches any structural ambiguity the
+        // segment parsing missed and guarantees the mint reproduces the
+        // port set and method allowlist the human approved — nothing
+        // dropped, nothing invented.
+        if decoded.canonical_form() != input {
+            return Err(bad());
+        }
+        Ok(decoded)
+    }
+
+    /// Uppercase RFC 9110 `token` characters — the canonical method
+    /// spelling the encoder emits (`to_uppercase()` on the allowlist).
+    fn is_canonical_method(method: &str) -> bool {
+        method
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || Self::is_method_tchar(b))
+    }
+
+    /// RFC 9110 `tchar` punctuation (the encoder uppercases letters, so the
+    /// canonical spelling keeps only the symbol half here).
+    fn is_method_tchar(b: u8) -> bool {
+        matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+    }
+
+    /// Decode the `{kind}:{value}` host segment of a canonical destination.
+    /// The kind tag must agree with what the value parses as — `dns:1.2.3.4`
+    /// is rejected because the encoder would have emitted `ip:1.2.3.4`.
+    fn parse_canonical_host(
+        kind: &str,
+        value: &str,
+        input: &str,
+    ) -> Result<HostPattern, CanonicalError> {
+        let bad = || CanonicalError::BadDestination(input.to_string());
+        match kind {
+            "dns" => match HostPattern::parse(value) {
+                Ok(HostPattern::DnsName(name)) => Ok(HostPattern::DnsName(name)),
+                _ => Err(bad()),
+            },
+            "dnswild" => {
+                let suffix = value.strip_prefix("*.").ok_or_else(bad)?;
+                match HostPattern::parse(suffix) {
+                    Ok(HostPattern::DnsName(name)) => Ok(HostPattern::DnsWildcard(name)),
+                    _ => Err(bad()),
+                }
+            }
+            "ip" => value
+                .parse::<IpAddr>()
+                .map(HostPattern::Ip)
+                .map_err(|_| bad()),
+            "iprange" => value
+                .parse::<IpNet>()
+                .map(HostPattern::IpRange)
+                .map_err(|_| bad()),
+            _ => Err(bad()),
+        }
+    }
+
+    /// Decode the `ports:*` / `ports:80,443,8000-9000` segment of a
+    /// canonical destination. Ranges are decoded as ranges — never expanded
+    /// into individual ports.
+    fn parse_canonical_ports(ports_list: &str, input: &str) -> Result<PortSet, CanonicalError> {
+        let bad = || CanonicalError::BadDestination(input.to_string());
+        if ports_list == "*" {
+            return Ok(PortSet::any());
+        }
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        for part in ports_list.split(',') {
+            if part.is_empty() {
+                return Err(bad());
+            }
+            match part.split_once('-') {
+                Some((start, end)) => {
+                    let start: u16 = start.parse().map_err(|_| bad())?;
+                    let end: u16 = end.parse().map_err(|_| bad())?;
+                    if start > end {
+                        return Err(bad());
+                    }
+                    ranges.push((start, end));
+                }
+                None => {
+                    let port: u16 = part.parse().map_err(|_| bad())?;
+                    ranges.push((port, port));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return Err(bad());
+        }
+        PortSet::from_ranges(&ranges).map_err(|_| bad())
     }
 
     /// Structural subset: same scheme (or parent any-scheme), host covered,
@@ -1681,5 +1886,109 @@ mod tests {
         let mut dns_parent = dns_child.clone();
         dns_parent.methods.insert("GET".to_string());
         assert!(dns_child.is_subset_of(&dns_parent).is_ok());
+    /// The canonical destination decoder is the exact inverse of the
+    /// encoder: every host kind, port shape, and method allowlist
+    /// round-trips, and the re-encoded form is byte-identical.
+    #[test]
+    fn canonical_destination_round_trip() {
+        let cases = [
+            // (scheme, host, ports, methods)
+            (
+                "https",
+                HostPattern::DnsName("example.com".to_string()),
+                PortSet::single(443),
+                vec![],
+            ),
+            (
+                "https",
+                HostPattern::DnsWildcard("example.com".to_string()),
+                PortSet::from_ports(&[80, 443]),
+                vec![],
+            ),
+            (
+                "ssh",
+                HostPattern::Ip("10.0.0.7".parse().unwrap()),
+                PortSet::single(22),
+                vec![],
+            ),
+            (
+                "https",
+                HostPattern::Ip("::1".parse().unwrap()),
+                PortSet::single(443),
+                vec![],
+            ),
+            (
+                "https",
+                HostPattern::IpRange("10.0.0.0/8".parse().unwrap()),
+                PortSet::range(8000, 9000).unwrap(),
+                vec![],
+            ),
+            (
+                "wss",
+                HostPattern::IpRange("2001:db8::/32".parse().unwrap()),
+                PortSet::any(),
+                vec![],
+            ),
+            (
+                "https",
+                HostPattern::DnsName("api.example.com".to_string()),
+                PortSet::from_ports(&[443, 8443]),
+                vec!["GET".to_string(), "POST".to_string()],
+            ),
+        ];
+        for (scheme, host, ports, methods) in cases {
+            let original = NetworkDestination {
+                scheme: scheme.to_string(),
+                host,
+                ports,
+                methods: methods.into_iter().collect(),
+            };
+            let encoded = original.canonical_form();
+            assert!(
+                encoded.starts_with("net:"),
+                "encoder must emit net: form, got {encoded}"
+            );
+            let decoded = NetworkDestination::parse_canonical_form(&encoded)
+                .unwrap_or_else(|e| panic!("decode failed for {encoded}: {e:?}"));
+            assert_eq!(decoded, original, "round-trip mismatch for {encoded}");
+            assert_eq!(
+                decoded.canonical_form(),
+                encoded,
+                "re-encode must be byte-identical"
+            );
+        }
+    }
+
+    /// Malformed canonical destinations fail closed — the decoder never
+    /// invents authority from garbage.
+    #[test]
+    fn canonical_destination_decode_rejects_malformed() {
+        let bad = [
+            "",
+            "https://example.com:443",
+            "net:https://example.com:443", // host not in canonical form
+            "net://dns:example.com:ports:443", // empty scheme
+            "net:HTTPS://dns:example.com:ports:443", // non-canonical scheme case
+            "net:https://dns::ports:443",  // empty host value
+            "net:https://dns:1.2.3.4:ports:443", // kind tag disagrees with value
+            "net:https://ip:example.com:ports:443",
+            "net:https://dnswild:example.com:ports:443", // wildcard missing *.
+            "net:https://iprange:not-a-net:ports:443",
+            "net:https://dns:example.com:ports:", // empty ports
+            "net:https://dns:example.com:ports:abc",
+            "net:https://dns:example.com:ports:9000-80", // inverted range
+            "net:https://dns:example.com:ports:443:",
+            "net:https://dns:example.com:ports:443:get", // non-canonical method case
+            "net:https://dns:example.com:ports:443:GET,",
+            "net:ftp://dns:example.com:ports:21:RETR", // methods on non-HTTP scheme
+            "net:https://dns:example.com",             // missing ports
+            "net:https://dns:example.com:ports:443:GET:extra",
+        ];
+        for input in bad {
+            assert!(
+                NetworkDestination::parse_canonical_form(input).is_err(),
+                "must reject {input:?}"
+            );
+        }
     }
 }
