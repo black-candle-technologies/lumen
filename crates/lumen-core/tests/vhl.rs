@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 use lumen_core::budget::{Budget, BudgetDimension, BudgetLedger};
 use lumen_core::canonical::EffectClass;
 use lumen_core::canonical::PathResolver;
+use lumen_core::canonical::{HostPattern, PathRights as CanonicalPathRights};
 use lumen_core::kernel_audit::{KernelAuditLog, MemoryAuditStore};
 use lumen_core::lease::{
     CanonicalAction, KernelKeys, LeaseDocument, LeaseError, LeaseLimits, OneShotGrant,
@@ -28,8 +29,8 @@ use lumen_core::pi_boundary::{ActionEnvelope, ResourceSet, ToolRef};
 use lumen_core::session_identity::SessionIdentityVault;
 use lumen_core::vhl::{
     Attestation, AttestationProof, CourierVhlVerifier, Fido2Credential, Fido2RpConfig, ProofKind,
-    SessionToken, VhlApprovalRequest, VhlAuditSink, VhlAuthority, VhlError, VhlRequestState,
-    attestation_signing_bytes, body_hash,
+    SessionToken, StandingLeaseConfirmation, VhlApprovalRequest, VhlAuditSink, VhlAuthority,
+    VhlError, VhlRequestState, attestation_signing_bytes, body_hash,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -1561,4 +1562,516 @@ fn audit_failure_leaves_request_unadvanced() {
         .deny(&mut request2, HUMAN_ADDRESS, "nope", &mut failing, NOW_MS)
         .expect_err("audit failure must fail the denial");
     assert!(matches!(request2.state, VhlRequestState::Requested));
+}
+
+// ---------------------------------------------------------------------------
+// Review remediation: side-effect-free verification, confirmation binding,
+// per-path rights, canonical destinations, mint retryability
+// ---------------------------------------------------------------------------
+
+/// Envelope with two paths carrying different declared rights: a read-only
+/// path and a read+write path.
+fn envelope_mixed_paths(session_subject: &str) -> ActionEnvelope {
+    use lumen_core::pi_boundary::{PathResource, PathRights as WirePathRights};
+    let mut env = envelope(
+        session_subject,
+        json!({"paths": ["/workspace/README.md", "/workspace/notes.txt"]}),
+        vec![],
+    );
+    env.resources.paths = vec![
+        PathResource {
+            path: "/workspace/README.md".to_string(),
+            rights: WirePathRights::Read,
+        },
+        PathResource {
+            path: "/workspace/notes.txt".to_string(),
+            rights: WirePathRights::Write,
+        },
+    ];
+    env.expected_effects.file_write = true;
+    env
+}
+
+/// Envelope with a single HTTPS network resource.
+fn envelope_with_network(session_subject: &str) -> ActionEnvelope {
+    use lumen_core::pi_boundary::NetworkResource;
+    let mut env = envelope(
+        session_subject,
+        json!({"url": "https://example.com/api"}),
+        vec![],
+    );
+    env.resources.network = vec![NetworkResource {
+        scheme: "https".to_string(),
+        host: "example.com".to_string(),
+        port: 443,
+    }];
+    env.expected_effects.network_egress = true;
+    env
+}
+
+/// Start a child session under the harness session; returns its subject.
+fn child_session(h: &mut Harness) -> String {
+    let parent_subject = h.session_subject.clone();
+    h.vault
+        .start_session(&mut h.sessions, Some(parent_subject), NOW_MS)
+        .expect("child session")
+        .subject
+}
+
+/// Full standing-lease flow through confirmation, plus a parent root lease
+/// whose scope covers the approved action. The envelope must already name
+/// a live child session.
+fn confirm_standing(
+    h: &mut Harness,
+    env: &ActionEnvelope,
+    budget_executions: u64,
+) -> (VhlApprovalRequest, StandingLeaseConfirmation, LeaseDocument) {
+    let action = canonical_action(env);
+    let mut request = h
+        .authority
+        .open_standing_request(&action, env, budget_executions, APPROVAL_TTL_MS, NOW_MS)
+        .expect("standing request opens");
+    let challenge_id = h.complete_ceremony(&request.action_digest);
+    let attestation = h.attestation_for(&request, &challenge_id);
+    let confirmation = h
+        .authority
+        .confirm_standing_lease(&mut request, &attestation, &mut h.audit, NOW_MS)
+        .expect("confirmation issues");
+    let parent_lease = mint_root_lease(
+        RootLeaseParams {
+            lease_id: "root-parent-1".to_string(),
+            subject: h.session_subject.clone(),
+            scope: parent_test_scope(&action),
+            limits: LeaseLimits {
+                not_before_ms: NOW_MS,
+                expires_at_ms: NOW_MS + 3_600_000,
+                budget: Budget::new().set(BudgetDimension::Executions, 100),
+                max_executions: Some(100),
+                single_use: false,
+            },
+            depth_limit: 4,
+            lease_nonce: "root-parent-nonce-1".to_string(),
+            issued_at_ms: NOW_MS,
+        },
+        &h.keys,
+        &h.sessions,
+        &h.ledger,
+        &h.nonces,
+        NOW_MS,
+    )
+    .expect("parent root lease mints");
+    (request, confirmation, parent_lease)
+}
+
+/// Mint a confirmed standing lease. The audit sink is a separate `&mut`
+/// (not a harness field) so tests can inject failures without
+/// double-borrowing the harness.
+#[allow(clippy::too_many_arguments)]
+fn mint_standing(
+    authority: &VhlAuthority<CourierVhlVerifier>,
+    vault: &SessionIdentityVault,
+    sessions: &SessionRegistry,
+    revocations: &RevocationIndex,
+    ledger: &BudgetLedger,
+    nonces: &NonceStore,
+    confirmation: StandingLeaseConfirmation,
+    request: &mut VhlApprovalRequest,
+    parent_lease: &LeaseDocument,
+    audit: &mut dyn VhlAuditSink,
+    now_ms: i64,
+) -> Result<LeaseDocument, VhlError> {
+    authority.mint_standing_lease(
+        confirmation,
+        request,
+        parent_lease,
+        vault,
+        sessions,
+        revocations,
+        ledger,
+        nonces,
+        audit,
+        now_ms,
+    )
+}
+
+/// Split the harness for a standing mint with the harness's recording audit.
+macro_rules! mint_standing_recording {
+    ($h:expr, $confirmation:expr, $request:expr, $parent_lease:expr) => {{
+        let Harness {
+            authority,
+            vault,
+            sessions,
+            revocations,
+            ledger,
+            nonces,
+            audit,
+            ..
+        } = &mut $h;
+        mint_standing(
+            authority,
+            vault,
+            sessions,
+            revocations,
+            ledger,
+            nonces,
+            $confirmation,
+            $request,
+            $parent_lease,
+            audit,
+            NOW_MS,
+        )
+    }};
+}
+
+/// Split the harness for a standing mint with an injected audit sink.
+macro_rules! mint_standing_injected {
+    ($h:expr, $confirmation:expr, $request:expr, $parent_lease:expr, $audit:expr) => {{
+        let Harness {
+            authority,
+            vault,
+            sessions,
+            revocations,
+            ledger,
+            nonces,
+            ..
+        } = &mut $h;
+        mint_standing(
+            authority,
+            vault,
+            sessions,
+            revocations,
+            ledger,
+            nonces,
+            $confirmation,
+            $request,
+            $parent_lease,
+            $audit,
+            NOW_MS,
+        )
+    }};
+}
+
+#[test]
+fn audit_failure_leaves_challenge_proof_unconsumed() {
+    let mut h = Harness::new();
+    let subject = h.session_subject.clone();
+    let env = envelope(
+        &subject,
+        json!({"path": "/workspace/README.md"}),
+        vec!["sha256:input-1".to_string()],
+    );
+    let action = canonical_action(&env);
+    let mut request = h
+        .authority
+        .open_request(&action, &env, APPROVAL_TTL_MS, NOW_MS)
+        .expect("request opens");
+    let challenge_id = h.complete_ceremony(&request.action_digest);
+    let attestation = h.attestation_for(&request, &challenge_id);
+
+    // Verification is side-effect-free: the audit fails, so the decision
+    // fails with the proof unconsumed — no stranded valid proof.
+    let mut failing = FailingAudit;
+    let err = h
+        .authority
+        .decide(&mut request, &attestation, &mut failing, NOW_MS)
+        .expect_err("audit failure must fail the decision");
+    assert!(matches!(err, VhlError::Encoding(_)), "got {err:?}");
+    assert!(matches!(request.state, VhlRequestState::Requested));
+    assert!(
+        h.authority
+            .challenges()
+            .is_consumable(&challenge_id, &request.action_digest, NOW_MS),
+        "challenge must still be consumable after audit failure"
+    );
+
+    // The exact same attestation retries cleanly: nothing was marked seen.
+    h.authority
+        .decide(&mut request, &attestation, &mut h.audit, NOW_MS)
+        .expect("retry succeeds");
+    assert!(matches!(request.state, VhlRequestState::Approved { .. }));
+
+    // After the durable commit the ceremony is spent.
+    assert!(
+        !h.authority
+            .challenges()
+            .is_consumable(&challenge_id, &request.action_digest, NOW_MS),
+        "challenge must be consumed after the committed decision"
+    );
+}
+
+#[test]
+fn standing_mint_rejects_view_mutated_after_confirmation() {
+    let mut h = Harness::new();
+    let child_subject = child_session(&mut h);
+    let env = envelope(
+        &child_subject,
+        json!({"path": "/workspace/README.md"}),
+        vec!["sha256:input-1".to_string()],
+    );
+    let (mut request, confirmation, parent_lease) = confirm_standing(&mut h, &env, 10);
+
+    // The caller keeps &mut access to the request after confirmation: widen
+    // the approved budget before mint.
+    request.view.budget_executions += 100;
+    let err = mint_standing_recording!(h, confirmation, &mut request, &parent_lease)
+        .expect_err("mutated view must fail the confirmation binding");
+    assert!(matches!(err, VhlError::ConfirmationMismatch), "got {err:?}");
+    assert!(
+        matches!(request.state, VhlRequestState::Approved { .. }),
+        "failed mint must not advance the request"
+    );
+}
+
+#[test]
+fn standing_mint_preserves_per_path_rights() {
+    let mut h = Harness::new();
+    let child_subject = child_session(&mut h);
+    let env = envelope_mixed_paths(&child_subject);
+    let action = canonical_action(&env);
+    // The canonical action carries each path's own declared rights.
+    assert_eq!(
+        action.path_rights,
+        vec![CanonicalPathRights::READ, CanonicalPathRights::READ_WRITE]
+    );
+    let (mut request, confirmation, parent_lease) = confirm_standing(&mut h, &env, 10);
+    // The approved view binds each path's own rights, and the human-readable
+    // summary shows them.
+    assert_eq!(
+        request.view.path_rights,
+        vec![CanonicalPathRights::READ, CanonicalPathRights::READ_WRITE]
+    );
+    assert!(
+        request.view.summary.contains("[read]"),
+        "summary must show per-path rights:\n{}",
+        request.view.summary
+    );
+    assert!(request.view.summary.contains("[read+write]"));
+
+    let lease = mint_standing_recording!(h, confirmation, &mut request, &parent_lease)
+        .expect("standing lease mints");
+    assert_eq!(lease.scope.paths.len(), 2);
+    // The read-only path must NOT be widened to write: under the old
+    // aggregate derivation both paths would have been read+write.
+    assert_eq!(lease.scope.paths[0].rights, CanonicalPathRights::READ);
+    assert_eq!(lease.scope.paths[1].rights, CanonicalPathRights::READ_WRITE);
+    assert!(
+        lease.scope.paths[0]
+            .root
+            .canonical_form()
+            .ends_with("README.md")
+    );
+}
+
+#[test]
+fn standing_mint_decodes_canonical_destinations() {
+    let mut h = Harness::new();
+    let child_subject = child_session(&mut h);
+    let env = envelope_with_network(&child_subject);
+    let (mut request, confirmation, parent_lease) = confirm_standing(&mut h, &env, 10);
+    // The approved view holds the canonical `net:` string the human saw.
+    assert_eq!(request.view.destinations.len(), 1);
+    assert!(
+        request.view.destinations[0].starts_with("net:https://dns:example.com:ports:443"),
+        "got {}",
+        request.view.destinations[0]
+    );
+
+    let lease = mint_standing_recording!(h, confirmation, &mut request, &parent_lease)
+        .expect("standing lease mints");
+    assert_eq!(lease.scope.destinations.len(), 1);
+    let dest = &lease.scope.destinations[0];
+    assert_eq!(dest.scheme, "https");
+    assert!(matches!(&dest.host, HostPattern::DnsName(n) if n == "example.com"));
+    assert!(dest.ports.contains(443));
+    assert!(!dest.ports.contains(80));
+    assert!(dest.methods.is_empty());
+    // The decoded destination re-encodes to exactly the approved string:
+    // no port set or method allowlist was dropped or invented.
+    assert_eq!(dest.canonical_form(), request.view.destinations[0]);
+}
+
+#[test]
+fn one_shot_mint_audit_failure_is_retryable() {
+    let mut h = Harness::new();
+    let subject = h.session_subject.clone();
+    let env = envelope(
+        &subject,
+        json!({"path": "/workspace/README.md"}),
+        vec!["sha256:input-1".to_string()],
+    );
+    let mut request = h.approved_request(&env);
+    let grant = h.grant_for(&request);
+    let action = canonical_action(&env);
+
+    // The lease engine runs, then the durable append fails: unwind the
+    // engine's side effects so the approval is retryable, not stranded.
+    let mut failing = FailingAudit;
+    let err = {
+        let Harness {
+            authority,
+            keys,
+            sessions,
+            ledger,
+            nonces,
+            ..
+        } = &mut h;
+        authority.mint_one_shot(
+            &mut request,
+            &grant,
+            &action,
+            keys,
+            sessions,
+            ledger,
+            nonces,
+            &mut failing,
+            NOW_MS,
+        )
+    }
+    .expect_err("audit failure must fail the mint");
+    assert!(matches!(err, VhlError::Encoding(_)), "got {err:?}");
+    assert!(
+        matches!(request.state, VhlRequestState::Approved { .. }),
+        "failed mint must leave the request Approved"
+    );
+    assert_eq!(
+        h.nonces.len(),
+        0,
+        "the consumed grant nonce must be forgotten for retry"
+    );
+    h.ledger.check_invariants().expect("ledger invariants hold");
+
+    // Retry with a working audit: the exact same grant mints exactly once.
+    let lease = h
+        .mint_lease(&mut request, &grant, &env)
+        .expect("retry mints");
+    assert!(lease.limits.single_use);
+    assert!(matches!(request.state, VhlRequestState::Minted { .. }));
+    let again = h.mint_lease(&mut request, &grant, &env);
+    assert!(
+        matches!(again, Err(VhlError::IllegalTransition(_))),
+        "double mint must fail closed, got {again:?}"
+    );
+}
+
+#[test]
+fn standing_mint_audit_failure_is_retryable() {
+    let mut h = Harness::new();
+    let child_subject = child_session(&mut h);
+    let env = envelope(
+        &child_subject,
+        json!({"path": "/workspace/README.md"}),
+        vec!["sha256:input-1".to_string()],
+    );
+    let (mut request, confirmation, parent_lease) = confirm_standing(&mut h, &env, 10);
+    let parent_id = parent_lease.lease_id.clone();
+
+    // The child mint runs (nonce consumed, parent budget reserved, child
+    // account registered), then the durable append fails: unwind all three.
+    let mut failing = FailingAudit;
+    let err = mint_standing_injected!(
+        h,
+        confirmation.clone(),
+        &mut request,
+        &parent_lease,
+        &mut failing
+    )
+    .expect_err("audit failure must fail the mint");
+    assert!(matches!(err, VhlError::Encoding(_)), "got {err:?}");
+    assert!(
+        matches!(request.state, VhlRequestState::Approved { .. }),
+        "failed mint must leave the request Approved"
+    );
+    assert!(
+        h.ledger.active_reservations().is_empty(),
+        "the parent budget reservation must be released"
+    );
+    let (_, reserved_out, _) = h
+        .ledger
+        .account_summary(&parent_id)
+        .expect("parent account survives");
+    assert!(
+        reserved_out.is_zero(),
+        "parent reserved_out must be restored, got {reserved_out:?}"
+    );
+    h.ledger.check_invariants().expect("ledger invariants hold");
+
+    // Retry with a working audit: the same confirmation mints exactly once.
+    let lease = mint_standing_recording!(h, confirmation, &mut request, &parent_lease)
+        .expect("retry mints");
+    assert!(!lease.limits.single_use);
+    assert_eq!(
+        lease.parent_id.as_deref(),
+        Some(parent_lease.lease_id.as_str())
+    );
+    assert!(matches!(request.state, VhlRequestState::Minted { .. }));
+}
+
+#[test]
+fn audit_failure_leaves_fido2_proof_unconsumed() {
+    let mut h = Harness::new();
+    let subject = h.session_subject.clone();
+    let env = envelope(
+        &subject,
+        json!({"path": "/workspace/README.md"}),
+        vec!["sha256:input-1".to_string()],
+    );
+    let action = canonical_action(&env);
+    let credential_key = SigningKey::generate(&mut OsRng);
+    let credential_id = enroll_fido2(&mut h, &credential_key, 41);
+
+    let mut request = h
+        .authority
+        .open_request(&action, &env, APPROVAL_TTL_MS, NOW_MS)
+        .expect("request opens");
+    let body = request.render_body().expect("body renders");
+    let assertion = fido2_assertion(
+        &credential_key,
+        &body_hash(&body),
+        RP_ID,
+        RP_ORIGIN,
+        0x01,
+        42,
+    );
+    let attestation = fido2_attestation(&h, &request, &credential_id, &assertion, "fido2");
+
+    // The audit fails after pure verification: the decision fails with the
+    // FIDO2 proof unconsumed — the counter must not advance and the
+    // attestation id must not be marked seen.
+    let mut failing = FailingAudit;
+    let err = h
+        .authority
+        .decide(&mut request, &attestation, &mut failing, NOW_MS)
+        .expect_err("audit failure must fail the decision");
+    assert!(matches!(err, VhlError::Encoding(_)), "got {err:?}");
+    assert!(matches!(request.state, VhlRequestState::Requested));
+
+    // The exact same attestation retries cleanly: had the counter advanced,
+    // check_fido2 would reject the non-increasing sign count; had the
+    // attestation been marked seen, the replay check would reject it.
+    h.authority
+        .decide(&mut request, &attestation, &mut h.audit, NOW_MS)
+        .expect("retry succeeds");
+    assert!(matches!(request.state, VhlRequestState::Approved { .. }));
+
+    // After the durable commit the counter DID advance: reusing the same
+    // sign count is now a replay.
+    let mut request2 = h
+        .authority
+        .open_request(&action, &env, APPROVAL_TTL_MS, NOW_MS)
+        .expect("request opens");
+    let body2 = request2.render_body().expect("body renders");
+    let replay_assertion = fido2_assertion(
+        &credential_key,
+        &body_hash(&body2),
+        RP_ID,
+        RP_ORIGIN,
+        0x01,
+        42,
+    );
+    let replay = fido2_attestation(&h, &request2, &credential_id, &replay_assertion, "fido2");
+    let err = h
+        .authority
+        .decide(&mut request2, &replay, &mut h.audit, NOW_MS)
+        .expect_err("stale sign count must fail");
+    assert!(matches!(err, VhlError::Fido2(_)), "got {err:?}");
 }
