@@ -931,22 +931,52 @@ impl ChallengeRegistry {
         action_digest: &str,
         now_ms: i64,
     ) -> bool {
-        match self.challenges.get_mut(challenge_id) {
-            Some(c)
-                if c.ceremony_complete
-                    && !c.used
-                    && now_ms < c.expires_at_ms
-                    && c.action_digest
-                        .as_bytes()
-                        .ct_eq(action_digest.as_bytes())
-                        .unwrap_u8()
-                        == 1 =>
-            {
+        if !self.is_consumable(challenge_id, action_digest, now_ms) {
+            return false;
+        }
+        // `is_consumable` just established the entry exists.
+        if let Some(c) = self.challenges.get_mut(challenge_id) {
+            c.used = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pure version of the [`Self::consume_completed`] precondition: is this
+    /// ceremony completed, unused, unexpired, and bound to `action_digest`?
+    /// Used by side-effect-free verification; the actual consumption happens
+    /// in the commit step, which must use the same predicate.
+    pub fn is_consumable(&self, challenge_id: &str, action_digest: &str, now_ms: i64) -> bool {
+        matches!(
+            self.challenges.get(challenge_id),
+            Some(c) if c.ceremony_complete
+                && !c.used
+                && now_ms < c.expires_at_ms
+                && c.action_digest
+                    .as_bytes()
+                    .ct_eq(action_digest.as_bytes())
+                    .unwrap_u8()
+                    == 1
+        )
+    }
+
+    /// Commit a verified challenge consumption: mark the ceremony used.
+    /// Verification already established the ceremony was completed and
+    /// consumable for this exact approval, so this only sets the flag — it
+    /// performs no checks that could fail and no I/O.
+    pub fn commit_consume(&mut self, challenge_id: &str) {
+        let committed = match self.challenges.get_mut(challenge_id) {
+            Some(c) if c.ceremony_complete && !c.used => {
                 c.used = true;
                 true
             }
             _ => false,
-        }
+        };
+        debug_assert!(
+            committed,
+            "commit_consume: a verified-consumable challenge must still be consumable"
+        );
     }
 
     pub fn get(&self, challenge_id: &str) -> Option<&HoldReleaseChallenge> {
@@ -1287,21 +1317,57 @@ pub struct VerifiedApproval {
     pub approver: String,
     pub proof_kind: ProofKind,
     pub decided_at_ms: i64,
+    /// The verifier state this approval must consume to take effect:
+    /// either a completed FIDO2 ceremony, or both the attestation's
+    /// own replay entry and its backing challenge ceremony.
+    consumption: VerifiedConsumption,
+}
+
+/// Proof-consumption verified by [`VhlVerifier::verify_approval`] and later
+/// committed by [`VhlVerifier::commit_verified`]. Verification is
+/// side-effect-free; consumption lands only after the audit append is
+/// durable, so a failed audit never strands a valid approval with a spent
+/// proof (the failure leaves the proof unconsumed and the approval
+/// retryable).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VerifiedConsumption {
+    /// A completed challenge ceremony; commit marks it used and records
+    /// the attestation id in the replay set.
+    Challenge { challenge_id: String },
+    /// A completed FIDO2 ceremony; commit advances its counter and marks
+    /// it attested. The attestation id is consumed atomically with the
+    /// counter advance, so a lost audit never strands the proof.
+    Fido2 {
+        approver: String,
+        credential_id: String,
+        attestation_id: String,
+        new_counter: u32,
+    },
 }
 
 /// Verifier for VHL approval attestations. Implementations hold the trust
 /// root (enrolled human keys) and the replay set.
 pub trait VhlVerifier {
-    /// Verify `attestation` against `request`. On success the attestation id
-    /// is consumed so exact replays fail, and a challenge ceremony backing
-    /// the attestation is consumed so it cannot authorize a second decision.
+    /// Verify `attestation` against `request` without consuming anything.
+    /// On success returns the verified approval; nothing is marked seen,
+    /// no FIDO2 counter advances, and no challenge is consumed — the caller
+    /// commits that state via [`Self::commit_verified`] once the decision
+    /// is durable.
     fn verify_approval(
-        &mut self,
+        &self,
         request: &VhlApprovalRequest,
         attestation: &Attestation,
-        challenges: &mut ChallengeRegistry,
+        challenges: &ChallengeRegistry,
         now_ms: i64,
     ) -> Result<VerifiedApproval, VhlError>;
+
+    /// Commit the proof consumption verified by
+    /// [`Self::verify_approval`]: mark the attestation seen, consume the
+    /// backing challenge ceremony, or advance the FIDO2 counter — whichever
+    /// the verified consumption requires. Only called after the audit
+    /// append is durable, so a failed audit leaves the proof valid and the
+    /// approval retryable instead of stranding it.
+    fn commit_verified(&mut self, verified: &VerifiedApproval, challenges: &mut ChallengeRegistry);
 
     /// Enrolled human VHL keys for an approver Courier address.
     fn keys_for(&self, approver: &str) -> Vec<VerifyingKey>;
@@ -1368,11 +1434,16 @@ impl CourierVhlVerifier {
         }
     }
 
-    fn verify_fido2(
-        &mut self,
+    /// Pure part of FIDO2 verification: verify the assertion against the
+    /// enrolled credential and return the new counter value without writing
+    /// anything. The commit step advances the stored counter, so a failure
+    /// between verification and commit can never strand a valid proof with
+    /// an advanced counter.
+    fn check_fido2(
+        &self,
         attestation: &Attestation,
         action_hash: &[u8; 32],
-    ) -> Result<(), VhlError> {
+    ) -> Result<u32, VhlError> {
         let credential_id = attestation
             .proof
             .credential_id
@@ -1400,19 +1471,36 @@ impl CourierVhlVerifier {
                 "signature counter did not increase (got {sign_count}, want > {stored})"
             )));
         }
+        Ok(sign_count)
+    }
+
+    /// Commit a verified FIDO2 check: advance the credential's counter and
+    /// mark the attestation seen. Both land together, after the audit is
+    /// durable.
+    fn commit_fido2(
+        &mut self,
+        approver: &str,
+        credential_id: &str,
+        attestation_id: &str,
+        new_counter: u32,
+        now_ms: i64,
+    ) {
+        // Verification already established the credential is enrolled and
+        // the counter strictly increases; nothing here can fail.
+        let key = (approver.to_string(), credential_id.to_string());
         if let Some(entry) = self.enrolled_credentials.get_mut(&key) {
-            entry.sign_count = sign_count;
+            entry.sign_count = new_counter;
         }
-        Ok(())
+        self.mark_seen(attestation_id, now_ms);
     }
 }
 
 impl VhlVerifier for CourierVhlVerifier {
     fn verify_approval(
-        &mut self,
+        &self,
         request: &VhlApprovalRequest,
         attestation: &Attestation,
-        challenges: &mut ChallengeRegistry,
+        challenges: &ChallengeRegistry,
         now_ms: i64,
     ) -> Result<VerifiedApproval, VhlError> {
         // Structural validity (version gate lives in signing_bytes).
@@ -1486,33 +1574,78 @@ impl VhlVerifier for CourierVhlVerifier {
         if !attestation.proof.kind.authorizes_exceptional() {
             return Err(VhlError::InsufficientProof(attestation.proof.kind));
         }
-        match attestation.proof.kind {
-            ProofKind::Fido2 => self.verify_fido2(attestation, &expected_hash)?,
+        // Side-effect-free: verify the ceremony without consuming it. The
+        // commit step consumes the proof once the audit is durable, so a
+        // failed audit leaves the proof valid and the approval retryable.
+        let consumption = match attestation.proof.kind {
+            ProofKind::Fido2 => {
+                let new_counter = self.check_fido2(attestation, &expected_hash)?;
+                let credential_id = attestation
+                    .proof
+                    .credential_id
+                    .as_deref()
+                    .ok_or_else(|| VhlError::Fido2("missing credential id".to_string()))?;
+                VerifiedConsumption::Fido2 {
+                    approver: attestation.approver.clone(),
+                    credential_id: credential_id.to_string(),
+                    attestation_id: attestation.id.clone(),
+                    new_counter,
+                }
+            }
             ProofKind::Challenge => {
                 let challenge_id = attestation.proof.challenge_id.as_deref().ok_or_else(|| {
                     VhlError::Challenge("challenge proof without challenge_id".to_string())
                 })?;
-                // Consuming (not just reading) the ceremony: each ceremony
-                // authorizes at most one decision.
-                if !challenges.consume_completed(challenge_id, &request.action_digest, now_ms) {
+                // Pure check (not consumption): each ceremony authorizes at
+                // most one decision, committed below.
+                if !challenges.is_consumable(challenge_id, &request.action_digest, now_ms) {
                     return Err(VhlError::Challenge(
                         "no unused completed hold-and-release ceremony for this action".to_string(),
                     ));
+                }
+                VerifiedConsumption::Challenge {
+                    challenge_id: challenge_id.to_string(),
                 }
             }
             ProofKind::Session | ProofKind::Pin => {
                 return Err(VhlError::InsufficientProof(attestation.proof.kind));
             }
-        }
-        // All checks passed: consume the attestation id so exact replays
-        // fail, then report the verified approval.
-        self.mark_seen(&attestation.id, now_ms);
+        };
+        // All checks passed. Nothing is consumed here — the caller commits
+        // via commit_verified once the decision is durable.
         Ok(VerifiedApproval {
             attestation_id: attestation.id.clone(),
             approver: attestation.approver.clone(),
             proof_kind: attestation.proof.kind,
             decided_at_ms: now_ms,
+            consumption,
         })
+    }
+
+    fn commit_verified(&mut self, verified: &VerifiedApproval, challenges: &mut ChallengeRegistry) {
+        // All consumption lands together, after the audit is durable. Every
+        // step is infallible (verified state is only re-asserted, never
+        // re-checked), so the proof can never be half-consumed.
+        match &verified.consumption {
+            VerifiedConsumption::Challenge { challenge_id } => {
+                challenges.commit_consume(challenge_id);
+                self.mark_seen(&verified.attestation_id, verified.decided_at_ms);
+            }
+            VerifiedConsumption::Fido2 {
+                approver,
+                credential_id,
+                attestation_id,
+                new_counter,
+            } => {
+                self.commit_fido2(
+                    approver,
+                    credential_id,
+                    attestation_id,
+                    *new_counter,
+                    verified.decided_at_ms,
+                );
+            }
+        }
     }
 
     fn keys_for(&self, approver: &str) -> Vec<VerifyingKey> {
@@ -1609,6 +1742,10 @@ impl StandingLeaseConfirmation {
     pub fn confirmed_at_ms(&self) -> i64 {
         self.confirmed_at_ms
     }
+
+    pub fn view_hash(&self) -> &[u8; 32] {
+        &self.view_hash
+    }
 }
 
 /// Orchestrates the approval state machine: opening requests, verifying
@@ -1675,10 +1812,22 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         }
         let verified =
             self.verifier
-                .verify_approval(request, attestation, &mut self.challenges, now_ms)?;
-        // Audit before mutating request state: if the audit append fails,
-        // the request stays Requested and the failure is fail-closed
-        // instead of leaving state and audit diverged.
+                .verify_approval(request, attestation, &self.challenges, now_ms)?;
+        // Order: verify (pure) → audit → commit proof consumption →
+        // transition request. The verifier consumes nothing, so a failed
+        // audit append leaves the challenge/FIDO2 proof unconsumed and the
+        // approval retryable — no stranded valid proof.
+        // Precompute the post-decision request state on a clone BEFORE the
+        // audit: decide_approved is fallible (the request can expire), and
+        // it must never fail after the audit is durable and the proof is
+        // committed — that would strand a consumed proof on a
+        // non-approved request. The final assignment below is infallible.
+        let mut prepared = request.clone();
+        prepared.decide_approved(
+            &verified.attestation_id,
+            &verified.approver,
+            verified.decided_at_ms,
+        )?;
         audit.record_vhl(
             &verified.approver,
             &request.session_subject,
@@ -1691,11 +1840,9 @@ impl<V: VhlVerifier> VhlAuthority<V> {
             }),
             now_ms,
         )?;
-        request.decide_approved(
-            &verified.attestation_id,
-            &verified.approver,
-            verified.decided_at_ms,
-        )?;
+        self.verifier
+            .commit_verified(&verified, &mut self.challenges);
+        *request = prepared;
         Ok(verified)
     }
 
@@ -1892,8 +2039,15 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         }
         let verified =
             self.verifier
-                .verify_approval(request, attestation, &mut self.challenges, now_ms)?;
-        // Audit before mutating request state (see decide()).
+                .verify_approval(request, attestation, &self.challenges, now_ms)?;
+        // Order: verify (pure) → prepare → audit → commit proof
+        // consumption → assign prepared state (see decide()).
+        let mut prepared = request.clone();
+        prepared.decide_approved(
+            &verified.attestation_id,
+            &verified.approver,
+            verified.decided_at_ms,
+        )?;
         audit.record_vhl(
             &verified.approver,
             &request.session_subject,
@@ -1905,15 +2059,20 @@ impl<V: VhlVerifier> VhlAuthority<V> {
             }),
             now_ms,
         )?;
-        request.decide_approved(
-            &verified.attestation_id,
-            &verified.approver,
-            verified.decided_at_ms,
-        )?;
+        self.verifier
+            .commit_verified(&verified, &mut self.challenges);
+        // Bind the confirmation to the exact view the human reviewed: the
+        // mint re-hashes and rejects any later widening.
+        let body = request
+            .render_body()
+            .map_err(|e| VhlError::Encoding(e.to_string()))?;
+        let view_hash = body_hash(&body);
+        *request = prepared;
         Ok(StandingLeaseConfirmation {
             request_id: request.request_id.clone(),
             approver: verified.approver,
             confirmed_at_ms: verified.decided_at_ms,
+            view_hash,
         })
     }
 

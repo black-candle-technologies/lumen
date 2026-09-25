@@ -71,8 +71,9 @@ impl NonceStore {
         Ok(())
     }
 
-    /// Explicitly forget a nonce (used only in tests / controlled reset).
-    #[cfg(test)]
+    /// Explicitly forget a nonce. Used to roll back a mint whose durable
+    /// step failed after the lease engine ran, so the approval stays
+    /// retryable instead of stranding a valid approval with a spent nonce.
     pub fn forget(&self, nonce: &str) {
         self.inner
             .lock()
