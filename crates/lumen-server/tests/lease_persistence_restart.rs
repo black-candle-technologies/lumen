@@ -52,9 +52,9 @@ use lumen_db::Database;
 use lumen_db::lease::KernelAuditQuery;
 use lumen_server::{
     ActionEnvelope, AuthorityDb, AuthorityKernelClient, AuthorityKernelConfig, Catalog,
-    CatalogError, EffectClass, KernelClient, KernelError, LeaseDocument, LeaseLimits as HostLeaseLimits,
-    MockSandboxRunner, OneShotGrant, PiToolRequest, ProjectionKind, SessionIdentityAuthority,
-    ToolDef, ToolOutcome, ToolPipeline, now_ms,
+    CatalogError, EffectClass, KernelClient, KernelError, LeaseDocument,
+    LeaseLimits as HostLeaseLimits, MockSandboxRunner, OneShotGrant, PiToolRequest, ProjectionKind,
+    SessionIdentityAuthority, ToolDef, ToolOutcome, ToolPipeline, now_ms,
 };
 
 /// Stub operator authority: allows or denies every `KeyManagement`
