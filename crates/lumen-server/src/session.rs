@@ -514,6 +514,20 @@ pub struct TerminationReport {
     pub identity_destroyed: bool,
 }
 
+/// Termination lifecycle of a session.
+///
+/// A failed termination attempt returns to [`TerminationState::Active`]
+/// so the next `terminate()` retries the incomplete steps (vault identity
+/// destruction, lease revocation, child shutdown) instead of falsely
+/// reporting success. Only [`TerminationState::Terminated`] — set after
+/// every step has completed — yields the idempotent success report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationState {
+    Active,
+    Terminating,
+    Terminated,
+}
+
 /// Kernel channel material handed to a freshly spawned Pi child.
 struct ChannelLaunch<'a> {
     socket_path: &'a Path,
@@ -551,7 +565,7 @@ struct SessionInner {
     last_activity: Instant,
     created_at: Instant,
     malformed_count: u32,
-    terminated: bool,
+    termination: TerminationState,
     event_tx: broadcast::Sender<SupervisorEvent>,
     stderr_tail: VecDeque<String>,
     /// Per-session kernel channel credential (hex). `None` when the
@@ -660,7 +674,7 @@ impl SupervisorInner {
         };
         let child = {
             let mut inner = session.lock().await;
-            if inner.terminated
+            if !matches!(inner.termination, TerminationState::Active)
                 || matches!(
                     inner.status,
                     SessionStatus::Interrupted { .. } | SessionStatus::Terminated
@@ -741,16 +755,18 @@ impl SessionSupervisor {
                 None => return,
             }
         };
-        let (status, idle_for, age, terminated) = {
+        let (status, idle_for, age, termination) = {
             let inner_session = session.lock().await;
             (
                 inner_session.status.clone(),
                 inner_session.last_activity.elapsed(),
                 inner_session.created_at.elapsed(),
-                inner_session.terminated,
+                inner_session.termination,
             )
         };
-        if terminated || !matches!(status, SessionStatus::Running | SessionStatus::Paused) {
+        if !matches!(termination, TerminationState::Active)
+            || !matches!(status, SessionStatus::Running | SessionStatus::Paused)
+        {
             return;
         }
         if age > inner.config.max_lifetime {
@@ -908,7 +924,7 @@ impl SessionSupervisor {
             last_activity: Instant::now(),
             created_at: Instant::now(),
             malformed_count: 0,
-            terminated: false,
+            termination: TerminationState::Active,
             event_tx,
             stderr_tail: VecDeque::new(),
             channel_credential,
@@ -1272,7 +1288,10 @@ impl SessionSupervisor {
                 let (expected, current) = match entry {
                     Some(session) => {
                         let guard = session.lock().await;
-                        (guard.terminated, guard.generation == generation)
+                        (
+                            !matches!(guard.termination, TerminationState::Active),
+                            guard.generation == generation,
+                        )
                     }
                     None => (true, false),
                 };
@@ -1310,22 +1329,39 @@ impl SessionSupervisor {
         session: &Arc<tokio::sync::Mutex<SessionInner>>,
         _reason: &str,
     ) -> Result<TerminationReport, SupervisorError> {
-        // Idempotent: the first caller wins; later callers get the report
-        // of an already-terminated session.
-        let already = { session.lock().await.terminated };
-        let session_id = { session.lock().await.id };
-        if already {
-            return Ok(TerminationReport {
-                session_id,
-                leases_revoked: true,
-                revoke_error: None,
-                identity_destroyed: true,
-            });
-        }
-        {
+        // Termination is a one-way latch with a retryable middle state,
+        // checked and armed under a single lock acquisition so two
+        // concurrent callers cannot both own the cleanup:
+        // - `Terminated`: every step completed; report idempotent success.
+        // - `Terminating`: another call owns the in-flight cleanup; report
+        //   honestly instead of claiming success.
+        // - `Active`: this call owns the cleanup. A failed attempt drops
+        //   back to `Active` so the next `terminate()` retries the
+        //   incomplete steps (vault identity destruction, lease
+        //   revocation, child shutdown) rather than falsely reporting
+        //   that the identity was destroyed and all leases revoked.
+        let session_id = {
             let mut guard = session.lock().await;
-            guard.terminated = true;
-        }
+            match guard.termination {
+                TerminationState::Terminated => {
+                    return Ok(TerminationReport {
+                        session_id: guard.id,
+                        leases_revoked: true,
+                        revoke_error: None,
+                        identity_destroyed: true,
+                    });
+                }
+                TerminationState::Terminating => {
+                    return Err(SupervisorError::TerminateFailed(
+                        "termination already in progress".to_string(),
+                    ));
+                }
+                TerminationState::Active => {
+                    guard.termination = TerminationState::Terminating;
+                    guard.id
+                }
+            }
+        };
 
         // 1. Destroy the session identity through the vault FIRST. The
         //    vault reports the destroyed subject plus every vault-known
@@ -1333,11 +1369,18 @@ impl SessionSupervisor {
         //    revoking ensures no new authority can be minted from a
         //    subject whose leases are about to die.
         let subject = { session.lock().await.binding.session_subject.clone() };
-        let end_report = inner
-            .kernel
-            .destroy_session_identity(&subject)
-            .await
-            .map_err(|e| SupervisorError::TerminateFailed(format!("vault destroy failed: {e}")))?;
+        let end_report = match inner.kernel.destroy_session_identity(&subject).await {
+            Ok(report) => report,
+            Err(e) => {
+                // The identity may still be live (e.g. transient vault
+                // failure): drop back to `Active` so the next
+                // `terminate()` retries instead of reporting success.
+                session.lock().await.termination = TerminationState::Active;
+                return Err(SupervisorError::TerminateFailed(format!(
+                    "vault destroy failed: {e}"
+                )));
+            }
+        };
 
         // 2. Revoke leases for EVERY affected subject (parent + all
         //    descendants). A revocation failure is fatal: the session
@@ -1355,6 +1398,10 @@ impl SessionSupervisor {
             guard.status = SessionStatus::Interrupted {
                 reason: error.clone(),
             };
+            // Leases may still be live: drop back to `Active` so the next
+            // `terminate()` retries the revocation (and the vault
+            // destroy, which is idempotent) instead of reporting success.
+            guard.termination = TerminationState::Active;
             let _ = inner.store.update_status(
                 &guard.id,
                 SessionStatus::Interrupted {
@@ -1394,10 +1441,13 @@ impl SessionSupervisor {
 
         // 4. Cleanup: clear the local fingerprint (the vault holds no more
         //    material for this subject) and persist the terminal state.
+        //    Only now is termination complete: a later `terminate()`
+        //    observes `Terminated` and reports the idempotent success.
         {
             let mut guard = session.lock().await;
             guard.identity_fingerprint = None;
             guard.status = SessionStatus::Terminated;
+            guard.termination = TerminationState::Terminated;
             let _ = inner
                 .store
                 .update_status(&guard.id, SessionStatus::Terminated, Some(now_ms()));
@@ -1417,7 +1467,8 @@ impl SessionSupervisor {
         let session = self.inner.session(id).await?;
         let terminated = {
             let guard = session.lock().await;
-            guard.terminated && matches!(guard.status, SessionStatus::Terminated)
+            matches!(guard.termination, TerminationState::Terminated)
+                && matches!(guard.status, SessionStatus::Terminated)
         };
         if !terminated {
             return Err(SupervisorError::Interrupted(
@@ -1448,7 +1499,7 @@ impl ChannelSessionResolver for SessionSupervisor {
             let guard = session.lock().await;
             // Only live sessions authenticate. Termination revokes the
             // credential first, but the check stays: fail closed.
-            if guard.terminated {
+            if !matches!(guard.termination, TerminationState::Active) {
                 return None;
             }
             let child_pid = match guard.child.as_ref() {
@@ -2298,6 +2349,45 @@ mod tests {
 
         kernel.fail_revoke(false);
         handle.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminate_retries_after_revoke_failure() {
+        let (supervisor, kernel) = supervisor(test_config());
+        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+
+        // First attempt: lease revocation fails. Termination must surface
+        // the failure, not claim success.
+        kernel.fail_revoke(true);
+        let err = handle
+            .terminate()
+            .await
+            .expect_err("revoke failure must fail terminate");
+        assert!(
+            matches!(err, SupervisorError::TerminateFailed(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(matches!(
+            handle.status().await.unwrap(),
+            SessionStatus::Interrupted { .. }
+        ));
+        assert!(
+            kernel.revoked_subjects().is_empty(),
+            "failed revocation must not record subjects"
+        );
+
+        // Second attempt: the incomplete termination is retried for real
+        // and completes. (The old code returned a success report here
+        // without revoking anything.)
+        kernel.fail_revoke(false);
+        let report = handle.terminate().await.unwrap();
+        assert!(report.identity_destroyed);
+        assert!(report.leases_revoked);
+        assert_eq!(handle.status().await.unwrap(), SessionStatus::Terminated);
+        assert!(
+            !kernel.revoked_subjects().is_empty(),
+            "retry must actually revoke"
+        );
     }
 
     #[tokio::test]
