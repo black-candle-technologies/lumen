@@ -1208,6 +1208,9 @@ fn to_core_lease(lease: &LeaseDocument) -> Result<CoreLeaseDocument, String> {
         depth_limit: lease.depth_limit,
         lease_nonce: lease.lease_nonce.clone(),
         signature: lease.signature.clone(),
+        // The host lease document predates the approved-action digest;
+        // it is not present to convert.
+        approved_action_digest: None,
     })
 }
 

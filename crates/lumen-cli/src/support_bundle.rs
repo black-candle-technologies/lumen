@@ -63,7 +63,7 @@ pub async fn export_bundle(
     // Build under a temp sibling, then the scan gates the final directory.
     // If the scan fails we delete everything: no partial bundle survives.
     let staging = out.with_extension(format!("staging-{}", Uuid::new_v4().simple()));
-    fs::create_dir_all(&staging)?;
+    create_staging_dir(&staging)?;
     let result = build_and_scan(config, database, config_path, &staging, out, audit_only).await;
     match result {
         Ok(report) => {
@@ -75,6 +75,25 @@ pub async fn export_bundle(
             Err(error)
         }
     }
+}
+
+/// Create the staging directory with owner-only permissions. The bundle can
+/// contain audit trails and configuration; it must not be world-readable
+/// while being assembled.
+fn create_staging_dir(staging: &Path) -> Result<(), SupportBundleError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(staging)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(staging)?;
+    }
+    Ok(())
 }
 
 async fn build_and_scan(
@@ -562,6 +581,20 @@ fn looks_like_secret(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let staging = directory.path().join("staging");
+        create_staging_dir(&staging).expect("create staging dir");
+        let mode = fs::metadata(&staging)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
 
     #[test]
     fn config_redaction_replaces_secret_values() {

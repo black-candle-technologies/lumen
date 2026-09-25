@@ -8,8 +8,11 @@ behind by crashes, kills, or failed shutdowns — without touching live work.
 ## Preconditions
 
 - `lumen` CLI with the runtime's `lumen.toml`.
-- The runtime (`lumen serve`) is **stopped** before destructive cleanup, or
-  you have confirmed the target runs are not owned by a live scheduler.
+- For Step 1 (listing runs needing reconciliation), the runtime
+  (`lumen serve`) must be **running** — the reconciliation endpoint is an
+  API call. For Steps 2–3 (manual reconciliation and staging cleanup), the
+  runtime must be **stopped** before destructive cleanup, or you have
+  confirmed the target runs are not owned by a live scheduler.
 
 ## Procedure
 
@@ -57,7 +60,10 @@ behind by crashes, kills, or failed shutdowns — without touching live work.
 - `runs/reconciliation` returns an empty list (or only entries you
   deliberately deferred, each with a recorded reason).
 - `lumen health` passes, including the audit-chain check.
-- No `.staging-*` directories remain under the quarantine root.
+- No **unreferenced** `.staging-*` directories remain under the quarantine
+  root. Directories still referenced by `plugin_staged_packages` must remain
+  intact — do not delete a referenced staging directory to satisfy this
+  check.
 
 ## Failure posture
 

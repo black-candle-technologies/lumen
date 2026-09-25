@@ -53,15 +53,21 @@ chain check.
    investigate before overriding (there is no override flag; remove or
    explicitly allowlist the content first).
 
+   Share only the generated support bundle. Delete the raw
+   `audit-page-*.json` files before sharing; they are unredacted and must
+   not leave the machine.
+
 3. Record the export itself as an audit event (who exported what range,
    when, and the export's own digest), so the export is part of the chain it
    describes.
 
 ## Verification
 
-- `lumen audit verify` exits 0 **after** the export (the export must not
-  mutate the chain; if it did, something wrote to the log outside the
-  append path — escalate).
+- `lumen audit verify` exits 0 **after** the export. The export appends its
+  own audit event (step 3), so verification must include that event: the
+  chain verifies with the export event present, and the recorded export
+  digest matches the exported bytes. Any other post-export mutation is an
+  error — something wrote to the log outside the append path; escalate.
 - The exported pages cover a contiguous `sequence` range with no gaps.
 - The export digest recorded in the audit log matches the exported bytes.
 

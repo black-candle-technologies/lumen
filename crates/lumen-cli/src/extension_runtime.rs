@@ -762,11 +762,17 @@ impl ExtensionAdminExecutor {
         let arguments: VersionArguments = parse_executor(action.arguments())?;
         let (plugin, version) = arguments.parsed()?;
         // Defense in depth: only an approved, unrevoked digest may be
-        // enabled, no matter which surface requested it.
+        // enabled, no matter which surface requested it. Use the installed
+        // digest, not the newest submitted.
+        let installed = self
+            .database
+            .installed_plugin_version(plugin.clone(), version.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "installed plugin version was not found".to_string())?;
         crate::plugin_admission::require_enabled_at(
             &self.data_root,
-            plugin.as_str(),
-            version.as_str(),
+            installed.package_digest().as_str(),
         )
         .map_err(|error| error.to_string())?;
         self.database
@@ -789,8 +795,7 @@ impl ExtensionAdminExecutor {
         let decided_by = format!("{}:{}", actor.provider(), actor.subject());
         let mark = crate::plugin_admission::mark_enabled_at(
             &self.data_root,
-            plugin.as_str(),
-            version.as_str(),
+            installed.package_digest().as_str(),
             &decided_by,
             now().as_u64(),
         );

@@ -1324,6 +1324,20 @@ impl SessionSupervisor {
         }
     }
 
+    /// Kill and reap the Pi child if present. Used on termination failure
+    /// paths: the untrusted agent loop must not keep running after the
+    /// kernel-side teardown failed, even though the termination itself
+    /// remains retryable.
+    async fn kill_and_reap_child(session: &Arc<tokio::sync::Mutex<SessionInner>>) {
+        if let Some(child) = session.lock().await.child.clone() {
+            let _ = child.lock().await.start_kill();
+            let mut guard = child.lock().await;
+            // `wait` on an already-exited child returns immediately and
+            // reaps it; the timeout bounds the pathological case.
+            let _ = tokio::time::timeout(Duration::from_secs(2), guard.wait()).await;
+        }
+    }
+
     async fn terminate_inner(
         inner: &Arc<SupervisorInner>,
         session: &Arc<tokio::sync::Mutex<SessionInner>>,
@@ -1375,6 +1389,9 @@ impl SessionSupervisor {
                 // The identity may still be live (e.g. transient vault
                 // failure): drop back to `Active` so the next
                 // `terminate()` retries instead of reporting success.
+                // Kill and reap the child first: the untrusted agent loop
+                // must not keep running after teardown failed.
+                Self::kill_and_reap_child(session).await;
                 session.lock().await.termination = TerminationState::Active;
                 return Err(SupervisorError::TerminateFailed(format!(
                     "vault destroy failed: {e}"
@@ -1394,6 +1411,10 @@ impl SessionSupervisor {
             }
         }
         if let Some(error) = revoke_error {
+            // Kill and reap the child: the untrusted agent loop must not
+            // keep running after lease revocation failed, even though the
+            // termination remains retryable.
+            Self::kill_and_reap_child(session).await;
             let mut guard = session.lock().await;
             guard.status = SessionStatus::Interrupted {
                 reason: error.clone(),
@@ -1818,13 +1839,25 @@ impl SessionHandle {
 
         // 4. Mint a fresh vault identity. The session id stays stable; the
         //    new `ed25519:` subject and the revocation above are what make
-        //    the new generation's authority fresh.
+        //    the new generation's authority fresh. A mint failure faults
+        //    the session: the old identity is destroyed and the new one
+        //    was never created, so the session cannot continue.
         let (binding, fingerprint) = {
-            let identity = inner
-                .kernel
-                .start_session_identity(None)
-                .await
-                .map_err(|e| SupervisorError::SpawnFailed(format!("vault mint failed: {e}")))?;
+            let identity = match inner.kernel.start_session_identity(None).await {
+                Ok(identity) => identity,
+                Err(e) => {
+                    let reason = format!("vault mint failed; restart aborted: {e}");
+                    inner
+                        .fault_session(
+                            &self.id,
+                            FaultKind::RestartFailed {
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await;
+                    return Err(SupervisorError::SpawnFailed(reason));
+                }
+            };
             let fingerprint = identity.verifying_key_hex.clone();
             let session = inner.session(&self.id).await?;
             let mut guard = session.lock().await;
@@ -1840,9 +1873,25 @@ impl SessionHandle {
         // 5. Rotate the kernel channel credential: the old child's
         //    credential dies with the old generation and is unregistered
         //    before the new child spawns, so it can never authenticate
-        //    the new generation's channel.
+        //    the new generation's channel. A mint failure faults the
+        //    session: without a credential the new child cannot be
+        //    distinguished from the old generation.
         inner.revoke_channel_credential(&self.id);
-        let new_channel_credential = inner.mint_channel_credential(&self.id)?;
+        let new_channel_credential = match inner.mint_channel_credential(&self.id) {
+            Ok(credential) => credential,
+            Err(e) => {
+                let reason = format!("channel credential mint failed; restart aborted: {e}");
+                inner
+                    .fault_session(
+                        &self.id,
+                        FaultKind::RestartFailed {
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await;
+                return Err(SupervisorError::SpawnFailed(reason));
+            }
+        };
         // 6. Spawn the replacement child.
         let (cmd_tx, cmd_rx) = mpsc::channel::<Vec<u8>>(inner.config.outbound_queue_depth);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

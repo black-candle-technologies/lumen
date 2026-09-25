@@ -68,11 +68,11 @@
 //! live host path calls them (verified by grep over `lumen-server`).
 
 use lumen_core::pi_boundary::{
-    self, ActionEnvelope as FrozenEnvelope, DecisionOutcome,
-    EffectClasses as FrozenEffectClasses, InputRef as FrozenInputRef, LeaseId,
-    NetworkResource as FrozenNet, Obligation as FrozenObligation, PathResource as FrozenPath,
-    PathRights as FrozenRights, PolicyDecision as FrozenDecision, ResourceSet as FrozenResources,
-    SecretRef as FrozenSecret, ToolRef as FrozenToolRef,
+    self, ActionEnvelope as FrozenEnvelope, DecisionOutcome, EffectClasses as FrozenEffectClasses,
+    InputRef as FrozenInputRef, LeaseId, NetworkResource as FrozenNet,
+    Obligation as FrozenObligation, PathResource as FrozenPath, PathRights as FrozenRights,
+    PolicyDecision as FrozenDecision, ResourceSet as FrozenResources, SecretRef as FrozenSecret,
+    ToolRef as FrozenToolRef,
 };
 use uuid::Uuid;
 
@@ -298,6 +298,18 @@ fn to_host_obligation(ob: &FrozenObligation) -> Obligation {
         FrozenObligation::RequireSandboxProfile { profile } => Obligation {
             kind: "require_sandbox_profile".to_string(),
             params: serde_json::json!({ "profile": profile }),
+        },
+        FrozenObligation::SettleBudget {
+            reservation_id,
+            lease_id,
+            action_id,
+        } => Obligation {
+            kind: "settle_budget".to_string(),
+            params: serde_json::json!({
+                "reservation_id": reservation_id,
+                "lease_id": lease_id,
+                "action_id": action_id,
+            }),
         },
     }
 }

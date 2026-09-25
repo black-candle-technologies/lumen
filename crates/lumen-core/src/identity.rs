@@ -1,12 +1,14 @@
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 macro_rules! uuid_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(
+            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+        )]
         #[serde(transparent)]
         pub struct $name(Uuid);
 

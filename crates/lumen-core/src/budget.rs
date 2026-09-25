@@ -445,6 +445,9 @@ impl BudgetLedger {
             }
         }
         inner.accounts.remove(lease_id);
+        Ok(())
+    }
+
     /// Restore a lease's full budget account state from durable storage
     /// (caps, reservations held, and consumed spend). Used at kernel open
     /// so the ledger reflects spend settled before a restart; without
@@ -472,6 +475,9 @@ impl BudgetLedger {
             LeaseAccount {
                 caps: caps.clone(),
                 reserved_out: reserved_out.clone(),
+                // The durable schema predates exec-held tracking; a
+                // restored account starts with nothing held.
+                exec_held: Budget::new(),
                 consumed: consumed.clone(),
             },
         );

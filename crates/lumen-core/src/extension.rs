@@ -679,7 +679,7 @@ pub enum InvocationContractError {
     UndeclaredActionKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExtensionProvenance {
     plugin_id: PluginId,
     plugin_version: PluginVersion,

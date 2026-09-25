@@ -281,9 +281,53 @@ impl LocalRuntimeService {
                 .await
                 .map_err(|error| ServiceError::Internal(error.to_string()))?;
         } else {
+            // The run may belong to a runtime instance that has since exited
+            // (e.g. the transient CLI runtime for approval-bound plugin
+            // administration). Rehydrate it so the decision takes effect.
+            if !self.runs.lock().await.contains_key(&run_id) {
+                self.rehydrate_parked_run(run_id, command.workspace_id(), command.approval_id())
+                    .await?;
+            }
             self.spawn_advance(run_id).await;
         }
         Ok(result)
+    }
+
+    /// Rehydrate a run parked in `awaiting_approval` whose creating runtime is
+    /// gone. Rebuilds the minimal run state needed for the orchestrator to
+    /// resolve the (now decided) approval and continue, then adopts the parked
+    /// run so this instance owns it.
+    async fn rehydrate_parked_run(
+        &self,
+        run_id: RunId,
+        workspace_id: lumen_core::identity::WorkspaceId,
+        approval_id: ApprovalId,
+    ) -> Result<(), ServiceError> {
+        // The approval was just decided via the (possibly rehydrated) record;
+        // fetch the action from the registry.
+        let action = self
+            .approvals
+            .decided_action(approval_id)
+            .await
+            .ok_or(ServiceError::NotFound)?;
+        let context = RunContext::new(run_id, workspace_id, action.actor().clone());
+        let mut state = RunState::new(context, "rehydrated approval-bound action", self.budget);
+        state.restore_pending_approval_action(action, approval_id);
+        self.database
+            .adopt_parked_run_for_resume(run_id, workspace_id, self.owner_instance_id, now())
+            .await
+            .map_err(repository_service_error)?;
+        let stored = StoredRun {
+            workspace_id,
+            state,
+            model_override: None,
+            capabilities_override: None,
+            scheduled_handoff: None,
+            start_disposition: StartDisposition::ScheduledStartCommitted,
+        };
+        self.runs.lock().await.insert(run_id, stored);
+        self.run_available.notify_waiters();
+        Ok(())
     }
 
     async fn renew_approval_admitted(
@@ -5228,6 +5272,31 @@ impl ApprovalRegistry {
         command: &ApprovalDecisionCommand,
     ) -> Result<(RunId, ApprovalResult), ServiceError> {
         let mut records = self.records.lock().await;
+        if let std::collections::btree_map::Entry::Vacant(e) = records.entry(command.approval_id())
+        {
+            // The approval may have been created by a different runtime
+            // instance (e.g. the transient CLI runtime for approval-bound
+            // plugin administration) that has since exited. Rehydrate the
+            // record from the database so the decision can be applied.
+            let rehydrated = self
+                .database
+                .load_pending_approval(
+                    command.workspace_id(),
+                    command.approval_id(),
+                    self.clock.now(),
+                )
+                .await
+                .map_err(repository_service_error)?
+                .ok_or(ServiceError::NotFound)?;
+            e.insert(ApprovalRecord {
+                workspace_id: rehydrated.workspace_id(),
+                run_id: rehydrated.run_id(),
+                action: rehydrated.action().clone(),
+                request: rehydrated.request().clone(),
+                attempt_id: None,
+                renewed: false,
+            });
+        }
         let record = records
             .get_mut(&command.approval_id())
             .ok_or(ServiceError::NotFound)?;
@@ -5294,6 +5363,16 @@ impl ApprovalRegistry {
             record.run_id,
             ApprovalResult::new(command.approval_id(), command.decision()),
         ))
+    }
+
+    /// Fetch the action for a decided approval. Used when rehydrating a run
+    /// whose record was restored from the database.
+    async fn decided_action(&self, approval_id: ApprovalId) -> Option<ActionEnvelope> {
+        self.records
+            .lock()
+            .await
+            .get(&approval_id)
+            .map(|record| record.action.clone())
     }
 
     async fn renew(

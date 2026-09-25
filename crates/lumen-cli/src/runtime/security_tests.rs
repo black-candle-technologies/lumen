@@ -70,8 +70,7 @@ use crate::{
     plugin_admission::admission_store_at,
 };
 use lumen_integrations::admission::{
-    AdmissionDigests, AdmissionRecord, AdmissionTestLeg, AdmissionTestReport, DeclaredPermission,
-    LockedSource,
+    AdmissionDigests, AdmissionRecord, AdmissionTestLeg, AdmissionTestReport, LockedSource,
 };
 
 const TOKEN: &str = "security-test-token";
@@ -1178,20 +1177,7 @@ fn admit_lifecycle_fixture(
         staged.manifest_digest(),
         manifest.integrity().artifact(),
     );
-    let declared_permissions = manifest
-        .components()
-        .iter()
-        .flat_map(|component| {
-            component
-                .capabilities()
-                .iter()
-                .map(|capability| DeclaredPermission {
-                    component_id: component.id().to_string(),
-                    capability: format!("{capability:?}"),
-                    scope: "test".into(),
-                })
-        })
-        .collect();
+    let declared_permissions = crate::plugin_admission::declared_permissions(manifest);
     let mut record = AdmissionRecord::new(
         manifest.id().to_string(),
         manifest.version().to_string(),
@@ -4149,27 +4135,25 @@ async fn approval_granted_before_run_is_parked_still_resumes_dispatch() {
     )
     .await;
     wait_for_run_state(&harness, &run_id.to_string(), "awaiting_approval").await;
-    let stored = tokio::time::timeout(Duration::from_secs(2), async {
+    // Simulate the race: the run is parked in the database but not in this
+    // runtime's memory (e.g. the creating runtime exited). Remove it from
+    // memory; the approval decision must rehydrate it automatically.
+    let removed = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(stored) = harness.service.runs.lock().await.remove(&run_id) {
-                return stored;
+            if harness.service.runs.lock().await.remove(&run_id).is_some() {
+                return true;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("run parked before injected race");
+    assert!(removed);
     approve_pending(&harness).await;
+    // The approval decision rehydrates the parked run; no manual re-insertion
+    // is needed. Wait for the run to complete.
     tokio::time::timeout(
-        Duration::from_secs(2),
-        harness.service.missing_run_observed.notified(),
-    )
-    .await
-    .expect("approval advance observed the missing parked run");
-    harness.service.runs.lock().await.insert(run_id, stored);
-    harness.service.run_available.notify_waiters();
-    tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         wait_for_run_state(&harness, &run_id.to_string(), "completed"),
     )
     .await

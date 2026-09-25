@@ -102,7 +102,7 @@ impl CapabilityName {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WorkspacePath(String);
 
 impl WorkspacePath {
@@ -138,7 +138,7 @@ impl WorkspacePath {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResourceScope {
     Workspace {
@@ -204,7 +204,7 @@ impl ResourceScope {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Capability {
     name: CapabilityName,
     scope: ResourceScope,

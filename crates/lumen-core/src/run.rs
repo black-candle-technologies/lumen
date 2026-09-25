@@ -358,6 +358,22 @@ impl RunState {
                 .is_some_and(|pending| pending.approval_id == approval_id)
     }
 
+    /// Restore a pending approval-bound action when rehydrating a run whose
+    /// creating runtime is gone. The action must have been previously
+    /// normalized and persisted; this re-arms the orchestrator to resolve the
+    /// (now decided) approval and continue.
+    pub fn restore_pending_approval_action(
+        &mut self,
+        action: ActionEnvelope,
+        approval_id: ApprovalId,
+    ) {
+        self.pending_action = Some(PendingAction {
+            action,
+            approval_id,
+            tool_call_id: None,
+        });
+    }
+
     pub fn renew_pending_approval(
         &mut self,
         previous: ApprovalId,

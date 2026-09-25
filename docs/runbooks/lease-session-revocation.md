@@ -13,7 +13,7 @@ actions can be authorized under it.
 > `lumen lease` / `lumen session` report that revocation is unavailable rather
 > than pretending to revoke. Use the procedure below once the Phase-1
 > authority kernel lands; until then, the closest available controls are run
-> cancellation and approval invalidation (steps 1-3).
+> cancellation and approval invalidation (see “Until Phase-1 lands” below).
 
 ## Preconditions
 
@@ -62,8 +62,10 @@ actions can be authorized under it.
 
 - `lumen lease show <lease-id>` reports state `revoked` with the revocation
   record (revoked_by, revoked_at, reason).
-- `lumen lease show <lease-id>` for each descendant reports `revoked`
-  (cascade).
+- Descendant leases are invalidated by the parent revocation during
+  validation (the cascade is enforced at validation time, not by writing a
+  separate revoked record per descendant); do not expect each descendant to
+  report an individual `revoked` state.
 - No run bound to the lease reports an `active` phase in
   `lumen run show <run-id>`.
 - The audit log contains the revocation event; chain still verifies:

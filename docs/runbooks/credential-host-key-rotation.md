@@ -3,8 +3,11 @@
 ## Purpose
 
 Rotate every credential the runtime depends on — the API bearer token,
-provider credentials, and host keys — without downtime and without ever
-exposing a secret value in logs, shell history, or the audit trail.
+provider credentials, and host keys — without ever exposing a secret value
+in logs, shell history, or the audit trail. The API token rotation requires
+a runtime restart; expect a brief maintenance interruption while the service
+restarts (there is no rolling or dual-token acceptance; plan the window
+accordingly).
 
 ## Preconditions
 
@@ -19,11 +22,16 @@ exposing a secret value in logs, shell history, or the audit trail.
 
 1. Generate a new token out-of-band (e.g. `openssl rand -hex 32`). Do not
    paste it into chat, tickets, or the audit log.
-2. Update the token where the runtime reads it:
+2. Update the token where the runtime reads it. Do not embed the secret in
+   command text (it would land in shell history); write it via a file
+   descriptor or a secret manager instead:
    ```
    # the runtime reads the token from the environment variable named in lumen.toml
-   export <TOKEN_ENV_VAR>='<new-token>'   # in the service's environment, then restart
+   # Write the new token to the service environment file without echoing it:
+   printf '%s' "$(cat /run/lumen/new-token)" >> /etc/lumen/environment
+   # Or: update the secret in your secret manager and re-render the environment.
    ```
+   Then restart the runtime (see step 3).
    The server authenticates with `state.authenticate(authorization)` on every
    request; there is no token cache beyond the process, so a restart applies
    the rotation atomically.
@@ -72,7 +80,7 @@ Provider credentials live in the OS keyring, referenced by id from
 - `lumen health` passes.
 - Old token returns `401`; new token returns `200`.
 - `lumen secret list` shows only the new reference ids (labels only, never values).
-- No secret value appears in the support bundle: `lumen support bundle --out`
+- No secret value appears in the support bundle: `lumen support bundle --out /tmp/rotation-check`
   runs a secret scan that **blocks** export on any hit.
 
 ## Failure posture

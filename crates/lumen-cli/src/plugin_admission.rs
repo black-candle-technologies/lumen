@@ -232,6 +232,7 @@ pub struct TestOutcome {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdmissionPolicyFile {
     #[serde(default)]
     allowed_capabilities: Vec<String>,
@@ -239,13 +240,23 @@ struct AdmissionPolicyFile {
     denied_capabilities: Vec<String>,
 }
 
-fn load_admission_policy(config: &Config) -> Option<AdmissionPolicyFile> {
+fn load_admission_policy(config: &Config) -> Result<Option<AdmissionPolicyFile>> {
     let path = config
         .runtime
         .data_directory
         .join("plugins/admission-policy.toml");
-    let bytes = std::fs::read(path).ok()?;
-    toml::from_slice(&bytes).ok()
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AdmissionCommandError::Io(error)),
+    };
+    let policy: AdmissionPolicyFile = toml::from_slice(&bytes).map_err(|error| {
+        AdmissionCommandError::Refused(format!(
+            "admission policy {} is malformed: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(policy))
 }
 
 /// The admission test suite. Every leg re-derives its result from the staged
@@ -291,11 +302,11 @@ fn run_test_legs(config: &Config, staged: &StagedPluginPackage) -> Result<Vec<Ad
     // Leg 3: static manifest checks on the staged bytes.
     let manifest_ok = {
         let components = staged.manifest().components();
+        let entrypoint = staged.manifest().runtime().entrypoint().as_str();
         let entrypoint_digest = staged
             .file_hashes()
-            .iter()
-            .find(|(path, _)| path.ends_with(staged.manifest().runtime().entrypoint().as_str()))
-            .map(|(_, digest)| digest.to_string());
+            .get(entrypoint)
+            .map(|digest| digest.to_string());
         !components.is_empty()
             && components.len() <= 128
             && components
@@ -321,7 +332,7 @@ fn run_test_legs(config: &Config, staged: &StagedPluginPackage) -> Result<Vec<Ad
     // capability names; without one, the declared set is surfaced for the
     // human approval step, which remains the enforcement point.
     let permissions = declared_permissions(staged.manifest());
-    let (policy_ok, policy_detail) = match load_admission_policy(config) {
+    let (policy_ok, policy_detail) = match load_admission_policy(config)? {
         Some(policy) => {
             let denied: Vec<_> = permissions
                 .iter()
@@ -475,8 +486,7 @@ pub fn require_installable_at(
 /// request a disable of any enabled deployment.
 pub fn revoke(
     config: &Config,
-    plugin_id: &str,
-    version: &str,
+    package_digest: &str,
     reason: &str,
     as_principal: Option<&str>,
     now: TimestampMillis,
@@ -487,9 +497,9 @@ pub fn revoke(
         ));
     }
     let store = admission_store(config)?;
-    let mut record = store.load_by_plugin(plugin_id, version)?.ok_or_else(|| {
+    let mut record = store.load(package_digest)?.ok_or_else(|| {
         AdmissionCommandError::Refused(format!(
-            "no admission record for {plugin_id} {version}; nothing to revoke"
+            "no admission record for digest {package_digest}; nothing to revoke"
         ))
     })?;
     record.revoke(
@@ -500,8 +510,8 @@ pub fn revoke(
     let package_digest = record.digests.package.clone();
     store.save(&record)?;
     Ok(Revocation {
-        plugin_id: plugin_id.to_owned(),
-        version: version.to_owned(),
+        plugin_id: record.plugin_id.clone(),
+        version: record.version.clone(),
         package_digest,
     })
 }
@@ -513,13 +523,14 @@ pub struct Revocation {
     pub package_digest: String,
 }
 
-/// Gate for enable by plugin identity: resolves the digest through the
-/// admission index and requires it to be approved and not revoked.
-pub fn require_enabled_at(data_root: &Path, plugin_id: &str, version: &str) -> Result<String> {
+/// Gate for enable by digest: requires the digest to be approved and not revoked.
+/// The caller must pass the digest actually being installed/enabled (typically
+/// the installed digest from the database), not the newest submitted digest.
+pub fn require_enabled_at(data_root: &Path, package_digest: &str) -> Result<String> {
     let store = admission_store_at(data_root)?;
-    let record = store.load_by_plugin(plugin_id, version)?.ok_or_else(|| {
+    let record = store.load(package_digest)?.ok_or_else(|| {
         AdmissionCommandError::Refused(format!(
-            "no admission record for {plugin_id} {version}; submit, test, and approve it first"
+            "no admission record for digest {package_digest}; submit, test, and approve it first"
         ))
     })?;
     match record.status() {
@@ -537,17 +548,17 @@ pub fn require_enabled_at(data_root: &Path, plugin_id: &str, version: &str) -> R
 }
 
 /// Path-based variant for the action executors: records the Approved →
-/// Enabled transition when the kernel actually enables the digest.
+/// Enabled transition when the kernel actually enables the digest. The caller
+/// must pass the digest actually being enabled.
 pub fn mark_enabled_at(
     data_root: &Path,
-    plugin_id: &str,
-    version: &str,
+    package_digest: &str,
     decided_by: &str,
     now: u64,
 ) -> Result<()> {
     let store = admission_store_at(data_root)?;
-    let mut record = store.load_by_plugin(plugin_id, version)?.ok_or_else(|| {
-        AdmissionCommandError::Refused(format!("no admission record for {plugin_id} {version}"))
+    let mut record = store.load(package_digest)?.ok_or_else(|| {
+        AdmissionCommandError::Refused(format!("no admission record for digest {package_digest}"))
     })?;
     record.mark_enabled(decided_by.to_owned(), now)?;
     store.save(&record)?;

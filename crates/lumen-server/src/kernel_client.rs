@@ -470,6 +470,10 @@ struct MockKernelState {
     deny_reason: String,
     leases: BTreeMap<String, LeaseDocument>,
     revoked_subjects: Vec<String>,
+    /// Parent→child identity links, tracked separately from
+    /// `revoked_subjects` (the audit trail of revoke calls) so a
+    /// restart does not poison the subject's future leases.
+    child_links: Vec<String>,
     /// Lease ids killed by `revoke_session`. Kept separate from
     /// `revoked_subjects` (the audit trail of revoke calls) so a
     /// restart does not poison the subject's future leases.
@@ -742,7 +746,7 @@ impl SessionIdentityAuthority for MockKernelClient {
             let subject = format!("ed25519:mock-session-{id}");
             if let Some(parent) = parent {
                 state
-                    .revoked_subjects
+                    .child_links
                     .push(format!("{parent}::child::{subject}"));
             }
             Ok(SessionIdentityInfo {
@@ -763,7 +767,7 @@ impl SessionIdentityAuthority for MockKernelClient {
             // markers; destroying a parent reports its children as affected.
             let prefix = format!("{subject}::child::");
             let mut affected = vec![subject.clone()];
-            for marker in state.revoked_subjects.iter() {
+            for marker in state.child_links.iter() {
                 if let Some(child) = marker.strip_prefix(&prefix) {
                     affected.push(child.to_string());
                 }

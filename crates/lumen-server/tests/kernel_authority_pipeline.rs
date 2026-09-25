@@ -682,12 +682,9 @@ async fn one_shot_mint_survives_kernel_restart() {
 
     // Phase 1: mint a one-shot lease.
     let (subject, lease_id, approval_id, grant_nonce) = {
-        let f = fixture_with_db_and_workspace(
-            vhl_keys.clone(),
-            Some(db_path.clone()),
-            Some(workspace),
-        )
-        .await;
+        let f =
+            fixture_with_db_and_workspace(vhl_keys.clone(), Some(db_path.clone()), Some(workspace))
+                .await;
         let info = f
             .kernel
             .start_session_identity(None)
@@ -882,7 +879,11 @@ async fn audit_failure_is_fail_closed() {
     // Sanity: the action authorizes before we break the store.
     let outcome = f
         .pipeline
-        .handle(&read_request(&f.leased_file), &subject, std::slice::from_ref(&lease_id))
+        .handle(
+            &read_request(&f.leased_file),
+            &subject,
+            std::slice::from_ref(&lease_id),
+        )
         .await;
     assert!(
         matches!(outcome, ToolOutcome::Completed { .. }),

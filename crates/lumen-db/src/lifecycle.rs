@@ -184,14 +184,20 @@ impl Database {
         current_owner: Uuid,
         now: TimestampMillis,
     ) -> Result<Vec<RunId>, RepositoryError> {
+        // Runs parked in `awaiting_approval` are deliberately NOT reconciled
+        // here. Awaiting a human decision is not abandonment: the approval
+        // record survives in the database and the run can be rehydrated and
+        // resumed by the new owner when the decision arrives (see
+        // `ApprovalRegistry::decide` rehydration). Terminalizing them as
+        // `owner_lost` would strand the pending approval.
         let rows = sqlx::query(
             "SELECT lifecycle.run_id, lifecycle.workspace_id, lifecycle.owner_instance_id
              FROM run_lifecycle lifecycle JOIN agent_runs run ON run.id = lifecycle.run_id
              LEFT JOIN scheduled_job_runs scheduled ON scheduled.run_id = lifecycle.run_id
              WHERE lifecycle.owner_instance_id <> ?
                AND lifecycle.phase IN ('admitted', 'preparing', 'running',
-                                       'awaiting_approval', 'reserving_effect')
-               AND run.state IN ('created', 'running', 'awaiting_approval')
+                                       'reserving_effect')
+               AND run.state IN ('created', 'running')
                AND (scheduled.run_id IS NULL OR scheduled.state = 'running')
              ORDER BY lifecycle.created_at, lifecycle.run_id",
         )
@@ -301,6 +307,46 @@ impl Database {
             now,
         )
         .await
+    }
+
+    /// Adopt a run parked in `awaiting_approval` by a previous owner so the
+    /// current instance can resume it after an approval decision. This is used
+    /// when rehydrating approval-bound runs created by a transient runtime
+    /// (e.g. CLI plugin administration) that has since exited.
+    pub async fn adopt_parked_run_for_resume(
+        &self,
+        run_id: RunId,
+        workspace_id: WorkspaceId,
+        new_owner: Uuid,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let run = sqlx::query(
+            "UPDATE agent_runs SET state = 'running'
+             WHERE id = ? AND workspace_id = ? AND state = 'awaiting_approval'",
+        )
+        .bind(run_id.to_string())
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let lifecycle = sqlx::query(
+            "UPDATE run_lifecycle
+             SET owner_instance_id = ?, phase = 'running', updated_at = ?
+             WHERE run_id = ? AND workspace_id = ? AND phase = 'awaiting_approval'",
+        )
+        .bind(new_owner.to_string())
+        .bind(timestamp_to_i64(now)?)
+        .bind(run_id.to_string())
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if run != 1 || lifecycle != 1 {
+            return Err(RepositoryError::ExecutionStateConflict);
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

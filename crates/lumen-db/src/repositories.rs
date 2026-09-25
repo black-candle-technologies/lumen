@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use lumen_core::{
-    action::{ActionEnvelope, ActionFingerprint, ActionId, CanonicalValue, RunId},
+    action::{ActionEnvelope, ActionFingerprint, ActionId, ActionKind, CanonicalValue, RunId},
     approval::{ApprovalId, ApprovalRequest, ExecutionAttemptId, TimestampMillis},
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope, WorkspacePath},
+    extension::ExtensionProvenance,
     identity::PrincipalId,
-    identity::WorkspaceId,
+    identity::{ComponentId, WorkspaceId},
     policy::PolicyVersion,
     secret::SecretRefId,
 };
@@ -222,6 +223,35 @@ impl PendingApprovalView {
 
     pub const fn expires_at(&self) -> TimestampMillis {
         self.expires_at
+    }
+}
+
+/// A pending approval rehydrated from the database for a runtime that did not
+/// create it. This supports deciding approvals created by a different (now
+/// gone) runtime instance, such as the transient CLI runtime used for
+/// approval-bound plugin administration.
+pub struct RehydratedApproval {
+    action: ActionEnvelope,
+    request: ApprovalRequest,
+    workspace_id: WorkspaceId,
+    run_id: RunId,
+}
+
+impl RehydratedApproval {
+    pub const fn action(&self) -> &ActionEnvelope {
+        &self.action
+    }
+
+    pub const fn request(&self) -> &ApprovalRequest {
+        &self.request
+    }
+
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
     }
 }
 
@@ -1124,6 +1154,112 @@ impl Database {
         .await
         .map(|result| result.rows_affected())
         .map_err(Into::into)
+    }
+
+    /// Load a pending approval and its action for rehydration into a runtime
+    /// that did not create them. Returns `None` when the approval does not
+    /// exist, is not pending, or belongs to a different workspace. Expired
+    /// approvals are expired first so they are never rehydrated as pending.
+    pub async fn load_pending_approval(
+        &self,
+        workspace_id: WorkspaceId,
+        approval_id: ApprovalId,
+        now: TimestampMillis,
+    ) -> Result<Option<RehydratedApproval>, RepositoryError> {
+        self.expire_pending_approvals(workspace_id, now).await?;
+        let row = sqlx::query(
+            "SELECT approvals.id AS approval_id, approvals.action_id,
+                    approvals.action_fingerprint, approvals.policy_version,
+                    approvals.created_at AS approval_created_at,
+                    approvals.expires_at AS approval_expires_at,
+                    actions.run_id, actions.workspace_id,
+                    actions.actor_provider, actions.actor_subject,
+                    actions.requesting_component, actions.kind,
+                    actions.arguments_json, actions.capabilities_json,
+                    actions.extension_provenance_json
+             FROM approval_requests AS approvals
+             JOIN actions ON actions.id = approvals.action_id
+             WHERE approvals.id = ?
+               AND approvals.state = 'pending'
+               AND actions.workspace_id = ?
+               AND actions.fingerprint = approvals.action_fingerprint",
+        )
+        .bind(approval_id.to_string())
+        .bind(workspace_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let row = match row {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+
+        let action_id = parse_uuid(row.try_get::<String, _>("action_id")?, ActionId::from_uuid)?;
+        let run_id = parse_uuid(row.try_get::<String, _>("run_id")?, RunId::from_uuid)?;
+        let workspace_id = parse_uuid(
+            row.try_get::<String, _>("workspace_id")?,
+            WorkspaceId::from_uuid,
+        )?;
+        let actor = PrincipalId::new(
+            row.try_get::<String, _>("actor_provider")?,
+            row.try_get::<String, _>("actor_subject")?,
+        )
+        .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))?;
+        let requesting_component =
+            ComponentId::new(row.try_get::<String, _>("requesting_component")?)
+                .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))?;
+        let kind = ActionKind::new(row.try_get::<String, _>("kind")?)
+            .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))?;
+        let arguments: CanonicalValue =
+            serde_json::from_str(&row.try_get::<String, _>("arguments_json")?)?;
+        let required_capabilities: Vec<Capability> =
+            serde_json::from_str(&row.try_get::<String, _>("capabilities_json")?)?;
+        let provenance: Option<ExtensionProvenance> = row
+            .try_get::<Option<String>, _>("extension_provenance_json")?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        let mut action = ActionEnvelope::new(
+            action_id,
+            run_id,
+            workspace_id,
+            actor,
+            requesting_component,
+            kind,
+            arguments,
+            required_capabilities,
+        );
+        if let Some(provenance) = provenance {
+            action = action.with_extension_provenance(provenance);
+        }
+        // The envelope is fully determined by the persisted columns, so its
+        // fingerprint must match the stored one. A mismatch indicates data
+        // corruption; fail closed rather than rehydrating a divergent action.
+        let stored_fingerprint: String = row.try_get("action_fingerprint")?;
+        if action.fingerprint().as_str() != stored_fingerprint {
+            return Err(RepositoryError::Sqlx(sqlx::Error::Protocol(
+                "rehydrated action fingerprint mismatch".into(),
+            )));
+        }
+
+        let approval_created_at = u64::try_from(row.try_get::<i64, _>("approval_created_at")?)
+            .map_err(|_| RepositoryError::TimestampOutOfRange)?;
+        let approval_expires_at = u64::try_from(row.try_get::<i64, _>("approval_expires_at")?)
+            .map_err(|_| RepositoryError::TimestampOutOfRange)?;
+        let request = ApprovalRequest::new(
+            approval_id,
+            action.fingerprint(),
+            PolicyVersion::new(row.try_get::<String, _>("policy_version")?)
+                .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))?,
+            TimestampMillis::new(approval_created_at),
+            TimestampMillis::new(approval_expires_at),
+        )
+        .map_err(|error| RepositoryError::Sqlx(sqlx::Error::Protocol(error.to_string())))?;
+
+        Ok(Some(RehydratedApproval {
+            action,
+            request,
+            workspace_id,
+            run_id,
+        }))
     }
 
     pub async fn reserve_execution(

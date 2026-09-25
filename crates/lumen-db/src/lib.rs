@@ -42,8 +42,8 @@ pub use extensions::{
 };
 pub use lifecycle::{EffectCertainty, RunLifecycleView, TerminalSpec, TerminalState};
 pub use repositories::{
-    DispatchReservation, PendingApprovalView, RecoveredExecution, SecretReference,
-    SecretReferenceError,
+    DispatchReservation, PendingApprovalView, RecoveredExecution, RehydratedApproval,
+    SecretReference, SecretReferenceError,
 };
 pub use routing::RoutingDispatchRecord;
 pub use worker::WorkerAttemptRecord;

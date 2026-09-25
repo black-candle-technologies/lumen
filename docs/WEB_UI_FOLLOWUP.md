@@ -21,8 +21,8 @@ control-plane API and this document instead.
 2. **Audit view**: hash-chained audit log with chain verification
    (see `docs/runbooks/audit-chain-verification-export.md`).
 3. **Session identities**: per-session ephemeral identity status and
-   explicit destroy (see `SessionIdentityVault` / `SessionRegistry` in
-   `lumen-db`).
+   explicit destroy (see `SessionIdentityVault` in
+   `crates/lumen-core/src/session_identity.rs`).
 4. **Plugin admission**: review queue for plugin digests, test results,
    and approval-bound installs (see `docs/runbooks/plugin-revocation.md`).
 

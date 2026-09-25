@@ -8,8 +8,6 @@ mod kernel_client;
 mod kernel_convert;
 mod model_gateway;
 mod orchestration;
-mod pi_sandbox;
-pub use pi_sandbox::PiSandboxConfig;
 pub mod pi_supervisor;
 mod routes;
 mod sandbox_driver;

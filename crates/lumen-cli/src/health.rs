@@ -38,6 +38,13 @@ pub struct HealthReport {
     pub healthy: bool,
 }
 
+impl HealthReport {
+    pub fn new(checks: Vec<HealthCheck>) -> Self {
+        let healthy = checks.iter().all(|check| check.passed);
+        Self { checks, healthy }
+    }
+}
+
 fn check(name: &str, passed: bool, detail: String) -> HealthCheck {
     HealthCheck {
         name: name.to_owned(),
@@ -206,8 +213,7 @@ pub async fn collect(config: &Config, database: &Database) -> Result<HealthRepor
         },
     ));
 
-    let healthy = checks.iter().all(|check| check.passed);
-    Ok(HealthReport { checks, healthy })
+    Ok(HealthReport::new(checks))
 }
 
 fn parse_host_port(endpoint: &str) -> (Option<String>, Option<u16>) {
@@ -229,13 +235,10 @@ mod tests {
 
     #[test]
     fn report_marks_unhealthy_on_any_failure() {
-        let report = HealthReport {
-            checks: vec![
-                check("a", true, "ok".into()),
-                check("b", false, "broken".into()),
-            ],
-            healthy: false,
-        };
+        let report = HealthReport::new(vec![
+            check("a", true, "ok".into()),
+            check("b", false, "broken".into()),
+        ]);
         assert!(!report.healthy);
         assert_eq!(report.checks.len(), 2);
         assert!(report.checks[0].passed);

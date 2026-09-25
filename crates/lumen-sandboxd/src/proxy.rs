@@ -417,42 +417,29 @@ async fn resolve_destination<U: DnsUpstream + 'static>(
 
 /// CONNECT carries no scheme; the port is the protocol hint. Map it to
 /// the scheme an allowlist entry would use for that protocol, so
-/// `CONNECT example.com:443` authorizes against `https://example.com:443`.
-/// An explicit `tcp://host:port` entry also authorizes a tunnel (the proxy
-/// cannot distinguish TLS from raw TCP inside a CONNECT anyway).
-fn connect_scheme(port: u16) -> &'static str {
-    match port {
-        443 => "https",
-        80 => "http",
-        _ => "tcp",
-    }
-}
-
 /// Authorize one guest request against the run's [`NetworkPolicy`].
 fn authorize(
     policy: &crate::contracts::NetworkPolicy,
     req: &ProxyRequest,
 ) -> Result<network::EgressDestination, SandboxdError> {
     if req.is_connect {
-        let hinted = connect_scheme(req.port);
-        // Try the port-hinted scheme first, then raw tcp: either entry
-        // expresses "this host:port may be tunneled". The deny flags inside
-        // `check_destination` still reject metadata/private/loopback even
-        // when listed.
-        match network::check_destination(policy, hinted, &req.host, req.port) {
-            ok @ Ok(_) => ok,
-            Err(first) => {
-                if hinted == "tcp" {
-                    Err(first)
-                } else {
-                    network::check_destination(policy, "tcp", &req.host, req.port)
-                }
+        // CONNECT carries no scheme on the wire; the tunnel target is just
+        // host:port. An allowlist entry written as `https://host:8443`,
+        // `http://host:8443`, or `tcp://host:8443` all name the same
+        // host:port, so try each scheme for the exact host:port. The deny
+        // flags inside `check_destination` still reject metadata/private/
+        // loopback even when listed.
+        for scheme in ["https", "http", "tcp"] {
+            match network::check_destination(policy, scheme, &req.host, req.port) {
+                ok @ Ok(_) => return ok,
+                Err(_) => continue,
             }
         }
+        // All three schemes failed; return the tcp error for the message.
+        network::check_destination(policy, "tcp", &req.host, req.port)
     } else {
         network::check_destination(policy, &req.scheme, &req.host, req.port)
     }
-}
 }
 
 /// Authorize + resolve + relay one guest connection.

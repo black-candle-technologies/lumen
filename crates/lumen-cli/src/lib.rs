@@ -1104,10 +1104,39 @@ async fn execute_plugin_command(
             if !yes && !confirm_dangerous_action("revoke this plugin digest (terminal)")? {
                 return Err(CliError::Runtime("revocation cancelled".into()));
             }
+            // Revoke the digest actually installed if there is one; otherwise
+            // revoke the newest submitted digest (via the admission index).
+            // This ensures the revoke targets the digest the operator means,
+            // not just whichever the index happens to point at after a newer
+            // submission.
+            let package_digest = match database
+                .installed_plugin_version(
+                    lumen_core::extension::PluginId::parse(&plugin_id)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                    lumen_core::extension::PluginVersion::parse(&version)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                )
+                .await?
+            {
+                Some(installed) => installed.package_digest().as_str().to_owned(),
+                None => {
+                    // Not installed: resolve via the admission index (newest submitted).
+                    let store = plugin_admission::admission_store(config)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?;
+                    let record = store
+                        .load_by_plugin(&plugin_id, &version)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?
+                        .ok_or_else(|| {
+                            CliError::Runtime(format!(
+                                "no admission record for {plugin_id} {version}; nothing to revoke"
+                            ))
+                        })?;
+                    record.digests.package.clone()
+                }
+            };
             let revocation = plugin_admission::revoke(
                 config,
-                &plugin_id,
-                &version,
+                &package_digest,
                 &reason,
                 as_principal.as_deref(),
                 now,
@@ -1201,12 +1230,22 @@ async fn execute_plugin_command(
                 extension_action_proposal(config, &database, command).await?;
             // Install and enable are gated on the admission workflow: the
             // digest must be approved and not revoked. Install arguments
-            // carry the staged digest; enable resolves it via the index.
+            // carry the staged digest; enable uses the installed digest.
             if proposal.kind() == "plugin.enable" {
+                let installed = database
+                    .installed_plugin_version(
+                        lumen_core::extension::PluginId::parse(&plugin_id)
+                            .map_err(|error| CliError::Runtime(error.to_string()))?,
+                        lumen_core::extension::PluginVersion::parse(&version)
+                            .map_err(|error| CliError::Runtime(error.to_string()))?,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        CliError::Runtime("installed plugin version was not found".into())
+                    })?;
                 plugin_admission::require_enabled_at(
                     &config.runtime.data_directory,
-                    &plugin_id,
-                    &version,
+                    installed.package_digest().as_str(),
                 )
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
             }

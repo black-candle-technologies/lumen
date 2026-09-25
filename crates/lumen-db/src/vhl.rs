@@ -158,7 +158,7 @@ impl Database {
             "SELECT request_id,action_digest,session_subject,nonce,created_at_ms,expires_at_ms, \
             decided_at_ms,decided_by,decision_reason,attestation_id,lease_id,minted_at_ms,consumed_at_ms, \
             view_json FROM vhl_approval_requests WHERE workspace_id=? AND state=? \
-            ORDER BY created_at_ms DESC",
+            ORDER BY created_at_ms ASC",
         )
         .bind(ws(workspace_id))
         .bind(state)

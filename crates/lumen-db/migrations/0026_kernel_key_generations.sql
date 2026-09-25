@@ -1,4 +1,4 @@
--- 0024_kernel_key_generations.sql: record every kernel key generation's
+-- 0026_kernel_key_generations.sql: record every kernel key generation's
 -- public keys. The kernel generates fresh issuer/host Ed25519 keys on each
 -- open (private keys live only in memory and are zeroized on drop); the
 -- verifying keys are recorded here, keyed by key_id, so that signatures made

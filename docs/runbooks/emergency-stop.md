@@ -62,6 +62,9 @@ afterwards (who, what, why, incident reference).
 
 If the runtime does not stop gracefully, or the host itself is suspect:
 
+Record the operator identity and reason in the incident log **before**
+the kill — after SIGKILL the runtime cannot append anything itself.
+
 ```
 systemctl kill -s KILL lumen
 ```
@@ -74,7 +77,13 @@ resuming: `lumen audit verify`.
 
 - No `lumen` runtime process is running; the API port is closed.
 - `lumen audit verify` passes — the stop itself must not corrupt the chain.
-- The audit log shows the stop/cancellation events with operator identity.
+- The audit log shows the stop/cancellation events with operator identity
+  for graceful stops (Levels 1–3). After a Level 4 SIGKILL, expect the
+  startup recovery records instead: recovered executions are recorded as
+  `ExecutionUnknown` without an operator identity (the runtime was dead
+  and could not attribute them). The operator identity for the kill itself
+  lives in the incident log recorded before the kill, not in the audit
+  chain.
 
 ## Failure posture
 

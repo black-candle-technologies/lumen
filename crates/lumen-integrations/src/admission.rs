@@ -486,6 +486,20 @@ impl AdmissionStore {
 
     pub fn save(&self, record: &AdmissionRecord) -> Result<(), AdmissionError> {
         validate_digest_key(&record.digests.package)?;
+        // Serialize the read-check-write under an exclusive lock so two
+        // processes cannot interleave their history checks.
+        let lock_path = self.root.join("admission.lock");
+        let lock_file = std::fs::File::create(&lock_path).map_err(AdmissionError::Io)?;
+        lock_file
+            .try_lock()
+            .map_err(|error| AdmissionError::Io(error.into()))?;
+        let result = self.save_locked(record);
+        // Unlock before returning; the lock file persists for reuse.
+        let _ = lock_file.unlock();
+        result
+    }
+
+    fn save_locked(&self, record: &AdmissionRecord) -> Result<(), AdmissionError> {
         if let Some(stored) = self.load(&record.digests.package)? {
             if record.decisions.len() < stored.decisions.len()
                 || record.decisions[..stored.decisions.len()] != stored.decisions[..]
