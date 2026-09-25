@@ -85,14 +85,14 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::VerifyingKey;
 use lumen_core::budget::{Budget, BudgetLedger};
-use lumen_core::canonical::RealFsResolver;
+use lumen_core::canonical::{RealFsResolver, ResourceScope};
 use lumen_core::identity::WorkspaceId;
 use lumen_core::kernel_audit::{AuditLink, verify_event_chain};
 use lumen_core::lease::{
     AuthorizeParams, CanonicalAction, KernelKeys, LeaseDocument as CoreLeaseDocument,
-    LeaseResolver, OneShotGrant as CoreOneShotGrant, OneShotTracker, RevocationIndex,
-    RootLeaseParams, SessionRegistry, VhlRequest, authorize_envelope, mint_one_shot_lease,
-    mint_root_lease,
+    LeaseLimits as CoreLeaseLimits, LeaseResolver, OneShotGrant as CoreOneShotGrant,
+    OneShotTracker, RevocationIndex, RootLeaseParams, SessionRegistry, VhlRequest,
+    authorize_envelope, mint_one_shot_lease, mint_root_lease,
 };
 use lumen_core::nonce::NonceStore;
 use lumen_core::pi_boundary;
@@ -532,39 +532,49 @@ impl AuthorityKernel {
             .ok_or_else(|| {
                 KernelError::VerificationFailed(format!("unknown lease {}", lease.lease_id))
             })?;
-        // The presented document must agree with the kernel's record on
-        // every identifying field; a mismatch is forgery, not a lookup
-        // miss.
-        if stored.subject != lease.subject
-            || stored.issuer_key_id != lease.issuer_key_id
-            || stored.signature != lease.signature
-        {
+        // Convert the presented host document into the kernel's typed
+        // form, failing closed when the opaque scope/budget JSON does not
+        // parse into the kernel grammar. The host never re-invents the
+        // scope grammar; unparseable scope is a verification failure, not
+        // a bypass.
+        let presented = to_core_lease(lease).map_err(|e| {
+            KernelError::VerificationFailed(format!("lease {} is malformed: {e}", lease.lease_id))
+        })?;
+        // The presented document must be identical to the kernel's
+        // durable record: the signature covers every field except
+        // `signature` itself, so any altered field (scope, limits,
+        // timestamps, parent/depth, nonce) is forgery, not a lookup
+        // miss. Full equality also lets the signature check below run
+        // over the presented document itself, so a valid signature
+        // necessarily covers the presented contents.
+        if stored != presented {
             return Err(KernelError::VerificationFailed(format!(
                 "lease {} does not match the kernel's record",
                 lease.lease_id
             )));
         }
         // Signature: root and VHL one-shot leases verify under the kernel
-        // issuer key; child leases under the parent session's key.
-        let key: VerifyingKey = if stored.is_root() {
+        // issuer key; child leases under the parent session's key. The
+        // check runs over the presented document, not a stored copy.
+        let key: VerifyingKey = if presented.is_root() {
             self.keys.issuer_verifying()
         } else {
             let state = self.state.lock().expect("kernel state mutex poisoned");
             state
                 .sessions
-                .get(&stored.issuer_key_id)
+                .get(&presented.issuer_key_id)
                 .map(|record| record.verifying_key)
                 .ok_or_else(|| {
                     KernelError::VerificationFailed(format!(
                         "unknown session key for {}",
-                        stored.issuer_key_id
+                        presented.issuer_key_id
                     ))
                 })?
         };
-        stored
+        presented
             .verify_signature(&key)
             .map_err(|e| KernelError::VerificationFailed(format!("bad signature: {e}")))?;
-        if !stored.live_at(now) {
+        if !presented.live_at(now) {
             return Err(KernelError::VerificationFailed(format!(
                 "lease {} is not live",
                 lease.lease_id
@@ -1167,6 +1177,38 @@ fn to_host_lease(doc: &CoreLeaseDocument) -> LeaseDocument {
         lease_nonce: doc.lease_nonce.clone(),
         signature: doc.signature.clone(),
     }
+}
+
+/// Host `LeaseDocument` -> kernel `LeaseDocument`. The opaque scope and
+/// budget JSON are parsed into the kernel's typed grammar; anything that
+/// does not parse is an error (fail closed). This is the inverse of
+/// [`to_host_lease`]; the two mappings must stay field-identical so a
+/// document that round-trips compares equal to the durable record.
+fn to_core_lease(lease: &LeaseDocument) -> Result<CoreLeaseDocument, String> {
+    let scope: ResourceScope = serde_json::from_value(lease.scope.clone())
+        .map_err(|e| format!("unparseable scope: {e}"))?;
+    let budget: Budget = serde_json::from_value(lease.limits.budget.clone())
+        .map_err(|e| format!("unparseable budget: {e}"))?;
+    Ok(CoreLeaseDocument {
+        protocol_version: lease.protocol_version,
+        lease_id: lease.lease_id.clone(),
+        parent_id: lease.parent_id.clone(),
+        subject: lease.subject.clone(),
+        issuer_key_id: lease.issuer_key_id.clone(),
+        issued_at_ms: lease.issued_at_ms,
+        scope,
+        limits: CoreLeaseLimits {
+            not_before_ms: lease.limits.not_before_ms,
+            expires_at_ms: lease.limits.expires_at_ms,
+            budget,
+            max_executions: lease.limits.max_executions,
+            single_use: lease.limits.single_use,
+        },
+        depth: lease.depth,
+        depth_limit: lease.depth_limit,
+        lease_nonce: lease.lease_nonce.clone(),
+        signature: lease.signature.clone(),
+    })
 }
 
 /// Host `OneShotGrant` -> kernel `OneShotGrant` (field-for-field).

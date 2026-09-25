@@ -133,8 +133,8 @@ async fn fixture_with_db_and_workspace(
 }
 
 /// Start a real vault identity and issue a real root lease covering the
-/// fixture's leased directory. Returns `(subject, lease_id)`.
-async fn leased_subject(f: &Fixture) -> (String, String) {
+/// fixture's leased directory. Returns the issued lease document.
+async fn issue_test_lease(f: &Fixture) -> lumen_server::LeaseDocument {
     let info = f
         .kernel
         .start_session_identity(None)
@@ -177,7 +177,69 @@ async fn leased_subject(f: &Fixture) -> (String, String) {
         })
         .await
         .expect("issue root lease");
-    (info.subject, lease.lease_id)
+    lease
+}
+
+/// Start a real vault identity and issue a real root lease covering the
+/// fixture's leased directory. Returns `(subject, lease_id)`.
+async fn leased_subject(f: &Fixture) -> (String, String) {
+    let lease = issue_test_lease(f).await;
+    (lease.subject.clone(), lease.lease_id.clone())
+}
+
+#[tokio::test]
+async fn verify_lease_accepts_pristine_presented_document() {
+    let f = fixture().await;
+    let lease = issue_test_lease(&f).await;
+    let verification = KernelClient::verify_lease(f.kernel.as_ref(), &lease)
+        .await
+        .expect("pristine lease must verify");
+    assert_eq!(verification.lease_id, lease.lease_id);
+    assert!(!verification.revoked);
+}
+
+#[tokio::test]
+async fn verify_lease_rejects_altered_presented_fields() {
+    let f = fixture().await;
+    let lease = issue_test_lease(&f).await;
+
+    // Case 1: altered timestamp (limits) with the stored lease id,
+    // subject, issuer id, and signature retained.
+    let mut tampered = lease.clone();
+    tampered.limits.expires_at_ms += 60_000;
+    let error = KernelClient::verify_lease(f.kernel.as_ref(), &tampered)
+        .await
+        .expect_err("altered limits must fail verification");
+    assert!(
+        matches!(error, KernelError::VerificationFailed(_)),
+        "unexpected error: {error:?}"
+    );
+
+    // Case 2: widened scope (grants an effect the stored lease never
+    // granted) with id/subject/issuer/signature retained.
+    let mut tampered = lease.clone();
+    let mut scope: ResourceScope =
+        serde_json::from_value(tampered.scope.clone()).expect("issued scope parses");
+    scope.effects.push(KernelEffectClass::Write);
+    tampered.scope = serde_json::to_value(&scope).expect("scope serializes");
+    let error = KernelClient::verify_lease(f.kernel.as_ref(), &tampered)
+        .await
+        .expect_err("widened scope must fail verification");
+    assert!(
+        matches!(error, KernelError::VerificationFailed(_)),
+        "unexpected error: {error:?}"
+    );
+
+    // Case 3: swapped nonce.
+    let mut tampered = lease;
+    tampered.lease_nonce = "forged-nonce".to_string();
+    let error = KernelClient::verify_lease(f.kernel.as_ref(), &tampered)
+        .await
+        .expect_err("swapped nonce must fail verification");
+    assert!(
+        matches!(error, KernelError::VerificationFailed(_)),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[tokio::test]
