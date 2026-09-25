@@ -756,7 +756,9 @@ impl PortSet {
         let mut merged: Vec<(u16, u16)> = Vec::new();
         for (start, end) in sorted {
             match merged.last_mut() {
-                Some(last) if start <= last.1.wrapping_add(1) => {
+                // last.1 == u16::MAX covers every later start (checked_add
+                // returns None instead of wrapping to 0).
+                Some(last) if last.1.checked_add(1).is_none_or(|next| start <= next) => {
                     last.1 = last.1.max(end);
                 }
                 _ => merged.push((start, end)),
@@ -1633,6 +1635,17 @@ mod tests {
         assert!(PortSet::any().is_subset_of(&PortSet::any()));
         assert!(!PortSet::any().is_subset_of(&PortSet::range(1, 1024).unwrap()));
         assert!(PortSet::single(80).is_subset_of(&PortSet::any()));
+    }
+
+    #[test]
+    fn port_range_merge_at_u16_max() {
+        // Regression: wrapping_add(1) on 65535 yields 0, so overlapping
+        // ranges at the top of the port space were never merged.
+        let set = PortSet::from_ranges(&[(60000, 65535), (65000, 65535)]).unwrap();
+        assert_eq!(set.ranges, vec![(60000, 65535)]);
+        // Adjacent-to-max still merges, and non-adjacent ranges stay split.
+        let set = PortSet::from_ranges(&[(1, 10), (11, 20), (60000, 65535)]).unwrap();
+        assert_eq!(set.ranges, vec![(1, 20), (60000, 65535)]);
     }
 
     #[test]

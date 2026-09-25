@@ -1,4 +1,4 @@
-//! Durable Phase 4 human-authority state (migration 0023).
+//! Durable Phase 4 human-authority state (migration 0025).
 //!
 //! Stores VHL approval requests, their decisions, and hold-and-release
 //! challenges. Replay uses the 0022 `kernel_nonces` table (attestation id as
@@ -338,11 +338,6 @@ impl Database {
         Ok(())
     }
 
-    /// Verify a code against the stored hash and atomically burn the
-    /// challenge. Returns `Ok(true)` when the ceremony completes.
-    /// Returns `Ok(false)` on wrong code, expiry, or a challenge that was
-    /// already used — without distinguishing, so an attacker probing codes
-    /// learns nothing about which check failed.
     /// Submit the out-of-band code for a challenge. A correct code completes
     /// the ceremony (`ceremony_complete=1`); it does *not* authorize anything
     /// by itself — the authorization is consumed exactly once by

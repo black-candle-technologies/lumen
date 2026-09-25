@@ -1539,6 +1539,50 @@ fn challenge_ceremony_authorizes_exactly_one_decision() {
     assert!(matches!(request2.state, VhlRequestState::Requested));
 }
 
+// ---------------------------------------------------------------------------
+// Review remediation: deny() must prepare the (fallible) transition before
+// the audit, like decide(). A denial clicked after approval is
+// IllegalTransition and must leave neither state nor a false denial event.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deny_after_approval_fails_without_false_denial_audit() {
+    let mut h = Harness::new();
+    let subject = h.session_subject.clone();
+    let env = envelope(
+        &subject,
+        json!({"path": "/workspace/README.md"}),
+        vec!["sha256:input-1".to_string()],
+    );
+    let action = canonical_action(&env);
+
+    let mut request = h
+        .authority
+        .open_request(&action, &env, APPROVAL_TTL_MS, NOW_MS)
+        .expect("request opens");
+    let challenge_id = h.complete_ceremony(&request.action_digest);
+    let attestation = h.attestation_for(&request, &challenge_id);
+    let mut audit = RecordingAudit::default();
+    h.authority
+        .decide(&mut request, &attestation, &mut audit, NOW_MS)
+        .expect("approval succeeds");
+    assert!(matches!(request.state, VhlRequestState::Approved { .. }));
+
+    let err = h
+        .authority
+        .deny(&mut request, HUMAN_ADDRESS, "too late", &mut audit, NOW_MS)
+        .expect_err("deny after approval must fail");
+    assert!(matches!(err, VhlError::IllegalTransition(_)), "got {err:?}");
+    assert!(
+        matches!(request.state, VhlRequestState::Approved { .. }),
+        "approved request must stay approved"
+    );
+    assert!(
+        !audit.events.iter().any(|e| e.3 == "approval.denied"),
+        "no denial audit event for a request that was never denied"
+    );
+}
+
 /// An audit sink that always fails: proves decision paths are atomic with
 /// respect to audit — a failed append must not leave the request advanced.
 #[derive(Debug, Default)]

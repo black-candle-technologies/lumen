@@ -39,7 +39,7 @@
 //!
 //! `Blocked` is the kernel's decision state before a request exists;
 //! [`VhlApprovalRequest`] covers `Requested` onward. Every transition is
-//! checked in Rust *and* re-checked by the 0023 migration's SQL guard
+//! checked in Rust *and* re-checked by the 0025 migration's SQL guard
 //! triggers, so a buggy host fails closed at the database too.
 
 use std::collections::{HashMap, VecDeque};
@@ -1900,7 +1900,12 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         audit: &mut dyn VhlAuditSink,
         now_ms: i64,
     ) -> Result<(), VhlError> {
-        // Audit before mutating request state (see decide()).
+        // Prepare the transition first (fallible), then audit, then assign
+        // (infallible) — see decide(). decide_denied fails when the request
+        // is no longer Requested, and the audit must never hold a denial
+        // event for a request that was not denied.
+        let mut prepared = request.clone();
+        prepared.decide_denied(reason, now_ms)?;
         audit.record_vhl(
             approver,
             &request.session_subject,
@@ -1912,7 +1917,8 @@ impl<V: VhlVerifier> VhlAuthority<V> {
             }),
             now_ms,
         )?;
-        request.decide_denied(reason, now_ms)
+        *request = prepared;
+        Ok(())
     }
 
     /// Approved → Minted: mint the single-use lease for the exact approved

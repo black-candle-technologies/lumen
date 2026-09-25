@@ -8,6 +8,7 @@ mod kernel_local;
 mod model_gateway;
 mod orchestration;
 mod pi_sandbox;
+pub use pi_sandbox::PiSandboxConfig;
 pub mod pi_supervisor;
 mod routes;
 mod sandbox_driver;

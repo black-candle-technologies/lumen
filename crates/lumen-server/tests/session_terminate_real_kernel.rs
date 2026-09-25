@@ -41,6 +41,7 @@ fn fixture_script() -> PathBuf {
 fn test_config() -> SupervisorConfig {
     let script = fixture_script();
     let digest = sha256_hex(&std::fs::read(&script).unwrap());
+    let fixture_dir = script.parent().unwrap().to_path_buf();
     SupervisorConfig {
         pi_binary: script.clone(),
         pi_args: Vec::new(),
@@ -57,6 +58,12 @@ fn test_config() -> SupervisorConfig {
         watchdog_interval: Duration::from_millis(50),
         event_buffer: 64,
         stderr_line_cap: 16,
+        // The fixture script lives outside the sandbox's built-in read-only
+        // set; allowlist its directory so Landlock-enforcing hosts can spawn.
+        pi_sandbox: lumen_server::PiSandboxConfig {
+            extra_read_only_paths: vec![fixture_dir],
+            ..Default::default()
+        },
         ..SupervisorConfig::default()
     }
 }

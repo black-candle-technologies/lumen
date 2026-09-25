@@ -1,4 +1,4 @@
-//! Durable Phase 4 human-authority tests: migration 0023, the forward-only
+//! Durable Phase 4 human-authority tests: migration 0025, the forward-only
 //! approval state machine, append-only decisions, challenge lifecycle, and
 //! the replay guards that reuse the 0022 nonce/one-shot tables.
 
@@ -99,7 +99,7 @@ async fn insert_lease(db: &Database, ws: &WorkspaceId, lease_id: &str) {
 }
 
 #[tokio::test]
-async fn migration_0023_creates_vhl_tables() {
+async fn migration_0025_creates_vhl_tables() {
     let db = Database::connect_in_memory().await.expect("connect");
     for table in ["vhl_approval_requests", "vhl_decisions", "vhl_challenges"] {
         let count: i64 =
