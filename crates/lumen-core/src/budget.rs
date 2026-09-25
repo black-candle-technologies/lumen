@@ -140,6 +140,8 @@ pub enum BudgetError {
     },
     #[error("unknown lease in ledger: {0}")]
     UnknownLease(String),
+    #[error("lease {0} is already registered in the ledger")]
+    DuplicateLease(String),
     #[error("unknown reservation: {0}")]
     UnknownReservation(String),
     #[error("reservation {0} is not active")]
@@ -280,8 +282,18 @@ impl BudgetLedger {
     /// Register a lease's budget caps. Called for root leases at issuance
     /// (caps are policy-granted) and for child leases after their reservation
     /// succeeds (the child's own caps are its held maximum).
+    ///
+    /// Rejects duplicate ids: silently replacing an account would reset its
+    /// `reserved_out`/`exec_held`/`consumed` books to zero and resurrect
+    /// spent budget (e.g. a child minted with its parent's id). Defense in
+    /// depth with [`BudgetLedger::reserve`], which already rejects an
+    /// already-registered child id before taking the hold; this guard
+    /// covers direct callers that skip `reserve`.
     pub fn register_lease(&self, lease_id: &str, caps: &Budget) -> Result<(), BudgetError> {
         let mut inner = self.inner.lock().expect("ledger mutex poisoned");
+        if inner.accounts.contains_key(lease_id) {
+            return Err(BudgetError::DuplicateLease(lease_id.to_string()));
+        }
         inner.accounts.insert(
             lease_id.to_string(),
             LeaseAccount {
@@ -294,8 +306,25 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// Whether the ledger already holds an account for `lease_id`. Used by
+    /// boot reconciliation (register-if-absent) and exposed for callers
+    /// that need to probe before acting; [`BudgetLedger::reserve`] and
+    /// [`BudgetLedger::register_lease`] enforce uniqueness themselves.
+    pub fn is_lease_registered(&self, lease_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("ledger mutex poisoned")
+            .accounts
+            .contains_key(lease_id)
+    }
+
     /// Reserve `child_max` against the parent's remaining balance. Fails
     /// atomically (no partial reservation) when any dimension is short.
+    ///
+    /// Also fails — before taking any hold — when `child_lease_id` is
+    /// already registered: re-reserving for a live account would strand a
+    /// second reservation against one account (a duplicate mint must never
+    /// leak a hold; the lease layer relies on this ordering).
     pub fn reserve(
         &self,
         parent_lease_id: &str,
@@ -304,6 +333,10 @@ impl BudgetLedger {
         now_ms: i64,
     ) -> Result<Reservation, BudgetError> {
         let mut inner = self.inner.lock().expect("ledger mutex poisoned");
+        // Check before mutating: a failed mint must not leave a hold behind.
+        if inner.accounts.contains_key(child_lease_id) {
+            return Err(BudgetError::DuplicateLease(child_lease_id.to_string()));
+        }
         let parent = inner
             .accounts
             .get_mut(parent_lease_id)
@@ -440,11 +473,23 @@ impl BudgetLedger {
 
     /// Release a reservation: the unspent held amount returns to the parent.
     /// Only called on explicit revocation or expiry — never implicitly.
+    ///
+    /// Conservation: the child's total spend moves into the parent's
+    /// `consumed`, and the full hold leaves the parent's `reserved_out`.
+    /// Child spend is the debits recorded on the reservation *plus* the
+    /// child account's settled consumption and outstanding execution holds
+    /// (child spend via [`BudgetLedger::settle_execution`] /
+    /// [`BudgetLedger::debit_lease`] never touches the reservation's
+    /// `consumed` field, so ignoring the child account would refund spent
+    /// budget). Outstanding holds count as spent: they are authorized
+    /// dispatches whose effects may still land, so this errs toward the
+    /// parent keeping less — spent budget is never resurrected.
+    /// Returns `held − spent` (saturating) to the caller.
     pub fn release(&self, reservation_id: &str, now_ms: i64) -> Result<Budget, BudgetError> {
         let mut inner = self.inner.lock().expect("ledger mutex poisoned");
-        // Scope the reservation borrow so it ends before the parent account
-        // is borrowed mutably below.
-        let (held, consumed, parent_id) = {
+        // Scope the reservation borrow so it ends before the accounts are
+        // borrowed below.
+        let (held, consumed, parent_id, child_id) = {
             let reservation = inner
                 .reservations
                 .get_mut(reservation_id)
@@ -460,15 +505,57 @@ impl BudgetLedger {
                 reservation.held.clone(),
                 reservation.consumed.clone(),
                 reservation.parent_lease_id.clone(),
+                reservation.child_lease_id.clone(),
             )
         };
-        let returned = held.saturating_sub(&consumed);
+        // The child's total spend: reservation-level debits plus whatever
+        // the child account itself settled or still holds.
+        let mut spent = consumed;
+        if let Some(child) = inner.accounts.get(&child_id) {
+            spent = spent
+                .checked_add(&child.consumed)
+                .and_then(|s| s.checked_add(&child.exec_held))
+                .ok_or(BudgetError::Overflow)?;
+        }
+        let returned = held.saturating_sub(&spent);
         let parent = inner
             .accounts
             .get_mut(&parent_id)
             .ok_or_else(|| BudgetError::UnknownLease(parent_id.clone()))?;
         parent.reserved_out = parent.reserved_out.saturating_sub(&held);
+        parent.consumed = parent
+            .consumed
+            .checked_add(&spent)
+            .ok_or(BudgetError::Overflow)?;
         Ok(returned)
+    }
+
+    /// Rehydrate one durable active reservation after a crash (boot
+    /// recovery). Restores the parent's `reserved_out` hold and the
+    /// reservation's recorded consumption without re-running admission —
+    /// the hold was admitted before the crash. Idempotent: a reservation id
+    /// already present is left untouched, so repeated reconciliations never
+    /// double-count the hold. The parent account must already be registered.
+    pub fn rehydrate_reservation(&self, reservation: &Reservation) -> Result<(), BudgetError> {
+        let mut inner = self.inner.lock().expect("ledger mutex poisoned");
+        if inner.reservations.contains_key(&reservation.id) {
+            return Ok(());
+        }
+        if reservation.state != ReservationState::Active {
+            return Err(BudgetError::ReservationNotActive(reservation.id.clone()));
+        }
+        let parent = inner
+            .accounts
+            .get_mut(&reservation.parent_lease_id)
+            .ok_or_else(|| BudgetError::UnknownLease(reservation.parent_lease_id.clone()))?;
+        parent.reserved_out = parent
+            .reserved_out
+            .checked_add(&reservation.held)
+            .ok_or(BudgetError::Overflow)?;
+        inner
+            .reservations
+            .insert(reservation.id.clone(), reservation.clone());
+        Ok(())
     }
 
     /// Atomically reserve execution capacity against the lease's remaining
@@ -800,6 +887,189 @@ mod tests {
             40
         );
         ledger.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn register_lease_rejects_duplicate_ids() {
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        assert!(ledger.is_lease_registered("parent"));
+        assert!(!ledger.is_lease_registered("ghost"));
+
+        // A duplicate mint (child id collides with an existing account)
+        // fails at reserve time, before any hold is taken: nothing leaks.
+        assert!(matches!(
+            ledger.reserve("parent", "parent", &micros(60), 1),
+            Err(BudgetError::DuplicateLease(_))
+        ));
+        // The parent's books are untouched and no reservation was recorded.
+        assert_eq!(
+            ledger
+                .remaining("parent")
+                .unwrap()
+                .get(BudgetDimension::SpendMicros),
+            100
+        );
+        assert!(ledger.active_reservations().is_empty());
+
+        // register_lease is the second layer: re-registering an id whose
+        // spend is already recorded must fail instead of resetting its
+        // books to zero (which would resurrect spent budget).
+        ledger.register_lease("sibling", &micros(10)).unwrap();
+        ledger
+            .debit_lease("sibling", &micros(4), "sib-key", 1)
+            .unwrap();
+        assert!(matches!(
+            ledger.register_lease("sibling", &micros(10)),
+            Err(BudgetError::DuplicateLease(_))
+        ));
+        assert_eq!(
+            ledger
+                .remaining("sibling")
+                .unwrap()
+                .get(BudgetDimension::SpendMicros),
+            6
+        );
+        ledger.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn release_debit_then_release_conserves_budget() {
+        // The finding's exact scenario: cap 100, child reserves 60, debit
+        // records 25. After release the parent must hold 75 remaining — the
+        // spent 25 moves into parent.consumed instead of becoming spendable
+        // again.
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        let res = ledger.reserve("parent", "child", &micros(60), 1).unwrap();
+        ledger.debit(&res.id, &micros(25), "key-1", 2).unwrap();
+
+        let returned = ledger.release(&res.id, 3).unwrap();
+        assert_eq!(returned.get(BudgetDimension::SpendMicros), 35);
+        let (caps, reserved_out, exec_held, consumed) = ledger.account_summary("parent").unwrap();
+        assert_eq!(consumed.get(BudgetDimension::SpendMicros), 25);
+        assert_eq!(reserved_out.get(BudgetDimension::SpendMicros), 0);
+        let remaining = ledger.remaining("parent").unwrap();
+        assert_eq!(remaining.get(BudgetDimension::SpendMicros), 75);
+        // Conservation: remaining + reserved_out + exec_held + consumed == cap.
+        let total = remaining.get(BudgetDimension::SpendMicros)
+            + reserved_out.get(BudgetDimension::SpendMicros)
+            + exec_held.get(BudgetDimension::SpendMicros)
+            + consumed.get(BudgetDimension::SpendMicros);
+        assert_eq!(total, caps.get(BudgetDimension::SpendMicros));
+        ledger.check_invariants().unwrap();
+
+        // Releasing twice fails closed.
+        assert!(matches!(
+            ledger.release(&res.id, 4),
+            Err(BudgetError::ReservationNotActive(_))
+        ));
+    }
+
+    #[test]
+    fn release_moves_child_account_spend_to_parent() {
+        // The larger leak: child spend via settle_execution / debit_lease
+        // lands on the child account, never on Reservation.consumed.
+        // Release must move all of it — settled consumption and outstanding
+        // execution holds — into the parent, or mint → spend → expire →
+        // mint again would exceed the parent cap every cycle.
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        let res = ledger.reserve("parent", "child", &micros(60), 1).unwrap();
+        ledger.register_lease("child", &micros(60)).unwrap();
+
+        // Spend through every path: reservation-level debit, the child
+        // account's own settle, and an outstanding execution hold.
+        ledger.debit(&res.id, &micros(25), "key-1", 2).unwrap();
+        let exec = ledger
+            .reserve_execution("child", "a1", &micros(10), "n1", 3)
+            .unwrap();
+        ledger
+            .settle_execution(&exec.id, &micros(10), "s1", 4)
+            .unwrap();
+        ledger
+            .reserve_execution("child", "a2", &micros(5), "n2", 5)
+            .unwrap();
+
+        // Child spend = 25 (reservation) + 10 (settled) + 5 (held) = 40.
+        let returned = ledger.release(&res.id, 6).unwrap();
+        assert_eq!(returned.get(BudgetDimension::SpendMicros), 20);
+        let (caps, reserved_out, exec_held, consumed) = ledger.account_summary("parent").unwrap();
+        assert_eq!(consumed.get(BudgetDimension::SpendMicros), 40);
+        assert_eq!(reserved_out.get(BudgetDimension::SpendMicros), 0);
+        let remaining = ledger.remaining("parent").unwrap();
+        assert_eq!(remaining.get(BudgetDimension::SpendMicros), 60);
+        let total = remaining.get(BudgetDimension::SpendMicros)
+            + reserved_out.get(BudgetDimension::SpendMicros)
+            + exec_held.get(BudgetDimension::SpendMicros)
+            + consumed.get(BudgetDimension::SpendMicros);
+        assert_eq!(total, caps.get(BudgetDimension::SpendMicros));
+        ledger.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn rehydrate_reservation_restores_hold_idempotently() {
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        let mut res = ledger.reserve("parent", "child", &micros(60), 1).unwrap();
+        ledger.debit(&res.id, &micros(25), "key-1", 2).unwrap();
+        res = ledger
+            .active_reservations()
+            .into_iter()
+            .find(|r| r.id == res.id)
+            .unwrap();
+
+        // Simulate the crash: a fresh ledger with only the parent's caps.
+        let fresh = BudgetLedger::new();
+        fresh.register_lease("parent", &micros(100)).unwrap();
+        fresh.rehydrate_reservation(&res).unwrap();
+        assert_eq!(
+            fresh
+                .remaining("parent")
+                .unwrap()
+                .get(BudgetDimension::SpendMicros),
+            40
+        );
+        // Re-running is a no-op: the hold is never double-counted.
+        fresh.rehydrate_reservation(&res).unwrap();
+        assert_eq!(
+            fresh
+                .remaining("parent")
+                .unwrap()
+                .get(BudgetDimension::SpendMicros),
+            40
+        );
+        // The recorded consumption survived and is charged at release.
+        let rehydrated = fresh.active_reservations();
+        assert_eq!(rehydrated.len(), 1);
+        assert_eq!(rehydrated[0].consumed.get(BudgetDimension::SpendMicros), 25);
+        fresh.release(&rehydrated[0].id, 3).unwrap();
+        assert_eq!(
+            fresh
+                .remaining("parent")
+                .unwrap()
+                .get(BudgetDimension::SpendMicros),
+            75
+        );
+        fresh.check_invariants().unwrap();
+
+        // Non-active reservations and unknown parents fail closed. (Note: the
+        // idempotency check runs first, so a re-submitted id is Ok even if
+        // the caller mutated its state copy — use fresh ids here.)
+        let mut released = res.clone();
+        released.id = "res_released".to_string();
+        released.state = ReservationState::Released;
+        assert!(matches!(
+            fresh.rehydrate_reservation(&released),
+            Err(BudgetError::ReservationNotActive(_))
+        ));
+        let mut orphan = res.clone();
+        orphan.id = "res_orphan".to_string();
+        orphan.parent_lease_id = "ghost".to_string();
+        assert!(matches!(
+            fresh.rehydrate_reservation(&orphan),
+            Err(BudgetError::UnknownLease(_))
+        ));
     }
 
     #[test]

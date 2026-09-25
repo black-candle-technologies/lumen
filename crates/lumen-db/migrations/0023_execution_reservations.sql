@@ -6,7 +6,9 @@
 -- actuals recorded as the durable debit receipt) or released (dispatch never
 -- happened, or failed before any effect). The row is the authority the
 -- in-memory ledger rehydrates from at boot; the guard trigger enforces the
--- held -> settled | released state machine in SQL.
+-- held -> settled | released state machine in SQL, and terminal
+-- (settled/released) rows are fully immutable: any update to a non-held row
+-- aborts, so concurrent settles cannot overwrite the durable receipt.
 
 CREATE TABLE kernel_executions(
  id TEXT PRIMARY KEY CHECK(length(id)>0),
@@ -35,7 +37,7 @@ WHEN (
  OR NEW.idempotency_key!=OLD.idempotency_key
  OR NEW.created_at_ms!=OLD.created_at_ms
  OR NEW.state NOT IN('held','settled','released')
- OR (OLD.state!='held' AND NEW.state!=OLD.state)
+ OR OLD.state!='held'
  OR (OLD.state='held' AND NEW.state='held')
  OR (NEW.state='settled' AND (NEW.actual_json IS NULL OR NEW.completed_at_ms IS NULL))
  OR (NEW.state='released' AND (NEW.actual_json IS NOT NULL OR NEW.completed_at_ms IS NULL))
