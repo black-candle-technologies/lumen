@@ -130,6 +130,8 @@ pub enum VhlError {
     Encoding(String),
     #[error("session identity error: {0}")]
     SessionIdentity(String),
+    #[error("internal error: {0}")]
+    Internal(String),
     #[error(transparent)]
     Lease(#[from] LeaseError),
 }
@@ -1971,8 +1973,18 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         let lease = mint_one_shot_lease(
             grant, &vhl_key, action, keys, sessions, ledger, nonces, now_ms,
         )?;
-        request.note_minted(&lease.lease_id, now_ms)?;
-        audit.record_vhl(
+        // Precompute the Minted request state on a clone before the
+        // audit: the state transition must not fail after the durable
+        // append. The final assignment below is infallible.
+        let mut prepared = request.clone();
+        prepared.note_minted(&lease.lease_id, now_ms)?;
+        // Audit before the state transition. The lease engine already
+        // consumed the grant nonce and registered the budget (both
+        // in-memory); if the durable append fails, unwind both so the
+        // approval stays Approved and the same grant retries instead of
+        // stranding a valid approval with a spent nonce and no lease
+        // document.
+        if let Err(audit_err) = audit.record_vhl(
             &approver,
             &request.session_subject,
             &request.action_digest,
@@ -1983,7 +1995,21 @@ impl<V: VhlVerifier> VhlAuthority<V> {
                 "lease_id": lease.lease_id,
             }),
             now_ms,
-        )?;
+        ) {
+            // Roll back the ledger BEFORE forgetting the nonce: only once
+            // the ledger is clean is the approval safely retryable. A
+            // failed rollback leaves the nonce spent and surfaces loudly —
+            // retrying against phantom ledger state would be worse.
+            if let Err(rollback_err) = ledger.rollback_lease_registration(&lease.lease_id) {
+                return Err(VhlError::Internal(format!(
+                    "audit failed ({audit_err}); ledger rollback also failed ({rollback_err}): \
+                     manual reconciliation required"
+                )));
+            }
+            nonces.forget(&grant.nonce);
+            return Err(audit_err);
+        }
+        *request = prepared;
         Ok(lease)
     }
 
@@ -2183,13 +2209,14 @@ impl<V: VhlVerifier> VhlAuthority<V> {
         if limits.expires_at_ms <= now_ms {
             return Err(VhlError::RequestExpired);
         }
+        let lease_nonce = format!("standing:{}", request.nonce);
         let params = ChildLeaseParams {
             lease_id: format!("standing_{}", Uuid::new_v4()),
             subject: request.session_subject.clone(),
             scope,
             limits,
             depth_limit: parent.depth_limit,
-            lease_nonce: format!("standing:{}", request.nonce),
+            lease_nonce: lease_nonce.clone(),
             issued_at_ms: now_ms,
         };
         let lease = vault
@@ -2206,8 +2233,16 @@ impl<V: VhlVerifier> VhlAuthority<V> {
                 )
             })
             .map_err(|e| VhlError::SessionIdentity(e.to_string()))?;
-        request.note_minted(&lease.lease_id, now_ms)?;
-        audit.record_vhl(
+        // Precompute the Minted request state on a clone before the
+        // audit (see mint_one_shot).
+        let mut prepared = request.clone();
+        prepared.note_minted(&lease.lease_id, now_ms)?;
+        // Audit before the state transition (see mint_one_shot): the child
+        // mint consumed the standing nonce, reserved parent budget, and
+        // registered the child account. If the durable append fails, unwind
+        // all three so the approval stays Approved and retryable instead
+        // of stranding a valid approval with a spent nonce.
+        if let Err(audit_err) = audit.record_vhl(
             &confirmation.approver,
             &request.session_subject,
             &request.action_digest,
@@ -2218,7 +2253,19 @@ impl<V: VhlVerifier> VhlAuthority<V> {
                 "parent_lease_id": parent.lease_id,
             }),
             now_ms,
-        )?;
+        ) {
+            // Roll back the ledger BEFORE forgetting the nonce (see
+            // mint_one_shot).
+            if let Err(rollback_err) = ledger.rollback_lease_registration(&lease.lease_id) {
+                return Err(VhlError::Internal(format!(
+                    "audit failed ({audit_err}); ledger rollback also failed ({rollback_err}): \
+                     manual reconciliation required"
+                )));
+            }
+            nonces.forget(&lease_nonce);
+            return Err(audit_err);
+        }
+        *request = prepared;
         Ok(lease)
     }
 

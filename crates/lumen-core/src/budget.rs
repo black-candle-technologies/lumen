@@ -156,6 +156,8 @@ pub enum BudgetError {
     Overflow,
     #[error("store error: {0}")]
     Store(String),
+    #[error("cannot roll back lease {0}: {1}")]
+    RollbackFailed(String, String),
 }
 
 /// A held reservation of a child's maximum budget against its parent.
@@ -316,6 +318,107 @@ impl BudgetLedger {
             .expect("ledger mutex poisoned")
             .accounts
             .contains_key(lease_id)
+    }
+
+    /// Undo a lease mint's ledger effects after the mint's durable step
+    /// failed: remove the failed issuance's reservation (standing-lease
+    /// mints reserve the child's maximum against the parent) and the
+    /// lease's own budget account, restoring the parent's held balance.
+    ///
+    /// The rollback is atomic: every check and mutation holds the single
+    /// ledger lock, so it either fully undoes the mint or fails closed
+    /// with the ledger untouched.
+    ///
+    /// Fails closed when the ledger does not look like a fresh, unused
+    /// mint: the child account is missing (the mint always registers it),
+    /// the child account shows any consumption, the child has reserved-out
+    /// budget or an active reservation naming it as parent (descendants
+    /// were granted — the lease escaped the failed mint), a reservation
+    /// naming this child exists but is not active, is consumed, or appears
+    /// more than once, or the parent account is missing / its held balance
+    /// would underflow.
+    ///
+    /// Rollback-only: called on the mint's error path, before the grant
+    /// nonce is forgotten, so a failed audit can never strand held parent
+    /// budget or a phantom account — and a failed rollback never forgets
+    /// the nonce for ledger state that is still in place.
+    pub fn rollback_lease_registration(&self, lease_id: &str) -> Result<(), BudgetError> {
+        let mut inner = self.inner.lock().expect("ledger mutex poisoned");
+        let fail =
+            |reason: &str| BudgetError::RollbackFailed(lease_id.to_string(), reason.to_string());
+
+        // Phase 1: checks. The mint always registers the child's account,
+        // so a missing account is inconsistent, not "already rolled back".
+        let account = inner
+            .accounts
+            .get(lease_id)
+            .ok_or_else(|| fail("child account missing"))?;
+        if !account.consumed.is_zero() {
+            return Err(fail("child account shows consumption"));
+        }
+        if !account.reserved_out.is_zero() {
+            return Err(fail("child account has reserved descendants"));
+        }
+        if inner
+            .reservations
+            .values()
+            .any(|r| r.parent_lease_id == lease_id && r.state == ReservationState::Active)
+        {
+            return Err(fail("child lease has active descendant reservations"));
+        }
+        // The mint creates exactly one reservation for a standing child and
+        // none for a one-shot; more than one is inconsistent.
+        let matching: Vec<(String, Budget, Budget, ReservationState, String)> = inner
+            .reservations
+            .iter()
+            .filter(|(_, r)| r.child_lease_id == lease_id)
+            .map(|(id, r)| {
+                (
+                    id.clone(),
+                    r.held.clone(),
+                    r.consumed.clone(),
+                    r.state,
+                    r.parent_lease_id.clone(),
+                )
+            })
+            .collect();
+        if matching.len() > 1 {
+            return Err(fail("multiple reservations name this child"));
+        }
+        // If a reservation exists, validate it — and the parent restore it
+        // implies — before mutating anything.
+        let restore: Option<(String, String, Budget)> = match matching.first() {
+            None => None,
+            Some((res_id, held, consumed, state, parent_id)) => {
+                if *state != ReservationState::Active {
+                    return Err(fail("issuance reservation is not active"));
+                }
+                if !consumed.is_zero() {
+                    return Err(fail("issuance reservation shows consumption"));
+                }
+                let parent = inner
+                    .accounts
+                    .get(parent_id)
+                    .ok_or_else(|| fail("parent account missing"))?;
+                let restored = parent
+                    .reserved_out
+                    .checked_sub(held)
+                    .ok_or_else(|| fail("parent held balance would underflow"))?;
+                Some((res_id.clone(), parent_id.clone(), restored))
+            }
+        };
+
+        // Phase 2: mutations. All checks passed; nothing below can fail.
+        if let Some((res_id, parent_id, restored)) = restore {
+            // Remove the failed issuance reservation entirely — no Released
+            // phantom is retained.
+            inner.reservations.remove(&res_id);
+            if let Some(parent) = inner.accounts.get_mut(&parent_id) {
+                parent.reserved_out = restored;
+            }
+        }
+        inner.accounts.remove(lease_id);
+        Ok(())
     }
 
     /// Reserve `child_max` against the parent's remaining balance. Fails
@@ -888,6 +991,91 @@ mod tests {
         );
         ledger.check_invariants().unwrap();
     }
+
+    #[test]
+    fn rollback_lease_registration_undoes_a_fresh_mint() {
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        // Standing-mint ledger effects: reservation + child account.
+        ledger.reserve("parent", "child", &micros(60), 1).unwrap();
+        ledger.register_lease("child", &micros(60)).unwrap();
+
+        ledger.rollback_lease_registration("child").unwrap();
+
+        // The issuance reservation is removed entirely (no Released
+        // phantom), the parent's held balance is restored, and the child
+        // account is gone.
+        assert!(ledger.active_reservations().is_empty());
+        assert!(ledger.account_summary("child").is_none());
+        assert_eq!(
+            ledger
+                .remaining("parent")
+                .unwrap()
+                .get(BudgetDimension::SpendMicros),
+            100
+        );
+        ledger.check_invariants().unwrap();
+        // One-shot mints (no reservation) roll back to just the account
+        // removal.
+        ledger.register_lease("oneshot", &micros(1)).unwrap();
+        ledger.rollback_lease_registration("oneshot").unwrap();
+        assert!(ledger.account_summary("oneshot").is_none());
+        ledger.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn rollback_lease_registration_fails_closed_on_used_state() {
+        // Consumption against the child account blocks rollback.
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        ledger.reserve("parent", "child", &micros(60), 1).unwrap();
+        ledger.register_lease("child", &micros(60)).unwrap();
+        ledger
+            .debit_lease("child", &micros(10), "spend-1", 2)
+            .unwrap();
+        let before = ledger.account_summary("parent").unwrap();
+        assert!(matches!(
+            ledger.rollback_lease_registration("child"),
+            Err(BudgetError::RollbackFailed(_, _))
+        ));
+        // Fail-closed: the ledger is untouched.
+        assert_eq!(ledger.account_summary("parent").unwrap(), before);
+        assert!(ledger.account_summary("child").is_some());
+        assert_eq!(ledger.active_reservations().len(), 1);
+
+        // Reserved descendants block rollback too.
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        ledger.reserve("parent", "child", &micros(60), 1).unwrap();
+        ledger.register_lease("child", &micros(60)).unwrap();
+        ledger
+            .reserve("child", "grandchild", &micros(10), 2)
+            .unwrap();
+        assert!(matches!(
+            ledger.rollback_lease_registration("child"),
+            Err(BudgetError::RollbackFailed(_, _))
+        ));
+        assert_eq!(ledger.active_reservations().len(), 2);
+
+        // A consumed issuance reservation blocks rollback.
+        let ledger = BudgetLedger::new();
+        ledger.register_lease("parent", &micros(100)).unwrap();
+        let res = ledger.reserve("parent", "child", &micros(60), 1).unwrap();
+        ledger.register_lease("child", &micros(60)).unwrap();
+        ledger.debit(&res.id, &micros(5), "debit-1", 2).unwrap();
+        assert!(matches!(
+            ledger.rollback_lease_registration("child"),
+            Err(BudgetError::RollbackFailed(_, _))
+        ));
+
+        // A missing child account is inconsistent, not "already done".
+        let ledger = BudgetLedger::new();
+        assert!(matches!(
+            ledger.rollback_lease_registration("ghost"),
+            Err(BudgetError::RollbackFailed(_, _))
+        ));
+    }
+
 
     #[test]
     fn register_lease_rejects_duplicate_ids() {
