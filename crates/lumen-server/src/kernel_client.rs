@@ -124,6 +124,8 @@ pub enum EnvelopeError {
     BadExpiry(String),
     #[error("empty tool name")]
     EmptyToolName,
+    #[error("effect class not representable at the kernel boundary: {0}")]
+    UnsupportedEffect(String),
     #[error("deserialization failed: {0}")]
     Deserialize(String),
 }

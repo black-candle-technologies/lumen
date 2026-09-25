@@ -36,9 +36,12 @@
 //! # Lossy mappings (documented, fail-closed)
 //!
 //! - `expected_effects`: `SecretUse` and `MessageSend` have no counterpart in
-//!   the frozen `EffectClasses`; they are preserved on the host envelope but
-//!   cannot be expressed to the frozen kernel. (The frozen phase-0 policy
-//!   denies anything but a pure read anyway.)
+//!   the frozen `EffectClasses`; the conversion rejects envelopes declaring
+//!   them ([`EnvelopeError::UnsupportedEffect`]) instead of silently
+//!   discarding the effect. Dropping them would let the kernel authorize an
+//!   action on a lease that never granted the effect, and the decision is
+//!   rebound to the host envelope's digest, hiding the loss from the caller.
+//!   They stay expressible on the host envelope only.
 //! - `resources.paths` carry no rights on the host shape; the frozen contract
 //!   requires per-resource rights. Paths are marked `Write` when the action
 //!   declares `Write`, otherwise `Read`.
@@ -155,6 +158,23 @@ pub(crate) fn to_frozen_envelope(env: &ActionEnvelope) -> Result<FrozenEnvelope,
         network_ingress: false,
         process_spawn: false,
     };
+    // Fail closed on effect classes the frozen contract cannot express:
+    // silently discarding them would let the kernel authorize an action
+    // on a lease that never granted the dropped effect, and the decision
+    // is rebound to the host envelope's digest, hiding the loss from the
+    // caller.
+    let unsupported: Vec<&str> = env
+        .expected_effects
+        .iter()
+        .filter_map(|class| match class {
+            EffectClass::SecretUse => Some("SecretUse"),
+            EffectClass::MessageSend => Some("MessageSend"),
+            _ => None,
+        })
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(EnvelopeError::UnsupportedEffect(unsupported.join(", ")).into());
+    }
     for class in &env.expected_effects {
         match class {
             EffectClass::Read => effects.file_read = true,
@@ -164,8 +184,11 @@ pub(crate) fn to_frozen_envelope(env: &ActionEnvelope) -> Result<FrozenEnvelope,
             // phase-0 policy denies network actions regardless.
             EffectClass::Network => effects.network_egress = true,
             EffectClass::Execute => effects.process_spawn = true,
-            // No frozen counterpart; preserved on the host envelope only.
-            EffectClass::SecretUse | EffectClass::MessageSend => {}
+            // Unreachable: rejected above. Kept to stay exhaustive if new
+            // variants are added without updating the rejection list.
+            EffectClass::SecretUse | EffectClass::MessageSend => {
+                return Err(EnvelopeError::UnsupportedEffect(format!("{class:?}")).into())
+            }
         }
     }
 
@@ -276,5 +299,69 @@ fn to_host_obligation(ob: &FrozenObligation) -> Obligation {
             kind: "require_sandbox_profile".to_string(),
             params: serde_json::json!({ "profile": profile }),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel_client::{
+        ACTION_ENVELOPE_VERSION, ResourceSet, ToolRef, deadline_rfc3339,
+    };
+
+    fn envelope_with_effects(effects: Vec<EffectClass>) -> ActionEnvelope {
+        ActionEnvelope {
+            protocol_version: ACTION_ENVELOPE_VERSION,
+            action_id: uuid::Uuid::new_v4().to_string(),
+            session_id: "ed25519:test-session".to_string(),
+            tool: ToolRef {
+                name: "bct.test_tool".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            arguments: serde_json::json!({}),
+            input_hashes: vec![],
+            resources: ResourceSet {
+                paths: vec![],
+                hosts: vec![],
+                secret_refs: vec![],
+            },
+            lease_chain: vec![],
+            nonce: uuid::Uuid::new_v4().to_string(),
+            expires_at: deadline_rfc3339(600),
+            expected_effects: effects,
+        }
+    }
+
+    #[test]
+    fn rejects_effects_without_frozen_counterpart() {
+        // `SecretUse` and `MessageSend` cannot be expressed to the frozen
+        // kernel; silently discarding them would let the kernel authorize
+        // an action on a lease that never granted the effect.
+        for class in [EffectClass::SecretUse, EffectClass::MessageSend] {
+            let error = to_frozen_envelope(&envelope_with_effects(vec![class]))
+                .expect_err("unrepresentable effect must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    KernelError::BadEnvelope(EnvelopeError::UnsupportedEffect(_))
+                ),
+                "unexpected error for {class:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn representable_effects_still_convert() {
+        let frozen = to_frozen_envelope(&envelope_with_effects(vec![
+            EffectClass::Read,
+            EffectClass::Write,
+            EffectClass::Network,
+            EffectClass::Execute,
+        ]))
+        .expect("representable effects must convert");
+        assert!(frozen.expected_effects.file_read);
+        assert!(frozen.expected_effects.file_write);
+        assert!(frozen.expected_effects.network_egress);
+        assert!(frozen.expected_effects.process_spawn);
     }
 }
