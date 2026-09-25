@@ -118,6 +118,10 @@ pub enum VhlError {
     GrantSignature,
     #[error("standing lease requires the explicit confirmation workflow; it is never inferred")]
     StandingLeaseNotConfirmed,
+    #[error(
+        "standing lease confirmation does not match the approved view: the request changed after confirmation"
+    )]
+    ConfirmationMismatch,
     #[error("audit sink failed: {0}")]
     Audit(String),
     #[error("envelope inconsistent with canonical action: {0}")]
@@ -1723,11 +1727,18 @@ impl<S: AuditStore> VhlAuditSink for KernelAuditLog<S> {
 /// [`VhlAuthority::confirm_standing_lease`]. It can only be constructed
 /// there, and [`VhlAuthority::mint_standing_lease`] consumes it — a standing
 /// lease can never be minted without passing through the explicit workflow.
-#[derive(Debug)]
+/// (Clone exists for retry-after-failure; the Approved→Minted state edge is
+/// what makes double-mint impossible, not the move.)
+#[derive(Debug, Clone)]
 pub struct StandingLeaseConfirmation {
     request_id: String,
     approver: String,
     confirmed_at_ms: i64,
+    /// Hash of the rendered approval body the human confirmed. The mint
+    /// re-hashes the current request body and rejects any drift, so the
+    /// view fields (paths, rights, destinations, effects, budget) cannot be
+    /// widened between confirmation and mint.
+    view_hash: [u8; 32],
 }
 
 impl StandingLeaseConfirmation {
@@ -2109,6 +2120,18 @@ impl<V: VhlVerifier> VhlAuthority<V> {
                 "standing mint requires an approved request, found {}",
                 request.state.kind()
             )));
+        }
+        // Bind the confirmation to the approved view: the caller keeps
+        // `&mut` access to the request after confirm_standing_lease returns,
+        // so re-hash the rendered body and reject any drift. Without this,
+        // mutating `view.paths` / `view.path_rights` / `view.effects` /
+        // `view.budget_executions` after confirmation would mint authority
+        // the human never reviewed.
+        let body = request
+            .render_body()
+            .map_err(|e| VhlError::Encoding(e.to_string()))?;
+        if body_hash(&body) != confirmation.view_hash {
+            return Err(VhlError::ConfirmationMismatch);
         }
         if !vault.is_live(&parent.subject) {
             // The parent session's key must be vault-held: only the kernel
