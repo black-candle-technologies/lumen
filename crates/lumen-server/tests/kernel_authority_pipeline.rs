@@ -158,8 +158,7 @@ async fn issue_test_lease(f: &Fixture) -> lumen_server::LeaseDocument {
     });
     scope.effects.push(KernelEffectClass::Read);
     let now = now_ms();
-    let lease = f
-        .kernel
+    f.kernel
         .issue_root_lease(RootLeaseParams {
             lease_id: seq.clone(),
             subject: info.subject.clone(),
@@ -176,8 +175,7 @@ async fn issue_test_lease(f: &Fixture) -> lumen_server::LeaseDocument {
             issued_at_ms: now,
         })
         .await
-        .expect("issue root lease");
-    lease
+        .expect("issue root lease")
 }
 
 /// Start a real vault identity and issue a real root lease covering the
