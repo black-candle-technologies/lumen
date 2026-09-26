@@ -1195,11 +1195,12 @@ impl Database {
         link: &AuditLink,
         created_at_ms: i64,
     ) -> Result<(), RepositoryError> {
+        let sequence = audit_sql_integer("checkpoint sequence", link.through_seq)?;
         let event_hash: Option<String> = sqlx::query_scalar(
             "SELECT hash FROM kernel_audit_events WHERE workspace_id=? AND seq=?",
         )
         .bind(ws(workspace_id))
-        .bind(link.through_seq as i64)
+        .bind(sequence)
         .fetch_optional(self.pool())
         .await?;
         match event_hash {
@@ -1216,7 +1217,7 @@ impl Database {
              VALUES(?,?,?,?,?,?)",
         )
         .bind(ws(workspace_id))
-        .bind(link.through_seq as i64)
+        .bind(sequence)
         .bind(&link.chain_hash)
         .bind(&link.signature)
         .bind(&link.key_id)
@@ -1250,14 +1251,17 @@ impl Database {
             qb.push(" AND decision=").push_bind(v);
         }
         if let Some(v) = query.min_seq {
-            qb.push(" AND seq>=").push_bind(v as i64);
+            qb.push(" AND seq>=")
+                .push_bind(audit_sql_integer("minimum sequence", v)?);
         }
         if let Some(v) = query.max_seq {
-            qb.push(" AND seq<=").push_bind(v as i64);
+            qb.push(" AND seq<=")
+                .push_bind(audit_sql_integer("maximum sequence", v)?);
         }
         qb.push(" ORDER BY seq");
         if let Some(limit) = query.limit {
-            qb.push(" LIMIT ").push_bind(limit as i64);
+            qb.push(" LIMIT ")
+                .push_bind(audit_sql_integer("query limit", limit)?);
         }
         let rows = qb.build().fetch_all(self.pool()).await?;
         rows.iter().map(audit_event_from_row).collect()
@@ -1278,7 +1282,7 @@ impl Database {
             .map(|r| {
                 Ok(AuditLink {
                     key_id: r.get("key_id"),
-                    through_seq: r.get::<i64, _>("seq") as u64,
+                    through_seq: audit_unsigned_integer("checkpoint sequence", r.try_get("seq")?)?,
                     chain_hash: r.get("hash"),
                     signature: r.get("signature"),
                 })
@@ -2197,14 +2201,35 @@ async fn append_audit_attempt(
         parse_actor(params.actor).map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
     let detail = render_detail(&params.details)
         .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
-    let tip: Option<(i64, String)> = sqlx::query_as(
-        "SELECT seq,hash FROM kernel_audit_events WHERE workspace_id=? ORDER BY seq DESC LIMIT 1",
+    let tip = sqlx::query(
+        "SELECT seq,version,event_id,kind,actor,session_id,action_digest,
+         decision,detail,prev_hash,hash,timestamp_ms
+         FROM kernel_audit_events WHERE workspace_id=? ORDER BY seq DESC LIMIT 1",
     )
     .bind(ws(workspace_id))
     .fetch_optional(&mut **tx)
     .await?;
     let (sequence, prev_hash) = match tip {
-        Some((seq, hash)) => (seq as u64 + 1, hash),
+        Some(row) => {
+            let event = audit_event_from_row(&row)?;
+            let recomputed = event
+                .compute_hash(&event.prev_hash)
+                .map_err(|e| RepositoryError::KernelAuditBreak(e.to_string()))?;
+            if event.hash != recomputed {
+                return Err(RepositoryError::KernelAuditBreak(
+                    "audit tip hash mismatch".into(),
+                ));
+            }
+            let next = audit_sql_integer("audit tip sequence", event.sequence)?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    RepositoryError::KernelAuditBreak("audit sequence exhausted".into())
+                })?;
+            (
+                audit_unsigned_integer("next audit sequence", next)?,
+                event.hash,
+            )
+        }
         None => (0, GENESIS_PREV_HASH.to_string()),
     };
     let event = AuditEvent {
@@ -2229,8 +2254,8 @@ async fn append_audit_attempt(
          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(ws(workspace_id))
-    .bind(sealed.sequence as i64)
-    .bind(sealed.version as i64)
+    .bind(audit_sql_integer("audit sequence", sealed.sequence)?)
+    .bind(i64::from(sealed.version))
     .bind(sealed.event_id.to_string())
     .bind(sealed.kind.as_str())
     .bind(actor_to_string(&sealed.actor))
@@ -2482,8 +2507,24 @@ fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseDocument, Reposito
     })
 }
 
+fn audit_sql_integer(field: &str, value: u64) -> Result<i64, RepositoryError> {
+    i64::try_from(value).map_err(|_| {
+        RepositoryError::KernelAuditBreak(format!("{field} exceeds SQLite's signed integer range"))
+    })
+}
+
+fn audit_unsigned_integer(field: &str, value: i64) -> Result<u64, RepositoryError> {
+    u64::try_from(value)
+        .map_err(|_| RepositoryError::KernelAuditBreak(format!("{field} must not be negative")))
+}
+
 fn audit_event_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, RepositoryError> {
-    let version = r.get::<i64, _>("version") as u32;
+    let stored_version: i64 = r.try_get("version")?;
+    let version = u32::try_from(stored_version).map_err(|_| {
+        RepositoryError::KernelAuditBreak(format!(
+            "audit event version out of range: {stored_version}"
+        ))
+    })?;
     if version != AUDIT_EVENT_VERSION {
         return Err(RepositoryError::KernelAuditBreak(format!(
             "unsupported audit event version {version}"
@@ -2509,8 +2550,8 @@ fn audit_event_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Repos
     Ok(AuditEvent {
         version,
         event_id,
-        sequence: r.get::<i64, _>("seq") as u64,
-        timestamp_ms: r.get("timestamp_ms"),
+        sequence: audit_unsigned_integer("audit sequence", r.try_get("seq")?)?,
+        timestamp_ms: r.try_get("timestamp_ms")?,
         actor,
         kind,
         session_id: r.get("session_id"),

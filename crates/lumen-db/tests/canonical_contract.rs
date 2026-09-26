@@ -131,6 +131,7 @@ async fn migration_preserves_legacy_evidence_and_refuses_old_authority_after_res
         versions,
         vec![
             ("action_envelope".into(), 2),
+            ("audit_event".into(), 1),
             ("host_action_channel".into(), 2),
             ("kernel_wire".into(), 2),
             ("lease_document".into(), 3),

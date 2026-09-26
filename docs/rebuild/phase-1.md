@@ -66,6 +66,22 @@ The host fixture freezes both representations and their distinct digests; the
 conversion rejects stale/future policy versions. The independent Python verifier
 checks these digests as well as the core/protocol fixture copies.
 
+The next persistence probe found a distinct audit failure: stored version
+`4294967297` narrowed to v1 before hashing, so an unchanged v1 checkpoint could
+verify the different stored version. Audit reads, checkpoint sequences, query
+bounds/limits and sequence advancement now use checked integer conversions.
+Append validates the existing tip's exact version and hash and refuses corrupt
+or exhausted tips. This is not a full-history verification on each append.
+
+Migration 0031 adds an exact-v1 guard for new audit rows and records the existing
+audit contract version. It does not change the AuditEvent v1 encoding or hashes,
+nor transform invalid historical bytes. The numeric regression tests retain a
+valid signature while varying the stored version, exercise migration failure
+rollback and restart preservation, reject overflowing query bounds, and fault
+inject corruption/exhaustion without allowing a new append. Audit JSON decoding,
+complete startup chain validation and signature-role distinctions still require
+review; these checks do not finish the audit gate.
+
 ## Contract and operator review
 
 Review code, fixtures, migrations, tests and ADR-0010/0011 together. Required owners:
@@ -80,10 +96,15 @@ and signatures must never be translated silently.
 
 The new binary refuses legacy live documents or malformed persisted authority.
 Historical rows remain available as raw evidence, not executable authority. Older
-binaries refuse newer schemas (0029/0030); rollback needs the reviewed backup with
+binaries refuse newer schemas (0029/0030/0031); rollback needs the reviewed backup with
 admission stopped, or a forward fix. Never downgrade a migrated database or
 restore unconfined Pi. The migration tests exercise scratch databases; an operator
 staging restore rehearsal remains outstanding.
+
+An invalid historical audit version is evidence of an integrity failure. Stop
+admission and preserve the original database for independent inspection; never
+rewrite the version, hash, event, or checkpoint to make verification pass. Use a
+reviewed verified restore point or a separately reviewed forward recovery plan.
 
 ## Verification and remaining gate work
 
@@ -112,6 +133,12 @@ package-selection warning because the excluded desktop package does not exist;
 there were no Rust/Clippy diagnostics. Logs and fixture/migration hashes are
 recorded in that evidence. [Draft PR #85](https://github.com/black-candle-technologies/lumen/pull/85)
 is stacked on Phase 0; owner review and phase acceptance remain pending.
+
+[Action contract checks](evidence/phase1-action-contracts.json) tie `7d01adf` to
+454 hash-matched files on lane-vps: 600 tests in 35 suites and the 14 bounded
+transport acceptance tests passed without ignores or warnings. Workspace Clippy
+and the independent fixture verifier passed. This evidence predates the audit
+numeric correction and is not its validation evidence.
 
 The historical decoder gap is reproduced in the
 [ActionEnvelope v1 probe](evidence/phase1-action-v1-probe.json). Adding an unknown
