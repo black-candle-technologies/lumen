@@ -56,6 +56,9 @@ def compile_guard(root: Path):
                     "-I/usr/include/node", "-o", str(out), str(here / "guard.c")],
                    check=True, timeout=30)
     copy_file(here / "bootstrap.cjs", root, "/guard/bootstrap.cjs")
+    subprocess.run(["/usr/bin/gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                    "-fstack-protector-strong", "-Wl,-z,relro,-z,now", "-o",
+                    str(root / "guard/liveness"), str(here / "liveness.c")], check=True, timeout=30)
 
 
 def manifest_for(root: Path, output: Path, entrypoint: str, arguments=()):
@@ -65,7 +68,7 @@ def manifest_for(root: Path, output: Path, entrypoint: str, arguments=()):
         files = sorted(inventory(fd))
     finally:
         os.close(fd)
-    data = {"version": 1, "platform": "linux-x86_64",
+    data = {"version": 2, "profile": "bwrap-stdio-liveness-v2", "platform": "linux-x86_64",
             "files": {path: sha256(root / path.lstrip("/")) for path in files},
             "host_tools": {name: sha256(Path(path)) for name, path in TOOLS.items()},
             "entrypoint": entrypoint, "arguments": list(arguments)}

@@ -3,12 +3,13 @@
 Status: **in progress; gate not passed; production Pi admission disabled**.
 Branch: `lumen-rebuild/phase-0-boundary-reset`, based on `c2ed463`.
 
-Current development evidence: [lane-vps results](evidence/phase0-confinement.json),
+The v1 development evidence remains immutable: [lane-vps results](evidence/phase0-confinement.json),
 [exact unsigned runtime candidate](evidence/phase0-runtime.candidate.json),
 [audited denial](evidence/phase0-denial.audit.json), and
 [separately captured checkpoint anchor](evidence/phase0-denial.anchor.json).
 The [earlier preparation record](evidence/phase0-preparation.json) is preserved
 unchanged and describes its earlier commit, before real Pi was exercised.
+The v2 liveness follow-up is specified in [ADR-0009](../adr/0009-pi-host-liveness.md).
 
 ## Why the reference spike is insufficient
 
@@ -50,8 +51,14 @@ The deny probe has no executor. Direct filesystem/shell/native-network attempts
 fail inside that Pi session; a separate Python verifier validates the durable
 audit chain, signatures, captured head and exact denial digest. Native tests also
 cover worker inheritance, environment stripping, quotas and managed timeouts.
-This does not establish Firecracker effects, abrupt host-restart cleanup, signed
-artifact admission or owner acceptance. No product feature is enabled by this PR.
+The v2 experiment adds an external pinned liveness monitor, systemd-owned runtime
+directories and ownership-locked recovery. Real SIGKILL tests cover an active
+non-cooperative guest and interrupted preparation; monitor death and corrupt
+liveness input terminate the entire unit. Recovery preserves live owners and
+rejects symlinks, unsafe permissions and unavailable service-manager state.
+These are process-crash observations, not machine-reboot, Firecracker, or kernel
+authority-reconciliation evidence. Signed artifact admission and owner acceptance
+remain pending. No product feature is enabled by this PR.
 
 ## Proposed contract transition
 
@@ -81,6 +88,13 @@ Required reviews (pending): host owner as producer, Pi integration owner as
 consumer, kernel owner for authority projection, sandbox owner for launch
 admission. This document does not supply their sign-off.
 
+The runtime candidate manifest separately advances from v1 to v2, requiring
+`profile: bwrap-stdio-liveness-v2` and the native monitor's hash. Missing monitor,
+unknown profiles/versions and v1 manifests fail closed. Drain v1 test units before
+switching; never reinterpret old manifests. No DB or historical audit migration
+is needed. Runtime ownership locks carry no authority. See the
+[operator procedure](../../scripts/rebuild/README.md) for recovery and rollback.
+
 ## Bypass inventory
 
 | Route | Reference gap | Current control / remaining proof |
@@ -98,6 +112,7 @@ admission. This document does not supply their sign-off.
 | Pending/deny/unknown response | Could fall into local execution | Only audited completed output returned; all other outcomes throw, no retry |
 | Missing audit/usage, oversized result | Extension read independently | Strict completion decoder fails closed; pipeline audit-failure tests retained |
 | Restart / alternate launcher | Two independent subprocess entry points | Both public launch paths disabled; fake-child tests explicitly separated |
+| Abrupt prototype host/monitor death | systemd parent outlived launcher | v2 FIFO monitor + managed runtime directories; real SIGKILL/partial-startup recovery tests; kernel lease reconciliation remains separate |
 
 Denial before launch is containment, **not proof of an instrumented confined Pi**.
 The historical fixture tests only check historical data. Do not count either as
@@ -133,4 +148,5 @@ On a deployed reference build, apply emergency-stop/session-revocation procedure
 under a separate deployment authorization before replacing binaries. This source
 change does not stop an already-running old service. Rolling back the draft's
 code must not re-enable unconfined Pi; retain the admission denial until a reviewed
-replacement exists. Staging rollback and real-Pi evidence are still pending.
+replacement exists. Real Pi denial evidence is available above; staging rollback,
+signed admission and owner acceptance remain pending.

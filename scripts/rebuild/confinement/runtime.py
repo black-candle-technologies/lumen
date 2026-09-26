@@ -1,4 +1,4 @@
-"""Experimental, fail-closed Linux Pi runtime launcher (ADR-0008).
+"""Experimental, fail-closed Linux Pi runtime launcher (ADR-0008/0009).
 
 This is test infrastructure, not an admission path for the product supervisors.
 No live repository, home, credential, host socket, or network is mounted.
@@ -15,7 +15,6 @@ import selectors
 import signal
 import stat
 import subprocess
-import tempfile
 import time
 import uuid
 
@@ -124,8 +123,9 @@ def load_manifest(path: Path, expected_digest: str):
     if len(raw) > 2 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected_digest:
         raise Refused("runtime manifest digest mismatch")
     obj = json.loads(raw, object_pairs_hook=unique_object)
-    exact(obj, ("version", "platform", "files", "host_tools", "entrypoint", "arguments"))
-    if type(obj["version"]) is not int or obj["version"] != 1 or obj["platform"] != "linux-x86_64":
+    exact(obj, ("version", "profile", "platform", "files", "host_tools", "entrypoint", "arguments"))
+    if (type(obj["version"]) is not int or obj["version"] != 2 or obj["platform"] != "linux-x86_64"
+            or obj["profile"] != "bwrap-stdio-liveness-v2"):
         raise Refused("unsupported runtime manifest")
     files = obj["files"]
     if not isinstance(files, dict) or not 3 <= len(files) <= MAX_FILES:
@@ -133,7 +133,7 @@ def load_manifest(path: Path, expected_digest: str):
     for name, expected in files.items():
         path_parts(name)
         digest(expected)
-    for required in ("/usr/bin/node", "/guard/guard.node", "/guard/bootstrap.cjs"):
+    for required in ("/usr/bin/node", "/guard/guard.node", "/guard/bootstrap.cjs", "/guard/liveness"):
         if required not in files:
             raise Refused("required runtime component missing")
     exact(obj["host_tools"], TOOLS)
@@ -176,7 +176,7 @@ def snapshot(source_root: Path, destination: Path, manifest):
                     out.write(chunk)
             if actual.hexdigest() != expected:
                 raise Refused("runtime file digest mismatch")
-            target.chmod(0o555 if name == "/usr/bin/node" or target.name.startswith("ld-linux-") else 0o444)
+            target.chmod(0o555 if name in ("/usr/bin/node", "/guard/liveness") or target.name.startswith("ld-linux-") else 0o444)
         for name in ("state", "dev"):
             (destination / name).mkdir(exist_ok=True)
     finally:
@@ -190,6 +190,19 @@ def control_env():
             "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
 
 
+def check_host_tools(manifest):
+    # Keep the distro's path-bound AppArmor profile for bubblewrap. Check
+    # before recovery too: an unpinned systemctl cannot perform cleanup.
+    for tool, original in TOOLS.items():
+        candidate = Path(original)
+        for component in (candidate, *candidate.parents):
+            info = component.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or os.access(component, os.W_OK):
+                raise Refused("host tool path is mutable or indirect")
+        if sha256(candidate) != manifest["host_tools"][tool]:
+            raise Refused("host tool digest mismatch")
+
+
 class Runtime:
     """One transient cgroup + disposable mount/PID/network namespace per run."""
     def __init__(self, source_root: Path, manifest_path: Path, expected_digest: str):
@@ -199,24 +212,19 @@ class Runtime:
         self.source_root = source_root
         self.process = None
         self.temp = None
+        self.started = False
         self.unit = "lumen-phase0-" + uuid.uuid4().hex + ".service"
 
     def __enter__(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="lumen-pi-runtime-")
+        from recovery import OwnedDirectory
+        if self.started:
+            raise Refused("runtime generations cannot be reused")
+        self.started = True
+        check_host_tools(self.manifest)
+        self.temp = OwnedDirectory(self.unit)
         try:
             base = Path(self.temp.name)
             snapshot(self.source_root, base / "root", self.manifest)
-            # Preserve the distro's path-bound AppArmor profile for bubblewrap.
-            # Host executables must be root-owned, immutable to this unprivileged
-            # account, and hash-pinned. A root compromise is outside this profile.
-            for tool, original in TOOLS.items():
-                candidate = Path(original)
-                for component in (candidate, *candidate.parents):
-                    info = component.lstat()
-                    if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or os.access(component, os.W_OK):
-                        raise Refused("host tool path is mutable or indirect")
-                if sha256(Path(original)) != self.manifest["host_tools"][tool]:
-                    raise Refused("host tool digest mismatch")
             argv = [TOOLS["bwrap"], "--unshare-all", "--unshare-user", "--unshare-cgroup",
                     "--disable-userns", "--die-with-parent", "--new-session",
                     "--uid", "65534", "--gid", "65534", "--cap-drop", "ALL",
@@ -238,12 +246,15 @@ class Runtime:
                        "--unit=" + self.unit, "-p", "MemoryMax=768M", "-p", "MemorySwapMax=0",
                        "-p", "TasksMax=64", "-p", "CPUQuota=100%", "-p", "RuntimeMaxSec=90",
                        "-p", "KillMode=control-group", "-p", "TimeoutStopSec=2", "-p", "LimitCORE=0",
+                       "-p", "RuntimeDirectory=" + self.temp.basename,
+                       "-p", "RuntimeDirectoryMode=0700", "-p", "RuntimeDirectoryPreserve=no",
+                       "-p", "Restart=no",
                        # libuv may initialize io_uring before --require runs.
                        # Deny setup before exec; the final TSYNC filter also
                        # denies all three calls. Never permit an existing ring.
                        "-p", "SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register",
                        "-p", "SystemCallErrorNumber=ENOSYS",
-                       "--", *argv]
+                       "--", str(base / "root/guard/liveness"), str(base / "liveness"), "--", *argv]
             self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.PIPE, env=control_env(), close_fds=True,
                                             start_new_session=True)
@@ -253,25 +264,28 @@ class Runtime:
             raise
 
     def __exit__(self, *_):
-        if self.process is not None:
-            try:
-                # Stop the complete cgroup even if the stdio relay exited.
-                subprocess.run([TOOLS["systemctl"], "--user", "stop", self.unit],
-                               env=control_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=10, check=False)
-            finally:
-                if self.process.poll() is None:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=10)
-                for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
-                    stream.close()
-            state = subprocess.run([TOOLS["systemctl"], "--user", "show", self.unit,
-                                    "--property=ActiveState", "--value"], env=control_env(),
-                                   capture_output=True, timeout=10, check=False)
-            if state.returncode == 0 and state.stdout.strip() not in (b"inactive", b"failed"):
-                raise Refused("transient runtime unit remains active")
-        if self.temp is not None:
+        from recovery import stop_unit
+        if self.temp is None:
+            return
+        self.temp.close_liveness()
+        try:
+            stop_unit(self.unit)
             self.temp.cleanup()
+        finally:
+            try:
+                if self.process is not None:
+                    if self.process.poll() is None:
+                        try:
+                            os.killpg(self.process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    self.process.wait(timeout=10)
+                    for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                        stream.close()
+            finally:
+                # On manager failure leave files for startup recovery; never
+                # mistake an observation failure for a verified stopped unit.
+                self.temp.close()
 
     def collect(self, input_bytes=b"", timeout=20, max_bytes=256 * 1024):
         """Bound both streams and stdin, including a child that never reads."""

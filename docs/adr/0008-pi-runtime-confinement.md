@@ -74,20 +74,21 @@ do not prove benign behavior. An operator/root compromise is outside this test.
 | Steal credentials or inherited descriptors | Clean environment, only three inherited pipes, no host home/proc/socket mounts; canary tests |
 | Bypass via worker threads | TSYNC at installation and inherited filters for CLONE_THREAD; worker repeats malicious operations |
 | Change namespaces, mount, ptrace, ioctl, io_uring | Default-deny syscall filter; explicit architecture guard and narrow ioctl allowance |
-| Resource exhaustion / orphaned child | Effective transient cgroup quotas plus managed timeout teardown; abrupt supervisor death and restart remain unaccepted |
+| Resource exhaustion / orphaned child | Effective transient cgroup quotas; ADR-0009 adds an experimental pinned liveness monitor and preparation recovery with fault tests; production acceptance remains pending |
 
 Residual risks to resolve before admission: independent review of the native
 filter and snapshot builder; signed runtime provenance; production cgroups and
-crash recovery; host/Pi generation binding and cancellation; a repeatable real Pi
-request that receives a real kernel verdict and audit. Node runtime initialization
+crash recovery; host/Pi generation binding and cancellation; independent
+reproduction of the real Pi request/kernel verdict/audit experiment. Node runtime initialization
 before the filter is trusted and therefore must be pinned as part of the runtime.
 systemd's user manager, its transient-unit API, and the bootstrap io_uring filter
-are also part of this proposed trusted mechanism. **Abrupt host-supervisor death
-is not yet a zero-orphan guarantee:** systemd parents the service, so bubblewrap's
-parent-death behavior does not follow the Python process. RuntimeMaxSec bounds
-that case; a parent-liveness/crash-recovery protocol and fault injection are still
-required before production admission. Do not interpret the successful managed
-timeout cleanup test as host-restart evidence.
+are also part of this proposed trusted mechanism. The v1 prototype depended on
+RuntimeMaxSec after abrupt host death because systemd parents the service;
+bubblewrap's parent-death behavior alone does not follow the Python process.
+[ADR-0009](0009-pi-host-liveness.md) supersedes that experimental liveness design
+with a v2 manifest, a private FIFO monitor and preparation recovery. Its process
+fault tests are distinct from machine restart, kernel authority reconciliation
+and production acceptance. The original v1 evidence remains immutable.
 
 References: [Linux seccomp documentation](https://docs.kernel.org/userspace-api/seccomp_filter.html)
 and [bubblewrap design](https://github.com/containers/bubblewrap/blob/main/README.md).

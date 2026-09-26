@@ -19,7 +19,7 @@ from prepare import compile_guard, manifest_for, system_runtime
 from runtime import Refused, Runtime, control_env, load_manifest, sha256
 
 
-class ConfinementTests(unittest.TestCase):
+class ConfinementFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.area = tempfile.TemporaryDirectory(prefix="lumen-confinement-tests-")
@@ -49,6 +49,8 @@ class ConfinementTests(unittest.TestCase):
         with Runtime(self.root, manifest, expected) as runtime:
             return runtime.collect(**kwargs)
 
+
+class ConfinementTests(ConfinementFixture):
     def test_01_runtime_reaches_node_after_native_seal(self):
         code, out, err = self.run_script("console.log(JSON.stringify({ready:true}));")
         self.assertEqual(code, 0, err.decode())
@@ -147,7 +149,7 @@ worker.on('error',err=>{console.error(err);process.exitCode=1});
     def test_08_unknown_manifest_fields_versions_and_traversal_are_rejected(self):
         manifest, expected = self.candidate("console.log('OK')")
         original = json.loads(manifest.read_bytes())
-        for change in ({"version": 2}, {"network": True}, {"entrypoint": "/app/../app/main.cjs"}):
+        for change in ({"version": 1}, {"version": 3}, {"profile": "unguarded"}, {"network": True}, {"entrypoint": "/app/../app/main.cjs"}):
             manifest.write_text(json.dumps({**original, **change}))
             with self.assertRaises(Refused):
                 load_manifest(manifest, sha256(manifest))

@@ -43,7 +43,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Native negative paths, quotas, cleanup, independent audit verifier
         working-directory: scripts/rebuild/confinement
-        run: python3 -m unittest -v test_runtime test_audit
+        run: python3 -m unittest -v test_runtime test_liveness test_audit
       - run: npm ci --ignore-scripts --no-audit --no-fund && npm test
         working-directory: lumen-integrations/bct-pi-extension
       - run: cargo build -p lumen-server --example phase0_kernel_probe

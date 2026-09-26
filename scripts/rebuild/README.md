@@ -1,8 +1,9 @@
 # Phase 0 confinement experiment
 
 Development verification only. Both production Pi launchers remain disabled.
-Read [ADR-0008](../../docs/adr/0008-pi-runtime-confinement.md) before changing the
-trusted bootstrap, syscall rules, mounts, or transient service policy.
+Read [ADR-0008](../../docs/adr/0008-pi-runtime-confinement.md) and
+[ADR-0009](../../docs/adr/0009-pi-host-liveness.md) before changing the trusted
+bootstrap, syscall rules, mounts, liveness monitor or recovery policy.
 
 Prerequisites: unprivileged Linux x86-64, cgroup v2 with a working systemd user
 manager, bubblewrap, system Node 22.22.1 at `/usr/bin/node`, GCC, N-API headers,
@@ -16,7 +17,7 @@ From the repository root, in a new **absolute** scratch directory:
 # The existing extension test build emits the actual host-client.js used below.
 (cd lumen-integrations/bct-pi-extension && npm ci --ignore-scripts --no-audit --no-fund && npm test)
 cargo build -p lumen-server --example phase0_kernel_probe
-(cd scripts/rebuild/confinement && python3 -m unittest -v test_runtime test_audit)
+(cd scripts/rebuild/confinement && python3 -m unittest -v test_runtime test_liveness test_audit)
 bash scripts/rebuild/build-pinned-pi.sh /absolute/scratch/upstream
 python3 scripts/rebuild/confinement/prepare_pi.py /absolute/scratch/upstream/repo /absolute/scratch/runtime
 # Supply the candidate manifest digest printed by preparation, after inspection.
@@ -47,6 +48,25 @@ independent admission review. These experimental manifests have no signature or
 production admission status. Registry provenance signatures have not yet been
 independently verified; matching a published gitHead is not such verification.
 
+The candidate manifest is v2, profile `bwrap-stdio-liveness-v2`; it additionally
+pins the native liveness monitor. v1 candidates are historical and are rejected.
+The host owns the only writer of a private FIFO outside Pi's mounts. Losing that
+writer terminates the monitor's child; systemd removes the entire service cgroup
+and its runtime directory. Killing the monitor itself also terminates the unit.
+The service manager owns `/run/user/UID/lumen-pi-runtime-UUID`, mode 0700. Pi cannot
+access its FIFO or ownership lock. The persistent registry lock is shared cleanup
+coordination state, not a per-run orphan, lease or identity store.
+
+Before each launch, the host verifies pinned host tools and recovers interrupted
+preparations. Recovery only stops strictly named units whose owner lock is no
+longer held, verifies the unit is inactive with no cgroup, then removes its owned
+snapshot using directory descriptors. It refuses unsafe paths and unavailable
+manager state. A concurrent live owner's snapshot is preserved. Fault tests use
+actual SIGKILL, observe cleanup before any fallback cleanup, and bound teardown
+to five seconds. Preparation crashes require startup recovery because no service
+exists yet. This is a process-crash test, not machine-reboot, Firecracker, or
+kernel session/lease reconciliation evidence.
+
 `probe_pi.py` supervises the actual upstream CLI over bounded JSONL stdio. Its
 pinned test extension supplies a deterministic model and calls the compiled BCT
 `requestRead` bridge; it is not a live model gateway. Pi 0.87.1's `--no-tools`
@@ -71,12 +91,16 @@ and a remote trusted checkpoint store are not provided here.
 
 No existing database or deployed service is touched. There is no database schema
 migration in this experiment. Keep production launch rejection when reverting
-prototype code. For an interrupted test, inspect only its `lumen-phase0-*`
-transient unit, stop that exact unit through `systemctl --user stop UNIT`, and
-verify its cgroup and private snapshot are gone before removing the scratch
-directory. Do not stop similarly named jobs indiscriminately. Abrupt supervisor
-death currently relies on RuntimeMaxSec for eventual termination; immediate
-orphan-free restart recovery and staging rollback are still open acceptance work.
+prototype code. Stop/drain v1 test units before moving to the v2 manifest; do not
+reuse or reinterpret a v1 manifest. For an interrupted test, inspect only its
+recorded `lumen-phase0-*` unit, stop that exact unit through `systemctl --user stop
+UNIT`, and verify its cgroup and private snapshot are gone before removing the
+scratch directory. Do not stop similarly named jobs indiscriminately. A fresh
+v2 launch performs preparation recovery after validating the candidate and host
+tool digests. If the manager is unavailable, restore its availability before
+retrying; do not manually declare an unknown unit stopped. A rollback rehearsal
+may stop this prototype and verify public launch refusal, but must never restore
+an unconfined launcher. Staging rollback remains separate acceptance work.
 
 Passing this experiment is not full Phase 0 acceptance, signed release evidence,
 Firecracker execution evidence, an independent security review, or authorization
