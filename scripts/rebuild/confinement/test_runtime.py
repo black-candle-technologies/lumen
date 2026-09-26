@@ -213,6 +213,14 @@ setTimeout(()=>console.log(JSON.stringify({existed,value:fs.readFileSync('/state
         self.assertEqual([value for _, value in results], [
             {"existed": False, "value": value} for value in ["session-a", "session-b", "restarted-session"]])
 
+    def test_13_arguments_cannot_expand_the_service_manager_environment(self):
+        manifest, _ = self.candidate("console.log(JSON.stringify(process.argv.slice(2)))")
+        expected = manifest_for(self.root, manifest, "/app/main.cjs", ["$HOME", "${PATH}"])
+        with Runtime(self.root, manifest, expected) as runtime:
+            code, out, err = runtime.collect()
+        self.assertEqual(code, 0, err.decode())
+        self.assertEqual(json.loads(out), ["$HOME", "${PATH}"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

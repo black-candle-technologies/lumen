@@ -234,6 +234,7 @@ class Runtime:
             # The user manager creates a transient service, never modifies a
             # deployed Lumen service, and enforces bounds outside the guest.
             command = [TOOLS["systemd_run"], "--user", "--quiet", "--wait", "--pipe", "--collect",
+                       "--expand-environment=no",
                        "--unit=" + self.unit, "-p", "MemoryMax=768M", "-p", "MemorySwapMax=0",
                        "-p", "TasksMax=64", "-p", "CPUQuota=100%", "-p", "RuntimeMaxSec=90",
                        "-p", "KillMode=control-group", "-p", "TimeoutStopSec=2", "-p", "LimitCORE=0",

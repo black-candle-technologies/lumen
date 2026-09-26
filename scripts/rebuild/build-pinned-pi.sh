@@ -42,7 +42,7 @@ pi_bwrap=(/usr/bin/bwrap --unshare-all --die-with-parent --new-session --cap-dro
 # Only the trusted package manager runs here; dependency lifecycle scripts are
 # disabled. The lockfile was verified before any packages were fetched.
 env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$pi_user_runtime" \
-    /usr/bin/systemd-run --user --quiet --wait --pipe --collect --unit="$pi_unit-deps" \
+    /usr/bin/systemd-run --user --quiet --wait --pipe --collect --expand-environment=no --unit="$pi_unit-deps" \
     -p MemoryMax=1536M -p MemorySwapMax=0 -p CPUQuota=100% -p TasksMax=128 -p RuntimeMaxSec=600 \
     -p KillMode=control-group -p TimeoutStopSec=3 -- \
     "${pi_bwrap[@]}" --share-net --ro-bind /etc/resolv.conf /etc/resolv.conf \
@@ -52,7 +52,7 @@ env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$pi_user_runtime" \
 # Repository build code runs with no network and no host home/credentials.
 # No network-enabled fallback if the upstream offline build cannot succeed.
 env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$pi_user_runtime" \
-    /usr/bin/systemd-run --user --quiet --wait --pipe --collect --unit="$pi_unit-compile" \
+    /usr/bin/systemd-run --user --quiet --wait --pipe --collect --expand-environment=no --unit="$pi_unit-compile" \
     -p MemoryMax=1536M -p MemorySwapMax=0 -p CPUQuota=100% -p TasksMax=128 -p RuntimeMaxSec=600 \
     -p KillMode=control-group -p TimeoutStopSec=3 -- \
     "${pi_bwrap[@]}" --setenv NODE_OPTIONS '--import /work/repo/node_modules/tsx/dist/loader.mjs' \

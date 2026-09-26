@@ -48,7 +48,9 @@ for the long-lived untrusted agent loop and does not replace effect isolation.
 The experimental launcher checks every regular file against an exact manifest,
 rejects symlinks/special files/unknown fields, snapshots verified bytes again into
 a private launch directory, clears the environment, closes inherited descriptors,
-and uses a fixed Node command. It does not accept arbitrary launcher flags or
+and uses a fixed Node command. systemd argument environment expansion is disabled
+so literal arguments cannot interpolate the service manager's environment. A
+native test verifies `$HOME` and `${PATH}` remain literal strings. It does not accept arbitrary launcher flags or
 environment assignments. Production signature/admission verification and host
 supervisor integration remain separate acceptance work.
 
