@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-26T04:37:48.727372+00:00",
+  "classification": "development process-fault evidence; unsigned candidate; phase gate not accepted",
+  "phase_0_gate": "not_passed",
+  "implementation_commit": "bbecd61e37c35db28475380ec5a96112bec8a549",
+  "source_archive_sha256": "8e7162d5d61c3caef4c8bb46b87c5df672464c66f16008fc21c327835c654c8a",
+  "host": {
+    "name": "lane-vps",
+    "platform": "Linux x86_64",
+    "node": "22.22.1",
+    "bubblewrap": "0.11.1",
+    "systemd": "259.5",
+    "scratch": "/home/ubuntu/lumen-phase0.Fq24kV",
+    "deployment_modified": false
+  },
+  "runtime": {
+    "manifest_version": 2,
+    "profile": "bwrap-stdio-liveness-v2",
+    "manifest_sha256": "768a04815e90a5560176c90643cc96de36767a8b8089ef4fbca3c0508da262a1",
+    "file_count": 3921,
+    "liveness_monitor_sha256": "f47c40544cd403fc777e496d8200d303f859f280813046214733fc1dc2521838",
+    "pi_source_commit": "f07218c4d4bbc12bef056a7058c3dd49dfe41abe",
+    "kernel_probe_binary_sha256": "fd07da4df85190e88cc70e9646a8133f069437e736dfbaaf0c3efaa7a0f26282",
+    "signature_admission": false
+  },
+  "results": {
+    "tests": 25,
+    "failures": 0,
+    "native_tests": 13,
+    "liveness_tests": 10,
+    "independent_audit_tests": 2,
+    "fault_measurements": [
+      {
+        "fault": "host_sigkill",
+        "teardown_seconds": [
+          0.03474159701727331,
+          0.03406415705103427,
+          0.020889597944915295
+        ]
+      },
+      {
+        "fault": "monitor_sigkill",
+        "teardown_seconds": 0.04209088592324406
+      }
+    ],
+    "latency_method": "monotonic time immediately before SIGKILL request through passive observation of inactive unit, removed cgroup and removed runtime directory; no fallback cleanup before observation",
+    "teardown_deadline_seconds": 5,
+    "partial_startup_recovered": true,
+    "live_owner_preserved_during_recovery": true,
+    "manager_outage_keeps_unverified_state": true,
+    "unsafe_cleanup_targets_rejected": true,
+    "remaining_prototype_units": [],
+    "remaining_runtime_directories": [],
+    "real_pi_rpc_events": 24,
+    "kernel_outcome": "denied",
+    "denial_reason": "scope_exceeded: one-shot lease is not bound to the presented action",
+    "action_digest": "38e703bd932ed8083a02ceb49bbde9fb709dab95da634cdd9620b40f71992396",
+    "audit_events": 7,
+    "signed_checkpoints": 7,
+    "independent_python_verifier": "passed",
+    "effect_executor_present": false
+  },
+  "log_sha256": {
+    "liveness-suite-25.log": "7f9741cbc1efd6742af9e98f937dee8eb226c716f32e6f46c75ef7b142ae4086",
+    "real-pi-liveness-probe.log": "89b3f59bc0e4b7e9484c2c089c613e2fe63949ebbbf8d6714b13c481cc6b395b"
+  },
+  "evidence_sha256": {
+    "kernel-evidence.json": "366d190e6e04001187900dd887e39a03c6cda7e6455ba5f37d2ab0b44c813508",
+    "audit-anchor.json": "dc08a8b28a1aa8578187a5daf21c01eda10484984b8ed9184c1b510fae6448e8",
+    "rpc-events.json": "4f6159bbe91d112dc0d241dd1898dc493f2f03a85203dadf82b54b8560d8e9d6",
+    "pi-stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_files_sha256": {
+    "scripts/rebuild/confinement/bootstrap.cjs": "9bf62f850a26dc521aeb0d660ef52dd7e570681864d1d1e8a061bfaa2ab95145",
+    "scripts/rebuild/confinement/fault_host.py": "90ef01ee06594e7ccf3c076fd5e395c13293b29fb59fee751de0c6434d76d61d",
+    "scripts/rebuild/confinement/guard.c": "17a9819ef74907bbad00d4c1bea2519c9fdde1722dd9ef16ca450b34bf0adb1d",
+    "scripts/rebuild/confinement/liveness.c": "0f57edb1938fd5f3f520313ff679c8a14b3f5b7dd24841c5fe633bb4d2880d21",
+    "scripts/rebuild/confinement/pi-probe.mjs": "10004a2e478642183750e57b07570ab30f6434678b7d765fa147fbc71a9f2b7c",
+    "scripts/rebuild/confinement/prepare.py": "6b33b67ece881e9ac97a4e8ca3772d58d92686a0a74ec43564743b90dc46c40d",
+    "scripts/rebuild/confinement/prepare_pi.py": "455f399a239404cb3a9edf3a0962f51c92069eb36c2a06a341fadc829270f2ef",
+    "scripts/rebuild/confinement/probe.c": "623adeeb0c9c0bd26c308ef74dbbb8ae4bbfda982d48cdede6d99ffd0517b138",
+    "scripts/rebuild/confinement/probe_pi.py": "caddb208157eafa407fd8923f03b80248280eabd9294adbe43c3a97e7adfa144",
+    "scripts/rebuild/confinement/recovery.py": "ed7cbb42409b1e56301891291d8e65ab237ad1e8e6fbec6dabb49eb64c68a5d7",
+    "scripts/rebuild/confinement/runtime.py": "8a2b28a6a874349d8f573bce52ccef5c206d2f4553f66defacdca54178a8a352",
+    "scripts/rebuild/confinement/test_audit.py": "771d70f2740a9c2d832d4c36f8579c2587268d320781246c986ca8f10e01a4fd",
+    "scripts/rebuild/confinement/test_liveness.py": "11e6acf888b2f54e9d75d688514225b8193a4761572e41e6052d3fd7ac83aa3d",
+    "scripts/rebuild/confinement/test_runtime.py": "8b5e492a154fc0b6211bb2e63e359eb384253ae93b846f2c4e74e95b869567bf",
+    "scripts/rebuild/confinement/verify_audit.py": "886b1800553cb6d335fc345a3e3b3f006ca5dfab48bee3f14404e08af04b9890"
+  },
+  "limitations": [
+    "Production supervisors remain disabled; this is an experimental deny-only harness.",
+    "No machine reboot, Firecracker effect, signed guest image, kernel lease reconciliation after host crash, or staging rollback is claimed.",
+    "The deterministic model is a fixture; no live provider or messaging credentials are used.",
+    "The runtime manifest and monitor are pinned candidates, not independently admitted signed artifacts.",
+    "The real kernel denial is missing exact one-shot action binding, before path-subset evaluation.",
+    "Owner and independent security reviews remain pending; no merge, release, tag or deployment."
+  ],
+  "artifact_export_check": "Manifest schema, tested source hashes and exported audit/anchor hashes verified; credential-pattern scan passed (not a universal secret-detection claim)."
+}

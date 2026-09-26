@@ -1,5 +1,10 @@
 # Lumen Documentation
 
+The [security-program rebuild baseline](rebuild/README.md) governs new work.
+The milestone documents below and the merged phase implementations are reference
+material pending verification against that baseline. No historical phase label
+constitutes a current security gate pass.
+
 These documents are the authoritative design baseline for Lumen. When a roadmap item conflicts with an architectural invariant or the security model, the invariant and security model take precedence.
 
 ## Foundations
