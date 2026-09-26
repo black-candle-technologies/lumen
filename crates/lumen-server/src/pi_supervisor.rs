@@ -235,6 +235,19 @@ pub struct PiSupervisor {
 impl PiSupervisor {
     pub async fn spawn(config: PiSupervisorConfig) -> Result<Self, SupervisorError> {
         config.validate()?;
+        crate::pi_launch::require_confinement()
+            .map_err(|reason| SupervisorError::Config(reason.to_string()))?;
+        Self::spawn_inner(config).await
+    }
+
+    /// Subprocess protocol mechanics only; absent from non-test builds.
+    #[cfg(test)]
+    pub(crate) async fn spawn_fixture(config: PiSupervisorConfig) -> Result<Self, SupervisorError> {
+        config.validate()?;
+        Self::spawn_inner(config).await
+    }
+
+    async fn spawn_inner(config: PiSupervisorConfig) -> Result<Self, SupervisorError> {
         let (events_tx, events) = mpsc::unbounded_channel();
         let mut supervisor = Self {
             config,
@@ -259,6 +272,7 @@ impl PiSupervisor {
         let mut command = Command::new(self.pi_binary());
         command
             .args(&self.config.args)
+            .env_clear()
             .envs(self.config.env.iter().cloned())
             .current_dir(&self.config.cwd)
             .stdin(Stdio::piped())
@@ -864,7 +878,7 @@ mod tests {
             pi_binary: PathBuf::from("/nonexistent/lumen-test-pi-binary"),
             ..Default::default()
         };
-        let err = match PiSupervisor::spawn(config).await {
+        let err = match PiSupervisor::spawn_fixture(config).await {
             Ok(_) => panic!("must fail to spawn a missing binary"),
             Err(e) => e,
         };

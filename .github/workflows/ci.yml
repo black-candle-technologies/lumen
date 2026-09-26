@@ -14,6 +14,25 @@ permissions:
   contents: read
 
 jobs:
+  phase0-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.1'
+      # This includes the ordinary-library launch-denial tests. cfg(test)
+      # fake-child helpers are protocol tests, not confinement evidence.
+      - run: cargo test -p lumen-server --lib --tests
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: lumen-integrations/bct-pi-extension
+      - run: npm run typecheck && npm test
+        working-directory: lumen-integrations/bct-pi-extension
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 10

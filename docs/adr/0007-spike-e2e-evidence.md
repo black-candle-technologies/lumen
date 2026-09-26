@@ -1,5 +1,10 @@
 # ADR-0007: Phase-0 spike end-to-end evidence (real Pi, real kernel wire)
 
+> Current acceptance: historical evidence only. This transcript does not meet the
+> rebuilt Phase-0 gate because Pi performed the read and hostile extensions were
+> unconfined. See [Phase-0 boundary reset](../rebuild/phase-0.md). The historical
+> transcript and audit fixture are preserved without modification.
+
 - Status: Accepted (phase-0 spike)
 - Date: 2026-09-24
 - Deciders: Lumen rebuild team

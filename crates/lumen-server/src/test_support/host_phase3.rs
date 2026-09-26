@@ -11,7 +11,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use lumen_server::{
+use crate::{
     AuthdClient, ChatMessage, CredentialVault, GatewayConfig, JevRouter, MemorySessionStore,
     MemorySpendPool, MockAuthdClient, MockJevRouter, MockKernelClient, MockProviderAdapter,
     MockSandboxRunner, MockVerdict, ModelGateway, ModelPolicy, ModelRequest, ModelSwitchDecision,
@@ -66,7 +66,7 @@ async fn phase3_vertical_slice() {
         Arc::new(default_catalog()),
         Arc::new(MemorySessionStore::new()),
     );
-    let handle = supervisor.spawn_session(&owner).await.unwrap();
+    let handle = supervisor.spawn_session_fixture(&owner).await.unwrap();
     assert_eq!(handle.status().await.unwrap(), SessionStatus::Running);
     assert!(handle.binding().await.unwrap().owner_is(&owner.account_id));
 

@@ -1,1 +1,17 @@
-{"description":"Black Candle Pi extension: kernel-mediated tools for the Lumen rebuild (phase-0 architecture spike). The extension is a stub, not a security boundary — all enforcement is repeated kernel-side.","license":"UNLICENSED","main":"src/index.ts","name":"@black-candle/bct-pi-extension","private":true,"scripts":{"typecheck":"tsc --noEmit"},"type":"module","version":"0.1.0","dependencies":{"@types/node":"^26.6.2","typescript":"^7.0.2"}}
+{
+  "description": "Unadmitted PiBridge v2 tool-intent stub; execution belongs to the Lumen host and kernel.",
+  "license": "UNLICENSED",
+  "main": "src/index.ts",
+  "name": "@black-candle/bct-pi-extension",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit false --outDir .test-build --rootDir src && node --test .test-build/test-host-client.js && node .test-build/test-read-limits.js"
+  },
+  "type": "module",
+  "version": "0.2.0",
+  "dependencies": {
+    "@types/node": "26.6.2",
+    "typescript": "7.0.2"
+  }
+}

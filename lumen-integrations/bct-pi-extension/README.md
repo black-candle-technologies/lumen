@@ -1,51 +1,40 @@
-# BCT Pi extension (phase-0 spike)
+# BCT Pi extension — proposed PiBridge v2
 
-Kernel-mediated tools for the Lumen rebuild's Pi boundary. This is a **stub,
-not a security boundary**: it registers `bct.*` tools and serializes every
-request to the Lumen kernel over the authenticated local transport
-(`lumen-kernel/1` on a Unix socket). All enforcement is repeated kernel-side;
-if this extension lies, crashes, or is replaced, actions still cannot bypass
-the kernel.
+This untrusted stub registers only `bct.read_file`. It sends typed intent through
+Pi's documented RPC extension-dialog subprotocol and renders host-produced output.
+It does not read files, spawn processes, open sockets, contact providers, access
+environment credentials, create envelopes, choose leases, or hold session keys.
 
-## Tools
+`ctx.ui.input` emits an `extension_ui_request` on stdout. The reserved title is
+`lumen.pi-bridge/2`; the placeholder holds the versioned request JSON. The host
+must intercept this machine request, bind it to the live child generation, and
+return an `extension_ui_response` with the same dialog ID and a JSON reply value.
+The inner tool call ID must match too. **This is not a human approval dialog.**
+A generic Pi UI is not a supported host for this extension.
 
-| Tool | Effect | Kernel action |
-|---|---|---|
-| `bct.read_file` | Read a UTF-8 text file (truncated at 64 KiB) | `ActionEnvelope` v1, `file_read` only |
+Only a completed response with digest, bounded output, known usage, and durable
+audit reference returns content. Denial, pending approval, unknown fields/version,
+cancellation, timeout, and uncertain completion fail once without local fallback.
+The host and kernel repeat all validation; replacing the extension must confer no
+authority. OS confinement, not the extension's tool filters, is the boundary.
 
-On `allow` the read is performed and returned with the action digest and
-audit sequence in `details`. On `deny` the model receives the kernel's reason
-code. On `pending` the model is told a human approval is required (VHL in
-phase 4 mints the one-shot lease).
+The host codec is in `crates/lumen-server/src/pi_tool_bridge.rs`. Both reference
+supervisors currently reject production launches. Wiring the codec into a confined
+real Pi session and reviewing the new immutable extension manifest are still
+required; **this package is not operationally admitted**.
 
-## Built-in tool lockdown
+The candidate upstream source/build pins in [PINNED_PI.md](PINNED_PI.md) are
+historical. The [Phase-0 reset](../../docs/rebuild/phase-0.md) records migration,
+owner sign-offs, bypasses, and remaining evidence. v1 fixtures are unchanged.
 
-Three layers, outermost first:
+Development checks:
 
-1. **Process launch**: `pi --mode rpc --no-session --no-builtin-tools` —
-   Pi itself never registers `bash`, `read`, `write`, `edit`, `grep`, `find`,
-   `ls`, or `powershell` (`packages/coding-agent/src/main.ts`, `noTools:
-   "builtin"`).
-2. **Extension**: `session_start` calls `pi.setActiveTools(["bct.read_file"])`;
-   a `tool_call` handler blocks anything not under `bct.*` (a handler failure
-   blocks as a fail-safe).
-3. **RPC command path**: a `user_bash` handler returns a replacement result
-   for the raw `bash` RPC command, so it can never fall through to local
-   execution. The supervisor additionally never sends it.
-
-## Environment (set by the host supervisor)
-
-- `LUMEN_KERNEL_SOCKET` — kernel Unix socket path
-- `LUMEN_KERNEL_NONCE` — per-session credential for the kernel transport
-- `LUMEN_SESSION_ID` — ephemeral Courier subject for this session
-- `LUMEN_LEASE_IDS` — comma-separated lease chain, leaf → root
-
-## Development
-
-```bash
-npm run typecheck   # tsc --noEmit against local API stubs
+```sh
+npm ci --ignore-scripts --no-audit --no-fund
+npm run typecheck
+npm test
 ```
 
-Runtime imports (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`)
-resolve through Pi's bundled virtual modules; the `types/*.d.ts` stubs are
-compile-time only. Pinned Pi source: see `PINNED_PI.md`.
+The local declarations model only the API used by this stub. They are not a
+substitute for the mandatory test against pinned upstream Pi declarations and a
+real confined Pi runtime. Tests use fake host responses and never launch Pi.

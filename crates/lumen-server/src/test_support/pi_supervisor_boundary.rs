@@ -4,9 +4,7 @@
 //! `LUMEN_FAKE_CHILD_MODE`) so tests exercise the real subprocess,
 //! byte-framing, and restart machinery — not mocks.
 
-use lumen_server::pi_supervisor::{
-    PiSupervisor, PiSupervisorConfig, RestartPolicy, SupervisorEvent,
-};
+use crate::pi_supervisor::{PiSupervisor, PiSupervisorConfig, RestartPolicy, SupervisorEvent};
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -93,7 +91,7 @@ async fn next_non_response(sup: &mut PiSupervisor) -> SupervisorEvent {
 #[tokio::test]
 async fn prompt_round_trip_correlates_by_id() {
     let (config, _script, _dir) = config_with_mode("echo");
-    let mut sup = PiSupervisor::spawn(config).await.expect("spawn");
+    let mut sup = PiSupervisor::spawn_fixture(config).await.expect("spawn");
     let response = sup
         .prompt(json!({"text": "hello"}), Duration::from_secs(5))
         .await
@@ -107,7 +105,7 @@ async fn prompt_round_trip_correlates_by_id() {
 #[tokio::test]
 async fn malformed_line_is_reported_and_stream_recovers() {
     let (config, _script, _dir) = config_with_mode("malformed_first");
-    let mut sup = PiSupervisor::spawn(config).await.expect("spawn");
+    let mut sup = PiSupervisor::spawn_fixture(config).await.expect("spawn");
     let event = next_non_response(&mut sup).await;
     assert!(
         matches!(event, SupervisorEvent::MalformedLine { .. }),
@@ -126,7 +124,7 @@ async fn malformed_line_is_reported_and_stream_recovers() {
 async fn output_flood_kills_child_and_restarts_observably() {
     let (mut config, _script, _dir) = config_with_mode("flood");
     config.max_line_bytes = 1024;
-    let mut sup = PiSupervisor::spawn(config).await.expect("spawn");
+    let mut sup = PiSupervisor::spawn_fixture(config).await.expect("spawn");
     let event = sup.next_event().await.expect("event");
     assert!(
         matches!(event, SupervisorEvent::LineTooLong { .. }),
@@ -148,7 +146,7 @@ async fn restart_policy_is_bounded() {
         max_restarts: 0,
         base_backoff: Duration::from_millis(10),
     };
-    let mut sup = PiSupervisor::spawn(config).await.expect("spawn");
+    let mut sup = PiSupervisor::spawn_fixture(config).await.expect("spawn");
     // The child exits immediately; with max_restarts=0 there is no restart.
     let mut saw_exit = false;
     for _ in 0..10 {
@@ -172,7 +170,7 @@ async fn restart_policy_is_bounded() {
 #[tokio::test]
 async fn agent_settled_is_observed() {
     let (config, _script, _dir) = config_with_mode("settled");
-    let mut sup = PiSupervisor::spawn(config).await.expect("spawn");
+    let mut sup = PiSupervisor::spawn_fixture(config).await.expect("spawn");
     sup.wait_settled(Duration::from_secs(5))
         .await
         .expect("agent_settled must arrive");
@@ -185,7 +183,7 @@ async fn unicode_line_separator_is_not_a_record_boundary() {
     // string. The supervisor must deliver exactly one Response, proving it
     // splits on LF only.
     let (config, _script, _dir) = config_with_mode("unicode");
-    let mut sup = PiSupervisor::spawn(config).await.expect("spawn");
+    let mut sup = PiSupervisor::spawn_fixture(config).await.expect("spawn");
     let event = tokio::time::timeout(Duration::from_secs(5), sup.next_event())
         .await
         .expect("event in time")

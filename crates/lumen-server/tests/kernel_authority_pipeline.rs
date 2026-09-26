@@ -43,7 +43,8 @@ fn read_file_catalog() -> Result<Catalog, CatalogError> {
             "additionalProperties": false,
             "required": ["path"],
             "properties": {
-                "path": {"type": "string", "minLength": 1, "maxLength": 4096}
+                "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576}
             }
         }),
         effects: vec![EffectClass::Read],
@@ -1102,4 +1103,55 @@ async fn lease_store_failure_is_unavailable_not_silent_deny() {
         0,
         "store outage must not reach the sandbox"
     );
+}
+
+// PiBridge v2 codec + REAL kernel, with an explicit sandbox double. This is
+// seam evidence, not a Firecracker/real-Pi phase-gate claim.
+#[tokio::test]
+async fn bridge_read_intent_uses_host_authority_and_rejects_concurrent_replay() {
+    use lumen_server::pi_tool_bridge::{BridgeError, PiToolBridge};
+    let f = fixture().await;
+    let (subject, lease) = leased_subject(&f).await;
+    let bridge = PiToolBridge::new(subject, vec![lease]);
+    let request = serde_json::to_vec(&serde_json::json!({
+        "version": 2, "tool_call_id": "bridge-1", "tool": "bct.read_file",
+        "arguments": { "path": f.leased_file, "max_bytes": 65536 }
+    }))
+    .unwrap();
+    let (a, b) = tokio::join!(
+        bridge.dispatch(&f.pipeline, &request),
+        bridge.dispatch(&f.pipeline, &request)
+    );
+    let (Ok(reply), Err(BridgeError::Replay)) = (a, b) else {
+        panic!("expected one completion and one replay denial")
+    };
+    assert!(matches!(reply.outcome, ToolOutcome::Completed { .. }));
+    assert_eq!(reply.action_digest.len(), 64);
+    assert_eq!(f.sandbox.staged_count(), 1);
+    f.kernel.verify_kernel_audit().await.unwrap();
+}
+
+#[tokio::test]
+async fn bridge_out_of_scope_and_missing_lease_do_not_execute() {
+    use lumen_server::pi_tool_bridge::PiToolBridge;
+    let f = fixture().await;
+    let (subject, lease) = leased_subject(&f).await;
+    let bridge = PiToolBridge::new(subject.clone(), vec![lease]);
+    let outside = serde_json::to_vec(&serde_json::json!({
+        "version": 2, "tool_call_id": "outside", "tool": "bct.read_file",
+        "arguments": { "path": f.outside_file, "max_bytes": 65536 }
+    }))
+    .unwrap();
+    let reply = bridge.dispatch(&f.pipeline, &outside).await.unwrap();
+    assert!(matches!(reply.outcome, ToolOutcome::Denied { .. }));
+    let unleased = PiToolBridge::new(subject, vec![]);
+    let request = serde_json::to_vec(&serde_json::json!({
+        "version": 2, "tool_call_id": "pending", "tool": "bct.read_file",
+        "arguments": { "path": f.leased_file, "max_bytes": 65536 }
+    }))
+    .unwrap();
+    let reply = unleased.dispatch(&f.pipeline, &request).await.unwrap();
+    assert!(matches!(reply.outcome, ToolOutcome::PendingApproval { .. }));
+    assert_eq!(f.sandbox.staged_count(), 0);
+    f.kernel.verify_kernel_audit().await.unwrap();
 }
