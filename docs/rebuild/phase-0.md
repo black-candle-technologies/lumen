@@ -17,6 +17,9 @@ preparation recovery and a repeated real Pi denial. The
 files; the [new public audit](evidence/phase0-liveness-denial.audit.json) and
 [checkpoint anchor](evidence/phase0-liveness-denial.anchor.json) are separate
 artifacts. No prior evidence is overwritten.
+The [cleanup follow-up](evidence/phase0-liveness-cleanup.json) records CI's
+post-stop cgroup-collection race, the bounded strict-state wait, and 23 repeated
+native/liveness tests. Current-head CI remains separately visible on the draft PR.
 
 ## Why the reference spike is insufficient
 

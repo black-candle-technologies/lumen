@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-26T04:42:20.885175+00:00",
+  "classification": "development cleanup follow-up; phase gate not accepted",
+  "implementation_commit": "2eb3dcc2983640a900da78404463a0efba5bde47",
+  "prior_record": "phase0-liveness.json",
+  "changed_source": "scripts/rebuild/confinement/recovery.py",
+  "changed_source_sha256": "55b11c31d61e5a941d13041eba59e35c6eb9deb1b99e7c67f9e5ddeff8b43406",
+  "trigger": {
+    "ci_url": "https://github.com/black-candle-technologies/lumen/actions/runs/36218347800/job/108338720334",
+    "observed_failure": "The unit was not yet reaped immediately after a concurrent stop request; cleanup correctly refused.",
+    "change": "Wait up to five seconds for the same inactive/failed and empty-ControlGroup condition; query failure, unknown state or deadline still refuses cleanup."
+  },
+  "lane_vps_recheck": {
+    "native_and_liveness_tests": 23,
+    "failures": 0,
+    "log_sha256": "4cc9b31c9a289d762a28b631065bd4d21cee538d45f3fb63d089216d9fd3fc7f",
+    "fault_measurements": [
+      {
+        "fault": "host_sigkill",
+        "teardown_seconds": [
+          0.03189209208358079,
+          0.04226602602284402,
+          0.042321510962210596
+        ]
+      },
+      {
+        "fault": "monitor_sigkill",
+        "teardown_seconds": 0.04392422107048333
+      }
+    ]
+  },
+  "unchanged_artifacts": {
+    "runtime_manifest_sha256": "768a04815e90a5560176c90643cc96de36767a8b8089ef4fbca3c0508da262a1",
+    "monitor_changed": false,
+    "pi_changed": false,
+    "audit_verifier_changed": false
+  },
+  "limitations": [
+    "CI on the exact PR head is a separate check.",
+    "The prior lane-vps measurements remain observations of their recorded commit, not this changed source.",
+    "No Firecracker, machine reboot, session lease reconciliation, signed admission, owner acceptance or staging rollback is established."
+  ]
+}
