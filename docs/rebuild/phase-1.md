@@ -80,6 +80,24 @@ test is Linux-only: macOS rejects those filenames before the kernel resolver run
 Other property/concurrency/restart suites still run; passing them does not by
 itself establish all Phase 1 invariants.
 
+[Recorded checks](evidence/phase1-contracts.json) tie the implementation at
+`876218890d6262da285631d926e5abedd08a98d8` to matching hashes for all 434 tracked
+source files in the Linux scratch checkout: 577 core/database/host tests in 31
+suites passed, with no ignored tests. The 14 focused contract/migration tests,
+independent fixture verifier and workspace Clippy also passed. Cargo emitted one
+package-selection warning because the excluded desktop package does not exist;
+there were no Rust/Clippy diagnostics. Logs and fixture/migration hashes are
+recorded in that evidence. [Draft PR #85](https://github.com/black-candle-technologies/lumen/pull/85)
+is stacked on Phase 0; owner review and phase acceptance remain pending.
+
+The next decoder gap is reproduced in the
+[ActionEnvelope v1 probe](evidence/phase1-action-v1-probe.json). Adding an unknown
+authority field at the envelope, tool, input, resource-set, path-resource or
+effect-class level is accepted and leaves the decoded action digest unchanged.
+This is a decoder observation, not proof of an external effect. The next contract
+revision must reject these fields and preserve v1 bytes only as historical
+evidence, with producer/consumer review and migration fixtures.
+
 Remaining work includes the other frozen authority decoders (ActionEnvelope and
 nested resources currently need a separate versioned strict-decoding transition),
 mount/inode identity and resolution-to-execution races, complete lease-chain and
