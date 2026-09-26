@@ -67,6 +67,19 @@ latency. Preserve the full native escape suite and real Pi/kernel/audit probe.
 This is not Firecracker fault evidence and does not prove kernel session-lease
 reconciliation after a host crash; that remains a separate integration gate.
 
+## Prototype observations
+
+The [lane-vps development record](../rebuild/evidence/phase0-liveness.json)
+identifies the tested implementation and runtime digests. All 25 tests passed:
+13 native confinement tests, ten liveness/recovery tests and two independent
+audit-verifier tests. Three actual host SIGKILL trials removed the cgroup and
+snapshot within 21–35 ms; monitor SIGKILL cleanup took 42 ms. Measurements begin
+before the kill request and end at passive cleanup observation. These are sample
+observations, not a production latency guarantee. The test deadline is five
+seconds. No prototype units or per-runtime directories remained after the suite.
+Real Pi repeated its mediated kernel denial with seven signed audit checkpoints.
+This evidence does not change the proposed status or supply owner sign-off.
+
 Mechanism references: [Linux FIFO semantics](https://man7.org/linux/man-pages/man7/fifo.7.html),
 [pidfd lifetime guarantees](https://man7.org/linux/man-pages/man2/pidfd_open.2.html),
 and [systemd runtime directories](https://github.com/systemd/systemd/blob/v259/man/systemd.exec.xml).

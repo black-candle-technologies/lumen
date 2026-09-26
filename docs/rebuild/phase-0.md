@@ -10,6 +10,13 @@ The v1 development evidence remains immutable: [lane-vps results](evidence/phase
 The [earlier preparation record](evidence/phase0-preparation.json) is preserved
 unchanged and describes its earlier commit, before real Pi was exercised.
 The v2 liveness follow-up is specified in [ADR-0009](../adr/0009-pi-host-liveness.md).
+Its [new evidence record](evidence/phase0-liveness.json) captures 25 passing Linux
+tests, three host-SIGKILL teardown measurements (21–35 ms), monitor failure,
+preparation recovery and a repeated real Pi denial. The
+[v2 runtime candidate](evidence/phase0-runtime-liveness.candidate.json) pins 3,921
+files; the [new public audit](evidence/phase0-liveness-denial.audit.json) and
+[checkpoint anchor](evidence/phase0-liveness-denial.anchor.json) are separate
+artifacts. No prior evidence is overwritten.
 
 ## Why the reference spike is insufficient
 
