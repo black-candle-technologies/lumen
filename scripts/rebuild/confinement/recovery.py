@@ -84,10 +84,21 @@ def unit_state(unit):
 def stop_unit(unit):
     subprocess.run([TOOLS["systemctl"], "--user", "stop", unit], env=control_env(),
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
-    state = unit_state(unit)
-    if (state["LoadState"] not in ("loaded", "not-found")
-            or state["ActiveState"] not in ("inactive", "failed") or state["ControlGroup"]):
-        raise Refused("runtime unit has not been reaped")
+    # A stop job can complete just before the manager collects its cgroup,
+    # notably when the monitor exits concurrently with this stop request.
+    # Poll the same strict condition; never treat a deadline or query failure
+    # as proof of teardown, and never delete before that condition holds.
+    deadline = time.monotonic() + 5
+    while True:
+        state = unit_state(unit)
+        if (state["LoadState"] not in ("loaded", "not-found") or state["ActiveState"] not in
+                ("activating", "active", "reloading", "deactivating", "inactive", "failed")):
+            raise Refused("unknown runtime unit state")
+        if state["ActiveState"] in ("inactive", "failed") and not state["ControlGroup"]:
+            return
+        if time.monotonic() >= deadline:
+            raise Refused("runtime unit has not been reaped: " + repr(state))
+        time.sleep(0.025)
 
 
 def remove_directory(directory, name):
