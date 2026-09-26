@@ -1966,7 +1966,7 @@ fn standing_mint_preserves_per_path_rights() {
     assert!(
         lease.scope.paths[0]
             .root
-            .canonical_form()
+            .absolute_path()
             .ends_with("README.md")
     );
 }

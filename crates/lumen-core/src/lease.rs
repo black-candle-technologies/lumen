@@ -45,10 +45,19 @@ use crate::{
 
 /// Contract version for [`LeaseDocument`].
 ///
-/// v1 was frozen by Phase 0. Phase 1 added `approved_action_digest` (the
-/// exact VHL-approved action digest carried by single-use leases), so the
-/// contract is v2; v1 documents are rejected, fail closed.
-pub const LEASE_PROTOCOL_VERSION: u32 = 2;
+/// v3 binds strict canonical-resource semantics and scope digest v2. Legacy
+/// v1/v2 authority is rejected, not repaired or re-signed (ADR-0010).
+pub const LEASE_PROTOCOL_VERSION: u32 = 3;
+
+fn current_lease_version<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<u32, D::Error> {
+    let version = u32::deserialize(decoder)?;
+    if version != LEASE_PROTOCOL_VERSION {
+        return Err(serde::de::Error::custom(
+            "unsupported lease contract version",
+        ));
+    }
+    Ok(version)
+}
 
 /// Maximum root-lease lifetime: 30 days (spec §6.4 retention bound).
 pub const MAX_ROOT_LEASE_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -75,6 +84,7 @@ pub struct LeaseLimits {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseDocument {
+    #[serde(deserialize_with = "current_lease_version")]
     pub protocol_version: u32,
     pub lease_id: String,
     pub parent_id: Option<String>,
@@ -133,6 +143,7 @@ impl LeaseDocument {
 
     /// Canonical bytes covered by the signature.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, LeaseError> {
+        self.scope.validate()?;
         canonical_json(
             &serde_json::to_value(self.signing_view())
                 .map_err(|e| LeaseError::Encoding(e.to_string()))?,
@@ -146,12 +157,19 @@ impl LeaseDocument {
         Ok(crate::sha256_hex(&bytes))
     }
 
-    pub fn sign(&mut self, key: &SigningKey) {
-        let bytes = self.signing_bytes().expect("signing bytes are infallible");
+    pub fn sign(&mut self, key: &SigningKey) -> Result<(), LeaseError> {
+        if self.protocol_version != LEASE_PROTOCOL_VERSION {
+            return Err(LeaseError::VersionMismatch(self.protocol_version));
+        }
+        let bytes = self.signing_bytes()?;
         self.signature = hex::encode(key.sign(&bytes).to_bytes());
+        Ok(())
     }
 
     pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), LeaseError> {
+        if self.protocol_version != LEASE_PROTOCOL_VERSION {
+            return Err(LeaseError::VersionMismatch(self.protocol_version));
+        }
         let bytes = self.signing_bytes()?;
         let sig_bytes: [u8; 64] = hex::decode(&self.signature)
             .map_err(|_| LeaseError::BadSignature)?
@@ -558,6 +576,7 @@ pub fn mint_root_lease(
     nonces: &NonceStore,
     now_ms: i64,
 ) -> Result<LeaseDocument, LeaseError> {
+    params.scope.validate()?;
     check_time_bounds(&params.limits, now_ms)?;
     // Retention bound (spec §6.4): cap how long a compromised old issuer
     // key stays a live signing capability. The cap is computed from the
@@ -646,6 +665,7 @@ pub fn mint_child_lease(
     // Mechanical subset proof over every resource dimension.
     params.scope.is_subset_of(&parent.scope)?;
     // Time bounds narrow monotonically.
+    params.scope.validate()?;
     check_time_bounds(&params.limits, now_ms)?;
     if params.limits.expires_at_ms > parent.limits.expires_at_ms {
         return Err(LeaseError::ExpiryTooWide(
@@ -700,7 +720,7 @@ pub fn mint_child_lease(
         now_ms,
     )?;
     ledger.register_lease(&doc.lease_id, &params.limits.budget)?;
-    doc.sign(parent_signing_key);
+    doc.sign(parent_signing_key)?;
     Ok(doc)
 }
 
@@ -1121,6 +1141,7 @@ pub fn mint_one_shot_lease(
     nonces: &NonceStore,
     now_ms: i64,
 ) -> Result<LeaseDocument, LeaseError> {
+    action.exact_scope().validate()?;
     grant.verify(vhl_key)?;
     if grant.action_digest != action.digest {
         // Changing any argument invalidates the approval — fail closed,

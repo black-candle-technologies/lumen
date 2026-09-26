@@ -71,9 +71,16 @@ impl BudgetDimension {
 }
 
 /// A per-dimension budget: missing dimensions are zero (no grant).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Budget(BTreeMap<BudgetDimension, u64>);
+
+impl<'de> Deserialize<'de> for Budget {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        let values: BTreeMap<BudgetDimension, u64> = crate::canonical::unique_map(decoder)?;
+        Ok(Self(values))
+    }
+}
 
 impl Budget {
     pub fn new() -> Self {
@@ -83,6 +90,8 @@ impl Budget {
     pub fn set(mut self, dim: BudgetDimension, amount: u64) -> Self {
         if amount > 0 {
             self.0.insert(dim, amount);
+        } else {
+            self.0.remove(&dim);
         }
         self
     }

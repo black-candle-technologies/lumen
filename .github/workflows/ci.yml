@@ -119,7 +119,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       # Bubblewrap is required by the sandbox test suites
       # (lumen-cli readiness, lumen-integrations extension_process/local_executors).
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap python3-cryptography
+      - name: Independently verify authority contract fixtures
+        run: python3 scripts/rebuild/verify_authority_fixtures.py
       - run: bwrap --version
       # Ubuntu 24.04 (what ubuntu-latest runs) restricts unprivileged user
       # namespaces via AppArmor (kernel.apparmor_restrict_unprivileged_userns=1

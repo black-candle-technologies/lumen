@@ -2269,6 +2269,11 @@ async fn insert_lease_tx(
     workspace_id: &WorkspaceId,
     doc: &LeaseDocument,
 ) -> Result<(), RepositoryError> {
+    if doc.protocol_version != lumen_core::lease::LEASE_PROTOCOL_VERSION {
+        return Err(RepositoryError::InvalidKernelLeaseState(
+            "unsupported lease version".into(),
+        ));
+    }
     let scope_digest = doc
         .scope
         .canonical_digest()
@@ -2443,8 +2448,19 @@ async fn post_parent_debit_tx(
 }
 
 fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseDocument, RepositoryError> {
+    let version = r.get::<i64, _>("protocol_version");
+    if version != i64::from(lumen_core::lease::LEASE_PROTOCOL_VERSION) {
+        return Err(RepositoryError::InvalidKernelLeaseState(
+            "unsupported stored lease version".into(),
+        ));
+    }
+    let checked_u32 = |column| {
+        u32::try_from(r.get::<i64, _>(column)).map_err(|_| {
+            RepositoryError::InvalidKernelLeaseState("out-of-range lease integer".into())
+        })
+    };
     Ok(LeaseDocument {
-        protocol_version: r.get::<i64, _>("protocol_version") as u32,
+        protocol_version: checked_u32("protocol_version")?,
         lease_id: r.get("lease_id"),
         parent_id: r.get("parent_id"),
         subject: r.get("subject"),
@@ -2454,8 +2470,8 @@ fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseDocument, Reposito
             .map_err(RepositoryError::Serialization)?,
         limits: serde_json::from_str(r.get::<String, _>("limits_json").as_str())
             .map_err(RepositoryError::Serialization)?,
-        depth: r.get::<i64, _>("depth") as u32,
-        depth_limit: r.get::<i64, _>("depth_limit") as u32,
+        depth: checked_u32("depth")?,
+        depth_limit: checked_u32("depth_limit")?,
         lease_nonce: r.get("lease_nonce"),
         signature: r.get("signature"),
         // NULL marks a standing lease or a legacy one-shot row minted before

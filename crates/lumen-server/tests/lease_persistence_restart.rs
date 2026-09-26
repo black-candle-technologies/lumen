@@ -614,7 +614,9 @@ async fn unknown_issuer_generation_fails_closed() {
     };
     // Well-formed signature, but from a throwaway key no generation
     // records: the failure must be key *resolution*, not signature math.
-    core_doc.sign(&SigningKey::from_bytes(&[0x5au8; 32]));
+    core_doc
+        .sign(&SigningKey::from_bytes(&[0x5au8; 32]))
+        .unwrap();
     let host_doc = to_host_doc(&core_doc);
 
     let db = Database::connect(&env.db_path).await.expect("db connect");
@@ -693,7 +695,7 @@ async fn pre_migration_lease_without_session_row_is_legacy_not_tamper() {
         signature: String::new(),
         approved_action_digest: None,
     };
-    core_doc.sign(&legacy_signing);
+    core_doc.sign(&legacy_signing).unwrap();
     db.insert_kernel_lease(&env.workspace, &core_doc)
         .await
         .expect("insert legacy lease");
@@ -1814,4 +1816,58 @@ async fn session_subject_key_mismatch_refuses_open() {
         ),
         other => panic!("expected Unavailable, got {other:?}"),
     }
+}
+
+/// Strict decoding applies at the real host/kernel seam, including after
+/// rebuilding caches from SQLite; malformed scope is never a signature lookup.
+#[tokio::test]
+async fn strict_scope_and_lease_versions_are_enforced_across_restart() {
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let (_, lease) = mint_root(&h.kernel, "strict-scope", 3_600_000).await;
+    h.kernel.verify_lease(&lease).await.unwrap();
+    let mut unknown = lease.clone();
+    unknown
+        .scope
+        .as_object_mut()
+        .unwrap()
+        .insert("future_authority".into(), serde_json::json!(true));
+    let mut legacy = lease.clone();
+    legacy.protocol_version = 2;
+    assert!(
+        h.kernel
+            .verify_lease(&unknown)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("malformed")
+    );
+    assert!(
+        h.kernel
+            .verify_lease(&legacy)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported lease version")
+    );
+    drop(h);
+    let reopened = open_kernel(&env, HashMap::new(), None).await;
+    assert!(
+        reopened
+            .kernel
+            .verify_lease(&unknown)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("malformed")
+    );
+    assert!(
+        reopened
+            .kernel
+            .verify_lease(&legacy)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported lease version")
+    );
 }

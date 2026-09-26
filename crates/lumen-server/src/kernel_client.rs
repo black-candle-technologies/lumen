@@ -36,7 +36,7 @@ pub const ACTION_ENVELOPE_VERSION: u32 = 1;
 /// Contract version for [`PolicyDecision`].
 pub const POLICY_DECISION_VERSION: u32 = 1;
 /// Contract version for [`LeaseDocument`].
-pub const LEASE_DOCUMENT_VERSION: u32 = 1;
+pub const LEASE_DOCUMENT_VERSION: u32 = lumen_core::lease::LEASE_PROTOCOL_VERSION;
 
 /// Stable tool identity: name plus pinned version. Floating tool versions
 /// are never used across the trust boundary.
@@ -252,7 +252,7 @@ pub struct LeaseLimits {
     pub single_use: bool,
 }
 
-/// LeaseDocument v1 (host view), mirroring the Phase-1 kernel's
+/// LeaseDocument v3 (host view), mirroring the Phase-1 kernel's
 /// `lumen_core::lease::LeaseDocument` field-for-field.
 ///
 /// `scope` is the kernel's `ResourceScope` kept opaque: the kernel
