@@ -1155,3 +1155,30 @@ async fn bridge_out_of_scope_and_missing_lease_do_not_execute() {
     assert_eq!(f.sandbox.staged_count(), 0);
     f.kernel.verify_kernel_audit().await.unwrap();
 }
+
+#[tokio::test]
+async fn bridge_reply_digest_identifies_the_durable_kernel_decision() {
+    use lumen_server::pi_tool_bridge::PiToolBridge;
+    let database_dir = tempfile::tempdir().unwrap();
+    let database_path = database_dir.path().join("authority.sqlite3");
+    let f = fixture_with_db(HashMap::new(), Some(database_path.clone())).await;
+    let (subject, lease) = leased_subject(&f).await;
+    let bridge = PiToolBridge::new(subject, vec![lease]);
+    let request = serde_json::to_vec(&serde_json::json!({
+        "version":2,"tool_call_id":"digest-bound","tool":"bct.read_file",
+        "arguments":{"path":f.outside_file,"max_bytes":65536}
+    }))
+    .unwrap();
+    let reply = bridge.dispatch(&f.pipeline, &request).await.unwrap();
+    assert!(matches!(reply.outcome, ToolOutcome::Denied { .. }));
+    let database = Database::connect(&database_path).await.unwrap();
+    let (audited_digest,): (String,) =
+        sqlx::query_as("SELECT action_digest FROM kernel_audit_events WHERE kind='policy_denied'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(reply.action_digest, audited_digest);
+    assert_eq!(f.sandbox.staged_count(), 0);
+    f.kernel.verify_kernel_audit().await.unwrap();
+    database.close().await;
+}

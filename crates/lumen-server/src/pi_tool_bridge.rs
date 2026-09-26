@@ -126,7 +126,13 @@ impl PiToolBridge {
         let envelope = pipeline
             .build_envelope(&intent, &self.subject, &self.lease_chain)
             .map_err(|_| BridgeError::InvalidRequest)?;
-        let digest = envelope.digest().map_err(|_| BridgeError::InvalidRequest)?;
+        // The reference host envelope has a different serialization from the
+        // kernel contract. Return the kernel's canonical digest: this is the
+        // value persisted by audit_decision, never the host compatibility hash.
+        let digest = crate::kernel_convert::to_frozen_envelope(&envelope)
+            .map_err(|_| BridgeError::InvalidRequest)?
+            .digest()
+            .map_err(|_| BridgeError::InvalidRequest)?;
         let outcome = pipeline.execute_envelope(&envelope, &self.subject).await;
         Ok(PiToolReply {
             version: PI_TOOL_BRIDGE_VERSION,

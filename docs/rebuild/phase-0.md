@@ -34,10 +34,17 @@ await and retained, including on failure; the per-generation set is bounded.
 Completion requires execution result, usage, action digest, and durable audit
 reference. An allow-only decision cannot be used as an execution result.
 
-The codec is tested against the real SQLite authority kernel and an explicitly
-identified sandbox double. **It is not yet wired into a confined real-Pi session.**
-It does not establish KVM isolation, credential absence, cancellation safety for
-effectful execution, or restart reconciliation. No feature is enabled by this PR.
+The codec has unit coverage against the real SQLite authority kernel and an
+explicit sandbox double. The new [confinement experiment](../../scripts/rebuild/README.md)
+also drives the **real pinned Pi CLI**, a deterministic model, the actual BCT
+read-request function, and the real SQLite kernel through an unapproved one-shot
+denial (missing exact-action binding, before path-scope evaluation).
+The deny probe has no executor. Direct filesystem/shell/native-network attempts
+fail inside that Pi session; a separate Python verifier validates the durable
+audit chain, signatures, captured head and exact denial digest. Native tests also
+cover worker inheritance, environment stripping, quotas and managed timeouts.
+This does not establish Firecracker effects, abrupt host-restart cleanup, signed
+artifact admission or owner acceptance. No product feature is enabled by this PR.
 
 ## Proposed contract transition
 
@@ -49,7 +56,10 @@ The new tool-intent component is **PiBridge v2, proposed**. Its fixture is
 
 Request: version 2, tool call ID, exact catalog tool, typed path and maximum byte
 count. Authority fields and unknown fields/versions are rejected. Reply: version,
-matching call ID, action digest, and explicit outcome. Completed outcomes require
+matching call ID, **kernel AuditEvent action digest**, and explicit outcome. The
+reference host compatibility envelope has a different digest; returning that
+value would sever reply-to-audit correlation. The v2 proposal now uses the kernel
+contract's canonical encoding, with a persisted-denial regression test. Completed outcomes require
 bounded output, zero exit status, known nonnegative usage, and an audit reference.
 Non-completed outcomes never authorize an operation in Pi.
 
@@ -68,14 +78,14 @@ admission. This document does not supply their sign-off.
 
 | Route | Reference gap | Current control / remaining proof |
 |---|---|---|
-| Built-in read/write/edit/find/grep/ls | Flags only | All launch admission denied; confined hostile run pending |
+| Built-in read/write/edit/find/grep/ls | Flags only | Real Pi fixture exposes only bct.read_file; syscalls/mounts separately constrain hostile code |
 | Raw bash/powershell/export RPC | Supervisor allowlist only | All launch admission denied; no production raw sender |
-| Replaced extension Node fs APIs | Host OS access | Local read removed; OS enforcement acceptance pending |
+| Replaced extension Node fs APIs | Host OS access | Real Pi host-sentinel read fails; no host repository/home mounted; acceptance pending |
 | Symlink/path race | Extension check then read | No Pi read; kernel canonicalization + guest snapshot/writeback need new gate evidence |
-| Node child_process / shell | Host OS access | Launch disabled; actual syscall denial still must be demonstrated |
-| Network/provider/metadata/DNS | Host network access | Launch disabled; default-deny confinement evidence still required |
-| Environment / home / credentials | Parent environment inherited | Environment cleared in fixture mechanics; real confined credential test pending |
-| Repository extension discovery | Inconsistent flags | Launch disabled; immutable runtime allowlist and startup discovery proof pending |
+| Node child_process / shell | Host OS access | Real Pi Node spawn and native exec/fork/process-clone probes return denial |
+| Network/provider/metadata/DNS | Host network access | Real Pi IPv4/IPv6/Unix socket creation denied; no network mount; Firecracker egress gate separate |
+| Environment / home / credentials | Parent environment inherited | Parent canary/NODE_OPTIONS stripped; exact runtime environment observed; no host home/proc mounts |
+| Repository extension discovery | Inconsistent flags | Exact hashed runtime inventory and explicit fixture extension; discovery disabled; production admission pending |
 | Forged authority fields | Pi built an envelope and held channel credential | v2 accepts only typed intent; authority comes from host |
 | Duplicate / concurrent tool request | New envelope on each attempt | Bounded atomic per-generation ID claim; kernel nonce/lease enforcement remains mandatory |
 | Pending/deny/unknown response | Could fall into local execution | Only audited completed output returned; all other outcomes throw, no retry |
@@ -96,9 +106,8 @@ the full Phase-0 gate.
 3. Wire bounded stdio v2 requests into a host generation whose identity/leases are
    kernel-owned; wire cancellation and termination to that generation. Explicitly
    reject unknown dialog requests. Never render machine requests as VHL prompts.
-4. Commit a repeatable harness using real pinned Pi and a deterministic model.
-   A kernel-denied real read satisfies the first mediation proof without creating
-   a pre-Firecracker host-read exception. A real allow path requires the actual
+4. Independently reproduce/review the committed real-Pi deterministic denial
+   harness and malicious native probes. A real allow path requires the actual
    per-action sandbox and signed audit path, not a mock or local read.
 5. Run malicious extensions attempting direct fs, shell, sockets, providers,
    discovery, malformed/flooded RPC, and credential access. Capture actual denial
