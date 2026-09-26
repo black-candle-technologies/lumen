@@ -130,7 +130,11 @@ async fn migration_preserves_legacy_evidence_and_refuses_old_authority_after_res
     assert_eq!(
         versions,
         vec![
+            ("action_envelope".into(), 2),
+            ("host_action_channel".into(), 2),
+            ("kernel_wire".into(), 2),
             ("lease_document".into(), 3),
+            ("policy_decision".into(), 3),
             ("resource_scope_digest".into(), 2)
         ]
     );
@@ -180,6 +184,58 @@ async fn migration_preserves_legacy_evidence_and_refuses_old_authority_after_res
     legacy.protocol_version = 2;
     assert!(reopened.insert_kernel_lease(&ws, &legacy).await.is_err());
     assert!(sqlx::query("INSERT INTO kernel_leases SELECT 'legacy-copy',workspace_id,parent_id,subject,issuer_key_id,issued_at_ms,2,scope_digest,scope_json,limits_json,depth,depth_limit,'old-nonce',signature,document_digest,created_at,approved_action_digest FROM kernel_leases WHERE lease_id='new-lease'").execute(reopened.pool()).await.is_err());
+}
+
+#[tokio::test]
+async fn action_contract_migration_is_atomic_and_legacy_evidence_survives_restart() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("action-contract.sqlite3");
+    let ws = WorkspaceId::from_uuid(Uuid::new_v4());
+    let pool = old_database(&path).await;
+    let keys = seed(&pool, &ws).await;
+    let v29 = Migrator::with_migrations(
+        CURRENT
+            .iter()
+            .filter(|m| m.version <= 29)
+            .cloned()
+            .collect(),
+    );
+    v29.run(&pool).await.unwrap();
+    let before = evidence(&pool).await;
+    // Failure on the second inserted version row must roll back the first.
+    sqlx::query("CREATE TRIGGER injected_contract_failure BEFORE INSERT ON kernel_contract_versions WHEN NEW.contract='kernel_wire' BEGIN SELECT RAISE(ABORT,'injected migration failure'); END")
+        .execute(&pool).await.unwrap();
+    assert!(Database::connect(&path).await.is_err());
+    let action_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kernel_contract_versions WHERE contract='action_envelope'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version=30")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((action_rows, applied), (0, 0));
+    assert_eq!(evidence(&pool).await, before);
+    sqlx::query("DROP TRIGGER injected_contract_failure")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let db = Database::connect(&path).await.unwrap();
+    assert_eq!(evidence(db.pool()).await, before);
+    assert!(matches!(
+        v29.run(db.pool()).await,
+        Err(MigrateError::VersionMissing(30))
+    ));
+    db.close().await;
+    let reopened = Database::connect(&path).await.unwrap();
+    assert_eq!(evidence(reopened.pool()).await, before);
+    reopened
+        .verify_kernel_audit(&ws, &keys.host_verifying(), &keys.host_key_id, 0)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

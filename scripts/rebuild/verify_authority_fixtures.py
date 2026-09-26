@@ -68,7 +68,37 @@ def main():
         Ed25519PublicKey.from_public_bytes(bytes.fromhex(fixture["test_public_key"])).verify(signature, encoded)
         if version == 2:
             require(document["limits"]["budget"]["tokens"] == 0, "historical explicit zero missing")
-    print("Verified scope v2 digest and legacy-v2/v3 lease signatures independently")
+    actions = []
+    for version in (1, 2):
+        action = read(f"action_envelope.v{version}.json")
+        digest = action.pop("_digest")
+        require(action["version"] == version, "action version mismatch")
+        require(hashlib.sha256(canonical(action)).hexdigest() == digest, "action digest mismatch")
+        actions.append((action, digest))
+    require(actions[0][1] != actions[1][1], "action version did not change digest")
+    request = read("kernel_wire_request.v2.json")
+    response = read("kernel_wire_response.v2.json")
+    require(request["protocol"] == response["protocol"] == "lumen-kernel/2", "transport version mismatch")
+    require(request["envelope"] == actions[1][0], "request envelope mismatch")
+    require(response["action_digest"] == actions[1][1], "response binding mismatch")
+    require(response["decision"]["version"] == 3, "response policy version mismatch")
+    names = ["action_envelope.v2.json", "kernel_wire_request.v2.json", "kernel_wire_response.v2.json"]
+    for outcome in ("allow", "deny", "pending"):
+        name = f"policy_decision_{outcome}.v3.json"
+        require(read(name)["version"] == 3, "policy fixture version mismatch")
+        names.append(name)
+    facade = FIXTURES.parents[2] / "lumen-protocol/fixtures"
+    for name in names:
+        require(read(name) == json.loads((facade / name).read_text(), object_pairs_hook=unique_object),
+                "protocol facade fixture drift")
+    host_path = FIXTURES.parents[2] / "lumen-server/tests/fixtures/host_action.v2.json"
+    host = json.loads(host_path.read_text(), object_pairs_hook=unique_object)
+    require(host["request"]["protocol"] == "lumen-host-action/2", "host channel version mismatch")
+    require(hashlib.sha256(canonical(host["request"]["envelope"])).hexdigest() == host["host_action_digest"], "host digest mismatch")
+    require(hashlib.sha256(canonical(host["kernel_envelope"])).hexdigest() == host["kernel_action_digest"], "converted kernel digest mismatch")
+    require(host["host_policy"]["action_digest"] == host["host_action_digest"], "host decision binding mismatch")
+    require(host["host_action_digest"] != host["kernel_action_digest"], "host/kernel representation digests conflated")
+    print("Verified scope digest, lease signatures, historical/v2 actions, and distinct host/kernel transport bindings independently")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 //! **and** every bypass attempt fails observably. Each entry below names the
 //! attack, the mechanism that closes it, and the test that proves it. All
 //! kernel-side tests go through the real Unix-socket wire
-//! (`lumen-kernel/1` JSONL), not the in-process shortcut.
+//! (`lumen-kernel/2` JSONL), not the in-process shortcut.
 //!
 //! | #   | Bypass attempt                                              | Closure                                                        | Test                              |
 //! |-----|-------------------------------------------------------------|----------------------------------------------------------------|---------------- --------------------------------- |
@@ -152,7 +152,7 @@ fn envelope(opts: &EnvelopeOpts) -> ActionEnvelope {
         session_id: opts.session.clone(),
         tool: ToolRef {
             name: opts.tool_name.clone(),
-            version: "1".to_string(),
+            version: "1.0.0".to_string(),
         },
         arguments,
         inputs: vec![],

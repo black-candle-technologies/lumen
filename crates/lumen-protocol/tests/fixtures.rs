@@ -18,7 +18,11 @@ fn fixture(name: &str) -> Value {
 
 #[test]
 fn facade_action_envelope_fixture() {
-    let mut value = fixture("action_envelope.v1.json");
+    let mut old = fixture("action_envelope.v1.json");
+    let digest = old.as_object_mut().unwrap().remove("_digest").unwrap();
+    assert_eq!(lumen_protocol::canonical_digest(&old).unwrap(), digest);
+    assert!(serde_json::from_value::<ActionEnvelope>(old).is_err());
+    let mut value = fixture("action_envelope.v2.json");
     let recorded = value
         .get("_digest")
         .and_then(Value::as_str)
@@ -33,9 +37,9 @@ fn facade_action_envelope_fixture() {
 #[test]
 fn facade_policy_decision_fixtures() {
     for (name, expected) in [
-        ("policy_decision_allow.v1.json", "allow"),
-        ("policy_decision_deny.v1.json", "deny"),
-        ("policy_decision_pending.v1.json", "pending"),
+        ("policy_decision_allow.v3.json", "allow"),
+        ("policy_decision_deny.v3.json", "deny"),
+        ("policy_decision_pending.v3.json", "pending"),
     ] {
         let value = fixture(name);
         let decision: PolicyDecision = serde_json::from_value(value.clone())
@@ -54,9 +58,10 @@ fn facade_policy_decision_fixtures() {
 
 #[test]
 fn facade_pibridge_fixtures() {
-    let request: BridgeToolRequest =
-        serde_json::from_value(fixture("pibridge_tool_request.v1.json")).unwrap();
-    assert_eq!(request.tool_name, "bct.read_file");
+    assert!(
+        serde_json::from_value::<BridgeToolRequest>(fixture("pibridge_tool_request.v1.json"))
+            .is_err()
+    );
 
     let settled: BridgeEvent =
         serde_json::from_value(fixture("pibridge_agent_settled.v1.json")).unwrap();
@@ -82,15 +87,23 @@ fn facade_sandbox_driver_fixture() {
 
 #[test]
 fn facade_kernel_wire_fixtures() {
+    assert!(
+        serde_json::from_value::<KernelWireRequest>(fixture("kernel_wire_request.v1.json"))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<KernelWireResponse>(fixture("kernel_wire_response.v1.json"))
+            .is_err()
+    );
     let request: KernelWireRequest =
-        serde_json::from_value(fixture("kernel_wire_request.v1.json")).unwrap();
+        serde_json::from_value(fixture("kernel_wire_request.v2.json")).unwrap();
     request
         .envelope
         .validate()
         .expect("wire envelope validates");
 
     let response: KernelWireResponse =
-        serde_json::from_value(fixture("kernel_wire_response.v1.json")).unwrap();
+        serde_json::from_value(fixture("kernel_wire_response.v2.json")).unwrap();
     assert!(response.error.is_none());
     assert!(response.decision.expect("decision").is_allow());
     // The response must bind to the request it answers: an allow for a

@@ -4,13 +4,13 @@
 //! Pi RPC subprocess (untrusted: model output, extensions, tool arguments),
 //! the host supervisor (`lumen-server`) and the Lumen kernel (this crate).
 //!
-//! Frozen contracts (all v1 — see `docs/adr/0004-canonical-encoding-and-versioning.md`):
+//! Versioned contracts (see ADR-0004 and the proposed ADR-0011 transition):
 //!
 //! | Contract | Contents | Owner |
 //! |---|---|---|
-//! | [`ActionEnvelope`] | action, resources, inputs, effects, lease chain | kernel |
-//! | [`PolicyDecision`] | allow / deny / pending-approval, reason, obligations; **no default allow** | kernel |
-//! | PiBridge v1 ([`BridgeToolRequest`], [`BridgeEvent`], [`BridgeCancellation`]) | session events, tool request, cancellation | host |
+//! | [`ActionEnvelope`] v2 | strict action, resources, inputs, effects, lease chain | kernel |
+//! | [`PolicyDecision`] v3 | strict allow / deny / pending-approval, reason, obligations; **no default allow** | kernel |
+//! | Legacy PiBridge v1 | events/cancellation remain historical; authority-bearing tool requests are retired | host |
 //! | [`AuditEvent`] | actor, action digest, decision, chain link | kernel |
 //! | [`SandboxDriver`] | prepare, start, stream, cancel, export, destroy | sandbox |
 //!
@@ -45,14 +45,13 @@ use uuid::Uuid;
 // Contract versions
 // ---------------------------------------------------------------------------
 
-/// Version of the [`ActionEnvelope`] contract frozen by Phase 0.
-pub const ACTION_ENVELOPE_VERSION: u32 = 1;
+/// Strict authority envelope. v1 remains historical evidence only (ADR-0011).
+pub const ACTION_ENVELOPE_VERSION: u32 = 2;
 /// Version of the [`PolicyDecision`] contract.
 ///
-/// v1 was frozen by Phase 0. Phase 1 added the `SettleBudget` obligation
-/// variant, so the contract is v2 per ADR-0004 (new version + new fixtures
-/// for every protocol change; v1 shapes still parse).
-pub const POLICY_DECISION_VERSION: u32 = 2;
+/// v3 rejects unknown fields/versions throughout decisions and obligations.
+/// Legacy v1/v2 decisions remain historical evidence only (ADR-0011).
+pub const POLICY_DECISION_VERSION: u32 = 3;
 /// Version of the PiBridge contract frozen by Phase 0.
 pub const PIBRIDGE_VERSION: u32 = 1;
 /// Version of the [`AuditEvent`] contract frozen by Phase 0.
@@ -60,7 +59,7 @@ pub const AUDIT_EVENT_VERSION: u32 = 1;
 /// Version of the [`SandboxDriver`] contract frozen by Phase 0.
 pub const SANDBOX_DRIVER_VERSION: u32 = 1;
 /// Wire protocol identifier spoken on the kernel's local transport.
-pub const KERNEL_WIRE_PROTOCOL: &str = "lumen-kernel/1";
+pub const KERNEL_WIRE_PROTOCOL: &str = "lumen-kernel/2";
 /// Maximum size of one kernel wire record (flood protection).
 pub const KERNEL_MAX_RECORD_BYTES: usize = 1024 * 1024;
 
@@ -194,7 +193,7 @@ fn all_numbers_integral(value: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ActionEnvelope v1
+// ActionEnvelope v2
 // ---------------------------------------------------------------------------
 
 /// Opaque lease identifier (leaf → root chain order in the envelope).
@@ -230,6 +229,7 @@ impl fmt::Display for LeaseId {
 
 /// Stable tool reference: name + contract version of the tool itself.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ToolRef {
     pub name: String,
     pub version: String,
@@ -237,6 +237,7 @@ pub struct ToolRef {
 
 /// A content input the action depends on, referenced by hash.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InputRef {
     /// Hex SHA-256 of the input content.
     pub content_hash: String,
@@ -254,6 +255,7 @@ pub enum PathRights {
 
 /// One filesystem resource the action touches.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PathResource {
     /// Canonical absolute path (lexically normalized, see [`canonical_path`]).
     pub path: String,
@@ -263,6 +265,7 @@ pub struct PathResource {
 /// One network destination the action may contact (unused by phase-0 reads,
 /// part of the frozen contract for phase 2+).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkResource {
     pub scheme: String,
     pub host: String,
@@ -271,6 +274,7 @@ pub struct NetworkResource {
 
 /// One secret the action may use (brokered, never disclosed to the model).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SecretRef {
     pub id: String,
     pub purpose: String,
@@ -278,6 +282,7 @@ pub struct SecretRef {
 
 /// Typed resource set named by the action.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceSet {
     #[serde(default)]
     pub paths: Vec<PathResource>,
@@ -290,6 +295,7 @@ pub struct ResourceSet {
 /// Declared effect classes. The kernel checks the *declared* classes against
 /// the lease; the sandbox (phase 2) enforces them at runtime.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EffectClasses {
     pub file_read: bool,
     pub file_write: bool,
@@ -301,6 +307,7 @@ pub struct EffectClasses {
 /// Canonical action description. The hash of the canonical form is the
 /// approval target and the primary audit key.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(try_from = "ActionEnvelopeWire")]
 pub struct ActionEnvelope {
     /// Must be [`ACTION_ENVELOPE_VERSION`].
     pub version: u32,
@@ -321,6 +328,44 @@ pub struct ActionEnvelope {
     pub expires_at_ms: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionEnvelopeWire {
+    version: u32,
+    action_id: Uuid,
+    session_id: String,
+    tool: ToolRef,
+    #[serde(deserialize_with = "crate::strict_json::arguments")]
+    arguments: BTreeMap<String, Value>,
+    inputs: Vec<InputRef>,
+    resources: ResourceSet,
+    expected_effects: EffectClasses,
+    lease_chain: Vec<LeaseId>,
+    nonce: String,
+    expires_at_ms: i64,
+}
+
+impl TryFrom<ActionEnvelopeWire> for ActionEnvelope {
+    type Error = BoundaryError;
+    fn try_from(w: ActionEnvelopeWire) -> Result<Self, Self::Error> {
+        let value = Self {
+            version: w.version,
+            action_id: w.action_id,
+            session_id: w.session_id,
+            tool: w.tool,
+            arguments: w.arguments,
+            inputs: w.inputs,
+            resources: w.resources,
+            expected_effects: w.expected_effects,
+            lease_chain: w.lease_chain,
+            nonce: w.nonce,
+            expires_at_ms: w.expires_at_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 impl ActionEnvelope {
     /// Structural validation. Does not consult leases.
     pub fn validate(&self) -> Result<(), BoundaryError> {
@@ -338,6 +383,22 @@ impl ActionEnvelope {
         if self.tool.name.is_empty() {
             return Err(BoundaryError::InvalidEnvelope(
                 "tool.name must not be empty".to_string(),
+            ));
+        }
+        crate::canonical::ToolName::parse(&self.tool.name)
+            .map_err(|_| BoundaryError::InvalidEnvelope("invalid tool identifier".into()))?;
+        semver::Version::parse(&self.tool.version).map_err(|_| {
+            BoundaryError::InvalidEnvelope("tool version must be an exact pin".into())
+        })?;
+        if self.inputs.iter().any(|input| {
+            input.content_hash.len() != 64
+                || !input
+                    .content_hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(BoundaryError::InvalidEnvelope(
+                "invalid input content hash".into(),
             ));
         }
         if self.nonce.is_empty() {
@@ -407,12 +468,13 @@ pub fn path_prefix_covers(prefix: &str, path: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// PolicyDecision v1
+// PolicyDecision v3
 // ---------------------------------------------------------------------------
 
 /// Machine-readable deny reason. There is no default-allow: every code path
 /// that cannot prove authority must produce one of these.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DenyReason {
     pub code: String,
     pub detail: String,
@@ -457,7 +519,7 @@ impl DenyReason {
 
 /// Obligations the executor must honor when carrying out an allowed action.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Obligation {
     TruncateOutput {
         max_bytes: u64,
@@ -478,7 +540,7 @@ pub enum Obligation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "decision", rename_all = "snake_case")]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DecisionOutcome {
     Allow { obligations: Vec<Obligation> },
     Deny { reason: DenyReason },
@@ -486,11 +548,57 @@ pub enum DecisionOutcome {
 }
 
 /// Kernel verdict for one action. `version` must be [`POLICY_DECISION_VERSION`].
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct PolicyDecision {
     pub version: u32,
     #[serde(flatten)]
     pub outcome: DecisionOutcome,
+}
+
+impl<'de> Deserialize<'de> for PolicyDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Allow {
+                version: u32,
+                obligations: Vec<Obligation>,
+            },
+            Deny {
+                version: u32,
+                reason: DenyReason,
+            },
+            PendingApproval {
+                version: u32,
+                approval_id: String,
+                reason: String,
+            },
+        }
+        let (version, outcome) = match Wire::deserialize(decoder)? {
+            Wire::Allow {
+                version,
+                obligations,
+            } => (version, DecisionOutcome::Allow { obligations }),
+            Wire::Deny { version, reason } => (version, DecisionOutcome::Deny { reason }),
+            Wire::PendingApproval {
+                version,
+                approval_id,
+                reason,
+            } => (
+                version,
+                DecisionOutcome::PendingApproval {
+                    approval_id,
+                    reason,
+                },
+            ),
+        };
+        if version != POLICY_DECISION_VERSION {
+            return Err(serde::de::Error::custom(
+                "unsupported policy decision version",
+            ));
+        }
+        Ok(Self { version, outcome })
+    }
 }
 
 impl PolicyDecision {
@@ -536,15 +644,23 @@ impl PolicyDecision {
 // PiBridge v1
 // ---------------------------------------------------------------------------
 
-/// A model-initiated tool call, normalized by the host supervisor into the
-/// kernel's action vocabulary.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Historical authority-bearing request. Deserialization always fails; the
+/// host's intent-only PiBridge v2 replaces this shape (ADR-0008/ADR-0011).
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct BridgeToolRequest {
     pub version: u32,
     pub call_id: String,
     pub tool_name: String,
     pub input: Value,
     pub envelope: ActionEnvelope,
+}
+
+impl<'de> Deserialize<'de> for BridgeToolRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "authority-bearing PiBridge v1 requests are retired",
+        ))
+    }
 }
 
 /// Cancellation of an in-flight tool call.
@@ -1457,7 +1573,9 @@ fn current_uid() -> u32 {
 
 /// One request on the kernel wire: JSONL, one object per line.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KernelWireRequest {
+    #[serde(deserialize_with = "current_wire_protocol")]
     pub protocol: String,
     pub credential: String,
     pub envelope: ActionEnvelope,
@@ -1465,7 +1583,9 @@ pub struct KernelWireRequest {
 
 /// One response on the kernel wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "KernelWireResponseWire")]
 pub struct KernelWireResponse {
+    #[serde(deserialize_with = "current_wire_protocol")]
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<PolicyDecision>,
@@ -1477,7 +1597,49 @@ pub struct KernelWireResponse {
     pub error: Option<WireError>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelWireResponseWire {
+    #[serde(deserialize_with = "current_wire_protocol")]
+    protocol: String,
+    decision: Option<PolicyDecision>,
+    audit_sequence: Option<u64>,
+    action_digest: Option<String>,
+    error: Option<WireError>,
+}
+
+impl TryFrom<KernelWireResponseWire> for KernelWireResponse {
+    type Error = &'static str;
+    fn try_from(w: KernelWireResponseWire) -> Result<Self, Self::Error> {
+        match (&w.decision, &w.audit_sequence, &w.action_digest, &w.error) {
+            (Some(_), Some(_), Some(digest), None)
+                if digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
+            (None, None, None, Some(_)) => {}
+            _ => return Err("ambiguous or incomplete kernel response"),
+        }
+        Ok(Self {
+            protocol: w.protocol,
+            decision: w.decision,
+            audit_sequence: w.audit_sequence,
+            action_digest: w.action_digest,
+            error: w.error,
+        })
+    }
+}
+
+fn current_wire_protocol<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<String, D::Error> {
+    let protocol = String::deserialize(decoder)?;
+    if protocol != KERNEL_WIRE_PROTOCOL {
+        return Err(serde::de::Error::custom("unsupported kernel wire protocol"));
+    }
+    Ok(protocol)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WireError {
     pub code: String,
     pub detail: String,
@@ -1666,9 +1828,29 @@ async fn serve_connection(
         }
         let request: KernelWireRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
-            Err(e) => {
-                let response = KernelWireResponse::err("malformed_request", e.to_string());
+            Err(_) => {
+                // No raw parser text: unknown keys or invalid values can
+                // contain secrets supplied by the untrusted peer.
+                let audited = kernel.audit(
+                    AuditActor::Kernel,
+                    AuditEventKind::TransportRejected,
+                    "",
+                    "none",
+                    None,
+                    "request rejected by strict authority decoder",
+                );
+                let response = if audited.is_some() {
+                    KernelWireResponse::err("malformed_request", "invalid authority request")
+                } else {
+                    KernelWireResponse::err(
+                        "audit_unavailable",
+                        "request denied; audit unavailable",
+                    )
+                };
                 let _ = write_response(&mut writer, &response).await;
+                if audited.is_none() {
+                    return;
+                }
                 continue;
             }
         };
@@ -1796,7 +1978,7 @@ mod tests {
             session_id: session_id.to_string(),
             tool: ToolRef {
                 name: "bct.read_file".to_string(),
-                version: "1".to_string(),
+                version: "1.0.0".to_string(),
             },
             arguments,
             inputs: vec![],

@@ -2279,6 +2279,7 @@ fn map_host_audit_kind(kind: &str) -> AuditEventKind {
         "approval_requested" => AuditEventKind::ApprovalRequested,
         "policy_allowed" => AuditEventKind::PolicyAllowed,
         "policy_denied" => AuditEventKind::PolicyDenied,
+        "transport_rejected" => AuditEventKind::TransportRejected,
         _ => AuditEventKind::ActionProposed,
     }
 }

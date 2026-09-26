@@ -1,45 +1,15 @@
-//! Local kernel channel: the BCT extension's path to the host.
+//! Authenticated legacy host action channel, kept disabled by Pi admission.
 //!
-//! Topology (per the rebuild design doc): the BCT extension runs inside
-//! Pi and serializes every tool call to the kernel; the extension is a
-//! stub, not a security boundary. In phase 3 the kernel client, sandbox
-//! runner, and audit sink are all owned by the host process, so the
-//! "kernel" the extension talks to is this channel, served by the host
-//! on a Unix domain socket.
+//! This channel carries the host ActionEnvelope v2 representation. It uses
+//! `lumen-host-action/2`, distinct from the authoritative `lumen-kernel/2`
+//! protocol and from the proposed intent-only PiBridge v2. It must not be
+//! exposed to a Pi runtime without the Phase 3 integration gate.
 //!
-//! Wire contract (framing mirrors the phase-0 `lumen-kernel/1` JSONL
-//! protocol; the envelope is the phase-3 [`ActionEnvelope`]):
-//!
-//! ```text
-//! extension -> host: {"protocol":"lumen-kernel/1","credential":"<hex>","envelope":{...}}\n
-//! host -> extension: {"protocol":"lumen-kernel/1","action_digest":"...",
-//!                     "decision":{"decision":"allow","version":1},
-//!                     "result":{...},"usage":{...},"audit_ref":{...}}\n
-//! ```
-//!
-//! Reconciliation note (integration restack): this channel's envelope is the
-//! *host* schema. The kernel the host talks to speaks the *frozen*
-//! `lumen_core::pi_boundary` schema; the conversion happens at the
-//! [`crate::AuthorityKernelClient`] boundary, which resolves kernel-side
-//! semantics (digest, decision, lease-chain validation, audit) in favor of
-//! frozen. Switching the extension-facing schema itself to the frozen shape
-//! would change what the Pi extension must emit and is a coordinator design
-//! decision — the extension is currently a stub (`fake-pi.sh`).
-//!
-//! Authentication is two layers, per the design doc's deployment rule
-//! ("expose the kernel only through a local authenticated channel with
-//! peer-process validation"):
-//!
-//! 1. A per-session channel credential (hex, 256 bit), minted at spawn,
-//!    delivered to Pi via `LUMEN_KERNEL_NONCE`, and zeroized at
-//!    termination. It authenticates the *session*, not the user.
-//! 2. `SO_PEERCRED` peer-pid validation: the connecting process must be
-//!    the session's live Pi child. A credential stolen by another local
-//!    process is useless without the pid.
-//!
-//! One request per connection (like phase-0): simple, robust against
-//! half-open sockets, cheap on loopback Unix sockets. Every failure is
-//! fail-closed: no decision, no sandbox, no audit write.
+//! Session credentials and peer-process checks are required before mediation.
+//! The host owns execution and audit; the response's v1 ChannelDecision is an
+//! outcome rendering, not the kernel PolicyDecision v3 or a reusable grant.
+//! Malformed authority is rejected with static diagnostics and audited without
+//! trusting or persisting caller-provided identity, keys, values or credentials.
 
 use std::{
     future::Future, os::unix::fs::PermissionsExt, path::PathBuf, pin::Pin, sync::Arc,
@@ -59,14 +29,24 @@ use crate::{
     tool_catalog::{ResourceUsage, ToolOutcome, ToolPipeline},
 };
 
-/// Wire protocol name. Kept from phase-0; the envelope version inside is
-/// authoritative for the action schema.
-pub const KERNEL_CHANNEL_PROTOCOL: &str = "lumen-kernel/1";
+/// Distinct host action-view protocol (ADR-0011).
+pub const KERNEL_CHANNEL_PROTOCOL: &str = "lumen-host-action/2";
+
+fn current_channel_protocol<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<String, D::Error> {
+    let protocol = String::deserialize(decoder)?;
+    if protocol != KERNEL_CHANNEL_PROTOCOL {
+        return Err(serde::de::Error::custom("unsupported host action channel"));
+    }
+    Ok(protocol)
+}
 
 /// One JSONL request line on the channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelRequest {
+    #[serde(deserialize_with = "current_channel_protocol")]
     pub protocol: String,
     pub credential: String,
     pub envelope: ActionEnvelope,
@@ -97,6 +77,7 @@ pub enum ChannelDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelResponse {
+    #[serde(deserialize_with = "current_channel_protocol")]
     pub protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_digest: Option<String>,
@@ -390,21 +371,26 @@ async fn serve_request(
 ) -> ChannelResponse {
     let request: ChannelRequest = match serde_json::from_slice(line) {
         Ok(request) => request,
-        Err(e) => {
-            return ChannelResponse::error(
-                "malformed",
-                format!("request is not valid JSON: {e}"),
-                None,
-            );
+        Err(_) => {
+            // Parser diagnostics may echo arbitrary keys or values. Record
+            // a static event and fail closed if audit cannot complete.
+            let audited = tokio::time::timeout(
+                shared.config.request_timeout,
+                shared.pipeline.audit_malformed_request(),
+            )
+            .await;
+            return match audited {
+                Ok(Ok(_)) => {
+                    ChannelResponse::error("malformed", "invalid authority request".into(), None)
+                }
+                _ => ChannelResponse::error(
+                    "audit",
+                    "request denied; audit unavailable".into(),
+                    None,
+                ),
+            };
         }
     };
-    if request.protocol != KERNEL_CHANNEL_PROTOCOL {
-        return ChannelResponse::error(
-            "protocol",
-            format!("unsupported protocol {:?}", request.protocol),
-            None,
-        );
-    }
 
     // Authenticate the session.
     let session = match shared.sessions.resolve_session(&request.credential).await {

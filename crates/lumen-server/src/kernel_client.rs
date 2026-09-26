@@ -1,14 +1,10 @@
-//! Kernel client seam: v1 host<->kernel contracts and the [`KernelClient`] trait.
+//! Kernel client seam: versioned host views and the [`KernelClient`] trait.
 //!
-//! The host (lumen-server) never implements policy itself. Every effect the
-//! host wants to run is described as an [`ActionEnvelope`] v1, sent to the
-//! kernel, and answered with a [`PolicyDecision`] v1. The contract shapes
-//! below mirror the Phase-1 authority kernel's `lumen-protocol` definitions
-//! (see `origin/lumen-rebuild/phase-1-authority-kernel`,
-//! `crates/lumen-protocol/src/{action_envelope,policy_decision}.rs`); they
-//! are duplicated here rather than imported because the base commit this
-//! branch builds on predates that crate. The coordinator wires a real
-//! kernel implementation behind this trait at integration time.
+//! The host describes an effect with ActionEnvelope v2; the authority kernel
+//! returns PolicyDecision v3. These host representations use string identities
+//! and timestamps. `kernel_convert` maps them explicitly into the typed kernel
+//! contract, whose canonical action digest is the approval and audit target.
+//! Host transport digests are not substitutes for that kernel action digest.
 //!
 //! Contract rules (from the plan's tables):
 //! - `ActionEnvelope`: action + resources + inputs + effects + lease chain in,
@@ -32,9 +28,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// Contract version for [`ActionEnvelope`].
-pub const ACTION_ENVELOPE_VERSION: u32 = 1;
+pub const ACTION_ENVELOPE_VERSION: u32 = lumen_core::pi_boundary::ACTION_ENVELOPE_VERSION;
 /// Contract version for [`PolicyDecision`].
-pub const POLICY_DECISION_VERSION: u32 = 1;
+pub const POLICY_DECISION_VERSION: u32 = lumen_core::pi_boundary::POLICY_DECISION_VERSION;
 /// Contract version for [`LeaseDocument`].
 pub const LEASE_DOCUMENT_VERSION: u32 = lumen_core::lease::LEASE_PROTOCOL_VERSION;
 
@@ -82,7 +78,7 @@ pub struct ResourceSet {
     pub secret_refs: Vec<String>,
 }
 
-/// ActionEnvelope v1: the canonical description of one requested effect.
+/// ActionEnvelope v2 host view: the description of one requested effect.
 ///
 /// Produced by the host from a Pi tool request; decided on by the kernel.
 /// The SHA-256 digest of the canonical envelope is the approval target for
@@ -90,6 +86,7 @@ pub struct ResourceSet {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionEnvelope {
+    #[serde(deserialize_with = "current_action_version")]
     pub protocol_version: u32,
     /// UUID v4 identifying this action attempt.
     pub action_id: String,
@@ -97,6 +94,7 @@ pub struct ActionEnvelope {
     pub session_id: String,
     pub tool: ToolRef,
     /// Canonical typed tool payload.
+    #[serde(deserialize_with = "lumen_core::strict_json::object")]
     pub arguments: serde_json::Value,
     /// Content hashes of inputs the action depends on (repo snapshot, files).
     #[serde(default)]
@@ -112,6 +110,16 @@ pub struct ActionEnvelope {
     pub expires_at: String,
     /// Declared effect classes; execution must not exceed these.
     pub expected_effects: Vec<EffectClass>,
+}
+
+fn current_action_version<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<u32, D::Error> {
+    let version = u32::deserialize(decoder)?;
+    if version != ACTION_ENVELOPE_VERSION {
+        return Err(serde::de::Error::custom(
+            "unsupported action envelope version",
+        ));
+    }
+    Ok(version)
 }
 
 #[derive(Debug, Error)]
@@ -147,6 +155,11 @@ impl ActionEnvelope {
         if self.tool.name.trim().is_empty() {
             return Err(EnvelopeError::EmptyToolName);
         }
+        if !self.arguments.is_object() {
+            return Err(EnvelopeError::Deserialize(
+                "action arguments must be an object".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -154,7 +167,8 @@ impl ActionEnvelope {
     pub fn digest(&self) -> Result<String, EnvelopeError> {
         let value =
             serde_json::to_value(self).map_err(|e| EnvelopeError::Deserialize(e.to_string()))?;
-        Ok(sha256_hex(canonical_json(&value).as_bytes()))
+        lumen_core::pi_boundary::canonical_digest(&value)
+            .map_err(|_| EnvelopeError::Deserialize("noncanonical action envelope".into()))
     }
 }
 
@@ -164,13 +178,14 @@ impl ActionEnvelope {
 #[serde(deny_unknown_fields)]
 pub struct Obligation {
     pub kind: String,
+    #[serde(deserialize_with = "lumen_core::strict_json::value")]
     pub params: serde_json::Value,
 }
 
 /// The kernel's answer. Explicit: allow, deny, or pending human approval.
 /// There is deliberately no "default allow".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Decision {
     Allow {
         /// The leaf lease that authorizes this action.
@@ -187,16 +202,27 @@ pub enum Decision {
     },
 }
 
-/// PolicyDecision v1: the kernel's answer to an [`ActionEnvelope`].
+/// PolicyDecision v3 host view: the kernel's answer to an [`ActionEnvelope`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyDecision {
+    #[serde(deserialize_with = "current_policy_version")]
     pub protocol_version: u32,
     /// Digest of the [`ActionEnvelope`] this decision answers.
     pub action_digest: String,
     pub decision: Decision,
     /// RFC 3339 timestamp of the decision.
     pub decided_at: String,
+}
+
+fn current_policy_version<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<u32, D::Error> {
+    let version = u32::deserialize(decoder)?;
+    if version != POLICY_DECISION_VERSION {
+        return Err(serde::de::Error::custom(
+            "unsupported policy decision version",
+        ));
+    }
+    Ok(version)
 }
 
 #[derive(Debug, Error)]
@@ -246,6 +272,7 @@ impl PolicyDecision {
 pub struct LeaseLimits {
     pub not_before_ms: i64,
     pub expires_at_ms: i64,
+    #[serde(deserialize_with = "lumen_core::strict_json::value")]
     pub budget: serde_json::Value,
     #[serde(default)]
     pub max_executions: Option<u64>,
@@ -263,12 +290,14 @@ pub struct LeaseLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseDocument {
+    #[serde(deserialize_with = "current_lease_version")]
     pub protocol_version: u32,
     pub lease_id: String,
     pub parent_id: Option<String>,
     pub subject: String,
     pub issuer_key_id: String,
     pub issued_at_ms: i64,
+    #[serde(deserialize_with = "lumen_core::strict_json::value")]
     pub scope: serde_json::Value,
     pub limits: LeaseLimits,
     pub depth: u32,
@@ -279,6 +308,16 @@ pub struct LeaseDocument {
     /// For one-shot leases: the exact approved action digest the lease is
     /// bound to. `None` for standing leases.
     pub approved_action_digest: Option<String>,
+}
+
+fn current_lease_version<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<u32, D::Error> {
+    let version = u32::deserialize(decoder)?;
+    if version != LEASE_DOCUMENT_VERSION {
+        return Err(serde::de::Error::custom(
+            "unsupported lease document version",
+        ));
+    }
+    Ok(version)
 }
 
 /// Result of [`KernelClient::verify_lease`].
@@ -507,6 +546,7 @@ struct MockKernelState {
     revoked_leases: BTreeSet<String>,
     audit_log: Vec<(AuditEvent, AuditRef)>,
     fail_audit: bool,
+    audit_delay: std::time::Duration,
     /// Fail every append after the first `n` succeed (see
     /// `fail_audit_after_appends`).
     fail_audit_after: Option<u64>,
@@ -547,6 +587,11 @@ impl MockKernelClient {
     /// Arm the next (and subsequent) audit appends to fail.
     pub fn fail_audit(&self, fail: bool) {
         self.inner.lock().unwrap().fail_audit = fail;
+    }
+
+    /// Inject a pending audit append to exercise caller timeout behavior.
+    pub fn delay_audit(&self, delay: std::time::Duration) {
+        self.inner.lock().unwrap().audit_delay = delay;
     }
 
     /// Fail every audit append after the first `n` succeed. `n = 1`
@@ -718,6 +763,10 @@ impl KernelClient for MockKernelClient {
 
     fn append_audit<'a>(&'a self, event: &'a AuditEvent) -> KernelFuture<'a, AuditRef> {
         Box::pin(async move {
+            let delay = self.inner.lock().unwrap().audit_delay;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let mut state = self.inner.lock().unwrap();
             if state.fail_audit {
                 return Err(KernelError::AuditFailed(
@@ -806,62 +855,6 @@ impl SessionIdentityAuthority for MockKernelClient {
             })
         })
     }
-}
-
-/// Canonical JSON: object keys sorted recursively, no whitespace.
-/// Used for envelope digests and audit chaining.
-pub fn canonical_json(value: &serde_json::Value) -> String {
-    fn write(value: &serde_json::Value, out: &mut String) {
-        match value {
-            serde_json::Value::Null => out.push_str("null"),
-            serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-            serde_json::Value::String(s) => {
-                out.push('"');
-                for c in s.chars() {
-                    match c {
-                        '"' => out.push_str("\\\""),
-                        '\\' => out.push_str("\\\\"),
-                        '\n' => out.push_str("\\n"),
-                        '\r' => out.push_str("\\r"),
-                        '\t' => out.push_str("\\t"),
-                        c if (c as u32) < 0x20 => {
-                            out.push_str(&format!("\\u{:04x}", c as u32));
-                        }
-                        c => out.push(c),
-                    }
-                }
-                out.push('"');
-            }
-            serde_json::Value::Array(items) => {
-                out.push('[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    write(item, out);
-                }
-                out.push(']');
-            }
-            serde_json::Value::Object(map) => {
-                out.push('{');
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                for (i, key) in keys.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    write(&serde_json::Value::String((*key).clone()), out);
-                    out.push(':');
-                    write(&map[*key], out);
-                }
-                out.push('}');
-            }
-        }
-    }
-    let mut out = String::new();
-    write(value, &mut out);
-    out
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -1050,9 +1043,9 @@ mod tests {
         env.protocol_version = 99;
         assert!(matches!(
             env.validate(),
-            Err(EnvelopeError::VersionMismatch(99, 1))
+            Err(EnvelopeError::VersionMismatch(99, ACTION_ENVELOPE_VERSION))
         ));
-        env.protocol_version = 1;
+        env.protocol_version = ACTION_ENVELOPE_VERSION;
         env.action_id = "not-a-uuid".to_string();
         assert!(matches!(env.validate(), Err(EnvelopeError::BadActionId(_))));
         env.action_id = Uuid::new_v4().to_string();
@@ -1061,9 +1054,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_json_sorts_keys() {
-        let v = serde_json::json!({"b": 1, "a": {"z": 1, "y": 2}});
-        assert_eq!(canonical_json(&v), r#"{"a":{"y":2,"z":1},"b":1}"#);
+    fn host_digest_rejects_non_integer_arguments() {
+        let mut envelope = sample_envelope();
+        envelope.arguments = serde_json::json!({"amount": 1.0});
+        assert!(envelope.digest().is_err());
     }
 
     #[tokio::test]

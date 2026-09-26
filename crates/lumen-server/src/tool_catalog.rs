@@ -845,6 +845,21 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
         }
     }
 
+    /// A raw request failed decoding, before any caller-provided identity or
+    /// action could be trusted. Persist only a fixed rejection reason.
+    pub(crate) async fn audit_malformed_request(
+        &self,
+    ) -> Result<AuditRef, crate::kernel_client::KernelError> {
+        self.kernel
+            .append_audit(&AuditEvent {
+                kind: "transport_rejected".into(),
+                session_id: "unidentified".into(),
+                action_digest: None,
+                payload: serde_json::json!({"reason":"invalid_authority_request"}),
+            })
+            .await
+    }
+
     /// Build the canonical envelope for one Pi tool request without
     /// executing it. The host is the envelope authority: resources and
     /// effects come from the host projection, never from Pi.

@@ -153,6 +153,9 @@ jobs:
       - run: >
           cargo test --workspace --exclude lumen-acceptance --exclude lumen-desktop --
           --skip fuel_deadline_and_cancellation_interrupt_guest_code
+      # This bounded acceptance target exercises the versioned raw Unix
+      # transport. It does not replace real Pi/Firecracker confinement evidence.
+      - run: cargo test -p lumen-acceptance --test pi_bypass_inventory
       # The no-default-features configuration is materially different
       # (default features pull in model-client, native-secrets, and
       # wasm-host): the sandbox gate must keep covering it, or a
