@@ -32,7 +32,7 @@ jobs:
       - name: Prepare disposable Linux runner
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap gcc libnode-dev python3-cryptography dbus-user-session
+          sudo apt-get install -y --no-install-recommends bubblewrap gcc libnode-dev npm python3-cryptography dbus-user-session
           # Only this ephemeral CI runner: use setup-node's exact runtime at the
           # prototype's fixed path. N-API headers do not grant runtime authority.
           sudo install -m755 "$(command -v node)" /usr/bin/node

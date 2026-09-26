@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
 
 from prepare import compile_guard, manifest_for, system_runtime
 from runtime import Refused, Runtime, control_env, load_manifest, sha256
@@ -191,6 +192,26 @@ worker.on('error',err=>{console.error(err);process.exitCode=1});
             self.assertEqual((cgroup / "pids.max").read_text().strip(), "64")
             quota, period = (cgroup / "cpu.max").read_text().split()
             self.assertEqual(int(quota), int(period))
+
+    def test_12_concurrent_and_restarted_runtimes_do_not_share_state(self):
+        manifest, expected = self.candidate("""
+const fs=require('node:fs');
+const value=fs.readFileSync(0,'utf8');
+const existed=fs.existsSync('/state/private-marker');
+fs.writeFileSync('/state/private-marker',value);
+setTimeout(()=>console.log(JSON.stringify({existed,value:fs.readFileSync('/state/private-marker','utf8')})),200);
+""")
+        def run(value):
+            with Runtime(self.root, manifest, expected) as runtime:
+                code, out, err = runtime.collect(value.encode())
+                self.assertEqual(code, 0, err.decode())
+                return runtime.unit, json.loads(out)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(run, ["session-a", "session-b"]))
+        results.append(run("restarted-session"))
+        self.assertEqual(len({unit for unit, _ in results}), 3)
+        self.assertEqual([value for _, value in results], [
+            {"existed": False, "value": value} for value in ["session-a", "session-b", "restarted-session"]])
 
 
 if __name__ == "__main__":
