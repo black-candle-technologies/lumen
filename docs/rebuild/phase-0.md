@@ -3,6 +3,13 @@
 Status: **in progress; gate not passed; production Pi admission disabled**.
 Branch: `lumen-rebuild/phase-0-boundary-reset`, based on `c2ed463`.
 
+Current development evidence: [lane-vps results](evidence/phase0-confinement.json),
+[exact unsigned runtime candidate](evidence/phase0-runtime.candidate.json),
+[audited denial](evidence/phase0-denial.audit.json), and
+[separately captured checkpoint anchor](evidence/phase0-denial.anchor.json).
+The [earlier preparation record](evidence/phase0-preparation.json) is preserved
+unchanged and describes its earlier commit, before real Pi was exercised.
+
 ## Why the reference spike is insufficient
 
 The prior BCT extension requested an allow decision and then called Node

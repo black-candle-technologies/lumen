@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-26T04:00:13.160360+00:00",
+  "classification": "development verification only; unsigned runtime candidate; phase gate not accepted",
+  "phase_0_gate": "not_passed",
+  "implementation_commit": "d2bb93763b1c7151243126a49c712e8ead0017a7",
+  "source_archive_sha256": "86649c023a46d17daafa16da340ce120b167552bec3a63ce33b4732a5f0560c9",
+  "host": {
+    "name": "lane-vps",
+    "platform": "Linux x86_64",
+    "node": "22.22.1",
+    "bubblewrap": "0.11.1",
+    "systemd": "259.5",
+    "scratch": "/home/ubuntu/lumen-phase0.Fq24kV",
+    "deployment_modified": false
+  },
+  "pi": {
+    "version": "0.87.1",
+    "source_commit": "f07218c4d4bbc12bef056a7058c3dd49dfe41abe",
+    "lock_sha256": "95dbf4d7aa54eebf235edccd6926efac42fbf4e1c6a92c625c9ac706a8b367f7",
+    "model_data_artifact_sha256": "35b4432f27cc2665f86beebb9af6a39b1251970883c3044bd8be4f4e8c731ca0",
+    "runtime_manifest_sha256": "e7b6b7b8d9630ea89c62b04070d95bee4062201d6e3fcef8c8939053a22048f5",
+    "runtime_file_count": 3920,
+    "cli_wrapper_sha256": "e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774",
+    "kernel_probe_binary_sha256": "fd07da4df85190e88cc70e9646a8133f069437e736dfbaaf0c3efaa7a0f26282",
+    "registry_provenance_verified": false
+  },
+  "results": {
+    "rust_server_tests": 188,
+    "rust_failures": 0,
+    "clippy_warnings_denied": "passed",
+    "native_and_audit_tests": 15,
+    "additional_concurrent_restart_test": "passed",
+    "real_pi_rpc_events": 24,
+    "real_tool": "bct.read_file",
+    "kernel_outcome": "denied",
+    "denial_reason": "scope_exceeded: one-shot lease is not bound to the presented action",
+    "action_digest": "308d3dc770606e641a144397a2a7821bbcc881c68fe828edd6186cceea433d67",
+    "audit_events": 7,
+    "signed_checkpoints": 7,
+    "independent_python_verifier": "passed",
+    "session_identity_destroyed": true,
+    "effect_executor_present": false,
+    "service_manager_expansion": "disabled; literal-argument regression passed"
+  },
+  "log_sha256": {
+    "rust-tests-confinement.log": "f05e2e3f6576a241c6619cfcc30e8363dea0c63e3dc14500ad5603ca34b061f2",
+    "clippy-confinement-final.log": "359807370d971fe224160cf9f766c77dce852620ff3a43240d5f19b5fa918011",
+    "confinement-concurrency.log": "8ccfff73b13a95a738d70758b9182d7557c34dda9a78c7b2322dcdb4d2d885c6",
+    "pi-release-build.log": "bcec44afd4d9d8de7115b04c12ac75405c426a4f94041ffa8a1910d7005feac4",
+    "kernel-probe-build-final.log": "b67aa404552cb7ac95b99079563c1cd6dcd64e470b449655f8b9dfcfc3d1c57f",
+    "confinement-suite-final-15.log": "0350f33ccb286b2983afc88ac419d704ed69a591581bdd951cf2e548a9c73696",
+    "real-pi-probe-pinned.log": "bc66168083868cbb387001e9a048ddefef15c9a485e8158f96f82181586358f7"
+  },
+  "evidence_sha256": {
+    "kernel-evidence.json": "6d931a4bb3bfadd989feb8ab40a07e6cc41e5ff264f86083b081007e2dc3e18e",
+    "audit-anchor.json": "576a04fb051c51106f6e5838b1ff6c2a7ed95184ced343b08d6fb9045724d066",
+    "rpc-events.json": "27ce1a1fd3e837e8ce771f0cd72b71707a82bc1b8fb52eee359c30ac263573aa",
+    "pi-stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "limitations": [
+    "Production supervisors remain disabled; this is an experimental deny-only harness.",
+    "The deterministic model is a fixture, not a credentialed model gateway.",
+    "The kernel first denies the missing one-shot action binding; path-subset evaluation is tested separately.",
+    "Runtime artifacts have hashes but no admission signatures or independent provenance review.",
+    "No Firecracker action or signed guest image was tested.",
+    "Managed timeout cleanup and fresh-state restart passed; abrupt supervisor death and orphan-free host recovery remain open.",
+    "No independent security review, subsystem owner sign-off, staging rollback, merge, release, tag or deployment."
+  ],
+  "source_files_sha256": {
+    "scripts/rebuild/build-pinned-pi.sh": "f5a1299e69af7c70fd5c3c5c0315925e00480d565cf480009dd05d5af6389400",
+    "scripts/rebuild/confinement/bootstrap.cjs": "9bf62f850a26dc521aeb0d660ef52dd7e570681864d1d1e8a061bfaa2ab95145",
+    "scripts/rebuild/confinement/guard.c": "17a9819ef74907bbad00d4c1bea2519c9fdde1722dd9ef16ca450b34bf0adb1d",
+    "scripts/rebuild/confinement/pi-probe.mjs": "10004a2e478642183750e57b07570ab30f6434678b7d765fa147fbc71a9f2b7c",
+    "scripts/rebuild/confinement/prepare.py": "738047de931a33fac4b15f64d8d0de6d8d38c73627b66ac929e1582360c48783",
+    "scripts/rebuild/confinement/prepare_pi.py": "455f399a239404cb3a9edf3a0962f51c92069eb36c2a06a341fadc829270f2ef",
+    "scripts/rebuild/confinement/probe.c": "623adeeb0c9c0bd26c308ef74dbbb8ae4bbfda982d48cdede6d99ffd0517b138",
+    "scripts/rebuild/confinement/probe_pi.py": "caddb208157eafa407fd8923f03b80248280eabd9294adbe43c3a97e7adfa144",
+    "scripts/rebuild/confinement/runtime.py": "965c36f7d6bc3b9dbd2ccdb0e75e8f0f2f0e8febf27432ca59c7101dfbc87125",
+    "scripts/rebuild/confinement/test_audit.py": "771d70f2740a9c2d832d4c36f8579c2587268d320781246c986ca8f10e01a4fd",
+    "scripts/rebuild/confinement/test_runtime.py": "bc2bbe18e6b0e8c86af0103523c0c320d62cc3af9f2963d911fd166e72fe1205",
+    "scripts/rebuild/confinement/verify_audit.py": "886b1800553cb6d335fc345a3e3b3f006ca5dfab48bee3f14404e08af04b9890",
+    "scripts/rebuild/hydrate-pinned-model-data.py": "af75227186500cf8f8434cfcf1bec434b52ea8908548481948c0d09edca9945d"
+  },
+  "prior_ci": {
+    "source_commit": "dc94ddf48ab41ed7e47a9864ad1fbf161d931064",
+    "url": "https://github.com/black-candle-technologies/lumen/actions/runs/36216126722",
+    "result": "all six jobs passed, including real Pi confinement",
+    "scope": "before the final environment-expansion hardening; current-head CI remains a separate check"
+  },
+  "artifact_export_check": "exact manifest/schema and audit file hashes checked; credential-pattern scan passed (not a universal secret-detection claim)"
+}
