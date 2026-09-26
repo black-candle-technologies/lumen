@@ -1,0 +1,14 @@
+{
+  "action_digest": "5a1b6b21ccf45cc12fdd331ff3b7a46e0a0bb1a2aa2ec96af8e89af78203a3f3",
+  "audit_sequence": 1,
+  "decision": {
+    "decision": "allow",
+    "obligations": [
+      {
+        "type": "redact_secrets"
+      }
+    ],
+    "version": 3
+  },
+  "protocol": "lumen-kernel/2"
+}

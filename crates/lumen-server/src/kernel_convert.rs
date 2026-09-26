@@ -1,71 +1,17 @@
-//! Host ↔ frozen `pi_boundary` envelope/decision/audit conversions.
+//! Conversion between host views and the authoritative kernel contracts.
 //!
-//! Phase-3's host logic speaks its own contract shapes (defined in
-//! [`crate::kernel_client`]; they predate the frozen `lumen-protocol`
-//! facade), while the kernel speaks the frozen `pi_boundary` contracts.
-//! This module is the conversion boundary between the two worlds, used by
-//! [`crate::AuthorityKernelClient`].
+//! `AuthorityKernelClient` uses this adapter with the signed lease engine.
+//! The host view and core ActionEnvelope v2 have different representations:
+//! host string IDs/timestamps and resource lists map to typed kernel fields.
+//! The kernel action digest binds approvals and kernel audit records; the
+//! returned host decision separately binds the host transport digest. These
+//! digests must not be substituted. Consolidation remains host integration work.
 //!
-//! # Honest scope: spike backend, not the Phase-1 lease engine
-//!
-//! The backend here is `pi_boundary::LocalKernel`, which documents itself
-//! as the Phase-0 spike ("stub policy + in-memory lease registry"); Phase 1
-//! was to replace the stub policy with the real lease engine. That
-//! replacement has not been assembled: the Phase-1 authority primitives
-//! exist as separate pieces — `lumen_core::lease` (`mint_root_lease`,
-//! `mint_child_lease`, `mint_one_shot_lease`, `SessionRegistry`,
-//! `RevocationIndex`, signed `LeaseDocument`), `canonical`, `budget`,
-//! `nonce`, `kernel_audit`, and the durable stores in `lumen-db` — but
-//! there is no concrete type implementing `pi_boundary::Kernel` over them.
-//!
-//! Assembling that service is a design decision, not a mechanical port:
-//! it must decide key custody (`KernelKeys`), state ownership and
-//! threading (`SessionRegistry` / `RevocationIndex` are `&mut`-style
-//! in-memory structures), persistence (in-memory vs `lumen-db`), and the
-//! async boundary — and then the host envelope conversion in this module
-//! must be re-pointed at it. Until that lands, this client proves the
-//! conversion boundary and the fail-closed behavior against the spike.
-//! Do not describe this client as "the real Phase-1 kernel".
-//!
-//! Kernel-side semantics are resolved **in favor of frozen**: the digest the
-//! kernel audits is the frozen envelope's digest, and the decision logic is
-//! the frozen policy. The host-facing `PolicyDecision::bind` check keeps
-//! working because the converted decision carries the *host* envelope's
-//! digest in `action_digest`.
-//!
-//! # Lossy mappings (documented, fail-closed)
-//!
-//! - `expected_effects`: `SecretUse` and `MessageSend` have no counterpart in
-//!   the frozen `EffectClasses`; the conversion rejects envelopes declaring
-//!   them ([`EnvelopeError::UnsupportedEffect`]) instead of silently
-//!   discarding the effect. Dropping them would let the kernel authorize an
-//!   action on a lease that never granted the effect, and the decision is
-//!   rebound to the host envelope's digest, hiding the loss from the caller.
-//!   They stay expressible on the host envelope only.
-//! - `resources.paths` carry no rights on the host shape; the frozen contract
-//!   requires per-resource rights. Paths are marked `Write` when the action
-//!   declares `Write`, otherwise `Read`.
-//! - `resources.hosts` are `scheme://host:port` strings; they are parsed into
-//!   the frozen typed network resources (malformed entries fail the
-//!   conversion, fail closed).
-//! - `secret_refs` carry no purpose on the host shape; the frozen
-//!   `SecretRef.purpose` is left empty.
-//! - Host audit kinds are free-form strings; the frozen `AuditEventKind` is a
-//!   closed enum. `"tool_committed"` maps to `ToolExecuted`; every other host
-//!   kind maps to `ActionProposed`, with the original kind preserved verbatim
-//!   at the front of `detail`.
-//!
-//! # Not wired
-//!
-//! `verify_lease` and `request_one_shot_lease` return
-//! [`crate::kernel_client::KernelError::Unavailable`]. The local kernel
-//! backend is the spike lease registry (`LeaseRecord`s keyed by `LeaseId`);
-//! it has no signed-`LeaseDocument` API, and the host's `LeaseDocument` /
-//! `OneShotGrant` shapes are not wire-compatible with
-//! `lumen_core::lease`'s signed types (opaque `scope`/`budget` values,
-//! different canonical JSON). Faking verification would be a security lie,
-//! so these stay explicitly unwired until a signed-lease backend lands. No
-//! live host path calls them (verified by grep over `lumen-server`).
+//! Unrepresentable SecretUse/MessageSend effect classes are rejected. Host
+//! paths map to per-resource write rights when Write is declared, otherwise
+//! read rights; host secret references lack a purpose and map to an empty one.
+//! The adapter supplies no authority: kernel canonicalization, lease checks,
+//! budgets, isolated execution and controlled commit are still required.
 
 use lumen_core::pi_boundary::{
     self, ActionEnvelope as FrozenEnvelope, DecisionOutcome, EffectClasses as FrozenEffectClasses,
@@ -252,6 +198,11 @@ pub(crate) fn to_host_decision(
     frozen: &FrozenDecision,
     envelope: &ActionEnvelope,
 ) -> Result<PolicyDecision, KernelError> {
+    if frozen.version != pi_boundary::POLICY_DECISION_VERSION {
+        return Err(KernelError::Protocol(
+            "unsupported kernel policy decision version".into(),
+        ));
+    }
     let action_digest = envelope.digest()?;
     let decision = match &frozen.outcome {
         DecisionOutcome::Allow { obligations } => {
@@ -339,6 +290,43 @@ mod tests {
             nonce: uuid::Uuid::new_v4().to_string(),
             expires_at: deadline_rfc3339(600),
             expected_effects: effects,
+        }
+    }
+
+    #[test]
+    fn host_and_kernel_fixture_digests_remain_distinct_and_exact() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/host_action.v2.json")).unwrap();
+        let host: ActionEnvelope =
+            serde_json::from_value(fixture["request"]["envelope"].clone()).unwrap();
+        assert_eq!(host.digest().unwrap(), fixture["host_action_digest"]);
+        let core = to_frozen_envelope(&host).unwrap();
+        assert_eq!(
+            serde_json::to_value(&core).unwrap(),
+            fixture["kernel_envelope"]
+        );
+        assert_eq!(core.digest().unwrap(), fixture["kernel_action_digest"]);
+        assert_ne!(core.digest().unwrap(), host.digest().unwrap());
+        let policy = to_host_decision(&FrozenDecision::allow(vec![]), &host).unwrap();
+        policy.bind(&host).unwrap();
+        assert_eq!(
+            policy.action_digest,
+            fixture["host_policy"]["action_digest"]
+        );
+    }
+
+    #[test]
+    fn conversion_never_upgrades_a_stale_or_future_policy_version() {
+        let envelope = envelope_with_effects(vec![EffectClass::Read]);
+        let decision = FrozenDecision::allow(vec![]);
+        to_host_decision(&decision, &envelope)
+            .unwrap()
+            .bind(&envelope)
+            .unwrap();
+        for version in [0, 1, 2, 4, u32::MAX] {
+            let mut invalid = decision.clone();
+            invalid.version = version;
+            assert!(to_host_decision(&invalid, &envelope).is_err());
         }
     }
 

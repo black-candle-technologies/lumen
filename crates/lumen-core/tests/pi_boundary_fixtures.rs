@@ -1,7 +1,7 @@
 //! Protocol fixture tests: every frozen Phase-0 contract has a checked-in
 //! JSON fixture under `tests/fixtures/`. These tests prove the fixtures
-//! deserialize into the v1 types, are byte-stable under canonical
-//! re-serialization, and carry valid digests / chain links.
+//! retain historical digests / chain links. New live contract fixtures must
+//! round-trip; superseded authority must fail decoding.
 
 use lumen_core::pi_boundary::*;
 use serde_json::Value;
@@ -36,7 +36,15 @@ where
 
 #[test]
 fn action_envelope_fixture() {
-    let value = fixture("action_envelope.v1.json");
+    let mut historical = fixture("action_envelope.v1.json");
+    let old_digest = historical
+        .as_object_mut()
+        .unwrap()
+        .remove("_digest")
+        .unwrap();
+    assert_eq!(canonical_digest(&historical).unwrap(), old_digest);
+    assert!(serde_json::from_value::<ActionEnvelope>(historical).is_err());
+    let value = fixture("action_envelope.v2.json");
     // `_digest` is fixture metadata, not part of the contract: strip it for
     // the round-trip check, then verify it independently.
     let recorded = value
@@ -46,46 +54,41 @@ fn action_envelope_fixture() {
         .to_string();
     let mut contract = value.clone();
     contract.as_object_mut().unwrap().remove("_digest");
-    assert_round_trip_stable::<ActionEnvelope>("action_envelope.v1.json", &contract, 1);
+    assert_round_trip_stable::<ActionEnvelope>("action_envelope.v2.json", &contract, 2);
     let envelope: ActionEnvelope = serde_json::from_value(contract).unwrap();
     envelope.validate().expect("fixture envelope validates");
     let digest = envelope.digest().expect("digest");
     assert_eq!(digest, recorded, "envelope digest matches fixture");
     assert_eq!(digest.len(), 64);
+    assert_ne!(digest, old_digest.as_str().unwrap());
 }
 
 #[test]
 fn policy_decision_fixtures() {
     for name in [
-        "policy_decision_allow.v1.json",
-        "policy_decision_deny.v1.json",
-        "policy_decision_pending.v1.json",
+        "policy_decision_allow.v3.json",
+        "policy_decision_deny.v3.json",
+        "policy_decision_pending.v3.json",
     ] {
         let value = fixture(name);
-        assert_round_trip_stable::<PolicyDecision>(name, &value, 1);
+        assert_round_trip_stable::<PolicyDecision>(name, &value, 3);
     }
     let allow: PolicyDecision =
-        serde_json::from_value(fixture("policy_decision_allow.v1.json")).unwrap();
+        serde_json::from_value(fixture("policy_decision_allow.v3.json")).unwrap();
     assert!(allow.is_allow());
     let deny: PolicyDecision =
-        serde_json::from_value(fixture("policy_decision_deny.v1.json")).unwrap();
+        serde_json::from_value(fixture("policy_decision_deny.v3.json")).unwrap();
     assert!(!deny.is_allow());
     assert_eq!(deny.summary(), "deny");
     let pending: PolicyDecision =
-        serde_json::from_value(fixture("policy_decision_pending.v1.json")).unwrap();
+        serde_json::from_value(fixture("policy_decision_pending.v3.json")).unwrap();
     assert_eq!(pending.summary(), "pending");
 }
 
 #[test]
 fn pibridge_fixtures() {
     let request = fixture("pibridge_tool_request.v1.json");
-    assert_round_trip_stable::<BridgeToolRequest>("pibridge_tool_request.v1.json", &request, 1);
-    let request: BridgeToolRequest = serde_json::from_value(request).unwrap();
-    assert_eq!(request.tool_name, "bct.read_file");
-    request
-        .envelope
-        .validate()
-        .expect("embedded envelope validates");
+    assert!(serde_json::from_value::<BridgeToolRequest>(request).is_err());
 
     let settled = fixture("pibridge_agent_settled.v1.json");
     let settled: BridgeEvent = serde_json::from_value(settled).unwrap();
@@ -124,7 +127,15 @@ fn sandbox_driver_fixture() {
 
 #[test]
 fn kernel_wire_fixtures() {
-    let request = fixture("kernel_wire_request.v1.json");
+    assert!(
+        serde_json::from_value::<KernelWireRequest>(fixture("kernel_wire_request.v1.json"))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<KernelWireResponse>(fixture("kernel_wire_response.v1.json"))
+            .is_err()
+    );
+    let request = fixture("kernel_wire_request.v2.json");
     let request: KernelWireRequest = serde_json::from_value(request).unwrap();
     assert_eq!(request.protocol, KERNEL_WIRE_PROTOCOL);
     request
@@ -132,7 +143,7 @@ fn kernel_wire_fixtures() {
         .validate()
         .expect("wire envelope validates");
 
-    let response = fixture("kernel_wire_response.v1.json");
+    let response = fixture("kernel_wire_response.v2.json");
     let response: KernelWireResponse = serde_json::from_value(response).unwrap();
     assert_eq!(response.protocol, KERNEL_WIRE_PROTOCOL);
     assert!(response.error.is_none());

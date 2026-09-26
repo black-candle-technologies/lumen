@@ -39,6 +39,7 @@ pub mod run;
 pub mod secret;
 pub mod session_identity;
 pub mod store;
+pub mod strict_json;
 pub mod trust_gate;
 pub mod vhl;
 pub mod worker;

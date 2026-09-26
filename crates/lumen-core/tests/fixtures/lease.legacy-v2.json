@@ -1,0 +1,86 @@
+{
+  "document": {
+    "protocol_version": 2,
+    "lease_id": "fixture-lease",
+    "parent_id": null,
+    "subject": "fixture-session",
+    "issuer_key_id": "fixture-issuer",
+    "issued_at_ms": 10,
+    "scope": {
+      "tools": {
+        "bct.read_file": "=1.0.0"
+      },
+      "paths": [
+        {
+          "root": {
+            "components": [
+              "workspace",
+              "file~fold"
+            ],
+            "case_folded": false
+          },
+          "rights": {
+            "read": true,
+            "write": false
+          }
+        }
+      ],
+      "destinations": [
+        {
+          "scheme": "https",
+          "host": {
+            "DnsName": "example.com"
+          },
+          "ports": {
+            "ranges": [
+              [
+                443,
+                443
+              ]
+            ],
+            "any": false
+          },
+          "methods": [
+            "GET"
+          ]
+        }
+      ],
+      "secrets": [
+        "vault:docs"
+      ],
+      "accounts": [
+        {
+          "provider": "a:b",
+          "account_id": "c"
+        }
+      ],
+      "models": {
+        "p": [
+          "local"
+        ]
+      },
+      "effects": [
+        "read",
+        "network"
+      ]
+    },
+    "limits": {
+      "not_before_ms": 0,
+      "expires_at_ms": 1000,
+      "budget": {
+        "executions": 2,
+        "tokens": 0
+      },
+      "max_executions": 2,
+      "single_use": false
+    },
+    "depth": 0,
+    "depth_limit": 3,
+    "lease_nonce": "fixture-nonce",
+    "approved_action_digest": null,
+    "signature": "fde76d3eb151b8dbd84b57c0113a68ebca7c001e422ccb74a7ccbb71a79b73015209c29f07a17c13c72f122051b6d6c54c5481cff0b6e14cb2b78fba01add10c"
+  },
+  "test_public_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "signing_digest": "8332eefe7bc13dca2c27d6a95fb806611722b9683181cf619ecc10a4b01a4cef",
+  "scope_digest_v1": "70b27e252c3eaa3a8221eb2778dbd9f725eb94cd521e3a99130f6c3156ea1e72"
+}

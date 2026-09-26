@@ -292,7 +292,7 @@ fn approve_once_mints_single_use_lease_for_exact_action() {
     let env = envelope(
         &h.session_subject.clone(),
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     assert!(matches!(request.state, VhlRequestState::Approved { .. }));
@@ -311,7 +311,7 @@ fn approve_once_mints_single_use_lease_for_exact_action() {
     assert_eq!(request.view.session_subject, h.session_subject);
     assert_eq!(
         request.view.input_hashes,
-        vec!["sha256:input-1".to_string()]
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()]
     );
 
     // Consuming completes the lifecycle; a second consume fails closed.
@@ -338,7 +338,7 @@ fn consume_audit_failure_leaves_request_minted() {
     let env = envelope(
         &h.session_subject.clone(),
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     let grant = h.grant_for(&request);
@@ -377,7 +377,7 @@ fn argument_mutation_fails_closed_at_mint() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     let grant = h.grant_for(&request);
@@ -387,7 +387,7 @@ fn argument_mutation_fails_closed_at_mint() {
     let mutated_env = envelope(
         &subject,
         json!({"path": "/workspace/SECRETS.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let err = h
         .mint_lease(&mut request, &grant, &mutated_env)
@@ -404,7 +404,7 @@ fn argument_mutation_fails_closed_at_decide() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let request = h
@@ -419,7 +419,7 @@ fn argument_mutation_fails_closed_at_decide() {
     let mutated_env = envelope(
         &subject,
         json!({"path": "/workspace/README.md", "extra": "evil"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mutated_action = canonical_action(&mutated_env);
     let mut mutated_request = h
@@ -444,7 +444,7 @@ fn resigned_request_id_swap_still_fails_on_body_hash() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let request = h
@@ -456,7 +456,7 @@ fn resigned_request_id_swap_still_fails_on_body_hash() {
     let other_env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-2".to_string()],
+        vec!["aedc0184310e566c7ba14b7fceaf97b1eca4bfd20153790a3c6ff992480cccf7".to_string()],
     );
     let other_action = canonical_action(&other_env);
     let other_request = h
@@ -493,7 +493,7 @@ fn input_hash_mutation_fails_closed() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let request = h
@@ -506,7 +506,7 @@ fn input_hash_mutation_fails_closed() {
     let changed_env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-2-TAMPERED".to_string()],
+        vec!["bf294a0b8d4192e98e35f46c1f0a2a40c69eb2f30e72c001d1f152457ba54039".to_string()],
     );
     let changed_action = canonical_action(&changed_env);
     let mut changed_request = h
@@ -539,7 +539,7 @@ fn digest_mutation_in_grant_fails_closed() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     let mut grant = h.grant_for(&request);
@@ -566,7 +566,7 @@ fn session_subject_swap_fails_closed() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     let mut grant = h.grant_for(&request);
@@ -598,7 +598,7 @@ fn attestation_replay_has_no_second_effect() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let mut request = h
@@ -630,7 +630,7 @@ fn double_mint_has_no_second_effect() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     let grant = h.grant_for(&request);
@@ -655,7 +655,7 @@ fn expired_request_fails_closed() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let mut request = h
@@ -693,7 +693,7 @@ fn session_end_during_action_revokes_lease_and_denies_commit() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     let grant = h.grant_for(&request);
@@ -923,7 +923,7 @@ fn weak_proofs_do_not_authorize_exceptional_action() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
 
@@ -986,7 +986,7 @@ fn tier1_attestation_does_not_authorize() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let mut request = h
@@ -1191,7 +1191,7 @@ fn fido2_attestation_verifies_and_counter_replay_fails() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let credential_key = SigningKey::generate(&mut OsRng);
@@ -1259,7 +1259,7 @@ fn standing_lease_requires_the_explicit_workflow() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
 
@@ -1306,7 +1306,7 @@ fn standing_lease_mint_needs_confirmation_and_matches_approved_scope() {
     let env = envelope(
         &child_subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let mut request = h
@@ -1494,7 +1494,7 @@ fn vhl_courier_messages_round_trip() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let request = h
@@ -1536,7 +1536,7 @@ fn challenge_ceremony_authorizes_exactly_one_decision() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
 
@@ -1583,7 +1583,7 @@ fn deny_after_approval_fails_without_false_denial_audit() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
 
@@ -1640,7 +1640,7 @@ fn audit_failure_leaves_request_unadvanced() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
 
@@ -1867,7 +1867,7 @@ fn audit_failure_leaves_challenge_proof_unconsumed() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let mut request = h
@@ -1915,7 +1915,7 @@ fn standing_mint_rejects_view_mutated_after_confirmation() {
     let env = envelope(
         &child_subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let (mut request, confirmation, parent_lease) = confirm_standing(&mut h, &env, 10);
 
@@ -1966,7 +1966,7 @@ fn standing_mint_preserves_per_path_rights() {
     assert!(
         lease.scope.paths[0]
             .root
-            .canonical_form()
+            .absolute_path()
             .ends_with("README.md")
     );
 }
@@ -2006,7 +2006,7 @@ fn one_shot_mint_audit_failure_is_retryable() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let mut request = h.approved_request(&env);
     let grant = h.grant_for(&request);
@@ -2069,7 +2069,7 @@ fn standing_mint_audit_failure_is_retryable() {
     let env = envelope(
         &child_subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let (mut request, confirmation, parent_lease) = confirm_standing(&mut h, &env, 10);
     let parent_id = parent_lease.lease_id.clone();
@@ -2122,7 +2122,7 @@ fn audit_failure_leaves_fido2_proof_unconsumed() {
     let env = envelope(
         &subject,
         json!({"path": "/workspace/README.md"}),
-        vec!["sha256:input-1".to_string()],
+        vec!["795ea836b19df01c8d39842e34e3670dc8c5a88a9b967128401c10e79d3908d7".to_string()],
     );
     let action = canonical_action(&env);
     let credential_key = SigningKey::generate(&mut OsRng);

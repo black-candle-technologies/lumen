@@ -1,0 +1,131 @@
+{
+  "source_commit": "7d01adfbfe6f33a1880b9ba7cf8b6e1a24767989",
+  "source_tree": "3e8ade3d9d43850b7e47046efccb36d602efe61e",
+  "host": "lane-vps",
+  "kernel": "7.0.0-31-generic",
+  "architecture": "x86_64",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "python": "3.14.4",
+  "source_files_matched": 454,
+  "source_manifest_sha256": "2b8aa69dcebf8541985897d4677bf9235f4ce2b89e9743b3b86c35a134baf8df",
+  "checks": [
+    {
+      "name": "committed-action-suite",
+      "command": [
+        "/home/ubuntu/.cargo/bin/cargo",
+        "test",
+        "-p",
+        "lumen-core",
+        "-p",
+        "lumen-db",
+        "-p",
+        "lumen-protocol",
+        "-p",
+        "lumen-server",
+        "--lib",
+        "--tests"
+      ],
+      "exit_code": 0,
+      "seconds": 68.96,
+      "log_sha256": "384abd8dce7a5ba71e149ab8ca3d78cef8f137dee65f644bc3e109cc2c50396a",
+      "passed": 600,
+      "ignored": 0,
+      "suites": 35,
+      "warnings": 0
+    },
+    {
+      "name": "committed-action-clippy",
+      "command": [
+        "/home/ubuntu/.cargo/bin/cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 18.18,
+      "log_sha256": "63fd9a6bff0b39ba70165907cca24c15826da0b2ed8fde90f0839a11f6694380",
+      "passed": 0,
+      "ignored": 0,
+      "suites": 0,
+      "warnings": 0
+    },
+    {
+      "name": "committed-action-bypass",
+      "command": [
+        "/home/ubuntu/.cargo/bin/cargo",
+        "test",
+        "-p",
+        "lumen-acceptance",
+        "--test",
+        "pi_bypass_inventory"
+      ],
+      "exit_code": 0,
+      "seconds": 0.57,
+      "log_sha256": "fc98ace5c887b45e7004c718cb34d27222a50981b901ff6dae1d8219814ba733",
+      "passed": 14,
+      "ignored": 0,
+      "suites": 1,
+      "warnings": 0
+    },
+    {
+      "name": "committed-action-fixtures",
+      "command": [
+        "python3",
+        "scripts/rebuild/verify_authority_fixtures.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.08,
+      "log_sha256": "d26560f775827ec3952c0e12a380885bddfa3714f070f585e4d8f840f9fabbcb",
+      "passed": 0,
+      "ignored": 0,
+      "suites": 0,
+      "warnings": 0
+    }
+  ],
+  "environment": {
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0"
+  },
+  "scratch_logs": "/home/ubuntu/lumen-phase1.1UuKBV",
+  "phase_gate": "not_passed",
+  "production_admission": false,
+  "artifact_signed": false,
+  "evidence_scope": "Isolated unprivileged source checkout; no deployment or strict Firecracker execution evidence.",
+  "fixtures_and_migrations": {
+    "crates/lumen-core/tests/fixtures/action_envelope.v1.json": "e077e4b2a9a583eea6f3d96914d0cd2964a817982d623aaa26313a5aa2ef08b1",
+    "crates/lumen-core/tests/fixtures/action_envelope.v2.json": "96461d12305114cb2feee863997c38488fb1327d239fbfe45e029979c24371ec",
+    "crates/lumen-core/tests/fixtures/kernel_wire_request.v1.json": "09332b9310e5e203c0279df7a1cd853079137ea8bcf15d4d1120661a1f0726bb",
+    "crates/lumen-core/tests/fixtures/kernel_wire_request.v2.json": "1b2ff2c3f1998013930baf6eb66a700e51f8e1170c8a9397d04c0b681e3c23d8",
+    "crates/lumen-core/tests/fixtures/kernel_wire_response.v1.json": "f8c720f46d07a5befe5ceeb4efa3107493eef6408f6102fd6fa1f731872effdf",
+    "crates/lumen-core/tests/fixtures/kernel_wire_response.v2.json": "94d44840b0bae54147e08d17ca762cc0cb5403bf363866a982681c5b925933fb",
+    "crates/lumen-core/tests/fixtures/policy_decision_allow.v1.json": "2ca5e77e8825ad4d360fcd6a6966d7c3ad658c05d10d10dad17ebe948e8a2465",
+    "crates/lumen-core/tests/fixtures/policy_decision_allow.v3.json": "aaad95cad81cb4e045845e1ce6c4916e936af0d5fcbae59d5d952727376ae3b4",
+    "crates/lumen-core/tests/fixtures/policy_decision_deny.v1.json": "e5a3eb9bbfccc7df055f453f0f6f3695ca7ae4e8e08e6e48662986473692a729",
+    "crates/lumen-core/tests/fixtures/policy_decision_deny.v3.json": "f8b0b7549f14d39d15900f538be12b50cc70214c1f5a9f87a6e4109ccf6b3a73",
+    "crates/lumen-core/tests/fixtures/policy_decision_pending.v1.json": "eaafaabab490c127918a4f95716f803a960b5ffea04207eae95216f3bf46987a",
+    "crates/lumen-core/tests/fixtures/policy_decision_pending.v3.json": "d7f597a6433770050440637b3e80302a4f9b29f448c42ff6aaadcc339243d4b5",
+    "crates/lumen-db/migrations/0030_action_envelope_v2.sql": "e194bc4039c106976d0f149f33ca549d4a578e7a50de79a8c7f53575983ebca7",
+    "crates/lumen-server/tests/fixtures/host_action.v2.json": "0121e96950c4f8991de0015da31ab614f8237a04cebb3baf64e1e80a11dccd38"
+  },
+  "ci": {
+    "pull_request_run": "https://github.com/black-candle-technologies/lumen/actions/runs/36223543729",
+    "push_run": "https://github.com/black-candle-technologies/lumen/actions/runs/36223541130",
+    "status": "pull_request_passed",
+    "pull_request_jobs_passed": 6,
+    "push_status": "pending"
+  },
+  "limitations": [
+    "Producer/consumer owner sign-offs pending for ADR-0010/0011",
+    "Historical signed records remain unchanged; no authority translation",
+    "Host/kernel representations remain distinct; consolidation is incomplete",
+    "Remaining authority decoders and restart session authority need revalidation",
+    "Complete lease-chain, nonce, budget faults, revocation latency and independent final audit gates remain open",
+    "Migration rollback tested in scratch databases; staging restore not rehearsed",
+    "No merge, release, tag or deployment performed"
+  ]
+}

@@ -233,6 +233,61 @@ async fn socket_is_parent_owned_group_mediated() {
 }
 
 #[tokio::test]
+async fn malformed_authority_is_audited_without_secrets_or_sandbox_dispatch() {
+    let (kernel, sandbox, child_pid, verify, max) = allow_harness_args();
+    let h = serve("strictwire", kernel, sandbox, child_pid, verify, max).await;
+    let mut request: serde_json::Value =
+        serde_json::from_slice(&request_line(&h.credential, &valid_envelope(&h.subject))).unwrap();
+    let marker = "SECRET_SENTINEL_NOT_A_REAL_SECRET";
+    request["envelope"]["tool"][marker] = serde_json::json!(marker);
+    let line = format!("{request}\n");
+    let response = roundtrip(&h.socket, line.as_bytes()).await;
+    assert!(!serde_json::to_string(&response).unwrap().contains(marker));
+    assert_eq!(response.error.unwrap().code, "malformed");
+    assert!(response.decision.is_none());
+    assert_eq!(h.sandbox.call_count(), 0);
+    let events = h.kernel.audit_log();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0.kind, "transport_rejected");
+    assert_eq!(events[0].0.session_id, "unidentified");
+    assert!(
+        !serde_json::to_string(&events[0].0)
+            .unwrap()
+            .contains(marker)
+    );
+    h.kernel.fail_audit(true);
+    let response = roundtrip(&h.socket, line.as_bytes()).await;
+    assert_eq!(response.error.unwrap().code, "audit");
+    assert!(response.decision.is_none());
+    assert_eq!(h.sandbox.call_count(), 0);
+}
+
+#[tokio::test]
+async fn malformed_authority_audit_timeout_never_dispatches_or_retries() {
+    let (kernel, sandbox, child_pid, verify, max) = allow_harness_args();
+    kernel.delay_audit(Duration::from_secs(30));
+    let h = serve_with_timeout(
+        "auditwait",
+        kernel,
+        sandbox,
+        child_pid,
+        verify,
+        max,
+        Duration::from_millis(100),
+    )
+    .await;
+    let response =
+        tokio::time::timeout(Duration::from_secs(2), roundtrip(&h.socket, b"{invalid\n"))
+            .await
+            .unwrap();
+    assert_eq!(response.error.unwrap().code, "audit");
+    assert!(response.decision.is_none());
+    assert_eq!(h.sandbox.call_count(), 0);
+    assert_eq!(h.kernel.decisions_made(), 0);
+    assert!(h.kernel.audit_log().is_empty());
+}
+
+#[tokio::test]
 async fn allow_roundtrip_returns_result_usage_and_audit_ref() {
     let (kernel, sandbox, child_pid, verify, max_bytes) = allow_harness_args();
     let h = serve("allow", kernel, sandbox, child_pid, verify, max_bytes).await;
@@ -332,7 +387,7 @@ async fn wrong_protocol_is_rejected() {
     let response = roundtrip(&h.socket, &line).await;
 
     let error = response.error.unwrap();
-    assert_eq!(error.code, "protocol");
+    assert_eq!(error.code, "malformed");
     assert_eq!(h.kernel.decisions_made(), 0);
 }
 

@@ -1,0 +1,14 @@
+{
+  "source_commit": "7d01adfbfe6f33a1880b9ba7cf8b6e1a24767989",
+  "platform": "local macOS scratch SQLite",
+  "probe": "persisted_versions_cannot_wrap_into_a_signed_v1_event",
+  "stored_version": 4294967297,
+  "returned_version": 1,
+  "row_decoded": true,
+  "checkpoint_verified": true,
+  "log_sha256": "7c94537b787b066aa91d91d1b9d00563011f348c4651e98f651fedad9a5d38c3",
+  "expected_result": "reject at exact version decoding before checkpoint verification",
+  "test_outcome": "failed_as_expected_before_correction",
+  "scope": "Only storage decoding and checkpoint verification were exercised; no action authorization or external effect is claimed.",
+  "historical_records_modified": false
+}

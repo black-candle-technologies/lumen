@@ -32,12 +32,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use crate::pi_boundary::canonical_digest;
+use crate::pi_boundary::{canonical_digest, canonical_json};
+
+mod decode;
+pub(crate) use decode::unique_map;
+
+/// Domain/version of the strict typed scope digest; never reinterpret v1 hashes.
+pub const SCOPE_DIGEST_VERSION: u32 = 2;
 
 /// Errors from resource canonicalization. Every variant fails closed: the
 /// caller must treat the resource as unusable, never as "close enough".
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CanonicalError {
+    #[error("invalid canonical resource encoding: {0}")]
+    InvalidEncoding(&'static str),
+    #[error("resolved filesystem path is not UTF-8")]
+    NonUtf8Path,
     #[error("empty resource")]
     Empty,
     #[error("resource too long")]
@@ -81,7 +91,7 @@ pub enum CanonicalError {
 /// A validated tool name: lowercase alphanumerics separated by single dots,
 /// e.g. `fs.read`. Versions are pinned separately (floating versions never
 /// cross the trust boundary).
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ToolName(String);
 
@@ -207,7 +217,7 @@ impl PathResolver for RealFsResolver {
 /// A canonical filesystem path: absolute, symlink-resolved, `.`/`..`-free,
 /// stored as components. Comparison is component-wise — never a string
 /// prefix test.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CanonicalPath {
     /// Resolved components below the root, e.g. `["workspace", "src"]`.
     components: Vec<String>,
@@ -256,22 +266,24 @@ impl CanonicalPath {
                     return Err(CanonicalError::Traversal(resolved.display().to_string()));
                 }
                 Component::Normal(seg) => {
-                    let s = seg.to_string_lossy();
+                    let s = seg.to_str().ok_or(CanonicalError::NonUtf8Path)?;
                     if s.is_empty() {
                         return Err(CanonicalError::BadChars(input.to_string()));
                     }
                     components.push(if case_insensitive {
                         s.to_lowercase()
                     } else {
-                        s.into_owned()
+                        s.to_owned()
                     });
                 }
             }
         }
-        Ok(Self {
+        let value = Self {
             components,
             case_folded: case_insensitive,
-        })
+        };
+        value.validate()?;
+        Ok(value)
     }
 
     /// `true` iff `self` is at or below `root`, compared component-wise.
@@ -288,14 +300,15 @@ impl CanonicalPath {
         self.components[..root.components.len()] == root.components[..]
     }
 
-    /// Canonical encoding: `/`-joined components with a leading slash.
+    /// Typed encoding: the filesystem view cannot collide with path bytes.
     pub fn canonical_form(&self) -> String {
-        let mut s = String::from("/");
-        s.push_str(&self.components.join("/"));
-        if self.case_folded {
-            s.push_str("~fold");
-        }
-        s
+        serde_json::json!(["path", 2, self.case_folded, self.components]).to_string()
+    }
+
+    /// Display/OS path only. Authority comparisons use the typed value and
+    /// scope digest, never this string without its filesystem-view flag.
+    pub fn absolute_path(&self) -> String {
+        format!("/{}", self.components.join("/"))
     }
 
     pub fn components(&self) -> &[String] {
@@ -306,6 +319,7 @@ impl CanonicalPath {
 /// Read/write rights on a path grant, as an explicit pair (not a bitmask
 /// string) so subset is structural.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathRights {
     pub read: bool,
     pub write: bool,
@@ -334,6 +348,7 @@ impl PathRights {
 /// parent grant iff the child root is within the parent root (component-wise)
 /// and the child rights are a subset of the parent rights.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathGrant {
     pub root: CanonicalPath,
     pub rights: PathRights,
@@ -358,7 +373,7 @@ impl PathGrant {
 
 /// A normalized host: DNS names and IP ranges are distinct variants and
 /// never compare equal to each other.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum HostPattern {
     /// Lowercased DNS name, no trailing dot, IDNA-encoded.
     DnsName(String),
@@ -392,7 +407,7 @@ impl HostPattern {
             if net.prefix_len() == net.max_prefix_len() {
                 return Ok(Self::Ip(net.addr()));
             }
-            return Ok(Self::IpRange(net));
+            return Ok(Self::IpRange(net.trunc()));
         }
         Self::parse_dns(value)
     }
@@ -404,18 +419,26 @@ impl HostPattern {
             return Err(CanonicalError::BadDestination(value.to_string()));
         }
         // Encode via the url crate for IDNA/punycode handling.
-        let probe = format!("http://{trimmed}/");
-        let url =
-            Url::parse(&probe).map_err(|_| CanonicalError::BadDestination(value.to_string()))?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| CanonicalError::BadDestination(value.to_string()))?;
-        // url crate rejects IP-looking hosts here only if parse failed above;
-        // a successful DNS parse that yields an IP means the input was an IP.
-        if host.parse::<IpAddr>().is_ok() {
+        let host = match url::Host::parse(trimmed)
+            .map_err(|_| CanonicalError::BadDestination(value.to_string()))?
+        {
+            url::Host::Domain(host) => host,
+            _ => return Err(CanonicalError::BadDestination(value.to_string())),
+        };
+        if host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+        {
             return Err(CanonicalError::BadDestination(value.to_string()));
         }
-        Ok(Self::DnsName(host.to_string()))
+        Ok(Self::DnsName(host))
     }
 
     fn parse_wildcard(suffix: &str) -> Result<Self, CanonicalError> {
@@ -436,6 +459,8 @@ impl HostPattern {
 
     /// Structural subset: is `self` (child) covered by `parent`?
     pub fn is_subset_of(&self, parent: &HostPattern) -> Result<(), CanonicalError> {
+        self.validate()?;
+        parent.validate()?;
         match (self, parent) {
             (Self::DnsName(c), Self::DnsName(p)) => {
                 if c == p {
@@ -694,7 +719,7 @@ fn classify_net(net: IpNet) -> NetworkClass {
 }
 
 /// A set of ports, normalized to sorted non-overlapping ranges.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PortSet {
     /// Sorted, non-overlapping, non-adjacent ranges.
     ranges: Vec<(u16, u16)>,
@@ -809,7 +834,7 @@ impl PortSet {
 
 /// A network destination grant: scheme + host pattern + ports + (for
 /// HTTP-like schemes) methods.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NetworkDestination {
     /// Lowercased scheme, e.g. `https`. Empty means "any scheme" only when
     /// constructed via [`NetworkDestination::any_scheme`] — parsing requires
@@ -830,6 +855,9 @@ impl NetworkDestination {
     pub fn parse(input: &str, methods: &[&str]) -> Result<Self, CanonicalError> {
         let url =
             Url::parse(input).map_err(|_| CanonicalError::BadDestination(input.to_string()))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(CanonicalError::InvalidEncoding("URL credentials"));
+        }
         let scheme = url.scheme().to_lowercase();
         if scheme.is_empty() {
             return Err(CanonicalError::BadDestination(input.to_string()));
@@ -854,12 +882,19 @@ impl NetworkDestination {
             .iter()
             .map(|m| m.to_uppercase())
             .collect::<BTreeSet<_>>();
-        Ok(Self {
+        let mut value = Self {
             scheme,
             host,
             ports: PortSet::single(port),
             methods,
-        })
+        };
+        // Non-HTTP input has no HTTP method dimension. Signed wire values,
+        // unlike input parsing, must already omit these irrelevant methods.
+        if !value.methods_apply() {
+            value.methods.clear();
+        }
+        value.validate()?;
+        Ok(value)
     }
 
     fn methods_apply(&self) -> bool {
@@ -941,6 +976,7 @@ impl NetworkDestination {
         // segment parsing missed and guarantees the mint reproduces the
         // port set and method allowlist the human approved — nothing
         // dropped, nothing invented.
+        decoded.validate()?;
         if decoded.canonical_form() != input {
             return Err(bad());
         }
@@ -1047,6 +1083,8 @@ impl NetworkDestination {
     /// Structural subset: same scheme (or parent any-scheme), host covered,
     /// ports covered, methods covered (when applicable).
     pub fn is_subset_of(&self, parent: &NetworkDestination) -> Result<(), CanonicalError> {
+        self.validate()?;
+        parent.validate()?;
         if !parent.scheme.is_empty() && self.scheme != parent.scheme {
             return Err(CanonicalError::Incomparable);
         }
@@ -1097,7 +1135,7 @@ impl NetworkDestination {
 
 /// An opaque secret reference (never the secret itself). Validated charset;
 /// subset is set inclusion on the validated string.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SecretRef(String);
 
@@ -1129,7 +1167,7 @@ impl SecretRef {
 
 /// A typed external account: provider plus the provider's account identity.
 /// Distinct providers never compare equal.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct AccountRef {
     pub provider: String,
     pub account_id: String,
@@ -1158,13 +1196,13 @@ impl AccountRef {
     }
 
     pub fn canonical_form(&self) -> String {
-        format!("account:{}:{}", self.provider, self.account_id)
+        serde_json::json!(["account", 2, self.provider, self.account_id]).to_string()
     }
 }
 
 /// A permitted model/provider class, e.g. provider `openai-compatible`,
 /// class `local`. Subset is per-provider set inclusion on classes.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ModelClass {
     pub provider: String,
     pub class: String,
@@ -1252,7 +1290,7 @@ impl EffectClass {
 
 /// The complete typed resource scope of a lease. Every dimension is a set of
 /// typed grants; the subset proof checks each dimension structurally.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ResourceScope {
     /// Tool name → allowed version requirement (children pin exact).
     #[serde(default)]
@@ -1285,6 +1323,8 @@ impl ResourceScope {
     ///
     /// Any dimension that cannot be compared safely fails the whole proof.
     pub fn is_subset_of(&self, parent: &ResourceScope) -> Result<(), ScopeSubsetError> {
+        self.validate().map_err(ScopeSubsetError::Canonical)?;
+        parent.validate().map_err(ScopeSubsetError::Canonical)?;
         for (name, child_req) in &self.tools {
             let parent_req = parent
                 .tools
@@ -1345,60 +1385,59 @@ impl ResourceScope {
         Ok(())
     }
 
-    /// Stable canonical encoding of the whole scope: sorted typed strings,
-    /// hashed for the action/lease digest.
+    /// Validate Rust-constructed scopes as well as decoded scopes. Call this
+    /// before claiming nonces, reserving budgets or signing a document.
+    pub fn validate(&self) -> Result<(), CanonicalError> {
+        for name in self.tools.keys() {
+            ToolName::parse(name)?;
+        }
+        for grant in &self.paths {
+            grant.root.validate()?;
+        }
+        for destination in &self.destinations {
+            destination.validate()?;
+        }
+        for secret in &self.secrets {
+            SecretRef::parse(secret)?;
+        }
+        for account in &self.accounts {
+            if AccountRef::parse(&account.provider, &account.account_id)? != *account {
+                return Err(CanonicalError::InvalidEncoding("account"));
+            }
+        }
+        for (provider, classes) in &self.models {
+            // Validate the provider even when the grant has no classes.
+            ModelClass::parse(provider, "validation")?;
+            for class in classes {
+                ModelClass::parse(provider, class)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical scope v2: typed values with explicit dimensions and version.
+    /// Reordering or repeating an identical set entry does not change meaning.
+    pub fn canonical_value(&self) -> Result<serde_json::Value, CanonicalError> {
+        self.validate()?;
+        fn set<T: Serialize>(items: &[T]) -> Result<Vec<serde_json::Value>, CanonicalError> {
+            let mut values = BTreeMap::new();
+            for item in items {
+                let value = serde_json::to_value(item).map_err(|_| CanonicalError::TooLong)?;
+                let key = canonical_json(&value).map_err(|_| CanonicalError::TooLong)?;
+                values.insert(key, value);
+            }
+            Ok(values.into_values().collect())
+        }
+        Ok(serde_json::json!({
+            "contract": "lumen.resource-scope", "version": SCOPE_DIGEST_VERSION,
+            "tools": self.tools, "paths": set(&self.paths)?,
+            "destinations": set(&self.destinations)?, "secrets": self.secrets,
+            "accounts": self.accounts, "models": self.models, "effects": set(&self.effects)?,
+        }))
+    }
+
     pub fn canonical_digest(&self) -> Result<String, CanonicalError> {
-        let mut items: Vec<String> = Vec::new();
-        let mut tools: Vec<(&String, &VersionReq)> = self.tools.iter().collect();
-        tools.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, req) in tools {
-            items.push(format!("tool:{name}@{req}"));
-        }
-        let mut paths: Vec<String> = self
-            .paths
-            .iter()
-            .map(|p| {
-                format!(
-                    "path:{}:{}:{}",
-                    p.root.canonical_form(),
-                    p.rights.read,
-                    p.rights.write
-                )
-            })
-            .collect();
-        paths.sort();
-        items.extend(paths);
-        let mut dests: Vec<String> = self
-            .destinations
-            .iter()
-            .map(|d| d.canonical_form())
-            .collect();
-        dests.sort();
-        items.extend(dests);
-        for s in &self.secrets {
-            items.push(format!("secret:{s}"));
-        }
-        for a in &self.accounts {
-            items.push(a.canonical_form());
-        }
-        let mut providers: Vec<(&String, &BTreeSet<String>)> = self.models.iter().collect();
-        providers.sort_by(|a, b| a.0.cmp(b.0));
-        for (provider, classes) in providers {
-            let mut c: Vec<&String> = classes.iter().collect();
-            c.sort();
-            items.push(format!(
-                "model:{provider}:{}",
-                c.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(",")
-            ));
-        }
-        let mut effects: Vec<String> = self.effects.iter().map(|e| format!("{e:?}")).collect();
-        effects.sort();
-        effects.dedup();
-        for e in effects {
-            items.push(format!("effect:{e}"));
-        }
-        let value = serde_json::to_value(&items).map_err(|_| CanonicalError::TooLong)?;
-        canonical_digest(&value).map_err(|_| CanonicalError::TooLong)
+        canonical_digest(&self.canonical_value()?).map_err(|_| CanonicalError::TooLong)
     }
 }
 
@@ -1898,7 +1937,10 @@ mod tests {
         let dns_child = NetworkDestination::parse("dns://example.com:53/", &[]).unwrap();
         let mut dns_parent = dns_child.clone();
         dns_parent.methods.insert("GET".to_string());
-        assert!(dns_child.is_subset_of(&dns_parent).is_ok());
+        // A signed DNS scope may not carry a silently ignored HTTP dimension.
+        assert!(dns_child.is_subset_of(&dns_parent).is_err());
+        let parsed = NetworkDestination::parse("dns://example.com:53", &["GET"]).unwrap();
+        assert!(parsed.methods.is_empty());
     }
 
     /// The canonical destination decoder is the exact inverse of the

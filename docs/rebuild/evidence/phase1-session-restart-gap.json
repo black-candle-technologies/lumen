@@ -1,0 +1,32 @@
+{
+  "source_commit": "546c1236977ba4a53579e140ada974d6a000892c",
+  "host": "lane-vps",
+  "evidence_log": "committed-audit-suite.log",
+  "evidence_log_sha256": "17eb81d07a288c2f6a21b026a3543eb3737fb40be88b08b0eee2a844bbd4388a",
+  "phase_gate": "not_passed",
+  "characterization": [
+    {
+      "test": "one_shot_mint_survives_kernel_restart",
+      "file": "crates/lumen-server/tests/kernel_authority_pipeline.rs",
+      "observed_assertion": "A retained exact approved envelope completes once after the kernel is reopened on the same SQLite database."
+    },
+    {
+      "test": "restored_session_cannot_mint",
+      "file": "crates/lumen-server/tests/lease_persistence_restart.rs",
+      "observed_assertion": "The restarted vault reports neither parent nor child identity live, yet the child lease still verifies through the hydrated public session registry."
+    },
+    {
+      "test": "restart_lease_stays_valid",
+      "file": "crates/lumen-server/tests/lease_persistence_restart.rs",
+      "observed_assertion": "A root lease verifies and is not revoked after restart."
+    }
+  ],
+  "required_behavior": "Private-key loss ends the session authority. Revoke roots and descendants before admission; retain public identities, signatures, audit, spent nonces and budget history as evidence only. Fresh sessions and grants require fresh authority.",
+  "scope": "Real authority kernel and SQLite exercised by inherited tests; pipeline execution uses a mock sandbox. No production action or Firecracker effect claimed.",
+  "next_verification": [
+    "Replace authorization-survival expectations with exact-envelope denial and zero dispatch after restart",
+    "Revoke descendant and orphaned-delegation leases atomically with session invalidation",
+    "Preserve nonce consumption, reservations and settled usage; unknown usage must not become a refund",
+    "Fail closed on crash, audit outage or overlapping authority owners during boot recovery"
+  ]
+}

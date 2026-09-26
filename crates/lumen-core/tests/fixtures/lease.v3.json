@@ -1,0 +1,84 @@
+{
+  "document": {
+    "protocol_version": 3,
+    "lease_id": "fixture-lease",
+    "parent_id": null,
+    "subject": "fixture-session",
+    "issuer_key_id": "fixture-issuer",
+    "issued_at_ms": 10,
+    "scope": {
+      "tools": {
+        "bct.read_file": "=1.0.0"
+      },
+      "paths": [
+        {
+          "root": {
+            "components": [
+              "workspace",
+              "file~fold"
+            ],
+            "case_folded": false
+          },
+          "rights": {
+            "read": true,
+            "write": false
+          }
+        }
+      ],
+      "destinations": [
+        {
+          "scheme": "https",
+          "host": {
+            "DnsName": "example.com"
+          },
+          "ports": {
+            "ranges": [
+              [
+                443,
+                443
+              ]
+            ],
+            "any": false
+          },
+          "methods": [
+            "GET"
+          ]
+        }
+      ],
+      "secrets": [
+        "vault:docs"
+      ],
+      "accounts": [
+        {
+          "provider": "a:b",
+          "account_id": "c"
+        }
+      ],
+      "models": {
+        "p": [
+          "local"
+        ]
+      },
+      "effects": [
+        "read",
+        "network"
+      ]
+    },
+    "limits": {
+      "not_before_ms": 0,
+      "expires_at_ms": 1000,
+      "budget": {
+        "executions": 2
+      },
+      "max_executions": 2,
+      "single_use": false
+    },
+    "depth": 0,
+    "depth_limit": 3,
+    "lease_nonce": "fixture-nonce",
+    "approved_action_digest": null,
+    "signature": "98b33f3df72044f55299db8637f15308c2d416804bb587498d72cc613e0ede89d5f1ea0657984f333d199007b0ed5440be2f9b618d8d3baa2c595a4a9e65e706"
+  },
+  "test_public_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "signing_digest": "3741b12e9c9284a78485c7b5177e7dbf6dd081e4691b0443f38941154efdf6e9"
+}
