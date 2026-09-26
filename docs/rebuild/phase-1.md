@@ -140,6 +140,23 @@ transport acceptance tests passed without ignores or warnings. Workspace Clippy
 and the independent fixture verifier passed. This evidence predates the audit
 numeric correction and is not its validation evidence.
 
+[Audit numeric checks](evidence/phase1-audit-numeric.json) tie `546c123` to 458
+hash-matched files on lane-vps: 605 tests in 36 suites, workspace Clippy and the
+independent fixture verifier passed without ignores or warnings. The
+[pre-correction probe](evidence/phase1-audit-version-probe.json) records the
+stored-version alias and successful checkpoint verification before correction.
+
+The [restart characterization](evidence/phase1-session-restart-gap.json) records
+an unresolved violation in the inherited implementation and tests. Reopening the
+kernel leaves the ephemeral identity vault empty, but hydrates public session
+records as live authority; retained root/child leases verify, and a retained
+one-shot envelope completes through the test pipeline. These passing reference
+tests express the wrong requirement. Startup must invalidate old sessions and
+revoke descendants before admission, preserve audit/nonces/budget history, and
+require fresh session authority. Boot failures, concurrent authority owners and
+unknown execution usage must also fail closed. The pipeline test uses a mock
+sandbox; this evidence does not claim a production external effect.
+
 The historical decoder gap is reproduced in the
 [ActionEnvelope v1 probe](evidence/phase1-action-v1-probe.json). Adding an unknown
 authority field at the envelope, tool, input, resource-set, path-resource or
