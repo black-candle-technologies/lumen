@@ -5,6 +5,7 @@
 //! speaks the JSONL protocol as the BCT extension would. The fake
 //! resolver stands in for the session supervisor's credential registry.
 
+use lumen_server::KernelClient;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -150,7 +151,7 @@ fn valid_envelope(subject: &str) -> ActionEnvelope {
         arguments: serde_json::to_value(args.fields()).unwrap(),
         input_hashes: Vec::new(),
         resources,
-        lease_chain: vec!["lease-1".to_string()],
+        lease_chain: vec![uuid::Uuid::new_v4().to_string()],
         nonce: uuid::Uuid::new_v4().to_string(),
         expires_at: deadline_rfc3339(ACTION_START_DEADLINE_SECS),
         expected_effects: effects,
@@ -668,7 +669,7 @@ async fn mediation_timeout_is_uncertain_not_a_plain_timeout() {
     let _channel = KernelChannel::serve(config, deps).await.unwrap();
 
     let envelope = valid_envelope(&subject);
-    let expected_digest = envelope.digest().unwrap();
+    let expected_digest = kernel.authoritative_action_digest(&envelope).unwrap();
     let response = roundtrip(&socket, &request_line(&credential, &envelope)).await;
 
     let error = response.error.unwrap();
@@ -679,7 +680,10 @@ async fn mediation_timeout_is_uncertain_not_a_plain_timeout() {
     assert!(response.decision.is_none());
     assert!(response.result.is_none());
     assert_eq!(
-        response.action_digest.as_deref(),
+        response
+            .action_digest
+            .as_ref()
+            .map(lumen_server::CoreActionDigest::as_str),
         Some(expected_digest.as_str()),
         "the digest keys reconciliation"
     );
@@ -688,7 +692,7 @@ async fn mediation_timeout_is_uncertain_not_a_plain_timeout() {
         "got: {}",
         error.detail
     );
-    assert!(error.detail.contains(&expected_digest));
+    assert!(error.detail.contains(expected_digest.as_str()));
     // The pipeline ran exactly once: the detached task is left
     // running, never retried, and the client is told to reconcile by
     // digest rather than resubmit the action.

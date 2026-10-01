@@ -80,7 +80,7 @@ pub struct ChannelResponse {
     #[serde(deserialize_with = "current_channel_protocol")]
     pub protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_digest: Option<String>,
+    pub action_digest: Option<crate::kernel_client::CoreActionDigest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<ChannelDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,7 +101,11 @@ pub struct ChannelError {
 }
 
 impl ChannelResponse {
-    fn error(code: &str, detail: String, digest: Option<String>) -> Self {
+    fn error(
+        code: &str,
+        detail: String,
+        digest: Option<crate::kernel_client::CoreActionDigest>,
+    ) -> Self {
         Self {
             protocol: KERNEL_CHANNEL_PROTOCOL.to_string(),
             action_digest: digest,
@@ -420,7 +424,11 @@ async fn serve_request(
         }
     }
 
-    let digest = request.envelope.digest().ok();
+    let digest = shared
+        .pipeline
+        .kernel()
+        .authoritative_action_digest(&request.envelope)
+        .ok();
     // Mediation runs in a detached task: if the deadline elapses, the
     // task is left running to completion -- its audit and completion
     // records still land -- while the channel replies `Uncertain`
@@ -441,14 +449,14 @@ async fn serve_request(
             // did NOT commit. Report `Uncertain` (fail closed) so the
             // client reconciles by action digest instead of blindly
             // retrying and double-executing.
-            mediation_panic_outcome(digest.as_deref(), join_error)
+            mediation_panic_outcome(digest.as_ref(), join_error)
         }
         Err(_) => {
             // Deadline elapsed: the detached task keeps running, so its
             // records still land. A plain timeout error would invite the
             // extension to blindly retry and double-execute; report
             // `Uncertain` instead so the client reconciles by digest.
-            mediation_timeout_outcome(digest.as_deref(), shared.config.request_timeout)
+            mediation_timeout_outcome(digest.as_ref(), shared.config.request_timeout)
         }
     };
 
@@ -463,7 +471,7 @@ async fn serve_request(
 /// itself produces, so the client must reconcile by action digest
 /// (re-query, never re-submit) rather than retry the action.
 fn mediation_panic_outcome(
-    digest: Option<&str>,
+    digest: Option<&crate::kernel_client::CoreActionDigest>,
     join_error: tokio::task::JoinError,
 ) -> ToolOutcome {
     ToolOutcome::Uncertain {
@@ -477,7 +485,9 @@ fn mediation_panic_outcome(
             "mediation task failed: {join_error}; the effect may have committed \
              -- reconcile by action digest, do not blindly retry"
         ),
-        action_digest: digest.unwrap_or_default().to_string(),
+        action_digest: digest.cloned().unwrap_or_else(|| {
+            crate::kernel_client::CoreActionDigest::from_kernel_hex(String::new())
+        }),
         // No staged audit ref exists: the mediation never got far
         // enough to produce one (or its handle was lost to the panic).
         // The digest alone keys reconciliation.
@@ -497,7 +507,10 @@ fn mediation_panic_outcome(
 /// pipeline's own [`ToolOutcome::Uncertain`], so the client must
 /// reconcile by action digest (re-query, never re-submit) rather than
 /// retry the action.
-fn mediation_timeout_outcome(digest: Option<&str>, timeout: Duration) -> ToolOutcome {
+fn mediation_timeout_outcome(
+    digest: Option<&crate::kernel_client::CoreActionDigest>,
+    timeout: Duration,
+) -> ToolOutcome {
     ToolOutcome::Uncertain {
         result: serde_json::Value::Null,
         usage: ResourceUsage {
@@ -509,7 +522,9 @@ fn mediation_timeout_outcome(digest: Option<&str>, timeout: Duration) -> ToolOut
             "mediation timed out after {timeout:?}; the effect may have committed \
              -- reconcile by action digest, do not blindly retry"
         ),
-        action_digest: digest.unwrap_or_default().to_string(),
+        action_digest: digest.cloned().unwrap_or_else(|| {
+            crate::kernel_client::CoreActionDigest::from_kernel_hex(String::new())
+        }),
         // No staged audit ref exists: the mediation never got far
         // enough to produce one (or its handle was lost to the
         // timeout). The digest alone keys reconciliation.
@@ -521,7 +536,10 @@ fn mediation_timeout_outcome(digest: Option<&str>, timeout: Duration) -> ToolOut
 }
 
 /// Render a pipeline outcome as the channel response.
-fn map_outcome(outcome: ToolOutcome, digest: Option<String>) -> ChannelResponse {
+fn map_outcome(
+    outcome: ToolOutcome,
+    digest: Option<crate::kernel_client::CoreActionDigest>,
+) -> ChannelResponse {
     let base = ChannelResponse {
         protocol: KERNEL_CHANNEL_PROTOCOL.to_string(),
         action_digest: digest,
@@ -608,10 +626,12 @@ mod tests {
                     egress_bytes: 0,
                 },
                 reason: "tool_committed audit write failed".to_string(),
-                action_digest: "digest-1".to_string(),
+                action_digest: crate::CoreActionDigest::from_kernel_hex("digest-1".to_string()),
                 staged_audit_ref: staged_ref.clone(),
             },
-            Some("digest-1".to_string()),
+            Some(crate::CoreActionDigest::from_kernel_hex(
+                "digest-1".to_string(),
+            )),
         );
         // Not a decision: no Allow/Deny, and no result payload that
         // could be mistaken for a successful completion.
@@ -626,12 +646,21 @@ mod tests {
         assert!(error.detail.contains("digest-1"));
         // The staged audit ref is attached for reconciliation.
         assert_eq!(response.audit_ref, Some(staged_ref));
-        assert_eq!(response.action_digest.as_deref(), Some("digest-1"));
+        assert_eq!(
+            response
+                .action_digest
+                .as_ref()
+                .map(crate::CoreActionDigest::as_str),
+            Some("digest-1")
+        );
     }
 
     #[test]
     fn mediation_timeout_maps_to_uncertain_not_a_timeout_error() {
-        let outcome = mediation_timeout_outcome(Some("digest-9"), Duration::from_secs(30));
+        let outcome = mediation_timeout_outcome(
+            Some(&crate::CoreActionDigest::from_kernel_hex("digest-9".into())),
+            Duration::from_secs(30),
+        );
         let (reason, action_digest) = match &outcome {
             ToolOutcome::Uncertain {
                 reason,
@@ -640,7 +669,7 @@ mod tests {
             } => (reason.clone(), action_digest.clone()),
             other => panic!("mediation timeout must map to Uncertain, got {other:?}"),
         };
-        assert_eq!(action_digest, "digest-9");
+        assert_eq!(action_digest.as_str(), "digest-9");
         assert!(reason.contains("timed out"), "got: {reason}");
         assert!(
             reason.contains("may have committed"),
@@ -649,7 +678,12 @@ mod tests {
 
         // Rendered on the wire as the reconciliation error, never as a
         // plain "timeout": no decision, no result, digest attached.
-        let response = map_outcome(outcome, Some("digest-9".to_string()));
+        let response = map_outcome(
+            outcome,
+            Some(crate::CoreActionDigest::from_kernel_hex(
+                "digest-9".to_string(),
+            )),
+        );
         let error = response
             .error
             .expect("timeout outcome must render a channel error");
@@ -658,7 +692,13 @@ mod tests {
         assert!(error.detail.contains("digest-9"));
         assert!(response.decision.is_none());
         assert!(response.result.is_none());
-        assert_eq!(response.action_digest.as_deref(), Some("digest-9"));
+        assert_eq!(
+            response
+                .action_digest
+                .as_ref()
+                .map(crate::CoreActionDigest::as_str),
+            Some("digest-9")
+        );
     }
 
     #[tokio::test]

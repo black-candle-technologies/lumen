@@ -14,7 +14,7 @@ fn host_fixture_is_bound_and_transport_namespaces_cannot_be_confused() {
     let policy: PolicyDecision = serde_json::from_value(fixture["host_policy"].clone()).unwrap();
     policy.bind(&request.envelope).unwrap();
     assert_eq!(
-        request.envelope.digest().unwrap(),
+        request.envelope.digest().unwrap().as_str(),
         fixture["host_action_digest"]
     );
     assert!(serde_json::from_value::<KernelWireRequest>(fixture["request"].clone()).is_err());

@@ -26,7 +26,8 @@ pub use jev::{
     SizeBucket, TaskProfile, apply_recommendation,
 };
 pub use kernel_authority::{
-    AuthorityDb, AuthorityKernel, AuthorityKernelClient, AuthorityKernelConfig, PendingApprovalView,
+    ApprovalRequestView, AuthorityDb, AuthorityKernel, AuthorityKernelClient,
+    AuthorityKernelConfig, PendingApprovalView,
 };
 pub use kernel_channel::{
     ChannelDecision, ChannelDeps, ChannelError, ChannelFuture, ChannelRequest, ChannelResponse,
@@ -34,12 +35,13 @@ pub use kernel_channel::{
     KernelChannelConfig,
 };
 pub use kernel_client::{
-    ACTION_ENVELOPE_VERSION, ActionEnvelope, AuditEvent, AuditRef, Decision, EffectClass,
-    EnvelopeError, KernelClient, KernelError, KernelFuture, KeyPurgeReport, KeyRotationReport,
-    LEASE_DOCUMENT_VERSION, LeaseDocument, LeaseLimits, LeaseVerification, MockKernelClient,
-    MockVerdict, Obligation, OneShotGrant, POLICY_DECISION_VERSION, PolicyDecision, ResourceSet,
-    SessionEndReport, SessionIdentityAuthority, SessionIdentityInfo, SupervisorKernel, ToolRef,
-    deadline_rfc3339, now_ms, now_rfc3339, sha256_hex,
+    ACTION_ENVELOPE_VERSION, ActionEnvelope, AuditEvent, AuditRef, CoreActionDigest, Decision,
+    EffectClass, EnvelopeError, HostTransportDigest, KernelClient, KernelError, KernelFuture,
+    KeyPurgeReport, KeyRotationReport, LEASE_DOCUMENT_VERSION, LeaseDocument, LeaseLimits,
+    LeaseVerification, MockKernelClient, MockVerdict, Obligation, OneShotGrant,
+    POLICY_DECISION_VERSION, PolicyDecision, ResourceSet, SessionEndReport,
+    SessionIdentityAuthority, SessionIdentityInfo, SupervisorKernel, ToolRef, deadline_rfc3339,
+    now_ms, now_rfc3339, sha256_hex,
 };
 pub use model_gateway::{
     ChatMessage, CredentialVault, GatewayConfig, GatewayError, GatewayResponse, MemorySpendPool,

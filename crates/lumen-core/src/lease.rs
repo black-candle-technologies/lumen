@@ -316,23 +316,24 @@ pub struct SessionRecord {
     pub parent_subject: Option<String>,
     pub verifying_key: VerifyingKey,
     pub active: bool,
-    /// Boot-relative wall clock when the session was created. Used with
-    /// [`SessionRegistry::max_lifetime_ms`] to bound the post-restart
-    /// stolen-key window (spec §6.3).
+    /// Authority-clock timestamp when the session was created. Used with
+    /// [`SessionRegistry::max_lifetime_ms`] to bound its live lifetime.
     pub created_at_ms: i64,
 }
 
 /// Kernel-side session registry. The kernel holds session *signing* keys
 /// separately in a private vault; this registry carries verifying keys and
-/// liveness for the descendant check.
+/// liveness for the descendant check. Registration establishes live authority:
+/// callers must possess the current vault identity, never infer liveness from
+/// a retained public record after private-key loss.
 #[derive(Default)]
 pub struct SessionRegistry {
     sessions: HashMap<String, SessionRecord>,
     /// Session max lifetime, if configured (spec §6.3; default 24h via
     /// [`DEFAULT_SESSION_MAX_LIFETIME_MS`]). Records older than this are
     /// dead for the TTL-checked descendant predicates. `None` disables the
-    /// TTL; only the host's durable `kernel_sessions` hydration decides
-    /// which records exist at all.
+    /// TTL; registration by the current authority owner decides which records
+    /// exist. Retained public session records are historical evidence only.
     max_lifetime_ms: Option<i64>,
 }
 
@@ -408,8 +409,7 @@ impl SessionRegistry {
     }
 
     /// Active descendant subjects of `subject`, inclusive, TTL-checked.
-    /// Used for post-restart destroy: everything named here loses authority
-    /// when `subject` ends.
+    /// Everything named here loses authority when `subject` ends.
     pub fn active_descendants_inclusive(&self, subject: &str, now_ms: i64) -> Vec<String> {
         let mut out: Vec<String> = self
             .sessions

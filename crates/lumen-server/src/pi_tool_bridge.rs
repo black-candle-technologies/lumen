@@ -85,7 +85,7 @@ impl PiReadRequest {
 pub struct PiToolReply {
     pub version: u32,
     pub tool_call_id: String,
-    pub action_digest: String,
+    pub action_digest: crate::kernel_client::CoreActionDigest,
     pub outcome: ToolOutcome,
 }
 

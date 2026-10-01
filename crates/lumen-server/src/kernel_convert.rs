@@ -27,6 +27,17 @@ use crate::kernel_client::{
     EnvelopeError, KernelError, Obligation, POLICY_DECISION_VERSION as HOST_DECISION_VERSION,
     PolicyDecision, now_rfc3339, rfc3339_to_ms,
 };
+/// Map an envelope to its kernel identity. This computes the frozen kernel
+/// representation; it never promotes a transport hash into the core domain.
+pub(crate) fn core_action_digest(
+    envelope: &ActionEnvelope,
+) -> Result<crate::kernel_client::CoreActionDigest, KernelError> {
+    to_frozen_envelope(envelope)?
+        .digest()
+        .map(crate::kernel_client::CoreActionDigest::from_kernel_hex)
+        .map_err(|e| KernelError::Protocol(format!("kernel action digest: {e}")))
+}
+
 pub(crate) fn to_frozen_envelope(env: &ActionEnvelope) -> Result<FrozenEnvelope, KernelError> {
     // Structural validation first: versions, UUID shape, timestamp shape.
     env.validate()?;
@@ -299,18 +310,21 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/host_action.v2.json")).unwrap();
         let host: ActionEnvelope =
             serde_json::from_value(fixture["request"]["envelope"].clone()).unwrap();
-        assert_eq!(host.digest().unwrap(), fixture["host_action_digest"]);
+        assert_eq!(
+            host.digest().unwrap().as_str(),
+            fixture["host_action_digest"]
+        );
         let core = to_frozen_envelope(&host).unwrap();
         assert_eq!(
             serde_json::to_value(&core).unwrap(),
             fixture["kernel_envelope"]
         );
         assert_eq!(core.digest().unwrap(), fixture["kernel_action_digest"]);
-        assert_ne!(core.digest().unwrap(), host.digest().unwrap());
+        assert_ne!(core.digest().unwrap(), host.digest().unwrap().as_str());
         let policy = to_host_decision(&FrozenDecision::allow(vec![]), &host).unwrap();
         policy.bind(&host).unwrap();
         assert_eq!(
-            policy.action_digest,
+            policy.action_digest.as_str(),
             fixture["host_policy"]["action_digest"]
         );
     }

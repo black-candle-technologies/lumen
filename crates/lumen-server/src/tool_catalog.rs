@@ -820,7 +820,7 @@ pub enum ToolOutcome {
         result: serde_json::Value,
         usage: ResourceUsage,
         reason: String,
-        action_digest: String,
+        action_digest: crate::kernel_client::CoreActionDigest,
         staged_audit_ref: AuditRef,
     },
 }
@@ -1003,7 +1003,7 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
             }
         }
 
-        let digest = match envelope.digest() {
+        let digest = match self.kernel.authoritative_action_digest(envelope) {
             Ok(digest) => digest,
             Err(e) => {
                 return ToolOutcome::Fault {
@@ -1033,7 +1033,7 @@ fn is_expired(expires_at: &str) -> bool {
 async fn decide_execute_audit<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized>(
     pipeline: &ToolPipeline<K, S>,
     envelope: &ActionEnvelope,
-    digest: &str,
+    digest: &crate::kernel_client::CoreActionDigest,
     session_subject: &str,
 ) -> ToolOutcome {
     // Exactly one kernel decision.
@@ -1098,7 +1098,7 @@ async fn decide_execute_audit<K: KernelClient + ?Sized, S: SandboxRunner + ?Size
                 .append_audit(&AuditEvent {
                     kind: "tool_staged".to_string(),
                     session_id: session_subject.to_string(),
-                    action_digest: Some(digest.to_string()),
+                    action_digest: Some(digest.clone()),
                     payload: serde_json::json!({
                         "tool": envelope.tool.name,
                         "tool_version": envelope.tool.version,
@@ -1131,11 +1131,18 @@ async fn decide_execute_audit<K: KernelClient + ?Sized, S: SandboxRunner + ?Size
             // hiccups); readers dedupe `tool_committed` by action
             // digest, so a retry that follows a lost acknowledgement is
             // detectable, not silently double-counted.
+            let reservation_id = obligations
+                .iter()
+                .find(|o| o.kind == "settle_budget")
+                .and_then(|o| o.params.get("reservation_id"))
+                .and_then(|v| v.as_str());
             let committed_event = AuditEvent {
                 kind: "tool_committed".to_string(),
                 session_id: session_subject.to_string(),
-                action_digest: Some(digest.to_string()),
+                action_digest: Some(digest.clone()),
                 payload: serde_json::json!({
+                    "reservation_id": reservation_id,
+                    "action_id": envelope.action_id,
                     "tool": envelope.tool.name,
                     "tool_version": envelope.tool.version,
                     "lease_id": lease_id,
@@ -1186,7 +1193,7 @@ async fn decide_execute_audit<K: KernelClient + ?Sized, S: SandboxRunner + ?Size
                         reason: format!(
                             "tool_committed audit write failed after {COMMIT_AUDIT_RETRIES} attempts: {append_err}; effect may have landed but is not audit-confirmed"
                         ),
-                        action_digest: digest.to_string(),
+                        action_digest: digest.clone(),
                         staged_audit_ref: staged_ref,
                     }
                 }
@@ -1383,7 +1390,7 @@ mod tests {
             .handle(
                 &request("bct.fs.read", serde_json::json!({"path": "/tmp/x"})),
                 "ed25519:subject",
-                &["lease-1".to_string()],
+                &[uuid::Uuid::new_v4().to_string()],
             )
             .await;
         match outcome {

@@ -150,7 +150,7 @@ async fn phase3_vertical_slice() {
                 arguments: serde_json::json!({"path": "/tmp/x"}),
             },
             handle.binding().await.unwrap().session_subject.as_str(),
-            &["lease-1".to_string()],
+            &[uuid::Uuid::new_v4().to_string()],
         )
         .await;
     let ToolOutcome::Completed {

@@ -27,6 +27,79 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Canonical kernel action identity, used for approvals and durable audits.
+/// Raw kernel/store values enter this domain explicitly with `from_kernel_hex`.
+/// There is no conversion from a host transport digest.
+///
+/// ```compile_fail
+/// use lumen_server::{CoreActionDigest, HostTransportDigest};
+/// let host = HostTransportDigest::from_transport_hex("abc".to_owned());
+/// let approval: CoreActionDigest = host;
+/// ```
+///
+/// ```compile_fail
+/// use lumen_server::{ActionEnvelope, AuditEvent};
+/// fn audit(envelope: &ActionEnvelope) -> AuditEvent {
+///     AuditEvent { kind: "tool_staged".into(), session_id: "session".into(),
+///         action_digest: Some(envelope.digest().unwrap()), payload: serde_json::json!({}) }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CoreActionDigest(String);
+
+impl CoreActionDigest {
+    pub fn from_kernel_hex(hex: String) -> Self {
+        Self(hex)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_kernel_hex(self) -> String {
+        self.0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Display for CoreActionDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Hash of the host envelope, used only to bind a transported decision.
+/// Kernel canonicalization must map the envelope to a separate core digest;
+/// hashing or converting this value cannot produce an approval target.
+///
+/// ```compile_fail
+/// use lumen_server::{CoreActionDigest, HostTransportDigest};
+/// let core = CoreActionDigest::from_kernel_hex("abc".to_owned());
+/// let binding: HostTransportDigest = core;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostTransportDigest(String);
+
+impl HostTransportDigest {
+    pub fn from_transport_hex(hex: String) -> Self {
+        Self(hex)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_transport_hex(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for HostTransportDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Contract version for [`ActionEnvelope`].
 pub const ACTION_ENVELOPE_VERSION: u32 = lumen_core::pi_boundary::ACTION_ENVELOPE_VERSION;
 /// Contract version for [`PolicyDecision`].
@@ -81,8 +154,10 @@ pub struct ResourceSet {
 /// ActionEnvelope v2 host view: the description of one requested effect.
 ///
 /// Produced by the host from a Pi tool request; decided on by the kernel.
-/// The SHA-256 digest of the canonical envelope is the approval target for
-/// VHL, the primary audit key, and the replay-protection boundary.
+/// The kernel canonical digest is the VHL approval and audit target. The
+/// hash of this host representation is only a transport binding, returned by
+/// [`ActionEnvelope::digest`]. Obtain the kernel identity through
+/// [`KernelClient::authoritative_action_digest`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionEnvelope {
@@ -163,11 +238,12 @@ impl ActionEnvelope {
         Ok(())
     }
 
-    /// SHA-256 hex digest of the canonical JSON encoding of this envelope.
-    pub fn digest(&self) -> Result<String, EnvelopeError> {
+    /// SHA-256 of the host JSON representation, for transport binding only.
+    pub fn digest(&self) -> Result<HostTransportDigest, EnvelopeError> {
         let value =
             serde_json::to_value(self).map_err(|e| EnvelopeError::Deserialize(e.to_string()))?;
         lumen_core::pi_boundary::canonical_digest(&value)
+            .map(HostTransportDigest::from_transport_hex)
             .map_err(|_| EnvelopeError::Deserialize("noncanonical action envelope".into()))
     }
 }
@@ -208,8 +284,8 @@ pub enum Decision {
 pub struct PolicyDecision {
     #[serde(deserialize_with = "current_policy_version")]
     pub protocol_version: u32,
-    /// Digest of the [`ActionEnvelope`] this decision answers.
-    pub action_digest: String,
+    /// Transport digest of the host envelope this decision answers.
+    pub action_digest: HostTransportDigest,
     pub decision: Decision,
     /// RFC 3339 timestamp of the decision.
     pub decided_at: String,
@@ -236,9 +312,9 @@ pub enum DecisionError {
 }
 
 impl PolicyDecision {
-    /// Bind the decision to the envelope it answers. A decision presented
-    /// for a different envelope digest is rejected: this is what makes
-    /// approval replay and decision substitution fail closed.
+    /// Bind the transported decision to the host envelope it answers,
+    /// rejecting decision substitution. VHL approval binds the separate
+    /// kernel canonical digest, never this transport hash.
     pub fn bind(&self, envelope: &ActionEnvelope) -> Result<(), DecisionError> {
         if self.protocol_version != POLICY_DECISION_VERSION {
             return Err(DecisionError::VersionMismatch(
@@ -250,7 +326,9 @@ impl PolicyDecision {
             .digest()
             .map_err(|e| DecisionError::Deserialize(e.to_string()))?;
         if digest != self.action_digest {
-            return Err(DecisionError::DigestMismatch(self.action_digest.clone()));
+            return Err(DecisionError::DigestMismatch(
+                self.action_digest.to_string(),
+            ));
         }
         Ok(())
     }
@@ -307,7 +385,7 @@ pub struct LeaseDocument {
     pub signature: String,
     /// For one-shot leases: the exact approved action digest the lease is
     /// bound to. `None` for standing leases.
-    pub approved_action_digest: Option<String>,
+    pub approved_action_digest: Option<CoreActionDigest>,
 }
 
 fn current_lease_version<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<u32, D::Error> {
@@ -341,7 +419,7 @@ pub struct LeaseVerification {
 #[serde(deny_unknown_fields)]
 pub struct OneShotGrant {
     pub approval_id: String,
-    pub action_digest: String,
+    pub action_digest: CoreActionDigest,
     pub session_subject: String,
     /// Key id of the human VHL key that signed this grant.
     pub signer_key_id: String,
@@ -365,7 +443,7 @@ pub struct AuditEvent {
     pub session_id: String,
     /// Digest of the action this event describes, when applicable.
     #[serde(default)]
-    pub action_digest: Option<String>,
+    pub action_digest: Option<CoreActionDigest>,
     pub payload: serde_json::Value,
 }
 
@@ -437,14 +515,14 @@ pub trait KernelClient: Send + Sync {
     /// The authoritative action identity used in this kernel's durable
     /// policy and execution audits. Implementations that convert envelopes
     /// must override this to hash the same representation as their authority.
-    /// The default supports kernels that use the host envelope directly.
+    /// The default explicitly maps the host envelope to the frozen core contract.
     /// This may differ from the compatibility digest in `PolicyDecision`,
     /// which is checked separately by `PolicyDecision::bind`.
     fn authoritative_action_digest(
         &self,
         envelope: &ActionEnvelope,
-    ) -> Result<String, KernelError> {
-        Ok(envelope.digest()?)
+    ) -> Result<CoreActionDigest, KernelError> {
+        crate::kernel_convert::core_action_digest(envelope)
     }
 
     /// Ask the kernel to decide on an action envelope.
@@ -1038,7 +1116,7 @@ mod tests {
         let d1 = env.digest().unwrap();
         let d2 = env.digest().unwrap();
         assert_eq!(d1, d2);
-        assert_eq!(d1.len(), 64);
+        assert_eq!(d1.as_str().len(), 64);
     }
 
     #[test]
@@ -1138,7 +1216,7 @@ mod tests {
         let kernel = MockKernelClient::new();
         let grant = OneShotGrant {
             approval_id: "appr-1".to_string(),
-            action_digest: "abc123".to_string(),
+            action_digest: CoreActionDigest::from_kernel_hex("abc123".to_string()),
             session_subject: "ed25519:subj".to_string(),
             signer_key_id: "vhl-key-1".to_string(),
             nonce: "n1".to_string(),

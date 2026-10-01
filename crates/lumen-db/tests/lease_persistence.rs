@@ -771,13 +771,15 @@ async fn live_lease_refs_counts_only_live_matching_leases() {
         0
     );
 
-    // The re-validation self-check set: only the live lease.
+    // Live admission selection excludes revoked and expired records.
     let live_docs = db.kernel_live_leases(&ws, 500_000).await.unwrap();
     assert_eq!(live_docs.len(), 1);
     assert_eq!(live_docs[0].lease_id, "lease-a");
 
-    // Purge is refused while that one live lease exists, then allowed once
-    // the clock passes its expiry.
+    // Integrity selection includes all retained records; expiry and revocation
+    // cannot hide signatures or make their public verification keys disposable.
+    assert_eq!(db.kernel_historical_leases(&ws).await.unwrap().len(), 3);
+    // Purge is refused even once every referencing lease has expired.
     assert_eq!(
         db.purge_key_generation(&ws, &key_id, 500_000, &[])
             .await
@@ -788,7 +790,7 @@ async fn live_lease_refs_counts_only_live_matching_leases() {
         db.purge_key_generation(&ws, &key_id, 1_000_001, &[])
             .await
             .unwrap(),
-        PurgeOutcome::Purged
+        PurgeOutcome::StillReferenced
     );
 }
 
@@ -983,4 +985,139 @@ async fn session_lifecycle_checks_reject_bad_inserts() {
     )
     .await
     .unwrap();
+}
+
+/// Inject failure after the session UPDATE but before revocation INSERT. SQLite
+/// rolls back both sides, and a retry converges without deleting any history.
+#[tokio::test]
+async fn authority_restart_invalidation_is_atomic_and_idempotent() {
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "restart-root", "restart-root-nonce", 100, 10_000);
+    let public_key = hex::encode(
+        fx.sessions
+            .get(&root.subject)
+            .unwrap()
+            .verifying_key
+            .to_bytes(),
+    );
+    db.insert_kernel_session(&ws, &root.subject, None, &public_key, 100)
+        .await
+        .unwrap();
+    db.insert_kernel_session(&ws, "child-session", Some(&root.subject), &public_key, 200)
+        .await
+        .unwrap();
+    db.insert_kernel_lease_with_budget(&ws, &root, 100)
+        .await
+        .unwrap();
+    // An external lease descendant has no session row. Parent ancestry must
+    // still carry revocation to it.
+    let mut external = root.clone();
+    external.lease_id = "external-descendant".into();
+    external.parent_id = Some(root.lease_id.clone());
+    external.subject = "external-subject".into();
+    external.lease_nonce = "external-descendant-nonce".into();
+    // Sign with a separate key: this store test exercises lifecycle atomicity.
+    external.sign(&SigningKey::from_bytes(&[0x71; 32])).unwrap();
+    db.insert_kernel_lease_with_budget(&ws, &external, 100)
+        .await
+        .unwrap();
+    let accounts = db.kernel_budget_account_states(&ws).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_retirement BEFORE INSERT ON kernel_revocations BEGIN SELECT RAISE(ABORT,'injected transition failure'); END")
+        .execute(db.pool()).await.unwrap();
+    assert!(
+        db.invalidate_kernel_sessions_and_revoke(&ws, 300)
+            .await
+            .is_err()
+    );
+    assert_eq!(db.active_kernel_sessions(&ws).await.unwrap().len(), 2);
+    assert!(db.kernel_revoked_ids(&ws).await.unwrap().is_empty());
+    sqlx::query("DROP TRIGGER fail_retirement")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (subjects, leases) = db
+        .invalidate_kernel_sessions_and_revoke(&ws, 300)
+        .await
+        .unwrap();
+    assert_eq!(subjects.len(), 2);
+    assert_eq!(leases.len(), 2);
+    assert!(db.active_kernel_sessions(&ws).await.unwrap().is_empty());
+    assert!(db.is_kernel_revoked(&ws, &external.lease_id).await.unwrap());
+    assert_eq!(
+        db.kernel_budget_account_states(&ws).await.unwrap(),
+        accounts
+    );
+    assert_eq!(
+        db.kernel_lease(&ws, &root.lease_id).await.unwrap(),
+        Some(root.clone())
+    );
+    let retry = db
+        .invalidate_kernel_sessions_and_revoke(&ws, 400)
+        .await
+        .unwrap();
+    assert!(retry.0.is_empty() && retry.1.is_empty());
+    assert_eq!(
+        db.kernel_session(&ws, &root.subject)
+            .await
+            .unwrap()
+            .unwrap()
+            .destroyed_at_ms,
+        Some(300)
+    );
+}
+
+/// A terminal execution row alone cannot prove that its spend was posted.
+#[tokio::test]
+async fn recovery_rejects_settled_execution_without_accounting_receipt() {
+    use lumen_core::budget::{ExecutionReservation, ExecutionState};
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let lease = mint_root(&fx, "unaccounted", "unaccounted-nonce", 100, 10_000);
+    db.insert_kernel_lease_with_budget(&ws, &lease, 100)
+        .await
+        .unwrap();
+    let mut execution = ExecutionReservation {
+        id: "unaccounted-execution".into(),
+        lease_id: lease.lease_id.clone(),
+        action_id: "action".into(),
+        held: Budget::new().set(BudgetDimension::Executions, 1),
+        state: ExecutionState::Held,
+        idempotency_key: "execution-nonce".into(),
+        created_at_ms: 100,
+        completed_at_ms: None,
+        actual: None,
+    };
+    db.insert_kernel_execution(&ws, &execution).await.unwrap();
+    execution.state = ExecutionState::Settled;
+    execution.completed_at_ms = Some(200);
+    execution.actual = Some(execution.held.clone());
+    db.update_kernel_execution(&ws, &execution).await.unwrap();
+    assert!(db.kernel_recovery_usage_unknown(&ws).await.unwrap());
+    assert_eq!(
+        db.kernel_budget_remaining(&ws, &lease.lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        100
+    );
+    db.debit_kernel_lease(
+        &ws,
+        &lease.lease_id,
+        &execution.held,
+        &format!("execution-settle:{}", execution.id),
+        200,
+    )
+    .await
+    .unwrap();
+    assert!(!db.kernel_recovery_usage_unknown(&ws).await.unwrap());
+    assert_eq!(
+        db.kernel_budget_remaining(&ws, &lease.lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        99
+    );
 }

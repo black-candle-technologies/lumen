@@ -1,35 +1,6 @@
-//! Acceptance matrix for lease persistence across kernel restarts
-//! (spec §8, "Lumen Lease Persistence Across Kernel Restarts").
-//!
-//! Every test uses a file-backed database and drives a real close +
-//! [`AuthorityKernelClient::open`] cycle ("restart") against the same db
-//! path and [`WorkspaceId`]. Only the public client API and the
-//! [`lumen_db`] store are touched: no non-test source is modified.
-//!
-//! Map to the spec's acceptance criteria:
-//! - §8.1  `restart_lease_stays_valid`
-//! - §8.2  `restart_expired_lease_stays_dead`
-//! - §8.3  `restart_revoked_lease_stays_dead`
-//! - §8.4  `restart_one_shot_replay_rejected`
-//! - §8.5  `unknown_issuer_generation_fails_closed`
-//! - §8.6  `purge_after_last_lease_dies`
-//! - §8.7  `purge_blocked_while_referenced`
-//! - §8.8  `pending_vhl_restart`
-//! - §8.9  `child_lease_survives_restart`
-//! - §8.10 (no-new-delegation) is covered structurally by
-//!   `restored_session_cannot_mint`: the vault is empty after a restart,
-//!   so no signing key exists to mint with.
-//! - §8.11 `destroyed_session_stays_destroyed` (+
-//!   `destroy_session_revokes_orphaned_delegation_restart_succeeds`: the
-//!   kernel destroy path revokes chain-orphaned delegations so the next
-//!   boot succeeds)
-//! - §8.12 `killed_generation_fails_closed`
-//! - §8.13 `startup_tamper_detection`
-//! - §8.14 `audit_and_budget_continuity` (audit half; the budget half is
-//!   `restart_preserves_budget_consumption` in `kernel_authority_pipeline`)
-//! - §8.15 guarded delete/update: covered by `lumen-db`'s
-//!   `lease_persistence.rs` (worker A) — not duplicated here.
-//! - §8.16 (guarded delete at the db layer) — same, see above.
+//! Restart security: durable historical records never restore live session authority.
+//! Includes admission/execution denial, replay and budget preservation, crash
+//! convergence, store ownership, and separate historical signature verification.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,7 +9,7 @@ use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use lumen_core::budget::{Budget, BudgetDimension, BudgetLedger};
-use lumen_core::canonical::ResourceScope;
+use lumen_core::canonical::{CanonicalPath, PathGrant, PathRights, RealFsResolver, ResourceScope};
 use lumen_core::identity::{PrincipalId, WorkspaceId};
 use lumen_core::lease::{
     ChildLeaseParams, LEASE_PROTOCOL_VERSION, LeaseDocument as CoreLeaseDocument,
@@ -171,6 +142,28 @@ async fn mint_root(
     tag: &str,
     lifetime_ms: i64,
 ) -> (String, LeaseDocument) {
+    mint_root_with_scope(kernel, tag, lifetime_ms, ResourceScope::default()).await
+}
+
+fn read_scope(env: &RestartEnv) -> ResourceScope {
+    let mut scope = ResourceScope::default();
+    scope
+        .tools
+        .insert("bct.read_file".into(), "=1.0.0".parse().unwrap());
+    scope.paths.push(PathGrant {
+        root: CanonicalPath::parse(&env.leased_file, &RealFsResolver, false).unwrap(),
+        rights: PathRights::READ,
+    });
+    scope.effects.push(lumen_core::canonical::EffectClass::Read);
+    scope
+}
+
+async fn mint_root_with_scope(
+    kernel: &AuthorityKernelClient,
+    tag: &str,
+    lifetime_ms: i64,
+    scope: ResourceScope,
+) -> (String, LeaseDocument) {
     let info = kernel
         .start_session_identity(None)
         .await
@@ -178,9 +171,9 @@ async fn mint_root(
     let now = now_ms();
     let lease = kernel
         .issue_root_lease(RootLeaseParams {
-            lease_id: format!("lease-{tag}-{}", uuid::Uuid::new_v4()),
+            lease_id: uuid::Uuid::new_v4().to_string(),
             subject: info.subject.clone(),
-            scope: ResourceScope::default(),
+            scope,
             limits: CoreLeaseLimits {
                 not_before_ms: now,
                 expires_at_ms: now + lifetime_ms,
@@ -242,7 +235,7 @@ fn sign_grant(
     core.sign(vhl_signing);
     OneShotGrant {
         approval_id: core.approval_id.clone(),
-        action_digest: core.action_digest.clone(),
+        action_digest: lumen_server::CoreActionDigest::from_kernel_hex(core.action_digest.clone()),
         session_subject: core.session_subject.clone(),
         signer_key_id: core.signer_key_id.clone(),
         nonce: core.nonce.clone(),
@@ -283,7 +276,7 @@ async fn mint_one_shot(
         vhl_signing,
         vhl_key_id,
         &approval_id,
-        &view.action_digest,
+        view.action_digest.as_str(),
         &subject,
     );
     let lease = KernelClient::request_one_shot_lease(h.kernel.as_ref(), &grant)
@@ -316,7 +309,10 @@ fn to_host_doc(core: &CoreLeaseDocument) -> LeaseDocument {
         depth_limit: core.depth_limit,
         lease_nonce: core.lease_nonce.clone(),
         signature: core.signature.clone(),
-        approved_action_digest: core.approved_action_digest.clone(),
+        approved_action_digest: core
+            .approved_action_digest
+            .clone()
+            .map(lumen_server::CoreActionDigest::from_kernel_hex),
     }
 }
 
@@ -340,53 +336,68 @@ fn assert_killed_generation(err: &KernelError, key_id: &str) {
     }
 }
 
-/// §8.1 — a root lease minted under generation N still verifies after a
-/// restart (generation N+1), resolved through the retired generation's
-/// recorded verifying key.
+/// Retained root leases and lease-less requests cannot restore old authority.
 #[tokio::test]
-async fn restart_lease_stays_valid() {
+async fn restart_root_session_cannot_authorize_or_execute() {
     let env = restart_env();
-    let lease = {
+    let (subject, lease) = {
         let h = open_kernel(&env, HashMap::new(), None).await;
-        let (_, lease) = mint_root(&h.kernel, "t1", 3_600_000).await;
-        lease
-        // `h` drops: simulated crash / upgrade.
+        let (subject, lease) =
+            mint_root_with_scope(&h.kernel, "old-root", 3_600_000, read_scope(&env)).await;
+        let envelope = h
+            .pipeline
+            .build_envelope(
+                &read_request(&env.leased_file),
+                &subject,
+                &[lease.lease_id.clone()],
+            )
+            .unwrap();
+        // Completed requires a bound Allow and a sandbox commit in this live boot.
+        let outcome = h.pipeline.execute_envelope(&envelope, &subject).await;
+        assert!(
+            matches!(outcome, ToolOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(h.sandbox.staged_count(), 1);
+        assert_eq!(h.sandbox.committed_count(), 1);
+        (subject, lease)
     };
-
-    let h2 = open_kernel(&env, HashMap::new(), None).await;
-    let verified = h2
-        .kernel
-        .verify_lease(&lease)
-        .await
-        .expect("lease must verify after restart");
-    assert_eq!(verified.lease_id, lease.lease_id);
-    assert!(!verified.revoked, "fresh lease must not be revoked");
-
-    // The doc's issuer is the retired (pre-restart) generation: two
-    // issuer generations are recorded, and the lease names the older one.
-    let db = Database::connect(&env.db_path).await.expect("db connect");
-    let gens = db
-        .kernel_key_generations(&env.workspace)
-        .await
-        .expect("generations");
-    let issuer_gens: Vec<_> = gens.iter().filter(|g| g.role == "issuer").collect();
-    assert_eq!(
-        issuer_gens.len(),
-        2,
-        "one generation per boot, got {issuer_gens:?}"
-    );
-    let current = issuer_gens
-        .iter()
-        .max_by_key(|g| g.created_at_ms)
-        .expect("current generation");
-    assert_ne!(
-        lease.issuer_key_id, current.key_id,
-        "the lease must name the retired generation, not the current one"
-    );
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    assert!(matches!(
+        h.kernel.verify_lease(&lease).await,
+        Err(KernelError::Revoked(_))
+    ));
+    for chain in [vec![lease.lease_id.clone()], vec![]] {
+        let envelope = h
+            .pipeline
+            .build_envelope(&read_request(&env.leased_file), &subject, &chain)
+            .unwrap();
+        assert!(!h.kernel.decide(&envelope).await.unwrap().is_allow());
+        assert!(matches!(
+            h.pipeline.execute_envelope(&envelope, &subject).await,
+            ToolOutcome::Denied { .. }
+        ));
+    }
+    assert_eq!(h.sandbox.staged_count(), 0);
+    assert_eq!(h.sandbox.committed_count(), 0);
     assert!(
-        issuer_gens.iter().any(|g| g.key_id == lease.issuer_key_id),
-        "the lease's generation must be among the recorded ones"
+        h.kernel
+            .start_session_identity(Some(&subject))
+            .await
+            .is_err()
     );
+    let fresh = h.kernel.start_session_identity(None).await.unwrap();
+    assert_ne!(fresh.subject, subject);
+    let (approval, _) = decide_pending(&h, &env.leased_file, &fresh.subject).await;
+    assert!(!approval.is_empty());
+    let db = Database::connect(&env.db_path).await.unwrap();
+    let row = db
+        .kernel_session(&env.workspace, &subject)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!row.active);
+    assert!(row.destroyed_at_ms.is_some());
 }
 
 /// §8.2 — an expired lease stays dead across a restart, and the failure
@@ -423,7 +434,7 @@ async fn restart_expired_lease_stays_dead() {
     h2.kernel
         .verify_lease(&long_lease)
         .await
-        .expect("long-lived lease from the same generation must still verify");
+        .expect_err("long-lived lease must also lose authority");
 }
 
 /// §8.3 — a lease revoked before the restart stays revoked after it.
@@ -463,16 +474,13 @@ async fn restart_revoked_lease_stays_dead() {
     h2.kernel
         .verify_lease(&anchor)
         .await
-        .expect("unrevoked lease must still verify");
+        .expect_err("anchor lease must also lose authority");
 }
 
-/// §8.3, second half — revocation also denies after the issuing
-/// generation is purged. D4 ordering holds on the `verify_lease` path:
-/// revocation is checked before key resolution, so the denial surfaces
-/// as `Revoked` even though the generation row is gone. (`validate_chain`,
-/// used by `decide` and the boot self-check, follows the same order.)
+/// Historical verifying keys remain retrievable without restoring authority:
+/// a revoked lease still denies before key resolution.
 #[tokio::test]
-async fn restart_revoked_lease_denied_after_generation_purged() {
+async fn restart_revoked_lease_denied_with_retained_verification_key() {
     let env = restart_env();
     let lease = {
         let h = open_kernel(&env, HashMap::new(), None).await;
@@ -486,8 +494,7 @@ async fn restart_revoked_lease_denied_after_generation_purged() {
         .expect("record revocation");
     drop(db);
 
-    // Restart: the revoked lease is not live, so the boot purge pass
-    // deletes its (now unreferenced) generation.
+    // Restart retains the generation for historical signature verification.
     let h2 = open_kernel(&env, HashMap::new(), None).await;
     let db = Database::connect(&env.db_path).await.expect("db connect");
     let gens = db
@@ -495,16 +502,15 @@ async fn restart_revoked_lease_denied_after_generation_purged() {
         .await
         .expect("generations");
     assert!(
-        !gens.iter().any(|g| g.key_id == lease.issuer_key_id),
-        "the revoked lease's generation should have been purged"
+        gens.iter().any(|g| g.key_id == lease.issuer_key_id),
+        "historical verification must retain the revoked lease's generation"
     );
     drop(db);
 
-    let err = h2
-        .kernel
-        .verify_lease(&lease)
-        .await
-        .expect_err("revoked lease must still be denied after its generation is purged");
+    let err =
+        h2.kernel.verify_lease(&lease).await.expect_err(
+            "revoked lease must still be denied with its historical generation retained",
+        );
     assert!(
         matches!(err, KernelError::Revoked(ref id) if *id == lease.lease_id),
         "expected Revoked (D4: revocation before key resolution), got {err:?}"
@@ -559,8 +565,8 @@ async fn restart_one_shot_replay_rejected() {
     let outcome = h2.pipeline.execute_envelope(&presented, &subject).await;
     match outcome {
         ToolOutcome::Denied { reason } => assert!(
-            reason.contains("replay"),
-            "expected the replay denial, got: {reason}"
+            reason.contains("inactive"),
+            "expected inactive session denial, got: {reason}"
         ),
         other => panic!("replayed one-shot must be denied, got {other:?}"),
     }
@@ -620,7 +626,7 @@ async fn unknown_issuer_generation_fails_closed() {
     let host_doc = to_host_doc(&core_doc);
 
     let db = Database::connect(&env.db_path).await.expect("db connect");
-    db.insert_kernel_lease(&env.workspace, &core_doc)
+    db.insert_kernel_lease_with_budget(&env.workspace, &core_doc, now)
         .await
         .expect("insert forged lease");
     drop(db);
@@ -642,7 +648,7 @@ async fn unknown_issuer_generation_fails_closed() {
         .verify_lease(&host_doc)
         .await
         .expect_err("unknown generation must fail closed after restart");
-    assert_unknown_generation(&err, "does-not-exist");
+    assert!(matches!(err, KernelError::Revoked(_)));
 }
 
 /// Pre-migration legacy lease: a live root lease whose subject has no
@@ -696,7 +702,7 @@ async fn pre_migration_lease_without_session_row_is_legacy_not_tamper() {
         approved_action_digest: None,
     };
     core_doc.sign(&legacy_signing).unwrap();
-    db.insert_kernel_lease(&env.workspace, &core_doc)
+    db.insert_kernel_lease_with_budget(&env.workspace, &core_doc, now)
         .await
         .expect("insert legacy lease");
     drop(db);
@@ -707,8 +713,14 @@ async fn pre_migration_lease_without_session_row_is_legacy_not_tamper() {
     let h2 = open_kernel(&env, HashMap::new(), None).await;
     // ...but the lease itself never authorizes: the decision-time
     // `validate_chain` fails closed on the unknown/inactive subject.
-    // (The diagnostic `verify_lease` only checks crypto + revocation;
-    // authorization is what matters.)
+    // Live verification also rejects it; historical signature checks are a
+    // separate core capability.
+    assert!(
+        h2.kernel
+            .verify_lease(&to_host_doc(&core_doc))
+            .await
+            .is_err()
+    );
     let outcome = h2
         .pipeline
         .handle(
@@ -770,108 +782,64 @@ async fn crash_residue_repair_unblocks_boot() {
         .expect_err("residue lease must stay denied");
 }
 
-/// §8.12 — killing an issuer generation fails closed for its outstanding
-/// leases immediately, durably (the kill survives the restart), without
-/// disturbing other generations. Pre-kill, the lease verifies — which
-/// also re-proves §8.5's complement (D5: retired generations verify).
+/// Killing a generation denies immediately; its kill record survives restart.
 #[tokio::test]
 async fn killed_generation_fails_closed() {
     let env = restart_env();
-    let (lease, gen_a) = {
-        let h = open_kernel(&env, HashMap::new(), Some(true)).await;
-        let (_, lease) = mint_root(&h.kernel, "t6", 3_600_000).await;
-        let gen_a = lease.issuer_key_id.clone();
-        (lease, gen_a)
-    };
-
-    let h2 = open_kernel(&env, HashMap::new(), Some(true)).await;
-    // Pre-kill it verifies: the retired generation resolves (D5).
-    h2.kernel
-        .verify_lease(&lease)
+    let h = open_kernel(&env, HashMap::new(), Some(true)).await;
+    let (_, lease) = mint_root(&h.kernel, "kill", 3_600_000).await;
+    h.kernel.verify_lease(&lease).await.unwrap();
+    h.kernel
+        .rotate_issuer_keys("rotate", &actor())
         .await
-        .expect("pre-kill lease must verify (D5 re-proof)");
-
-    let actor = actor();
-    let report = h2
-        .kernel
-        .rotate_issuer_keys("test rotation", &actor)
-        .await
-        .expect("rotate");
-    assert_ne!(report.old_issuer_key_id, report.new_issuer_key_id);
-    let killed = h2
-        .kernel
-        .kill_key_generation(&gen_a, "issuer", "test compromise", &actor)
-        .await
-        .expect("kill generation");
-    assert!(killed, "kill must be recorded");
-
-    let err = h2
-        .kernel
-        .verify_lease(&lease)
-        .await
-        .expect_err("lease from a killed generation must fail");
-    assert_killed_generation(&err, &gen_a);
-    drop(h2);
-
-    // The kill is durable: still fails closed after another restart.
-    let h3 = open_kernel(&env, HashMap::new(), Some(true)).await;
-    let err = h3
-        .kernel
-        .verify_lease(&lease)
-        .await
-        .expect_err("kill must survive the restart");
-    assert_killed_generation(&err, &gen_a);
+        .unwrap();
+    assert!(
+        h.kernel
+            .kill_key_generation(&lease.issuer_key_id, "issuer", "compromise", &actor())
+            .await
+            .unwrap()
+    );
+    let err = h.kernel.verify_lease(&lease).await.unwrap_err();
+    assert_killed_generation(&err, &lease.issuer_key_id);
+    drop(h);
+    let h = open_kernel(&env, HashMap::new(), Some(true)).await;
+    assert!(matches!(
+        h.kernel.verify_lease(&lease).await,
+        Err(KernelError::Revoked(_))
+    ));
+    let db = Database::connect(&env.db_path).await.unwrap();
+    assert!(
+        db.killed_key_generation_ids(&env.workspace)
+            .await
+            .unwrap()
+            .contains(&lease.issuer_key_id)
+    );
 }
 
-/// §8.7 — purge is blocked while a live lease references the retired
-/// generation: the report lists it in `skipped_live`, the row survives,
-/// and the lease still verifies afterwards (across a restart).
+/// Mid-boot rotation retains keys for live leases. Restart still retires authority.
 #[tokio::test]
 async fn purge_blocked_while_referenced() {
     let env = restart_env();
-    let (lease, gen_a) = {
-        let h = open_kernel(&env, HashMap::new(), Some(true)).await;
-        let (_, lease) = mint_root(&h.kernel, "t7", 3_600_000).await;
-        let gen_a = lease.issuer_key_id.clone();
-        (lease, gen_a)
-    };
-
-    let h2 = open_kernel(&env, HashMap::new(), Some(true)).await;
-    let report = h2
-        .kernel
-        .purge_key_generations(&actor())
+    let h = open_kernel(&env, HashMap::new(), Some(true)).await;
+    let (_, lease) = mint_root(&h.kernel, "purge", 3_600_000).await;
+    h.kernel
+        .rotate_issuer_keys("rotate", &actor())
         .await
-        .expect("purge");
-    assert!(
-        report.skipped_live.contains(&gen_a),
-        "expected {gen_a} in skipped_live, got {report:?}"
-    );
-    assert!(
-        !report.purged.contains(&gen_a),
-        "a referenced generation must never be purged, got {report:?}"
-    );
-
-    let db = Database::connect(&env.db_path).await.expect("db connect");
-    let gens = db
-        .kernel_key_generations(&env.workspace)
-        .await
-        .expect("generations");
-    assert!(
-        gens.iter().any(|g| g.key_id == gen_a),
-        "gen A row must survive the purge while referenced"
-    );
-    drop(db);
-
-    h2.kernel
-        .verify_lease(&lease)
-        .await
-        .expect("live lease must still verify after the purge attempt");
+        .unwrap();
+    let report = h.kernel.purge_key_generations(&actor()).await.unwrap();
+    assert!(report.skipped_live.contains(&lease.issuer_key_id));
+    h.kernel.verify_lease(&lease).await.unwrap();
+    drop(h);
+    let h = open_kernel(&env, HashMap::new(), Some(true)).await;
+    assert!(matches!(
+        h.kernel.verify_lease(&lease).await,
+        Err(KernelError::Revoked(_))
+    ));
 }
 
-/// §8.6 — once the last lease referencing a retired generation dies, the
-/// boot purge pass deletes the generation row.
+/// An expired lease still needs independently retrievable verification material.
 #[tokio::test]
-async fn purge_after_last_lease_dies() {
+async fn purge_retains_keys_after_last_lease_dies() {
     let env = restart_env();
     let gen_a = {
         let h = open_kernel(&env, HashMap::new(), Some(true)).await;
@@ -898,8 +866,8 @@ async fn purge_after_last_lease_dies() {
         .await
         .expect("generations");
     assert!(
-        !gens.iter().any(|g| g.key_id == gen_a),
-        "gen A row must be purged once its last lease died, got {:?}",
+        gens.iter().any(|g| g.key_id == gen_a),
+        "gen A must remain retrievable for historical verification, got {:?}",
         gens.iter().map(|g| &g.key_id).collect::<Vec<_>>()
     );
     drop(db);
@@ -970,7 +938,7 @@ async fn pending_vhl_restart() {
         &vhl_signing,
         vhl_key_id,
         &old_approval_id,
-        &old_digest,
+        old_digest.as_str(),
         &subject,
     );
     let err = KernelClient::request_one_shot_lease(h2.kernel.as_ref(), &stale_grant)
@@ -987,6 +955,20 @@ async fn pending_vhl_restart() {
     // Re-propose the same action post-restart: fresh request, fresh cache
     // entry. Retain the envelope: the minted one-shot is bound to its
     // exact digest.
+    let old_envelope = h2
+        .pipeline
+        .build_envelope(&read_request(&env.leased_file), &subject, &[])
+        .unwrap();
+    assert!(matches!(
+        h2.pipeline.execute_envelope(&old_envelope, &subject).await,
+        ToolOutcome::Denied { .. }
+    ));
+    let subject = h2
+        .kernel
+        .start_session_identity(None)
+        .await
+        .unwrap()
+        .subject;
     let (new_approval_id, envelope) = decide_pending(&h2, &env.leased_file, &subject).await;
     assert_ne!(
         new_approval_id, old_approval_id,
@@ -1008,7 +990,7 @@ async fn pending_vhl_restart() {
         &vhl_signing,
         vhl_key_id,
         &new_approval_id,
-        &view.action_digest,
+        view.action_digest.as_str(),
         &subject,
     );
     let lease = KernelClient::request_one_shot_lease(h2.kernel.as_ref(), &grant)
@@ -1066,9 +1048,8 @@ async fn pending_vhl_restart() {
 /// deliberately NOT passed back: after a restart there is nothing to
 /// pass — that is the point of §8.10.
 ///
-/// The session rows are written *before* the kernel boots, because the
-/// boot hydrates the in-memory session registry from them
-/// (`issue_root_lease` requires an active subject session).
+/// Core fixtures persist a previous authority generation before the client
+/// boots. Startup must invalidate these public rows, never hydrate them.
 struct ChildLeaseFixture {
     parent_subject: String,
     child_subject: String,
@@ -1109,17 +1090,30 @@ async fn setup_child_lease(
     )
     .await
     .expect("child session");
-    drop(db);
-
-    let h = open_kernel(&env, HashMap::new(), None).await;
-    // The root lease is minted by the kernel itself: issuer-signed and
-    // persisted (like any production root lease).
-    let root_host = h
-        .kernel
-        .issue_root_lease(RootLeaseParams {
-            lease_id: format!("root-{tag}-{}", uuid::Uuid::new_v4()),
+    // Construct a previous-generation fixture in the core. Public rows are
+    // never admitted into a newly booted authority client.
+    let keys = lumen_core::lease::KernelKeys::generate();
+    db.record_kernel_key_generation(
+        &env.workspace,
+        &keys.issuer_key_id,
+        "issuer",
+        &hex::encode(keys.issuer_verifying().to_bytes()),
+        now,
+    )
+    .await
+    .unwrap();
+    let mut root_sessions = SessionRegistry::new();
+    root_sessions.register(
+        parent_subject.clone(),
+        None,
+        parent_signing.verifying_key(),
+        now,
+    );
+    let parent_doc = lumen_core::lease::mint_root_lease(
+        RootLeaseParams {
+            lease_id: uuid::Uuid::new_v4().to_string(),
             subject: parent_subject.clone(),
-            scope: ResourceScope::default(),
+            scope: read_scope(&env),
             limits: CoreLeaseLimits {
                 not_before_ms: now,
                 expires_at_ms: now + 3_600_000,
@@ -1128,18 +1122,19 @@ async fn setup_child_lease(
                 single_use: false,
             },
             depth_limit: 4,
-            lease_nonce: format!("root-nonce-{tag}-{}", uuid::Uuid::new_v4()),
+            lease_nonce: format!("root-{tag}"),
             issued_at_ms: now,
-        })
+        },
+        &keys,
+        &root_sessions,
+        &BudgetLedger::new(),
+        &NonceStore::new(),
+        now,
+    )
+    .unwrap();
+    db.insert_kernel_lease_with_budget(&env.workspace, &parent_doc, now)
         .await
-        .expect("issue root lease");
-
-    let db = Database::connect(&env.db_path).await.expect("db connect");
-    let parent_doc = db
-        .kernel_lease(&env.workspace, &root_host.lease_id)
-        .await
-        .expect("fetch parent")
-        .expect("parent lease stored");
+        .unwrap();
 
     // The child is minted under the parent *session* key (not the kernel
     // issuer key): exactly what a live agent session would do.
@@ -1167,9 +1162,9 @@ async fn setup_child_lease(
     let child_lease = mint_child_lease(
         &parent_doc,
         ChildLeaseParams {
-            lease_id: format!("child-{tag}-{}", uuid::Uuid::new_v4()),
+            lease_id: uuid::Uuid::new_v4().to_string(),
             subject: child_subject.clone(),
-            scope: ResourceScope::default(),
+            scope: read_scope(&env),
             limits: CoreLeaseLimits {
                 not_before_ms: now,
                 expires_at_ms: now + child_lifetime_ms,
@@ -1189,11 +1184,10 @@ async fn setup_child_lease(
         now,
     )
     .expect("mint child lease");
-    db.insert_kernel_lease(&env.workspace, &child_lease)
+    db.mint_kernel_child_lease(&env.workspace, &child_lease, now)
         .await
         .expect("insert child lease");
     drop(db);
-    drop(h);
 
     (
         env,
@@ -1206,61 +1200,142 @@ async fn setup_child_lease(
     )
 }
 
-/// §8.9 — a child lease survives a restart: its `parent_id` chain is
-/// still recorded, the session registry is rehydrated from the db
-/// (verifying key only), and verification succeeds under the parent
-/// session's key.
-#[tokio::test]
-async fn child_lease_survives_restart() {
-    let (env, fixture) = setup_child_lease(
-        &SigningKey::from_bytes(&[0x11u8; 32]),
-        &SigningKey::from_bytes(&[0x22u8; 32]),
-        "t9",
-        3_600_000,
-    )
-    .await;
-
-    let h2 = open_kernel(&env, HashMap::new(), None).await;
-    // The session rows survived (verifying keys rehydrated).
-    let db = Database::connect(&env.db_path).await.expect("db connect");
-    let active = db
-        .active_kernel_sessions(&env.workspace)
-        .await
-        .expect("active sessions");
-    assert!(
-        active.iter().any(|s| s.subject == fixture.child_subject),
-        "child session row must survive restart"
-    );
-    drop(db);
-
-    // The child → parent link is intact...
-    assert_eq!(
-        fixture.child_lease.parent_id.as_deref(),
-        Some(fixture.parent_lease_id.as_str()),
-        "the child lease must still name its parent lease"
-    );
-    // ...and the child lease verifies through the rehydrated registry.
-    let verified = h2
+async fn mint_live_child(h: &KernelHandles, env: &RestartEnv) -> ChildLeaseFixture {
+    let (parent_subject, parent) =
+        mint_root_with_scope(&h.kernel, "child", 3_600_000, read_scope(env)).await;
+    let child_subject = h
         .kernel
-        .verify_lease(&fixture.child_lease)
+        .start_session_identity(Some(&parent_subject))
         .await
-        .expect("child lease must verify after restart");
-    assert_eq!(verified.lease_id, fixture.child_lease.lease_id);
-    assert!(!verified.revoked);
+        .unwrap()
+        .subject;
+    let now = now_ms();
+    let child = h
+        .kernel
+        .issue_child_lease(
+            &parent.lease_id,
+            ChildLeaseParams {
+                lease_id: uuid::Uuid::new_v4().to_string(),
+                subject: child_subject.clone(),
+                scope: read_scope(env),
+                limits: CoreLeaseLimits {
+                    not_before_ms: now,
+                    expires_at_ms: parent.limits.expires_at_ms,
+                    budget: Budget::new().set(BudgetDimension::Executions, 10),
+                    max_executions: None,
+                    single_use: false,
+                },
+                depth_limit: 3,
+                lease_nonce: "live-child".into(),
+                issued_at_ms: now,
+            },
+        )
+        .await
+        .unwrap();
+    ChildLeaseFixture {
+        parent_subject,
+        child_subject,
+        parent_lease_id: parent.lease_id,
+        child_lease: child,
+    }
 }
 
-/// §8.10 — a restored session cannot mint new child leases: the vault
-/// holds no private keys after a restart, and the store structurally
-/// cannot yield them. Proven three ways:
-/// 1. the `kernel_sessions` schema has no private-key column at all;
-/// 2. the active rows expose only verifying keys;
-/// 3. the db file (and journals) contain no copy of the private key
-///    bytes.
-///
-/// The child lease still verifies (the registry rehydrated), but the
-/// kernel has no signing capability to mint with: no public API takes a
-/// restored session to a new signature, and the construction above shows
-/// the db cannot supply the private key.
+/// Restart invalidates the full session subtree and retained child leases.
+#[tokio::test]
+async fn restart_child_session_cannot_authorize_or_execute() {
+    let env = restart_env();
+    let fixture = {
+        let h = open_kernel(&env, HashMap::new(), None).await;
+        let fixture = mint_live_child(&h, &env).await;
+        for (subject, chain) in [
+            (
+                &fixture.parent_subject,
+                vec![fixture.parent_lease_id.clone()],
+            ),
+            (
+                &fixture.child_subject,
+                vec![
+                    fixture.child_lease.lease_id.clone(),
+                    fixture.parent_lease_id.clone(),
+                ],
+            ),
+        ] {
+            let envelope = h
+                .pipeline
+                .build_envelope(&read_request(&env.leased_file), subject, &chain)
+                .unwrap();
+            let outcome = h.pipeline.execute_envelope(&envelope, subject).await;
+            assert!(
+                matches!(outcome, ToolOutcome::Completed { .. }),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(h.sandbox.staged_count(), 2);
+        assert_eq!(h.sandbox.committed_count(), 2);
+        fixture
+    };
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    assert!(matches!(
+        h.kernel.verify_lease(&fixture.child_lease).await,
+        Err(KernelError::Revoked(_))
+    ));
+    for (subject, chain) in [
+        (
+            &fixture.parent_subject,
+            vec![fixture.parent_lease_id.clone()],
+        ),
+        (
+            &fixture.child_subject,
+            vec![
+                fixture.child_lease.lease_id.clone(),
+                fixture.parent_lease_id.clone(),
+            ],
+        ),
+    ] {
+        let envelope = h
+            .pipeline
+            .build_envelope(&read_request(&env.leased_file), subject, &chain)
+            .unwrap();
+        assert!(!h.kernel.decide(&envelope).await.unwrap().is_allow());
+        assert!(matches!(
+            h.pipeline.execute_envelope(&envelope, subject).await,
+            ToolOutcome::Denied { .. }
+        ));
+        assert!(
+            h.kernel
+                .start_session_identity(Some(subject))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        h.kernel
+            .budget_remaining(&fixture.child_lease.lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        9
+    );
+    assert_eq!(
+        h.kernel
+            .budget_remaining(&fixture.parent_lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        89
+    );
+    assert_eq!(h.sandbox.staged_count(), 0);
+    assert_eq!(h.sandbox.committed_count(), 0);
+    let db = Database::connect(&env.db_path).await.unwrap();
+    assert!(
+        db.active_kernel_sessions(&env.workspace)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Old sessions cannot mint and no private keys are ever persisted.
 #[tokio::test]
 async fn restored_session_cannot_mint() {
     let parent_bytes: [u8; 32] = [0x33u8; 32];
@@ -1297,16 +1372,22 @@ async fn restored_session_cannot_mint() {
             "kernel_sessions must not hold private key material (columns: {names:?})"
         );
     }
-    // 2. Active rows expose verifying keys only.
+    // 2. Public records survive destruction, but never restore active authority.
     let active = db
         .active_kernel_sessions(&env.workspace)
         .await
         .expect("active sessions");
     assert!(
-        !active.is_empty(),
-        "the restarted kernel must rehydrate sessions to have anything to check"
+        active.is_empty(),
+        "public records cannot restore session authority"
     );
-    for row in &active {
+    for subject in [&fixture.parent_subject, &fixture.child_subject] {
+        let row = db
+            .kernel_session(&env.workspace, subject)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.active);
         let key = hex::decode(&row.verifying_key_hex).expect("verifying key hex");
         assert_eq!(
             key.len(),
@@ -1333,268 +1414,102 @@ async fn restored_session_cannot_mint() {
         );
     }
 
-    // The child lease still verifies through the rehydrated registry.
+    // Retention of public records does not restore admission authority.
     h2.kernel
         .verify_lease(&fixture.child_lease)
         .await
-        .expect("child lease must verify after restart");
+        .expect_err("retained child lease must not verify for admission");
 }
 
-/// §8.11 — destroying a session pre-restart stays destroyed.
-///
-/// The kernel fails closed at boot: a destroyed session with live
-/// leases makes session hydration refuse the open (the child session's
-/// ancestry no longer resolves to a live parent), rather than booting
-/// with an unverifiable lease. A destroyed session with *no* live leases
-/// boots cleanly and stays destroyed.
+/// A partially destroyed subtree is repaired atomically without resurrection.
 #[tokio::test]
-async fn destroyed_session_stays_destroyed() {
-    // Part A: destroyed parent with a live child lease → the restart
-    // refuses to open. The destroy persisted (otherwise the boot would
-    // have succeeded) and the kernel fails closed instead of silently
-    // dropping the lease.
-    {
-        let (env, fixture) = setup_child_lease(
-            &SigningKey::from_bytes(&[0x55u8; 32]),
-            &SigningKey::from_bytes(&[0x66u8; 32]),
-            "t11a",
-            3_600_000,
-        )
-        .await;
-        let db = Database::connect(&env.db_path).await.expect("db connect");
-        db.destroy_kernel_session(&env.workspace, &fixture.parent_subject, now_ms())
-            .await
-            .expect("destroy session");
-        drop(db);
-
-        let mut config = AuthorityKernelConfig::test_config();
-        config.db = AuthorityDb::Path(env.db_path.clone());
-        config.workspace = env.workspace;
-        let err = AuthorityKernelClient::open(config)
-            .await
-            .map(|_| ())
-            .expect_err("open must fail closed on a destroyed session with live leases");
-        match &err {
-            KernelError::Unavailable(msg) => assert!(
-                msg.contains("refusing to hydrate") && msg.contains("inactive parent"),
-                "expected the boot fail-closed refusal, got: {msg}"
-            ),
-            other => panic!("expected Unavailable, got {other:?}"),
-        }
-    }
-
-    // Part B: destroying a session with no live leases → clean boot,
-    // and the session stays destroyed.
-    {
-        let (env, fixture) = setup_child_lease(
-            &SigningKey::from_bytes(&[0x77u8; 32]),
-            &SigningKey::from_bytes(&[0x88u8; 32]),
-            "t11b",
-            3_600_000,
-        )
-        .await;
-        // An extra session nobody's leases reference.
-        let spare_signing = SigningKey::from_bytes(&[0x99u8; 32]);
-        let spare_subject = session_address(&spare_signing.verifying_key());
-        let db = Database::connect(&env.db_path).await.expect("db connect");
-        db.insert_kernel_session(
-            &env.workspace,
-            &spare_subject,
-            None,
-            &hex::encode(spare_signing.verifying_key().to_bytes()),
-            now_ms(),
-        )
-        .await
-        .expect("spare session");
-        db.destroy_kernel_session(&env.workspace, &spare_subject, now_ms())
-            .await
-            .expect("destroy spare session");
-        drop(db);
-
-        let h2 = open_kernel(&env, HashMap::new(), None).await;
-        // The destroyed session stayed destroyed...
-        let db = Database::connect(&env.db_path).await.expect("db connect");
-        let active = db
-            .active_kernel_sessions(&env.workspace)
-            .await
-            .expect("active");
-        assert!(
-            !active.iter().any(|s| s.subject == spare_subject),
-            "destroyed session must not come back after a restart"
-        );
-        drop(db);
-        // ...while the unrelated child lease still verifies.
-        h2.kernel
-            .verify_lease(&fixture.child_lease)
-            .await
-            .expect("unrelated child lease must still verify");
-    }
-}
-
-/// §8.11, destroy path — a session destroyed *through the kernel* revokes
-/// not only its own leases but delegations orphaned by chain: a child
-/// lease whose subject is not a session descendant, but whose
-/// verification needs the destroyed session's key, can never verify
-/// again. The destroy revokes it, so the next boot's re-validation
-/// succeeds and the session stays destroyed. (Contrast Part A of
-/// `destroyed_session_stays_destroyed`, which destroys via raw db writes,
-/// bypassing the kernel — that inconsistency must still fail the open.)
-#[tokio::test]
-async fn destroy_session_revokes_orphaned_delegation_restart_succeeds() {
-    let env = restart_env();
-    let now = now_ms();
-    let sess_signing = SigningKey::from_bytes(&[0xC1u8; 32]);
-    let sess_subject = session_address(&sess_signing.verifying_key());
-    let delegatee_signing = SigningKey::from_bytes(&[0xC2u8; 32]);
-
-    // Session row first: the boot hydrates the registry from it
-    // (`issue_root_lease` requires an active subject session).
-    let db = Database::connect(&env.db_path).await.expect("db connect");
-    db.ensure_workspace(&env.workspace, "test", now)
-        .await
-        .expect("ensure workspace");
-    db.insert_kernel_session(
-        &env.workspace,
-        &sess_subject,
-        None,
-        &hex::encode(sess_signing.verifying_key().to_bytes()),
-        now,
+async fn destroyed_parent_and_live_descendants_converge_to_inactive() {
+    let (env, fixture) = setup_child_lease(
+        &SigningKey::from_bytes(&[0x55; 32]),
+        &SigningKey::from_bytes(&[0x66; 32]),
+        "destroyed",
+        3_600_000,
     )
-    .await
-    .expect("session row");
-    drop(db);
-
+    .await;
+    let db = Database::connect(&env.db_path).await.unwrap();
+    db.destroy_kernel_session(&env.workspace, &fixture.parent_subject, now_ms())
+        .await
+        .unwrap();
+    let destroyed_at = db
+        .kernel_session(&env.workspace, &fixture.parent_subject)
+        .await
+        .unwrap()
+        .unwrap()
+        .destroyed_at_ms;
     let h = open_kernel(&env, HashMap::new(), None).await;
-    let root = h
-        .kernel
-        .issue_root_lease(RootLeaseParams {
-            lease_id: format!("root-orphan-{}", uuid::Uuid::new_v4()),
-            subject: sess_subject.clone(),
-            scope: ResourceScope::default(),
-            limits: CoreLeaseLimits {
-                not_before_ms: now,
-                expires_at_ms: now + 3_600_000,
-                budget: Budget::new().set(BudgetDimension::Executions, 100),
-                max_executions: None,
-                single_use: false,
-            },
-            depth_limit: 4,
-            lease_nonce: format!("root-nonce-orphan-{}", uuid::Uuid::new_v4()),
-            issued_at_ms: now,
-        })
-        .await
-        .expect("issue root lease");
-
-    let db = Database::connect(&env.db_path).await.expect("db connect");
-    let parent_doc = db
-        .kernel_lease(&env.workspace, &root.lease_id)
-        .await
-        .expect("fetch parent")
-        .expect("parent lease stored");
-
-    // A delegation to an *external* subject: its subject is not a session
-    // descendant, so subject-scoped revocation would miss it — but its
-    // signature was made by the session key, so destroying the session
-    // orphans it.
-    let mut sessions = SessionRegistry::new();
-    sessions.register(
-        sess_subject.clone(),
-        None,
-        sess_signing.verifying_key(),
-        now,
+    assert!(
+        db.active_kernel_sessions(&env.workspace)
+            .await
+            .unwrap()
+            .is_empty()
     );
-    sessions.register(
-        "external-delegatee".to_string(),
-        Some(sess_subject.clone()),
-        delegatee_signing.verifying_key(),
-        now,
+    assert!(matches!(
+        h.kernel.verify_lease(&fixture.child_lease).await,
+        Err(KernelError::Revoked(_))
+    ));
+    assert_eq!(
+        db.kernel_session(&env.workspace, &fixture.parent_subject)
+            .await
+            .unwrap()
+            .unwrap()
+            .destroyed_at_ms,
+        destroyed_at
     );
-    let revocations = RevocationIndex::default();
-    let ledger = BudgetLedger::new();
-    ledger
-        .register_lease(&parent_doc.lease_id, &parent_doc.limits.budget)
-        .expect("register parent budget");
-    let delegation = mint_child_lease(
-        &parent_doc,
-        ChildLeaseParams {
-            lease_id: format!("delegation-orphan-{}", uuid::Uuid::new_v4()),
-            subject: "external-delegatee".to_string(),
-            scope: ResourceScope::default(),
-            limits: CoreLeaseLimits {
-                not_before_ms: now,
-                expires_at_ms: now + 3_600_000,
-                budget: Budget::new().set(BudgetDimension::Executions, 10),
-                max_executions: Some(1),
-                single_use: false,
-            },
-            depth_limit: 3,
-            lease_nonce: format!("delegation-nonce-{}", uuid::Uuid::new_v4()),
-            issued_at_ms: now,
-        },
-        &sess_signing,
-        &sessions,
-        &revocations,
-        &ledger,
-        &NonceStore::new(),
-        now,
-    )
-    .expect("mint delegation");
-    db.insert_kernel_lease(&env.workspace, &delegation)
-        .await
-        .expect("insert delegation");
-    drop(db);
-    let host_delegation = to_host_doc(&delegation);
-
-    // Sanity: the delegation verifies while the session lives.
-    h.kernel
-        .verify_lease(&host_delegation)
-        .await
-        .expect("delegation verifies pre-destroy");
-
-    // Destroy through the kernel. The vault holds no private key for this
-    // session (it came from the durable row, not `start_session_identity`),
-    // so this exercises the durable-only path, including the
-    // orphan-delegation revocation.
-    let report = h
-        .kernel
-        .destroy_session_identity(&sess_subject)
-        .await
-        .expect("destroy session");
-    assert_eq!(report.affected_subjects, vec![sess_subject.clone()]);
     drop(h);
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    assert!(matches!(
+        h.kernel.verify_lease(&fixture.child_lease).await,
+        Err(KernelError::Revoked(_))
+    ));
+}
 
-    // The restart must now SUCCEED: the orphaned delegation was revoked
-    // at destroy time instead of failing the boot re-validation.
-    let h2 = open_kernel(&env, HashMap::new(), None).await;
-
-    // The session stayed destroyed...
-    let db = Database::connect(&env.db_path).await.expect("db connect");
-    let active = db
-        .active_kernel_sessions(&env.workspace)
+/// Lease ancestry is revoked even for an external subject without a session row.
+#[tokio::test]
+async fn restart_revokes_external_lease_descendants() {
+    let child_signing = SigningKey::from_bytes(&[0xc2; 32]);
+    let (env, fixture) = setup_child_lease(
+        &SigningKey::from_bytes(&[0xc1; 32]),
+        &child_signing,
+        "external",
+        3_600_000,
+    )
+    .await;
+    let db = Database::connect(&env.db_path).await.unwrap();
+    let mut external = db
+        .kernel_lease(&env.workspace, &fixture.child_lease.lease_id)
         .await
-        .expect("active sessions");
-    assert!(
-        !active.iter().any(|s| s.subject == sess_subject),
-        "destroyed session must not resurrect after a restart"
-    );
-    drop(db);
-
-    // ...and the orphaned delegation is dead (revoked, not merely
-    // unverifiable).
-    let err = h2
-        .kernel
-        .verify_lease(&host_delegation)
+        .unwrap()
+        .unwrap();
+    external.parent_id = Some(external.lease_id.clone());
+    external.lease_id = "external-descendant".into();
+    external.subject = "external-subject".into();
+    external.lease_nonce = "external-descendant-nonce".into();
+    external.issuer_key_id = fixture.child_subject.clone();
+    external.depth += 1;
+    external.sign(&child_signing).unwrap();
+    db.insert_kernel_lease_with_budget(&env.workspace, &external, now_ms())
         .await
-        .expect_err("orphaned delegation must be revoked");
+        .unwrap();
+    let h = open_kernel(&env, HashMap::new(), None).await;
     assert!(
-        matches!(err, KernelError::Revoked(_)),
-        "expected Revoked, got {err:?}"
+        db.is_kernel_revoked(&env.workspace, &external.lease_id)
+            .await
+            .unwrap()
     );
+    assert!(matches!(
+        h.kernel.verify_lease(&to_host_doc(&external)).await,
+        Err(KernelError::Revoked(_))
+    ));
 }
 
 /// §8.13 — startup tamper detection: if the stored issuer generation
-/// record is modified on disk, the boot-time revalidation (which
-/// re-signs with the sealed key and compares) aborts the open.
+/// record is modified on disk, verifying historical signatures aborts every
+/// open, including retries after the lease has been revoked.
 ///
 /// The tampered value is a *valid* 64-hex Ed25519 public key that does
 /// not match the original: schema checks reject malformed text, so
@@ -1640,21 +1555,23 @@ async fn startup_tamper_detection() {
         .expect("tamper generation row");
     drop(db);
 
-    // Reopening must fail: the boot self-check re-derives the sealed
-    // key, re-signs, and finds the stored record does not match.
-    let mut config = AuthorityKernelConfig::test_config();
-    config.db = AuthorityDb::Path(env.db_path.clone());
-    config.workspace = env.workspace;
-    let err = AuthorityKernelClient::open(config)
-        .await
-        .map(|_| ())
-        .expect_err("tampered open must fail");
-    match &err {
-        KernelError::Unavailable(msg) => assert!(
-            msg.contains("startup re-validation failed"),
-            "expected the boot re-validation refusal, got: {msg}"
-        ),
-        other => panic!("expected Unavailable, got {other:?}"),
+    for _ in 0..2 {
+        let err = AuthorityKernelClient::open(file_config(&env))
+            .await
+            .map(|_| ())
+            .expect_err("every tampered open must fail");
+        assert!(
+            err.to_string().contains("startup re-validation failed"),
+            "{err}"
+        );
+        let db = Database::connect(&env.db_path).await.unwrap();
+        assert!(
+            db.kernel_key_generations(&env.workspace)
+                .await
+                .unwrap()
+                .iter()
+                .any(|g| g.key_id == victim.key_id && g.verifying_key_hex == tampered_key)
+        );
     }
 }
 
@@ -1779,9 +1696,8 @@ async fn rollback_clock_refuses_open() {
     );
 }
 
-/// Session hydration fails the open on a subject/key mismatch: the
-/// subject is derived from the verifying key, so a tampered row cannot
-/// hydrate a session the key doesn't own.
+/// Historical public identities still undergo subject/key integrity checks.
+/// Such records must never be restored into the live registry.
 #[tokio::test]
 async fn session_subject_key_mismatch_refuses_open() {
     let env = restart_env();
@@ -1811,7 +1727,7 @@ async fn session_subject_key_mismatch_refuses_open() {
         .expect_err("open must fail closed on a subject/key mismatch");
     match &err {
         KernelError::Unavailable(msg) => assert!(
-            msg.contains("refusing to hydrate a mismatched identity"),
+            msg.contains("historical identity mismatch"),
             "expected the mismatch refusal, got: {msg}"
         ),
         other => panic!("expected Unavailable, got {other:?}"),
@@ -1869,5 +1785,684 @@ async fn strict_scope_and_lease_versions_are_enforced_across_restart() {
             .unwrap_err()
             .to_string()
             .contains("unsupported lease version")
+    );
+}
+
+/// Core signature verification is a historical integrity capability. It says
+/// nothing about session liveness, revocation, scope, or execution admission.
+#[tokio::test]
+async fn historical_signatures_verify_without_restoring_authority() {
+    let (env, fixture) = setup_child_lease(
+        &SigningKey::from_bytes(&[0x31; 32]),
+        &SigningKey::from_bytes(&[0x32; 32]),
+        "history",
+        3_600_000,
+    )
+    .await;
+    let db = Database::connect(&env.db_path).await.unwrap();
+    let root = db
+        .kernel_lease(&env.workspace, &fixture.parent_lease_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let issuer = db
+        .kernel_key_generations(&env.workspace)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|g| g.key_id == root.issuer_key_id)
+        .unwrap();
+    let issuer_key = VerifyingKey::from_bytes(
+        &hex::decode(issuer.verifying_key_hex)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    let child = db
+        .kernel_lease(&env.workspace, &fixture.child_lease.lease_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent = db
+        .kernel_session(&env.workspace, &fixture.parent_subject)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!parent.active);
+    let parent_key = VerifyingKey::from_bytes(
+        &hex::decode(parent.verifying_key_hex)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    root.verify_signature(&issuer_key).unwrap();
+    child.verify_signature(&parent_key).unwrap();
+    let mut tampered = child.clone();
+    tampered.subject = "another-subject".into();
+    assert!(tampered.verify_signature(&parent_key).is_err());
+    assert!(matches!(
+        h.kernel.verify_lease(&fixture.child_lease).await,
+        Err(KernelError::Revoked(_))
+    ));
+    h.kernel.verify_kernel_audit().await.unwrap();
+}
+
+fn file_config(env: &RestartEnv) -> AuthorityKernelConfig {
+    let mut config = AuthorityKernelConfig::test_config();
+    config.db = AuthorityDb::Path(env.db_path.clone());
+    config.workspace = env.workspace;
+    config
+}
+
+/// The transition commits before a failing audit tail; a second boot converges
+/// without ever hydrating previous keys into live authority.
+#[tokio::test]
+async fn failed_boot_tail_converges_on_retry() {
+    let env = restart_env();
+    let (subject, lease) = {
+        let h = open_kernel(&env, HashMap::new(), None).await;
+        mint_root(&h.kernel, "boot-tail", 3_600_000).await
+    };
+    let db = Database::connect(&env.db_path).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_boot_audit BEFORE INSERT ON kernel_audit_events BEGIN SELECT RAISE(ABORT,'injected boot tail failure'); END")
+        .execute(db.pool()).await.unwrap();
+    assert!(
+        AuthorityKernelClient::open(file_config(&env))
+            .await
+            .is_err()
+    );
+    let row = db
+        .kernel_session(&env.workspace, &subject)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!row.active);
+    assert!(
+        db.is_kernel_revoked(&env.workspace, &lease.lease_id)
+            .await
+            .unwrap()
+    );
+    let timestamp = row.destroyed_at_ms;
+    sqlx::query("DROP TRIGGER fail_boot_audit")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    assert_eq!(
+        db.kernel_session(&env.workspace, &subject)
+            .await
+            .unwrap()
+            .unwrap()
+            .destroyed_at_ms,
+        timestamp
+    );
+    let envelope = h
+        .pipeline
+        .build_envelope(&read_request(&env.leased_file), &subject, &[lease.lease_id])
+        .unwrap();
+    assert!(matches!(
+        h.pipeline.execute_envelope(&envelope, &subject).await,
+        ToolOutcome::Denied { .. }
+    ));
+    assert_eq!(h.sandbox.committed_count(), 0);
+}
+
+/// Unknown usage blocks every recovery attempt without refunding spend or held
+/// reservations. Old sessions are still durably invalidated on the first try.
+#[tokio::test]
+async fn unknown_execution_usage_blocks_recovery_and_preserves_reservations() {
+    use lumen_core::budget::ExecutionState;
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let fixture = mint_live_child(&h, &env).await;
+    let subject = fixture.child_subject.clone();
+    let lease = fixture.child_lease.clone();
+    let envelope = h
+        .pipeline
+        .build_envelope(
+            &read_request(&env.leased_file),
+            &subject,
+            &[lease.lease_id.clone(), fixture.parent_lease_id.clone()],
+        )
+        .unwrap();
+    assert!(h.kernel.decide(&envelope).await.unwrap().is_allow());
+    assert_eq!(
+        h.kernel
+            .budget_remaining(&lease.lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        9
+    );
+    let db = Database::connect(&env.db_path).await.unwrap();
+    let executions = db.all_kernel_executions(&env.workspace).await.unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "real Allow must durably hold execution capacity"
+    );
+    let mut execution = executions[0].clone();
+    assert_eq!(execution.state, ExecutionState::Held);
+    db.record_kernel_nonce(
+        &env.workspace,
+        "preserved-nonce",
+        now_ms(),
+        now_ms() + 3_600_000,
+    )
+    .await
+    .unwrap();
+    drop(h);
+    let accounts = db
+        .kernel_budget_account_states(&env.workspace)
+        .await
+        .unwrap();
+    let reservations = db.active_kernel_reservations(&env.workspace).await.unwrap();
+    assert_eq!(reservations.len(), 1);
+    for _ in 0..2 {
+        let error = AuthorityKernelClient::open(file_config(&env))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unknown execution usage"));
+        assert!(
+            db.active_kernel_sessions(&env.workspace)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.kernel_budget_account_states(&env.workspace)
+                .await
+                .unwrap(),
+            accounts
+        );
+        assert_eq!(
+            db.active_kernel_reservations(&env.workspace).await.unwrap(),
+            reservations
+        );
+        assert_eq!(
+            db.get_kernel_execution(&env.workspace, &execution.id)
+                .await
+                .unwrap(),
+            Some(execution.clone())
+        );
+        assert!(
+            !db.record_kernel_nonce(
+                &env.workspace,
+                "preserved-nonce",
+                now_ms(),
+                now_ms() + 3_600_000
+            )
+            .await
+            .unwrap()
+        );
+    }
+    // An explicit reconciliation proves dispatch did not occur. Boot itself
+    // must never manufacture this transition or release child reservations.
+    execution.state = ExecutionState::Released;
+    execution.completed_at_ms = Some(now_ms());
+    db.update_kernel_execution(&env.workspace, &execution)
+        .await
+        .unwrap();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    assert!(h.kernel.start_session_identity(None).await.is_ok());
+    assert_eq!(
+        db.active_kernel_reservations(&env.workspace).await.unwrap(),
+        reservations
+    );
+}
+
+#[tokio::test]
+async fn staged_effect_with_unknown_completion_blocks_recovery() {
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let (subject, _) = mint_root(&h.kernel, "staged", 3_600_000).await;
+    let envelope = h
+        .pipeline
+        .build_envelope(&read_request(&env.leased_file), &subject, &[])
+        .unwrap();
+    let event = lumen_server::AuditEvent {
+        kind: "tool_staged".into(),
+        session_id: subject,
+        action_digest: Some(h.kernel.authoritative_action_digest(&envelope).unwrap()),
+        payload: serde_json::json!({}),
+    };
+    h.kernel.append_audit(&event).await.unwrap();
+    drop(h);
+    for _ in 0..2 {
+        let error = AuthorityKernelClient::open(file_config(&env))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unknown execution usage"));
+    }
+    let db = Database::connect(&env.db_path).await.unwrap();
+    assert!(
+        db.active_kernel_sessions(&env.workspace)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Exactly one concurrent opener can own a store; clones share that owner.
+#[tokio::test]
+async fn concurrent_owners_are_excluded_before_boot() {
+    let env = restart_env();
+    let (a, b) = tokio::join!(
+        AuthorityKernelClient::open(file_config(&env)),
+        AuthorityKernelClient::open(file_config(&env))
+    );
+    let owner = match (a, b) {
+        (Ok(owner), Err(error)) | (Err(error), Ok(owner)) => {
+            assert!(error.to_string().contains("already owned"));
+            owner
+        }
+        _ => panic!("exactly one store owner must boot"),
+    };
+    let subject = owner.start_session_identity(None).await.unwrap().subject;
+    let clone = owner.clone();
+    drop(owner);
+    assert!(
+        AuthorityKernelClient::open(file_config(&env))
+            .await
+            .is_err()
+    );
+    assert!(clone.identity_is_live(&subject).await);
+    // A hard-link alias cannot evade an inode lock.
+    let alias = env.db_path.with_extension("alias");
+    std::fs::hard_link(&env.db_path, &alias).unwrap();
+    let mut config = file_config(&env);
+    config.db = AuthorityDb::Path(alias);
+    assert!(AuthorityKernelClient::open(config).await.is_err());
+    drop(clone);
+    let next = AuthorityKernelClient::open(file_config(&env))
+        .await
+        .unwrap();
+    assert!(!next.identity_is_live(&subject).await);
+}
+
+/// Runs in a distinct process when invoked by the ownership test below.
+#[tokio::test]
+async fn authority_owner_subprocess() {
+    let Ok(path) = std::env::var("LUMEN_TEST_AUTHORITY_STORE") else {
+        return;
+    };
+    let mut config = AuthorityKernelConfig::test_config();
+    config.db = AuthorityDb::Path(path.into());
+    config.workspace = serde_json::from_value(serde_json::Value::String(
+        std::env::var("LUMEN_TEST_WORKSPACE").unwrap(),
+    ))
+    .unwrap();
+    if let Ok(ready_path) = std::env::var("LUMEN_TEST_OWNER_READY") {
+        let owner = AuthorityKernelClient::open(config).await.unwrap();
+        let subject = owner.start_session_identity(None).await.unwrap().subject;
+        std::fs::write(ready_path, subject).unwrap();
+        std::future::pending::<()>().await;
+        drop(owner);
+        return;
+    }
+    let error = AuthorityKernelClient::open(config)
+        .await
+        .err()
+        .expect("competing process must be refused");
+    assert!(error.to_string().contains("already owned"));
+}
+
+#[tokio::test]
+async fn competing_process_cannot_invalidate_live_owner() {
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let (subject, lease) = mint_root(&h.kernel, "process-owner", 3_600_000).await;
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "authority_owner_subprocess", "--nocapture"])
+        .env("LUMEN_TEST_AUTHORITY_STORE", &env.db_path)
+        .env("LUMEN_TEST_WORKSPACE", env.workspace.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "subprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(h.kernel.identity_is_live(&subject).await);
+    h.kernel.verify_lease(&lease).await.unwrap();
+}
+
+/// Missing accounting cannot be interpreted as an untouched declared balance.
+#[tokio::test]
+async fn missing_budget_account_blocks_recovery_without_restoring_caps() {
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let (subject, lease) = mint_root(&h.kernel, "missing-account", 3_600_000).await;
+    let db = Database::connect(&env.db_path).await.unwrap();
+    let mut unbacked = db
+        .kernel_lease(&env.workspace, &lease.lease_id)
+        .await
+        .unwrap()
+        .unwrap();
+    unbacked.lease_id = uuid::Uuid::new_v4().to_string();
+    unbacked.lease_nonce = "unbacked-nonce".into();
+    // Unknown generation avoids making this an unrelated signature-corruption
+    // fixture: the missing account itself must stop recovery.
+    unbacked.issuer_key_id = "legacy-unknown-generation".into();
+    unbacked.sign(&SigningKey::from_bytes(&[0x61; 32])).unwrap();
+    db.insert_kernel_lease(&env.workspace, &unbacked)
+        .await
+        .unwrap();
+    let accounts = db
+        .kernel_budget_account_states(&env.workspace)
+        .await
+        .unwrap();
+    drop(h);
+    for _ in 0..2 {
+        let error = AuthorityKernelClient::open(file_config(&env))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("budget account missing"));
+        assert_eq!(
+            db.kernel_budget_account_states(&env.workspace)
+                .await
+                .unwrap(),
+            accounts
+        );
+        assert!(
+            !db.kernel_session(&env.workspace, &subject)
+                .await
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(
+            db.is_kernel_revoked(&env.workspace, &unbacked.lease_id)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+/// OS ownership must be released by process death, with old sessions retired by
+/// the next boot instead of trusting the dead process's public records.
+#[tokio::test]
+async fn crashed_owner_releases_lock_and_next_boot_invalidates_sessions() {
+    let env = restart_env();
+    let ready_path = env.db_path.with_extension("ready");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "authority_owner_subprocess", "--nocapture"])
+        .env("LUMEN_TEST_AUTHORITY_STORE", &env.db_path)
+        .env("LUMEN_TEST_WORKSPACE", env.workspace.to_string())
+        .env("LUMEN_TEST_OWNER_READY", &ready_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(subject) = std::fs::read_to_string(&ready_path) {
+                break subject;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("owner subprocess exited early: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // Always reap the child, including when readiness times out.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let subject = ready.expect("owner subprocess did not become ready");
+    let owner = AuthorityKernelClient::open(file_config(&env))
+        .await
+        .unwrap();
+    assert!(!owner.identity_is_live(&subject).await);
+    let db = Database::connect(&env.db_path).await.unwrap();
+    assert!(
+        !db.kernel_session(&env.workspace, &subject)
+            .await
+            .unwrap()
+            .unwrap()
+            .active
+    );
+    assert!(owner.start_session_identity(Some(&subject)).await.is_err());
+    assert!(owner.start_session_identity(None).await.is_ok());
+}
+
+/// Real pipeline execution is durably charged, including after repeated boots.
+#[tokio::test]
+async fn completed_pipeline_usage_is_not_refunded_on_restart() {
+    use lumen_core::budget::ExecutionState;
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let (subject, lease) =
+        mint_root_with_scope(&h.kernel, "completed", 3_600_000, read_scope(&env)).await;
+    let envelope = h
+        .pipeline
+        .build_envelope(
+            &read_request(&env.leased_file),
+            &subject,
+            &[lease.lease_id.clone()],
+        )
+        .unwrap();
+    let outcome = h.pipeline.execute_envelope(&envelope, &subject).await;
+    assert!(
+        matches!(outcome, ToolOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(h.sandbox.committed_count(), 1);
+    let db = Database::connect(&env.db_path).await.unwrap();
+    let execs = db.all_kernel_executions(&env.workspace).await.unwrap();
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].state, ExecutionState::Settled);
+    assert_eq!(
+        execs[0]
+            .actual
+            .as_ref()
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        1
+    );
+    assert!(
+        !db.kernel_recovery_usage_unknown(&env.workspace)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.kernel_budget_remaining(&env.workspace, &lease.lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        99
+    );
+    drop(h);
+    for _ in 0..2 {
+        let h = open_kernel(&env, HashMap::new(), None).await;
+        assert_eq!(
+            h.kernel
+                .budget_remaining(&lease.lease_id)
+                .await
+                .unwrap()
+                .get(BudgetDimension::Executions),
+            99
+        );
+        h.kernel.verify_kernel_audit().await.unwrap();
+    }
+}
+
+/// A failed hold write cannot expose Allow or reach the sandbox. An audit
+/// failure AFTER the hold commits must preserve it and block recovery.
+#[tokio::test]
+async fn durable_hold_precedes_allow_and_survives_failed_admission_tail() {
+    use lumen_core::budget::ExecutionState;
+    for fail_hold in [true, false] {
+        let env = restart_env();
+        let h = open_kernel(&env, HashMap::new(), None).await;
+        let (subject, lease) =
+            mint_root_with_scope(&h.kernel, "hold-failure", 3_600_000, read_scope(&env)).await;
+        let db = Database::connect(&env.db_path).await.unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            synchronous, 2,
+            "file-backed authority commits must use FULL durability"
+        );
+        let trigger = if fail_hold {
+            "CREATE TRIGGER fail_admission BEFORE INSERT ON kernel_executions BEGIN SELECT RAISE(ABORT,'hold failure'); END"
+        } else {
+            "CREATE TRIGGER fail_admission BEFORE INSERT ON kernel_audit_events WHEN NEW.decision='allow' BEGIN SELECT RAISE(ABORT,'allow audit failure'); END"
+        };
+        sqlx::query(trigger).execute(db.pool()).await.unwrap();
+        let envelope = h
+            .pipeline
+            .build_envelope(&read_request(&env.leased_file), &subject, &[lease.lease_id])
+            .unwrap();
+        let outcome = h.pipeline.execute_envelope(&envelope, &subject).await;
+        assert!(matches!(outcome, ToolOutcome::Fault { .. }), "{outcome:?}");
+        assert_eq!(h.sandbox.staged_count(), 0);
+        assert_eq!(h.sandbox.committed_count(), 0);
+        let executions = db.all_kernel_executions(&env.workspace).await.unwrap();
+        if fail_hold {
+            assert!(executions.is_empty());
+        } else {
+            assert_eq!(executions.len(), 1);
+            assert_eq!(executions[0].state, ExecutionState::Held);
+        }
+        sqlx::query("DROP TRIGGER fail_admission")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        drop(h);
+        if fail_hold {
+            let _h = open_kernel(&env, HashMap::new(), None).await;
+        } else {
+            for _ in 0..2 {
+                let error = AuthorityKernelClient::open(file_config(&env))
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("unknown execution usage"));
+            }
+        }
+    }
+}
+
+/// A landed completion audit cannot substitute for durable accounting. The
+/// terminal-state write and debit roll back together, preserving the hold.
+#[tokio::test]
+async fn completion_accounting_failure_blocks_recovery_without_partial_debit() {
+    use lumen_core::budget::ExecutionState;
+    let env = restart_env();
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    let (subject, lease) =
+        mint_root_with_scope(&h.kernel, "settle-failure", 3_600_000, read_scope(&env)).await;
+    let db = Database::connect(&env.db_path).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_settlement BEFORE UPDATE ON kernel_executions WHEN NEW.state='settled' BEGIN SELECT RAISE(ABORT,'settlement failure'); END").execute(db.pool()).await.unwrap();
+    let envelope = h
+        .pipeline
+        .build_envelope(
+            &read_request(&env.leased_file),
+            &subject,
+            &[lease.lease_id.clone()],
+        )
+        .unwrap();
+    let outcome = h.pipeline.execute_envelope(&envelope, &subject).await;
+    assert!(
+        matches!(outcome, ToolOutcome::Uncertain { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(h.sandbox.committed_count(), 1);
+    let execution = db
+        .all_kernel_executions(&env.workspace)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(execution.state, ExecutionState::Held);
+    assert!(
+        db.kernel_audit_events(&env.workspace, &KernelAuditQuery::default())
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.detail.contains("tool_committed"))
+    );
+    let account = db
+        .kernel_budget_account_states(&env.workspace)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        account.3.is_zero(),
+        "failed settlement must roll back consumption too"
+    );
+    assert_eq!(
+        db.kernel_budget_remaining(&env.workspace, &lease.lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        99
+    );
+    let digest = h.kernel.authoritative_action_digest(&envelope).unwrap();
+    drop(h);
+    for _ in 0..2 {
+        let error = AuthorityKernelClient::open(file_config(&env))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unknown execution usage"));
+    }
+    sqlx::query("DROP TRIGGER fail_settlement")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        db.settle_kernel_execution(
+            &env.workspace,
+            &execution.id,
+            "wrong-action",
+            &subject,
+            digest.as_str(),
+            now_ms()
+        )
+        .await
+        .is_err()
+    );
+    let settled = db
+        .settle_kernel_execution(
+            &env.workspace,
+            &execution.id,
+            &envelope.action_id,
+            &subject,
+            digest.as_str(),
+            now_ms(),
+        )
+        .await
+        .unwrap();
+    let retried = db
+        .settle_kernel_execution(
+            &env.workspace,
+            &execution.id,
+            &envelope.action_id,
+            &subject,
+            digest.as_str(),
+            now_ms(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled, retried);
+    let h = open_kernel(&env, HashMap::new(), None).await;
+    assert_eq!(
+        h.kernel
+            .budget_remaining(&lease.lease_id)
+            .await
+            .unwrap()
+            .get(BudgetDimension::Executions),
+        99
     );
 }

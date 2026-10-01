@@ -147,15 +147,30 @@ independent fixture verifier passed without ignores or warnings. The
 stored-version alias and successful checkpoint verification before correction.
 
 The [restart characterization](evidence/phase1-session-restart-gap.json) records
-an unresolved violation in the inherited implementation and tests. Reopening the
-kernel leaves the ephemeral identity vault empty, but hydrates public session
-records as live authority; retained root/child leases verify, and a retained
-one-shot envelope completes through the test pipeline. These passing reference
-tests express the wrong requirement. Startup must invalidate old sessions and
-revoke descendants before admission, preserve audit/nonces/budget history, and
-require fresh session authority. Boot failures, concurrent authority owners and
-unknown execution usage must also fail closed. The pipeline test uses a mock
-sandbox; this evidence does not claim a production external effect.
+an inherited authority violation at its recorded commit. The review correction
+replaces public-session hydration with one transactional destroy-and-revoke
+transition for all prior sessions and lease descendants, before admission. An OS
+lock on the database inode excludes competing authority clients until the last
+owner or worker drops. Fresh vault sessions are required for new actions.
+Historical session records and signatures, audits, replay gates, spent budgets,
+and unresolved reservations remain evidence. Admission writes its execution hold
+before returning `Allow`; pipeline completion atomically posts the debit and settles
+the hold before returning `Completed`. Held executions, settlements without durable
+accounting receipts, staged effects without a later durable completion, and missing
+budget accounts block recovery;
+boot never manufactures zero usage or refunds. Tests now deny retained root,
+child, and exact one-shot actions with zero sandbox dispatch, test transaction
+rollback and a failed boot tail, and separate historical signature verification
+from live admission. Issuer keys referenced by historical leases survive purge, and
+boot checks all retained signatures regardless of revocation or expiry so retries
+cannot suppress corruption. Pipeline execution still uses a mock sandbox. The production
+Pi quarantine and phase-gate disposition are unchanged.
+
+The host envelope's `HostTransportDigest` binds returned decisions to transport
+bytes. `CoreActionDigest` identifies approvals (including outbox delivery), execution audits, and
+reconciliation. The existing `authoritative_action_digest` seam maps the envelope
+through the frozen kernel representation; the types cannot be substituted without
+an explicit raw boundary conversion. Wire encodings remain strings.
 
 The historical decoder gap is reproduced in the
 [ActionEnvelope v1 probe](evidence/phase1-action-v1-probe.json). Adding an unknown

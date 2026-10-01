@@ -319,11 +319,9 @@ impl Database {
         Ok(ids)
     }
 
-    /// (lease_id, budget caps) for every lease in the workspace. Used at
-    /// kernel startup to hydrate the in-memory [`BudgetLedger`] so budget
-    /// admission checks keep working across restarts. Consumed spend is
-    /// not tracked (there is no settle path yet); hydration starts every
-    /// account at zero consumption.
+    /// Declared budget caps for every lease. These cannot establish a recovery
+    /// balance: restore held and consumed amounts from durable account states.
+    /// A missing account is unknown usage, never evidence of zero consumption.
     pub async fn kernel_lease_budgets(
         &self,
         workspace_id: &WorkspaceId,
@@ -710,123 +708,79 @@ impl Database {
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<DebitReceipt, RepositoryError> {
-        let pool = self.pool();
-        let mut tx = pool.begin().await?;
-        if let Some(existing) = sqlx::query(
-            "SELECT lease_id_link,amounts_json,debited_at_ms FROM kernel_lease_debits
-             WHERE workspace_id=? AND idempotency_key=?",
+        let mut tx = self.pool().begin().await?;
+        let receipt = debit_kernel_lease_tx(
+            &mut tx,
+            workspace_id,
+            lease_id,
+            actual,
+            idempotency_key,
+            now_ms,
         )
-        .bind(ws(workspace_id))
-        .bind(idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            let prev_lease: String = existing.get("lease_id_link");
-            let prev_amounts = parse_budget(existing.get::<String, _>("amounts_json").as_str())?;
-            if prev_lease == lease_id && prev_amounts == *actual {
-                let at: i64 = existing.get("debited_at_ms");
-                tx.commit().await?;
-                return Ok(DebitReceipt {
-                    reservation_id: lease_id.to_string(),
-                    actual: actual.clone(),
-                    debited_at_ms: at,
-                });
-            }
-            return Err(RepositoryError::KernelDebitConflict);
-        }
-        let row = sqlx::query(
-            "SELECT caps_json,reserved_out_json,consumed_json FROM kernel_budget_accounts
-             WHERE workspace_id=? AND lease_id=?",
-        )
-        .bind(ws(workspace_id))
-        .bind(lease_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| insufficient(&format!("unknown lease {lease_id}")))?;
-        let caps = parse_budget(row.get::<String, _>("caps_json").as_str())?;
-        let reserved_out = parse_budget(row.get::<String, _>("reserved_out_json").as_str())?;
-        let consumed = parse_budget(row.get::<String, _>("consumed_json").as_str())?;
-        let remaining = caps.saturating_sub(&reserved_out).saturating_sub(&consumed);
-        if !remaining.covers(actual) {
-            return Err(insufficient(&format!(
-                "lease {lease_id} cannot cover direct debit"
-            )));
-        }
-        // A reservation-backed child also spends against its reservation:
-        // check the reservation's available hold before writing anything, so
-        // a desynchronized ledger fails closed instead of half-applying.
-        let child_reservation = sqlx::query(
-            "SELECT reservation_id,parent_lease_id,held_json,consumed_json
-             FROM kernel_reservations
-             WHERE workspace_id=? AND child_lease_id=? AND state='active'
-             ORDER BY created_at_ms LIMIT 1",
-        )
-        .bind(ws(workspace_id))
-        .bind(lease_id)
-        .fetch_optional(&mut *tx)
         .await?;
-        if let Some(res) = &child_reservation {
-            let held = parse_budget(res.get::<String, _>("held_json").as_str())?;
-            let res_consumed = parse_budget(res.get::<String, _>("consumed_json").as_str())?;
-            let available = held.saturating_sub(&res_consumed);
-            if !available.covers(actual) {
-                return Err(insufficient(&format!(
-                    "reservation for child lease {lease_id} cannot cover direct debit"
-                )));
-            }
-        }
-        sqlx::query(
-            "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
-             amounts_json,debited_at_ms) VALUES(?,?,?,?,?)",
-        )
-        .bind(ws(workspace_id))
-        .bind(idempotency_key)
-        .bind(lease_id)
-        .bind(budget_json(actual)?)
-        .bind(now_ms)
-        .execute(&mut *tx)
-        .await?;
-        let new_consumed = consumed
-            .checked_add(actual)
-            .ok_or_else(|| insufficient("account consumed overflow"))?;
-        sqlx::query(
-            "UPDATE kernel_budget_accounts SET consumed_json=?,updated_at=?
-             WHERE workspace_id=? AND lease_id=?",
-        )
-        .bind(budget_json(&new_consumed)?)
-        .bind(now_ms)
-        .bind(ws(workspace_id))
-        .bind(lease_id)
-        .execute(&mut *tx)
-        .await?;
-        // Post the child's spend to the reservation ledger in the same
-        // transaction: the reservation's consumed grows, and the parent's
-        // reserved_out shrinks by `actual` while its consumed grows by
-        // `actual` (counted exactly once — see post_parent_debit_tx).
-        if let Some(res) = &child_reservation {
-            let reservation_id: String = res.get("reservation_id");
-            let parent_lease_id: String = res.get("parent_lease_id");
-            let res_consumed = parse_budget(res.get::<String, _>("consumed_json").as_str())?;
-            let res_new = res_consumed
-                .checked_add(actual)
-                .ok_or_else(|| insufficient("reservation consumed overflow"))?;
-            sqlx::query(
-                "UPDATE kernel_reservations SET consumed_json=?
-                 WHERE workspace_id=? AND reservation_id=?",
-            )
-            .bind(budget_json(&res_new)?)
-            .bind(ws(workspace_id))
-            .bind(&reservation_id)
-            .execute(&mut *tx)
-            .await?;
-            post_parent_debit_tx(&mut tx, workspace_id, &parent_lease_id, actual, now_ms).await?;
-        }
         tx.commit().await?;
-        Ok(DebitReceipt {
-            reservation_id: lease_id.to_string(),
-            actual: actual.clone(),
-            debited_at_ms: now_ms,
-        })
+        Ok(receipt)
+    }
+
+    /// Atomically convert a durable execution hold into consumed accounting.
+    /// Completion is bound to the admitted action, lease subject, and core
+    /// digest. Retries return the same receipt; a crash cannot mark a hold
+    /// settled without posting its debit (including its parent's reservation).
+    pub async fn settle_kernel_execution(
+        &self,
+        workspace_id: &WorkspaceId,
+        reservation_id: &str,
+        action_id: &str,
+        session_subject: &str,
+        action_digest: &str,
+        now_ms: i64,
+    ) -> Result<ExecutionReservation, RepositoryError> {
+        let mut tx = self.pool().begin().await?;
+        let row = sqlx::query(
+            "SELECT id,lease_id,action_id,held_json,state,idempotency_key,created_at_ms,completed_at_ms,actual_json
+             FROM kernel_executions WHERE workspace_id=? AND id=?",
+        ).bind(ws(workspace_id)).bind(reservation_id).fetch_optional(&mut *tx).await?
+            .ok_or(RepositoryError::KernelReservationConflict)?;
+        let mut exec = parse_execution_row(&row)?;
+        let bound: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kernel_leases l
+             JOIN kernel_audit_events a ON a.workspace_id=l.workspace_id
+             WHERE l.workspace_id=? AND l.lease_id=? AND l.subject=?
+             AND a.session_id=l.subject AND a.action_digest=?
+             AND json_extract(a.detail,'$.host_kind')='policy_allow'
+             AND json_extract(a.detail,'$.action_id')=?)",
+        )
+        .bind(ws(workspace_id))
+        .bind(&exec.lease_id)
+        .bind(session_subject)
+        .bind(action_digest)
+        .bind(action_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exec.action_id != action_id || bound == 0 || exec.state == ExecutionState::Released {
+            return Err(RepositoryError::KernelReservationConflict);
+        }
+        if exec.state == ExecutionState::Settled {
+            tx.commit().await?;
+            return Ok(exec);
+        }
+        debit_kernel_lease_tx(
+            &mut tx,
+            workspace_id,
+            &exec.lease_id,
+            &exec.held,
+            &format!("execution-settle:{}", exec.id),
+            now_ms,
+        )
+        .await?;
+        sqlx::query("UPDATE kernel_executions SET state='settled',completed_at_ms=?,actual_json=? WHERE workspace_id=? AND id=? AND state='held'")
+            .bind(now_ms).bind(budget_json(&exec.held)?).bind(ws(workspace_id)).bind(&exec.id)
+            .execute(&mut *tx).await?;
+        exec.state = ExecutionState::Settled;
+        exec.completed_at_ms = Some(now_ms);
+        exec.actual = Some(exec.held.clone());
+        tx.commit().await?;
+        Ok(exec)
     }
 
     /// Release a reservation: the unspent held amount returns to the parent.
@@ -1463,8 +1417,9 @@ impl Database {
         row.map(|r| session_from_row(&r)).transpose()
     }
 
-    /// Every active session, oldest first: the set the kernel hydrates its
-    /// validating-only registry from at open.
+    /// Every active session, oldest first, for lifecycle inspection. Restart
+    /// must invalidate these records before admitting actions, never hydrate
+    /// them into live authority without the current signing-key vault.
     pub async fn active_kernel_sessions(
         &self,
         workspace_id: &WorkspaceId,
@@ -1485,9 +1440,8 @@ impl Database {
     /// descendant subtree of each expired session**: the durable
     /// session-TTL rotation that bounds the stolen-session-key window.
     /// A child of a TTL-expired parent is destroyed even if the child
-    /// itself is within its TTL — its authority derives from the parent,
-    /// and the hydration pass would otherwise reject the dangling child
-    /// and fail the open until the database is manually repaired.
+    /// itself is within its TTL — its authority derives from the parent.
+    /// This lifecycle helper does not restore sessions after restart.
     /// Returns every destroyed subject (expired roots and descendants).
     ///
     /// NOTE: this commits the destroy transitions on its own. Prefer
@@ -1607,6 +1561,83 @@ impl Database {
         }
         tx.commit().await?;
         Ok((subjects, lease_ids))
+    }
+
+    /// Retire all authority from the previous owner. The caller must hold an
+    /// exclusive store ownership lock for its whole lifetime. All persisted
+    /// sessions (including descendants) predate that owner: destroy them and
+    /// revoke their leases and lease descendants in one transaction. Historical
+    /// rows, replay gates, spend, and reservations are never deleted or released.
+    /// Repeating this after a failed boot is an idempotent safe transition.
+    pub async fn invalidate_kernel_sessions_and_revoke(
+        &self,
+        workspace_id: &WorkspaceId,
+        now_ms: i64,
+    ) -> Result<(Vec<String>, Vec<String>), RepositoryError> {
+        let mut tx = self.pool().begin().await?;
+        // Write first to acquire SQLite's writer lock before selecting anything.
+        let subjects: Vec<String> = sqlx::query_scalar(
+            "UPDATE kernel_sessions SET active=0,destroyed_at_ms=max(created_at_ms,?)
+             WHERE workspace_id=? AND active=1 RETURNING subject",
+        )
+        .bind(now_ms)
+        .bind(ws(workspace_id))
+        .fetch_all(&mut *tx)
+        .await?;
+        // Include already inactive sessions to repair residue from older boots,
+        // and external delegations whose ancestry depends on a retired session.
+        let lease_ids: Vec<String> = sqlx::query_scalar(
+            "WITH RECURSIVE retired(lease_id) AS (
+                 SELECT l.lease_id FROM kernel_leases l
+                 WHERE l.workspace_id=? AND EXISTS (
+                     SELECT 1 FROM kernel_sessions s WHERE s.workspace_id=l.workspace_id
+                     AND (s.subject=l.subject OR s.subject=l.issuer_key_id))
+                 UNION
+                 SELECT l.lease_id FROM kernel_leases l JOIN retired r ON l.parent_id=r.lease_id
+                 WHERE l.workspace_id=?
+             )
+             INSERT OR IGNORE INTO kernel_revocations(lease_id,workspace_id,revoked_at_ms,reason)
+             SELECT lease_id,?,?, 'authority owner restarted' FROM retired
+             RETURNING lease_id",
+        )
+        .bind(ws(workspace_id))
+        .bind(ws(workspace_id))
+        .bind(ws(workspace_id))
+        .bind(now_ms)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((subjects, lease_ids))
+    }
+
+    /// A held execution, unaccounted settlement, or staged effect without durable
+    /// completion has unknown usage. Recovery must stop until it is reconciled; revocation cannot turn
+    /// an unknown execution into a refund.
+    pub async fn kernel_recovery_usage_unknown(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool, RepositoryError> {
+        let unknown: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kernel_executions e WHERE e.workspace_id=?
+                 AND (e.state='held' OR (e.state='settled' AND NOT EXISTS(
+                     SELECT 1 FROM kernel_lease_debits d
+                     WHERE d.workspace_id=e.workspace_id AND d.lease_id_link=e.lease_id
+                     AND d.idempotency_key='execution-settle:' || e.id
+                     AND json(d.amounts_json)=json(e.actual_json)))))
+             OR EXISTS(SELECT 1 FROM kernel_audit_events staged WHERE staged.workspace_id=?
+                 AND json_extract(staged.detail,'$.host_kind')='tool_staged'
+                 AND NOT EXISTS(SELECT 1 FROM kernel_audit_events completed
+                     WHERE completed.workspace_id=staged.workspace_id
+                     AND completed.action_digest=staged.action_digest
+                     AND completed.session_id=staged.session_id
+                     AND completed.seq>staged.seq
+                     AND json_extract(completed.detail,'$.host_kind')='tool_committed'))",
+        )
+        .bind(ws(workspace_id))
+        .bind(ws(workspace_id))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(unknown != 0)
     }
 
     /// Destroy the named sessions AND revoke the named leases in ONE
@@ -1876,8 +1907,8 @@ impl Database {
 
     /// Live references to a generation: leases with `issuer_key_id=key_id`
     /// that are neither revoked nor expired (`expires_at_ms > now_ms`).
-    /// This is the purge gate: a nonzero count means deleting the
-    /// generation would orphan outstanding leases, so the purge refuses.
+    /// A nonzero count prevents purge. Purge also retains generations needed
+    /// by historical lease documents, independently of this live count.
     pub async fn live_lease_refs_to_generation(
         &self,
         workspace_id: &WorkspaceId,
@@ -1890,8 +1921,8 @@ impl Database {
         Ok(n)
     }
 
-    /// Every live lease document (unexpired, unrevoked): the set the
-    /// re-validation self-check walks at open.
+    /// Every live lease document (unexpired, unrevoked). Historical integrity
+    /// checks use `kernel_historical_leases` independently of admission.
     pub async fn kernel_live_leases(
         &self,
         workspace_id: &WorkspaceId,
@@ -1911,6 +1942,23 @@ impl Database {
         )
         .bind(ws(workspace_id))
         .bind(now_ms)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(lease_from_row).collect()
+    }
+
+    /// All retained signed documents, including revoked and expired leases.
+    /// Integrity validation must be independent of current admission eligibility.
+    pub async fn kernel_historical_leases(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<LeaseDocument>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT lease_id,parent_id,subject,issuer_key_id,issued_at_ms,protocol_version,
+             scope_json,limits_json,depth,depth_limit,lease_nonce,signature,approved_action_digest
+             FROM kernel_leases WHERE workspace_id=? ORDER BY issued_at_ms,lease_id",
+        )
+        .bind(ws(workspace_id))
         .fetch_all(self.pool())
         .await?;
         rows.iter().map(lease_from_row).collect()
@@ -1942,8 +1990,8 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Purge one generation row, atomically gated on the live-lease
-    /// predicate and a purge permit.
+    /// Purge one generation row, atomically gated on retained lease references
+    /// (including revoked/expired history) and a purge permit.
     ///
     /// The purge runs on a single pooled connection: the permit row is
     /// inserted, the predicate re-verified, and the generation row deleted
@@ -2036,7 +2084,7 @@ pub struct KernelSessionRow {
 pub enum PurgeOutcome {
     /// The generation row was deleted.
     Purged,
-    /// The row was kept: at least one live lease still references it.
+    /// The row was kept: a live or historical lease still references it.
     StillReferenced,
     /// The row was kept: it is one of the kernel's live generations
     /// (current issuer/host). Purging it would orphan the signing key in
@@ -2117,6 +2165,17 @@ async fn purge_key_generation_permitted(
     use sqlx::Acquire;
     let mut tx = (&mut *conn).begin().await?;
     if live_lease_refs_tx(&mut tx, workspace_id, key_id, now_ms).await? != 0 {
+        tx.rollback().await?;
+        return Ok(PurgeOutcome::StillReferenced);
+    }
+    let historical_refs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kernel_leases WHERE workspace_id=? AND issuer_key_id=?",
+    )
+    .bind(ws(workspace_id))
+    .bind(key_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if historical_refs != 0 {
         tx.rollback().await?;
         return Ok(PurgeOutcome::StillReferenced);
     }
@@ -2560,5 +2619,129 @@ fn audit_event_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Repos
         detail: r.get("detail"),
         prev_hash: r.get("prev_hash"),
         hash: r.get("hash"),
+    })
+}
+
+/// Post direct lease consumption inside the caller's accounting transaction.
+async fn debit_kernel_lease_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &WorkspaceId,
+    lease_id: &str,
+    actual: &Budget,
+    idempotency_key: &str,
+    now_ms: i64,
+) -> Result<DebitReceipt, RepositoryError> {
+    if let Some(existing) = sqlx::query(
+        "SELECT lease_id_link,amounts_json,debited_at_ms FROM kernel_lease_debits
+             WHERE workspace_id=? AND idempotency_key=?",
+    )
+    .bind(ws(workspace_id))
+    .bind(idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let prev_lease: String = existing.get("lease_id_link");
+        let prev_amounts = parse_budget(existing.get::<String, _>("amounts_json").as_str())?;
+        if prev_lease == lease_id && prev_amounts == *actual {
+            let at: i64 = existing.get("debited_at_ms");
+            return Ok(DebitReceipt {
+                reservation_id: lease_id.to_string(),
+                actual: actual.clone(),
+                debited_at_ms: at,
+            });
+        }
+        return Err(RepositoryError::KernelDebitConflict);
+    }
+    let row = sqlx::query(
+        "SELECT caps_json,reserved_out_json,consumed_json FROM kernel_budget_accounts
+             WHERE workspace_id=? AND lease_id=?",
+    )
+    .bind(ws(workspace_id))
+    .bind(lease_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| insufficient(&format!("unknown lease {lease_id}")))?;
+    let caps = parse_budget(row.get::<String, _>("caps_json").as_str())?;
+    let reserved_out = parse_budget(row.get::<String, _>("reserved_out_json").as_str())?;
+    let consumed = parse_budget(row.get::<String, _>("consumed_json").as_str())?;
+    let remaining = caps.saturating_sub(&reserved_out).saturating_sub(&consumed);
+    if !remaining.covers(actual) {
+        return Err(insufficient(&format!(
+            "lease {lease_id} cannot cover direct debit"
+        )));
+    }
+    // A reservation-backed child also spends against its reservation:
+    // check the reservation's available hold before writing anything, so
+    // a desynchronized ledger fails closed instead of half-applying.
+    let child_reservation = sqlx::query(
+        "SELECT reservation_id,parent_lease_id,held_json,consumed_json
+             FROM kernel_reservations
+             WHERE workspace_id=? AND child_lease_id=? AND state='active'
+             ORDER BY created_at_ms LIMIT 1",
+    )
+    .bind(ws(workspace_id))
+    .bind(lease_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(res) = &child_reservation {
+        let held = parse_budget(res.get::<String, _>("held_json").as_str())?;
+        let res_consumed = parse_budget(res.get::<String, _>("consumed_json").as_str())?;
+        let available = held.saturating_sub(&res_consumed);
+        if !available.covers(actual) {
+            return Err(insufficient(&format!(
+                "reservation for child lease {lease_id} cannot cover direct debit"
+            )));
+        }
+    }
+    sqlx::query(
+        "INSERT INTO kernel_lease_debits(workspace_id,idempotency_key,lease_id_link,
+             amounts_json,debited_at_ms) VALUES(?,?,?,?,?)",
+    )
+    .bind(ws(workspace_id))
+    .bind(idempotency_key)
+    .bind(lease_id)
+    .bind(budget_json(actual)?)
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await?;
+    let new_consumed = consumed
+        .checked_add(actual)
+        .ok_or_else(|| insufficient("account consumed overflow"))?;
+    sqlx::query(
+        "UPDATE kernel_budget_accounts SET consumed_json=?,updated_at=?
+             WHERE workspace_id=? AND lease_id=?",
+    )
+    .bind(budget_json(&new_consumed)?)
+    .bind(now_ms)
+    .bind(ws(workspace_id))
+    .bind(lease_id)
+    .execute(&mut **tx)
+    .await?;
+    // Post the child's spend to the reservation ledger in the same
+    // transaction: the reservation's consumed grows, and the parent's
+    // reserved_out shrinks by `actual` while its consumed grows by
+    // `actual` (counted exactly once — see post_parent_debit_tx).
+    if let Some(res) = &child_reservation {
+        let reservation_id: String = res.get("reservation_id");
+        let parent_lease_id: String = res.get("parent_lease_id");
+        let res_consumed = parse_budget(res.get::<String, _>("consumed_json").as_str())?;
+        let res_new = res_consumed
+            .checked_add(actual)
+            .ok_or_else(|| insufficient("reservation consumed overflow"))?;
+        sqlx::query(
+            "UPDATE kernel_reservations SET consumed_json=?
+                 WHERE workspace_id=? AND reservation_id=?",
+        )
+        .bind(budget_json(&res_new)?)
+        .bind(ws(workspace_id))
+        .bind(&reservation_id)
+        .execute(&mut **tx)
+        .await?;
+        post_parent_debit_tx(tx, workspace_id, &parent_lease_id, actual, now_ms).await?;
+    }
+    Ok(DebitReceipt {
+        reservation_id: lease_id.to_string(),
+        actual: actual.clone(),
+        debited_at_ms: now_ms,
     })
 }

@@ -22,9 +22,10 @@
 //!   authorizes against.
 //! - Authority state is durable in `lumen-db` (leases, revocations,
 //!   nonces, one-shot uses, budgets, audit events) via the checked-in
-//!   migrations; the in-memory structures (`SessionRegistry`,
-//!   `RevocationIndex`, `NonceStore`, `BudgetLedger`) are hot caches
-//!   hydrated at startup.
+//!   migrations. Startup atomically invalidates every prior session and its
+//!   lease descendants before admission. `SessionRegistry` starts empty;
+//!   only fresh vault identities establish live authority. Revocations and
+//!   budget accounting are restored from durable state.
 //!
 //! ## Async boundary
 //!
@@ -41,23 +42,14 @@
 //!
 //! ## Budget settlement
 //!
-//! `authorize_envelope` enforces the budget *admission* check (the leaf
-//! lease's remaining budget must cover one execution) but does not
-//! reserve or debit: there is no settle signal in the pipeline (nothing
-//! reports execution usage back to the kernel), and reserving without a
-//! release path would leak budget. Child-lease mints reserve against
-//! their parent. Wiring a debit-on-commit settle step is a coordinator
-//! design decision; it needs a `KernelClient` settle method and a policy
-//! for failed executions, so it is deliberately not invented here.
+//! `authorize_envelope` reserves one execution against the leaf budget. The
+//! server persists that hold before returning `Allow`. A durable
+//! `tool_committed` completion posts its debit and terminal execution state in
+//! one transaction before acknowledging completion. Interrupted dispatch or
+//! accounting leaves a held row, which blocks recovery until reconciled.
 //!
-//! The ledger is a write-through cache of the durable `kernel_budget_accounts`
-//! rows: mint writes both, and a future settle path must write both. At open
-//! the ledger restores the full account state (caps, held reservations,
-//! consumed spend) via [`BudgetLedger::restore_account`], so settled spend
-//! is never forgotten by a restart and admission cannot over-authorize.
-//! Reservation *objects* are not restored into the ledger — only the
-//! aggregate held amounts admission needs; per-reservation reconciliation
-//! stays at the store level (`active_kernel_reservations`).
+//! The ledger caches durable budget accounts. Boot restores caps, child holds,
+//! and consumption; it never releases unknown execution holds or refunds spend.
 //!
 //! ## Key custody
 //!
@@ -66,18 +58,17 @@
 //! `ZeroizeOnDrop`, enabled by the `zeroize` feature in
 //! `lumen-core/Cargo.toml`; the `kernel_keys_zeroize_on_drop` test pins the
 //! feature so it cannot be silently removed). They are never written to disk
-//! or logs. A kernel restart generates fresh keys, which the host must treat
-//! as a key rotation: **retired generations' verifying keys are retained
-//! durably in `kernel_key_generations`, so leases minted under a retired
-//! issuer keep verifying after restart**; only the private keys die with the
-//! boot (zeroized on drop at rotation).
+//! or logs. A kernel restart generates fresh keys and ends old session
+//! authority. Recorded public keys support historical signature integrity
+//! checks, independently of admission; they never restore a live session.
+//! Purge retains public keys referenced by any historical signed lease.
 //!
 //! Signatures that must survive a restart are keyed to their generation:
 //! every boot records its issuer/host verifying keys in the durable
-//! `kernel_key_generations` table, and lease validation resolves each root
-//! document's `issuer_key_id` through the [`IssuerKeyResolver`]
-//! implementation over the in-memory generation index (hydrated at open),
-//! with the kill-list checked first. A generation that was killed
+//! `kernel_key_generations` table. Mid-boot key rotation resolves still-live
+//! leases through [`IssuerKeyResolver`], with the kill-list checked first.
+//! Across a restart, old sessions and leases are invalidated regardless of
+//! whether the public signature still verifies. A generation that was killed
 //! (`kernel_killed_generations`) fails closed even though its verifying key
 //! remains recorded. [`AuthorityKernelClient::verify_kernel_audit`]
 //! resolves each checkpoint's signing key from those recorded generations,
@@ -86,6 +77,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -96,11 +88,12 @@ use lumen_core::canonical::{RealFsResolver, ResourceScope};
 use lumen_core::identity::{PrincipalId, WorkspaceId};
 use lumen_core::kernel_audit::{AuditLink, verify_event_chain};
 use lumen_core::lease::{
-    AuthorizeParams, CanonicalAction, DEFAULT_SESSION_MAX_LIFETIME_MS, IssuerKeyResolver,
-    KernelKeys, LeaseDocument as CoreLeaseDocument, LeaseError, LeaseLimits as CoreLeaseLimits,
-    LeaseResolver, OneShotGrant as CoreOneShotGrant, OneShotTracker, RevocationIndex,
-    RootLeaseParams, SessionRegistry, VhlRequest, authorize_envelope, mint_one_shot_lease,
-    mint_root_lease, validate_chain,
+    AuthorizeParams, CanonicalAction, ChildLeaseParams, DEFAULT_SESSION_MAX_LIFETIME_MS,
+    IssuerKeyResolver, KernelKeys, LeaseDocument as CoreLeaseDocument,
+    LeaseLimits as CoreLeaseLimits, LeaseResolver, OneShotGrant as CoreOneShotGrant,
+    OneShotTracker, RevocationIndex, RootLeaseParams, SessionRegistry, VhlRequest,
+    authorize_envelope, execution_reservation_id, mint_child_lease, mint_one_shot_lease,
+    mint_root_lease,
 };
 use lumen_core::nonce::NonceStore;
 use lumen_core::operator::{AuthorityRequest, OperatorAuthorityPort, OperatorOperation};
@@ -117,9 +110,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kernel_client::{
-    ActionEnvelope, AuditEvent, AuditRef, KernelClient, KernelError, KernelFuture, KeyPurgeReport,
-    KeyRotationReport, LeaseDocument, LeaseLimits, LeaseVerification, OneShotGrant, PolicyDecision,
-    SessionEndReport, SessionIdentityAuthority, SessionIdentityInfo, now_ms,
+    ActionEnvelope, AuditEvent, AuditRef, CoreActionDigest, KernelClient, KernelError,
+    KernelFuture, KeyPurgeReport, KeyRotationReport, LeaseDocument, LeaseLimits, LeaseVerification,
+    OneShotGrant, PolicyDecision, SessionEndReport, SessionIdentityAuthority, SessionIdentityInfo,
+    now_ms,
 };
 use crate::kernel_convert::{to_frozen_envelope, to_host_decision};
 
@@ -183,6 +177,24 @@ struct PendingApproval {
     expires_at_ms: i64,
 }
 
+/// Approval outbox delivery view. The authoritative digest stays in the core
+/// action domain at every public server boundary; its wire value stays a string.
+///
+/// ```compile_fail
+/// use lumen_server::{ApprovalRequestView, HostTransportDigest};
+/// fn substitute(request: &mut ApprovalRequestView, host: HostTransportDigest) {
+///     request.action_digest = host;
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalRequestView {
+    pub request_id: String,
+    pub action_digest: CoreActionDigest,
+    pub session_subject: String,
+    pub nonce: String,
+    pub expires_at_ms: i64,
+}
+
 /// Durable approval request awaiting a human decision (host/VHL poller
 /// view). Read from the database, not the in-memory outbox mirror, so a
 /// poller sees requests that survived a restart.
@@ -190,7 +202,7 @@ struct PendingApproval {
 pub struct PendingApprovalView {
     pub request_id: String,
     pub session_subject: String,
-    pub action_digest: String,
+    pub action_digest: CoreActionDigest,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
 }
@@ -214,8 +226,8 @@ pub struct GenerationIndex {
 }
 
 /// Point-in-time issuer-key view for lease validation: the resolver the
-/// phase-1 `validate_chain` and the envelope path consult so retired
-/// generations keep verifying after a restart.
+/// phase-1 `validate_chain` and the envelope path consult after mid-boot
+/// key rotation. Resolving a signature key cannot establish live authority.
 #[derive(Clone, Default)]
 struct IssuerKeySnapshot {
     keys: HashMap<String, VerifyingKey>,
@@ -361,6 +373,10 @@ pub struct AuthorityKernel {
     /// kernel is dropped (see `Drop`).
     rt: Option<tokio::runtime::Runtime>,
     config: AuthorityKernelConfig,
+    /// OS lock on the database inode, held across boot and every action until
+    /// the last client/worker drops. Aliases and hard links share the lock;
+    /// process death releases it automatically. SQLite uses separate locks.
+    _store_owner: Option<File>,
 }
 
 impl Drop for AuthorityKernel {
@@ -493,10 +509,9 @@ impl AuthorityKernel {
         }
     }
 
-    /// Boot tail (spec §4.2): generation hydration, fresh-generation
-    /// recording, session TTL expiry, session hydration, boot audit, the
-    /// re-validation self-check, and the purge pass. Runs on a blocking
-    /// worker; the state mutex is never held across audit or db calls.
+    /// Boot while exclusively owning the store: invalidate prior authority,
+    /// reject unknown usage, restore accounting, record fresh generations,
+    /// audit, and check historical integrity before returning a usable client.
     fn boot_sequence_sync(&self) -> Result<(), KernelError> {
         // 0. Wall-clock rollback check, before any authority decision.
         //    The durable time anchor is the greatest effective time the
@@ -530,8 +545,66 @@ impl AuthorityKernel {
             state.time_high_water_persisted_ms = now;
         }
         let boot_id = format!("boot-{}", Uuid::new_v4());
-        let max_lifetime = self.config.session_max_lifetime_ms;
-        let ttl = max_lifetime.unwrap_or(DEFAULT_SESSION_MAX_LIFETIME_MS);
+        // No public record restores signing authority. Invalidate before any
+        // fallible boot tail; a failed tail leaves the same safe durable state.
+        let historical_leases = self.db_run(|db, ws| db.kernel_historical_leases(ws))?;
+        let (invalidated, revoked_ids) =
+            self.db_run(|db, ws| db.invalidate_kernel_sessions_and_revoke(ws, now))?;
+        {
+            let mut state = self.state.lock().expect("kernel state mutex poisoned");
+            state
+                .sessions
+                .set_max_lifetime(self.config.session_max_lifetime_ms);
+            for id in &revoked_ids {
+                state.revocations.revoke(id);
+            }
+        }
+        if self.db_run(|db, ws| db.kernel_recovery_usage_unknown(ws))? {
+            return Err(KernelError::Unavailable(
+                "unknown execution usage blocks recovery; reconcile durable executions and staged effects".into(),
+            ));
+        }
+        // Restore the full budget account state (caps, held reservations,
+        // consumed spend) from durable storage. A missing or corrupt account
+        // blocks recovery: declared caps cannot prove that consumption is zero.
+        let declared = self.db_run(|db, ws| db.kernel_lease_budgets(ws))?;
+        let accounts = self.db_run(|db, ws| db.kernel_budget_account_states(ws))?;
+        let account_state: HashMap<String, (Budget, Budget, Budget)> = accounts
+            .into_iter()
+            .map(|(id, caps, reserved, consumed)| (id, (caps, reserved, consumed)))
+            .collect();
+
+        for (lease_id, _caps) in declared {
+            if let Some((caps, reserved, consumed)) = account_state.get(&lease_id) {
+                self.ledger
+                    .restore_account(&lease_id, caps, reserved, consumed)
+            } else {
+                return Err(KernelError::Unavailable(format!(
+                    "budget account missing for lease {lease_id}; unknown usage blocks recovery"
+                )));
+            }
+            .map_err(|e| KernelError::Unavailable(format!("kernel budget restore: {e}")))?;
+        }
+
+        // Public session material is checked for integrity only. Never register
+        // these keys in SessionRegistry: new authority requires the fresh vault.
+        let subjects = self.db_run(|db, ws| db.kernel_session_subjects(ws))?;
+        let mut historical_session_keys = HashMap::new();
+        for subject in &subjects {
+            let row = self
+                .db_run(|db, ws| db.kernel_session(ws, subject))?
+                .ok_or_else(|| {
+                    KernelError::Unavailable("historical session record missing".into())
+                })?;
+            let vk = parse_recorded_verifying_key("session", &row.subject, &row.verifying_key_hex)?;
+            if session_address(&vk) != row.subject {
+                return Err(KernelError::Unavailable(format!(
+                    "session row '{}' verifying key does not derive its subject; historical identity mismatch",
+                    row.subject
+                )));
+            }
+            historical_session_keys.insert(row.subject, vk);
+        }
 
         // 1. Load recorded generations + kill set into the in-memory
         //    index. A malformed recorded key fails the open rather than
@@ -629,101 +702,6 @@ impl AuthorityKernel {
             None => 0,
         };
 
-        // 3. Session TTL: destroy-transition every session older than the
-        //    max lifetime, and revoke its leases durably (spec §6.3). The
-        //    expiry and the revocations commit in ONE transaction: a crash
-        //    between them would leave destroyed sessions with live,
-        //    unrevoked leases, and the next boot's re-validation
-        //    self-check would fail the open on `SubjectInactive` (the
-        //    expiry finds nothing — the rows are already inactive — so the
-        //    leases would never be revoked).
-        let (expired, revoked_ids) = self.db_run(|db, ws| {
-            db.expire_kernel_sessions_and_revoke(ws, ttl, now, "session TTL expired")
-        })?;
-        {
-            let mut state = self.state.lock().expect("kernel state mutex poisoned");
-            for id in &revoked_ids {
-                state.revocations.revoke(id);
-            }
-            for subject in &expired {
-                state.sessions.deactivate(subject);
-            }
-        }
-
-        // 4. Hydrate the session registry from active rows
-        //    (validating-only: the vault stays empty, D2). Every row is
-        //    verified before registration:
-        //    - subject == session_address(verifying_key): the subject is
-        //      *derived from* the key, so a tampered row (subject/key
-        //      mismatch) cannot hydrate a session the key doesn't own.
-        //    - the parent graph resolves to live sessions with no cycles:
-        //      a dangling or cyclic parent fails the open rather than
-        //      hydrating a session whose ancestry can't authorize.
-        //    TTL expiry was already destroy-transitioned in step 3 with
-        //    the same `now`, so every row here is within its lifetime.
-        let active = self.db_run(|db, ws| db.active_kernel_sessions(ws))?;
-        {
-            let mut state = self.state.lock().expect("kernel state mutex poisoned");
-            state.sessions.set_max_lifetime(max_lifetime);
-            for row in &active {
-                let vk =
-                    parse_recorded_verifying_key("session", &row.subject, &row.verifying_key_hex)?;
-                if session_address(&vk) != row.subject {
-                    return Err(KernelError::Unavailable(format!(
-                        "session row '{}' verifying key does not derive its subject; \
-                         refusing to hydrate a mismatched identity",
-                        row.subject
-                    )));
-                }
-                state.sessions.register(
-                    row.subject.clone(),
-                    row.parent_subject.clone(),
-                    vk,
-                    row.created_at_ms,
-                );
-            }
-            for row in &active {
-                let mut current = row.subject.clone();
-                let mut seen = HashSet::new();
-                loop {
-                    if !seen.insert(current.clone()) {
-                        return Err(KernelError::Unavailable(format!(
-                            "session ancestry cycle at '{current}'; refusing to hydrate"
-                        )));
-                    }
-                    if seen.len() > 256 {
-                        return Err(KernelError::Unavailable(format!(
-                            "session ancestry of '{}' exceeds 256 hops; refusing to hydrate",
-                            row.subject
-                        )));
-                    }
-                    let record = state.sessions.get(&current).ok_or_else(|| {
-                        KernelError::Unavailable(format!(
-                            "session '{current}' has no hydrated record; refusing to hydrate"
-                        ))
-                    })?;
-                    if !record.active {
-                        return Err(KernelError::Unavailable(format!(
-                            "session '{current}' is not active; refusing to hydrate"
-                        )));
-                    }
-                    match &record.parent_subject {
-                        Some(parent) => match state.sessions.get(parent) {
-                            Some(p) if p.active => current = parent.clone(),
-                            _ => {
-                                return Err(KernelError::Unavailable(format!(
-                                    "session '{}' names unknown or inactive parent '{parent}'; \
-                                     refusing to hydrate",
-                                    row.subject
-                                )));
-                            }
-                        },
-                        None => break,
-                    }
-                }
-            }
-        }
-
         // 5. Boot audit events (signed by the new host key).
         let recorded = |key_id: &str, role: &str, vk: &VerifyingKey| {
             serde_json::json!({
@@ -777,146 +755,58 @@ impl AuthorityKernel {
             "kernel",
             AuditEventKind::ActionProposed,
             "kernel",
-            "kernel.session.restored",
+            "kernel.session.invalidated",
             None,
             now,
             serde_json::json!({
-                "host_kind": "kernel.session.restored",
-                "count": active.len(),
+                "host_kind": "kernel.session.invalidated",
+                "count": invalidated.len(),
+                "revoked_leases": revoked_ids.len(),
                 "at_ms": now,
             }),
         )
         .map(|_| ())?;
 
-        // 6. Re-validation self-check: every live lease's chain must
-        //    verify against the generation snapshot. Failure classes:
-        //    - UnknownIssuerGeneration: counted, open proceeds. These are
-        //      pre-migration leases (spec §7): issued before generations
-        //      were recorded, so no verifying key exists. They are NOT
-        //      treated as tamper, but they also never authorize — any
-        //      decision path re-validates and fails closed on them.
-        //    - Legacy pre-migration leases (subject has no
-        //      `kernel_sessions` row: sessions were not durably recorded
-        //      before migration 0025): counted, open proceeds. Like
-        //      unknown-generation leases they never authorize — decision
-        //      paths re-validate and fail closed on `SubjectInactive`.
-        //    - AlreadyConsumed / KilledIssuerGeneration: counted as
-        //      verified_ok for the self-check's liveness purpose (a
-        //      consumed one-shot or a killed generation is a *decided*
-        //      state, not corruption); both still deny at decision time.
-        //    - Anything else (signature mismatch against a known
-        //      generation, unknown session key, inactive session,
-        //      revocation, chain break): tamper or corruption evidence —
-        //      fails the open. A live lease naming a subject WITH a
-        //      session row that is inactive is corruption (or crash
-        //      residue the repair pass below missed), not migration:
-        //      sessions are always recorded at creation once migration
-        //      0025 has run.
-        //
-        //    Crash-residue repair (before the lease fetch): a crash in the
-        //    pre-atomicity window between the session destroy transition
-        //    and the lease revocation leaves live leases for destroyed
-        //    sessions. Those leases must never authorize, so they are
-        //    durably revoked here; without the repair the self-check
-        //    would fail the open on `SubjectInactive` and the kernel
-        //    would stay down until the database is repaired by hand.
-        let repaired_ids = self.db_run(|db, ws| {
-            db.revoke_leases_for_inactive_sessions(
-                ws,
-                now,
-                "boot repair: session destroyed without revocation",
-            )
-        })?;
-        {
-            let mut state = self.state.lock().expect("kernel state mutex poisoned");
-            for id in &repaired_ids {
-                state.revocations.revoke(id);
-            }
-        }
-        if !repaired_ids.is_empty() {
-            self.audit_event_sync(
-                "kernel",
-                AuditEventKind::ActionProposed,
-                "kernel",
-                "kernel.session.residue_repaired",
-                None,
-                now,
-                serde_json::json!({
-                    "host_kind": "kernel.session.residue_repaired",
-                    "revoked_leases": repaired_ids.len(),
-                    "at_ms": now,
-                }),
-            )
-            .map(|_| ())?;
-        }
-        let leases = self.db_run(|db, ws| db.kernel_live_leases(ws, now))?;
-        // Preserve the total live-lease count for the audit BEFORE the
-        // legacy filter below narrows the re-validation set: the audit
-        // must record every live lease, not just the ones we re-walk.
-        let total_live_leases = leases.len() as u64;
-        let session_subjects = self.db_run(|db, ws| db.kernel_session_subjects(ws))?;
-        let mut legacy_leases: u64 = 0;
-        let leases: Vec<_> = leases
-            .into_iter()
-            .filter(|lease| {
-                if session_subjects.contains(&lease.subject) {
-                    true
-                } else {
-                    legacy_leases += 1;
-                    false
-                }
-            })
-            .collect();
-        let mut verified_ok: u64 = 0;
-        let mut unknown_generation: u64 = 0;
+        // Historical signature verification is independent of admission.
+        // Revocation and expiry never suppress checking of retained historical rows,
+        // but this pass never registers a session or restores lease authority.
+        let total_historical_leases = historical_leases.len() as u64;
+        let mut verified_ok = 0u64;
+        let mut unknown_generation = 0u64;
+        let mut legacy_leases = 0u64;
         {
             let state = self.state.lock().expect("kernel state mutex poisoned");
-            let snapshot = state.issuer_snapshot();
-            let db_resolver = DbLeaseResolver {
-                kernel: self,
-                store_error: Cell::new(None),
-            };
-            let one_shot: HashSet<String> = HashSet::new();
-            for lease in &leases {
-                // Walk the chain to the root via the resolver (cap 64
-                // hops against corrupt data); `validate_chain` re-walks
-                // and requires the presented chain to match exactly.
-                let mut chain_ids = vec![lease.lease_id.clone()];
-                let mut parent = lease.parent_id.clone();
-                for _ in 0..64 {
-                    let Some(pid) = parent else { break };
-                    chain_ids.push(pid.clone());
-                    parent = db_resolver.lease(&pid).and_then(|d| d.parent_id);
+            for lease in &historical_leases {
+                if !subjects.contains(&lease.subject) {
+                    legacy_leases += 1;
                 }
-                match validate_chain(
-                    &db_resolver,
-                    &chain_ids,
-                    &state.revocations,
-                    &state.sessions,
-                    &snapshot,
-                    &one_shot,
-                    now,
-                ) {
-                    Ok(_)
-                    | Err(LeaseError::AlreadyConsumed(_))
-                    | Err(LeaseError::KilledIssuerGeneration(_)) => {
+                let key = if lease.is_root() {
+                    state.generations.issuer.get(&lease.issuer_key_id)
+                } else {
+                    historical_session_keys.get(&lease.issuer_key_id)
+                };
+                if state.generations.killed.contains(&lease.issuer_key_id) {
+                    continue;
+                }
+                match key {
+                    Some(key) => {
+                        lease.verify_signature(key).map_err(|e| {
+                            KernelError::Unavailable(format!(
+                                "startup re-validation failed for lease {}: {e}",
+                                lease.lease_id
+                            ))
+                        })?;
                         verified_ok += 1;
                     }
-                    Err(LeaseError::UnknownIssuerGeneration(_)) => {
-                        unknown_generation += 1;
-                    }
-                    Err(e) => {
+                    None if lease.is_root() => unknown_generation += 1,
+                    None if !subjects.contains(&lease.subject) => {}
+                    None => {
                         return Err(KernelError::Unavailable(format!(
-                            "startup re-validation failed for lease {}: {e}",
-                            lease.lease_id
+                            "startup re-validation failed for lease {}: unknown historical session key {}",
+                            lease.lease_id, lease.issuer_key_id
                         )));
                     }
                 }
-            }
-            if let Some(store_error) = db_resolver.take_store_error() {
-                return Err(KernelError::Unavailable(format!(
-                    "startup re-validation hit a store failure: {store_error}"
-                )));
             }
         }
         self.audit_event_sync(
@@ -928,8 +818,8 @@ impl AuthorityKernel {
             now,
             serde_json::json!({
                 "host_kind": "kernel.restart.revalidation",
-                "live_leases": total_live_leases,
-                "verified_ok": verified_ok,
+                "historical_leases": total_historical_leases,
+                "historical_signatures_verified": verified_ok,
                 "unknown_generation": unknown_generation,
                 "legacy_leases": legacy_leases,
                 "tamper_failures": 0,
@@ -945,7 +835,8 @@ impl AuthorityKernel {
 
     /// Purge retired generations: every recorded generation except the
     /// current issuer/host ids is a candidate. Issuer generations need
-    /// zero live lease refs; host generations additionally need zero
+    /// zero retained lease refs, including revoked and expired documents;
+    /// host generations additionally need zero
     /// retained checkpoints (the store refuses host generations while any
     /// checkpoint references them, of any age — checkpoints are
     /// immutable and never deleted, so an age window would let a host key
@@ -1227,6 +1118,29 @@ impl AuthorityKernel {
             return to_host_decision(&FrozenDecision::deny(reason), envelope);
         }
 
+        let (session_live, revoked) = {
+            let state = self.state.lock().expect("kernel state mutex poisoned");
+            (
+                state.vault.is_live(&frozen.session_id)
+                    && state.sessions.is_subject_live(&frozen.session_id, now),
+                frozen
+                    .lease_chain
+                    .iter()
+                    .any(|id| state.revocations.is_revoked(&id.to_string())),
+            )
+        };
+        if !session_live {
+            let reason = if revoked {
+                DenyReason::lease_revoked(
+                    "session authority is inactive and its lease is revoked; establish a fresh session",
+                )
+            } else {
+                DenyReason::no_lease("session authority is inactive; establish a fresh session")
+            };
+            self.audit_decision(&frozen, "deny", &reason)?;
+            return to_host_decision(&FrozenDecision::deny(reason), envelope);
+        }
+
         // Durable replay gate: the nonce row commits before evaluation,
         // so a crash between gate and decision still fails closed on
         // retry (the retry sees the replay, not a fresh envelope).
@@ -1257,7 +1171,8 @@ impl AuthorityKernel {
         // tracker consult the durable store; the in-memory structures are
         // hot caches over the same rows. Issuer keys resolve through the
         // point-in-time generation snapshot (current + retired), not the
-        // live keys: retired generations keep verifying after restart.
+        // live keys: mid-boot rotation preserves live lease signatures, while
+        // restart invalidation independently removes session authority.
         let issuer_snapshot = {
             let state = self.state.lock().expect("kernel state mutex poisoned");
             state.issuer_snapshot()
@@ -1322,6 +1237,16 @@ impl AuthorityKernel {
             return Err(KernelError::Unavailable(format!(
                 "kernel store unavailable during authorization: {store_error}"
             )));
+        }
+
+        // Write the core's hold through BEFORE returning executable authority.
+        // A crash after this insert (including a later audit failure) leaves a
+        // durable held row: recovery refuses until usage is explicitly resolved.
+        if let Some(id) = execution_reservation_id(&decision) {
+            let reservation = self.ledger.get_execution(id).ok_or_else(|| {
+                KernelError::Unavailable("authorized execution reservation missing".into())
+            })?;
+            self.db_run(|db, ws| db.insert_kernel_execution(ws, &reservation))?;
         }
 
         // Persist the exact action behind any emitted approval request
@@ -1580,6 +1505,17 @@ impl AuthorityKernel {
         presented
             .verify_signature(&key)
             .map_err(|e| KernelError::VerificationFailed(format!("bad signature: {e}")))?;
+        // This seam verifies live authority. Historical integrity callers use
+        // CoreLeaseDocument::verify_signature with a retained public key.
+        let state = self.state.lock().expect("kernel state mutex poisoned");
+        if !state.vault.is_live(&stored.subject)
+            || !state.sessions.is_subject_live(&stored.subject, now)
+        {
+            return Err(KernelError::VerificationFailed(format!(
+                "subject {} is not live",
+                stored.subject
+            )));
+        }
         Ok(LeaseVerification {
             lease_id: lease.lease_id.clone(),
             subject: lease.subject.clone(),
@@ -1662,7 +1598,7 @@ impl AuthorityKernel {
                 grant.approval_id, row.state
             )));
         }
-        if row.action_digest != grant.action_digest {
+        if row.action_digest != grant.action_digest.as_str() {
             return Err(KernelError::OneShotRejected(
                 "grant does not bind the approved action".to_string(),
             ));
@@ -1801,7 +1737,7 @@ impl AuthorityKernel {
             &doc.subject,
             AuditEventKind::PolicyAllowed,
             &doc.subject,
-            &grant.action_digest,
+            grant.action_digest.as_str(),
             Some("allow"),
             now,
             serde_json::from_str(&detail).unwrap_or(serde_json::Value::Null),
@@ -1821,13 +1757,63 @@ impl AuthorityKernel {
             &event.session_id,
             kind,
             &event.session_id,
-            event.action_digest.as_deref().unwrap_or("none"),
+            event
+                .action_digest
+                .as_ref()
+                .map(CoreActionDigest::as_str)
+                .unwrap_or("none"),
             None,
             // Authority time: ingested host events join the same
             // monotonic audit chain.
             self.effective_now_sync()?,
             serde_json::from_str(&detail).unwrap_or(serde_json::Value::Null),
         )?;
+        if event.kind == "tool_committed" {
+            let reservation_id = event.payload.get("reservation_id").and_then(|v| v.as_str());
+            if let Some(reservation_id) = reservation_id {
+                let action_id = event
+                    .payload
+                    .get("action_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        KernelError::AuditFailed("execution completion missing action id".into())
+                    })?;
+                let digest = event.action_digest.as_ref().ok_or_else(|| {
+                    KernelError::AuditFailed("execution completion missing digest".into())
+                })?;
+                let completed = self.db_run(|db, ws| {
+                    db.settle_kernel_execution(
+                        ws,
+                        reservation_id,
+                        action_id,
+                        &event.session_id,
+                        digest.as_str(),
+                        stored.timestamp_ms,
+                    )
+                })?;
+                // Only update the hot ledger after the complete accounting
+                // transaction commits. Failed accounting leaves a durable hold
+                // and cannot be reported as Completed or recovered as a refund.
+                self.ledger
+                    .settle_execution(
+                        reservation_id,
+                        completed.actual.as_ref().ok_or_else(|| {
+                            KernelError::AuditFailed(
+                                "settled execution missing actual usage".into(),
+                            )
+                        })?,
+                        &format!("execution-settle:{reservation_id}"),
+                        completed.completed_at_ms.ok_or_else(|| {
+                            KernelError::AuditFailed(
+                                "settled execution missing completion time".into(),
+                            )
+                        })?,
+                    )
+                    .map_err(|e| {
+                        KernelError::AuditFailed(format!("execution accounting cache: {e}"))
+                    })?;
+            }
+        }
         Ok(AuditRef {
             event_id: stored.event_id.to_string(),
             chain_hash: stored.hash,
@@ -1852,6 +1838,38 @@ impl AuthorityKernel {
             .map_err(|e| KernelError::Unavailable(format!("mint failed: {e}")))?
         };
         self.db_run(|db, ws| db.insert_kernel_lease_with_budget(ws, &doc, now))?;
+        Ok(to_host_lease(&doc))
+    }
+
+    /// Delegate using the live parent's vault key; no signing key escapes.
+    /// Both the document and its parent budget reservation commit before return.
+    fn issue_child_lease_sync(
+        &self,
+        parent_id: &str,
+        params: ChildLeaseParams,
+    ) -> Result<LeaseDocument, KernelError> {
+        let now = self.effective_now_sync()?;
+        let parent = self
+            .db_run(|db, ws| db.kernel_lease(ws, parent_id))?
+            .ok_or_else(|| KernelError::Unavailable("delegation parent missing".into()))?;
+        self.verify_lease_sync(&to_host_lease(&parent))?;
+        let state = self.state.lock().expect("kernel state mutex poisoned");
+        let doc = state
+            .vault
+            .with_signing_key(&parent.subject, |signing| {
+                mint_child_lease(
+                    &parent,
+                    params,
+                    signing,
+                    &state.sessions,
+                    &state.revocations,
+                    &self.ledger,
+                    &self.nonces,
+                    now,
+                )
+            })
+            .map_err(|e| KernelError::Unavailable(format!("delegation: {e}")))?;
+        self.db_run(|db, ws| db.mint_kernel_child_lease(ws, &doc, now))?;
         Ok(to_host_lease(&doc))
     }
 
@@ -1910,9 +1928,9 @@ impl AuthorityKernel {
     /// - **Remembered path:** `end_session` errs but the kernel remembers
     ///   the subject (idempotent retry): the durable transition already
     ///   applied, so it is skipped.
-    /// - **Durable-only path (post-restart):** `end_session` errs and the
-    ///   subject is not remembered, but the hydrated registry still has
-    ///   active descendants — those lose authority now.
+    /// - **Registry fallback:** `end_session` errs and the subject is not
+    ///   remembered, but registry descendants are deactivated fail-closed.
+    ///   Boot never uses this path to restore authority from public records.
     ///   Anything else is an unknown session.
     fn destroy_session_identity_sync(
         &self,
@@ -1954,9 +1972,8 @@ impl AuthorityKernel {
                         // transition committed: rerun it now.
                         remembered
                     } else {
-                        // Post-restart: the vault holds no private key, but
-                        // the hydrated registry may still have active
-                        // descendants whose authority dies with this subject.
+                        // Fail-closed registry fallback. Startup never
+                        // hydrates previous sessions into this registry.
                         let descendants = sessions.active_descendants_inclusive(subject, now);
                         if descendants.is_empty() {
                             return Err(KernelError::Unavailable(format!(
@@ -2072,7 +2089,7 @@ impl AuthorityKernel {
 
     /// Drain the approval requests the kernel emitted (for the VHL
     /// delivery path and tests).
-    fn drain_approval_requests_sync(&self) -> Vec<VhlRequest> {
+    fn drain_approval_requests_sync(&self) -> Vec<ApprovalRequestView> {
         std::mem::take(
             &mut self
                 .state
@@ -2080,6 +2097,15 @@ impl AuthorityKernel {
                 .expect("kernel state mutex poisoned")
                 .outbox,
         )
+        .into_iter()
+        .map(|request| ApprovalRequestView {
+            request_id: request.request_id,
+            action_digest: CoreActionDigest::from_kernel_hex(request.action_digest),
+            session_subject: request.session_subject,
+            nonce: request.nonce,
+            expires_at_ms: request.expires_at_ms,
+        })
+        .collect()
     }
 
     /// List durable approval requests still awaiting a human decision.
@@ -2090,7 +2116,7 @@ impl AuthorityKernel {
             .map(|row| PendingApprovalView {
                 request_id: row.request_id,
                 session_subject: row.session_subject,
-                action_digest: row.action_digest,
+                action_digest: CoreActionDigest::from_kernel_hex(row.action_digest),
                 created_at_ms: row.created_at_ms,
                 expires_at_ms: row.expires_at_ms,
             })
@@ -2306,7 +2332,10 @@ fn to_host_lease(doc: &CoreLeaseDocument) -> LeaseDocument {
         depth_limit: doc.depth_limit,
         lease_nonce: doc.lease_nonce.clone(),
         signature: doc.signature.clone(),
-        approved_action_digest: doc.approved_action_digest.clone(),
+        approved_action_digest: doc
+            .approved_action_digest
+            .clone()
+            .map(CoreActionDigest::from_kernel_hex),
     }
 }
 
@@ -2339,7 +2368,10 @@ fn to_core_lease(lease: &LeaseDocument) -> Result<CoreLeaseDocument, String> {
         depth_limit: lease.depth_limit,
         lease_nonce: lease.lease_nonce.clone(),
         signature: lease.signature.clone(),
-        approved_action_digest: lease.approved_action_digest.clone(),
+        approved_action_digest: lease
+            .approved_action_digest
+            .clone()
+            .map(CoreActionDigest::into_kernel_hex),
     })
 }
 
@@ -2351,7 +2383,7 @@ fn to_core_lease(lease: &LeaseDocument) -> Result<CoreLeaseDocument, String> {
 fn to_core_grant(grant: &OneShotGrant) -> CoreOneShotGrant {
     CoreOneShotGrant {
         approval_id: grant.approval_id.clone(),
-        action_digest: grant.action_digest.clone(),
+        action_digest: grant.action_digest.clone().into_kernel_hex(),
         session_subject: grant.session_subject.clone(),
         signer_key_id: grant.signer_key_id.clone(),
         nonce: grant.nonce.clone(),
@@ -2380,11 +2412,31 @@ pub struct AuthorityKernelClient {
 }
 
 impl AuthorityKernelClient {
-    /// Open the kernel: connect the database (running migrations),
-    /// ensure the workspace row, generate fresh kernel keys, and hydrate
-    /// the in-memory caches (revocations, budget ledger) from durable
-    /// state.
+    /// Exclusively own the store, run migrations, and invalidate prior session
+    /// authority before returning a usable client. Restore durable accounting
+    /// without refunds and block on unknown usage. New actions require fresh
+    /// vault identities. The last client/worker holds ownership until drop.
     pub async fn open(config: AuthorityKernelConfig) -> Result<Self, KernelError> {
+        let store_owner = match &config.db {
+            AuthorityDb::Path(path) => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)
+                    .map_err(|e| {
+                        KernelError::Unavailable(format!("authority store ownership: {e}"))
+                    })?;
+                file.try_lock().map_err(|e| {
+                    KernelError::Unavailable(format!(
+                        "authority store already owned or cannot be locked: {e}"
+                    ))
+                })?;
+                Some(file)
+            }
+            AuthorityDb::Memory => None,
+        };
         let db = match &config.db {
             AuthorityDb::Path(path) => Database::connect(path)
                 .await
@@ -2416,33 +2468,6 @@ impl AuthorityKernelClient {
         for id in revoked {
             revocations.revoke(&id);
         }
-        // Restore the full budget account state (caps, held reservations,
-        // consumed spend) from durable storage. Leases that predate the
-        // budget-accounts table fall back to their declared caps at zero
-        // consumption. A corrupt account fails the open rather than
-        // hydrating an impossible ledger that would over-authorize.
-        let declared = db
-            .kernel_lease_budgets(&config.workspace)
-            .await
-            .map_err(|e| KernelError::Unavailable(format!("kernel budget hydration: {e}")))?;
-        let accounts = db
-            .kernel_budget_account_states(&config.workspace)
-            .await
-            .map_err(|e| KernelError::Unavailable(format!("kernel budget hydration: {e}")))?;
-        let account_state: HashMap<String, (Budget, Budget, Budget)> = accounts
-            .into_iter()
-            .map(|(id, caps, reserved, consumed)| (id, (caps, reserved, consumed)))
-            .collect();
-        let ledger = BudgetLedger::new();
-        for (lease_id, caps) in declared {
-            if let Some((caps, reserved, consumed)) = account_state.get(&lease_id) {
-                ledger.restore_account(&lease_id, caps, reserved, consumed)
-            } else {
-                ledger.register_lease(&lease_id, &caps)
-            }
-            .map_err(|e| KernelError::Unavailable(format!("kernel budget restore: {e}")))?;
-        }
-
         // Fresh key generation for this boot. The generation is recorded
         // durably (verifying keys only) inside `boot_sequence_sync` below,
         // so signatures made by this generation — audit checkpoints and
@@ -2454,7 +2479,7 @@ impl AuthorityKernelClient {
         let kernel = AuthorityKernel {
             fs: RealFsResolver,
             nonces: NonceStore::new(),
-            ledger,
+            ledger: BudgetLedger::new(),
             state: Mutex::new(KernelMutable {
                 keys,
                 generations: GenerationIndex::default(),
@@ -2473,12 +2498,12 @@ impl AuthorityKernelClient {
             db,
             rt: Some(rt),
             config,
+            _store_owner: store_owner,
         };
         let kernel = Arc::new(kernel);
         // The boot tail runs synchronously on a blocking worker (it does
-        // database IO through the kernel's private runtime): generation
-        // hydration, session TTL expiry, session hydration, audit, the
-        // re-validation self-check, and the purge pass.
+        // database IO through the kernel's private runtime). No caller can
+        // admit an action until invalidation and recovery checks finish.
         let boot = Arc::clone(&kernel);
         blocking(move || boot.boot_sequence_sync()).await?;
         Ok(Self { kernel })
@@ -2494,9 +2519,20 @@ impl AuthorityKernelClient {
         blocking(move || kernel.issue_root_lease_sync(params)).await
     }
 
+    /// Delegate a lease through the live parent's kernel-held session key.
+    pub async fn issue_child_lease(
+        &self,
+        parent_id: &str,
+        params: ChildLeaseParams,
+    ) -> Result<LeaseDocument, KernelError> {
+        let kernel = Arc::clone(&self.kernel);
+        let parent_id = parent_id.to_owned();
+        blocking(move || kernel.issue_child_lease_sync(&parent_id, params)).await
+    }
+
     /// Drain the approval requests the kernel emitted since the last
     /// drain (VHL delivery path / tests).
-    pub async fn drain_approval_requests(&self) -> Vec<VhlRequest> {
+    pub async fn drain_approval_requests(&self) -> Vec<ApprovalRequestView> {
         let kernel = Arc::clone(&self.kernel);
         // Infallible; unwrap is safe.
         blocking(move || Ok(kernel.drain_approval_requests_sync()))
@@ -2647,10 +2683,8 @@ impl KernelClient for AuthorityKernelClient {
     fn authoritative_action_digest(
         &self,
         envelope: &ActionEnvelope,
-    ) -> Result<String, KernelError> {
-        to_frozen_envelope(envelope)?
-            .digest()
-            .map_err(|e| KernelError::Unavailable(format!("digest failed: {e}")))
+    ) -> Result<CoreActionDigest, KernelError> {
+        crate::kernel_convert::core_action_digest(envelope)
     }
 
     fn decide<'a>(&'a self, envelope: &'a ActionEnvelope) -> KernelFuture<'a, PolicyDecision> {
