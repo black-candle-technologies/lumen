@@ -16,6 +16,9 @@ from runtime import Refused, Runtime, unique_object
 from verify_audit import verify
 
 
+EXPECTED_DENIAL_REASON = "scope_exceeded: one-shot lease is not bound to the presented action"
+
+
 def probe(candidate, expected_digest, kernel_probe, evidence):
     evidence.mkdir(exist_ok=False)
     (evidence / "leased").mkdir()
@@ -87,6 +90,11 @@ def probe(candidate, expected_digest, kernel_probe, evidence):
                             request = event["placeholder"].encode()
                             if len(request) > 16384:
                                 raise Refused("oversized bridge intent")
+                            intent = json.loads(request, object_pairs_hook=unique_object)
+                            if (type(intent.get("version")) is not int or intent["version"] != 2
+                                    or not isinstance(intent.get("tool_call_id"), str) or not intent["tool_call_id"]
+                                    or intent.get("tool") != "bct.read_file"):
+                                raise Refused("unexpected bridge request version or tool call")
                             result = subprocess.run([str(kernel_probe), str(evidence / "audit.sqlite3"),
                                                      str(evidence / "leased")], input=request,
                                                     capture_output=True, timeout=15, check=False,
@@ -100,8 +108,15 @@ def probe(candidate, expected_digest, kernel_probe, evidence):
                             verify(authority, anchor)
                             (evidence / "audit-anchor.json").write_text(json.dumps(anchor, indent=2) + "\n")
                             reply = authority["reply"]
-                            if reply["outcome"]["status"] != "denied":
-                                raise Refused("kernel did not deny the real tool request")
+                            # Audit integrity alone does not establish that the
+                            # bridge can decode this reply for the captured call.
+                            if (set(reply) != {"version", "tool_call_id", "action_digest", "outcome"}
+                                    or type(reply.get("version")) is not int
+                                    or reply["version"] != intent["version"]
+                                    or reply.get("tool_call_id") != intent["tool_call_id"]):
+                                raise Refused("host reply version or tool call correlation mismatch")
+                            if reply["outcome"] != {"status": "denied", "reason": EXPECTED_DENIAL_REASON}:
+                                raise Refused("kernel did not return the expected tool denial")
                             send({"type": "extension_ui_response", "id": event["id"], "value": json.dumps(reply)})
                         elif event.get("type") == "agent_end":
                             done = True
@@ -120,8 +135,13 @@ def probe(candidate, expected_digest, kernel_probe, evidence):
                                                              "AI_AGENT", "PI_CODING_AGENT"])):
                 raise Refused("real Pi bypass observations do not match the confined profile")
             errors = [e for e in events if e.get("type") == "tool_execution_end"]
-            if len(errors) != 1 or errors[0].get("isError") is not True:
-                raise Refused("Pi did not render exactly one terminal tool denial")
+            expected_result = {"content": [{"type": "text", "text": "Lumen denied: " + EXPECTED_DENIAL_REASON}],
+                               "details": {}}
+            if (len(errors) != 1 or errors[0].get("isError") is not True
+                    or errors[0].get("toolCallId") != intent["tool_call_id"]
+                    or errors[0].get("toolName") != intent["tool"]
+                    or errors[0].get("result") != expected_result):
+                raise Refused("Pi did not render exactly one matching terminal kernel denial")
             if target.read_text() != "HOST_ONLY_SENTINEL":
                 raise Refused("host sentinel changed")
             (evidence / "rpc-events.json").write_text(json.dumps(events, indent=2) + "\n")

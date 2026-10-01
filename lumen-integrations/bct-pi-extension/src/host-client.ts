@@ -5,6 +5,11 @@
  */
 export const BRIDGE_TITLE = "lumen.pi-bridge/2";
 export const BRIDGE_TIMEOUT_MS = 60_000;
+// PiBridge v2 budget, mirrored in pi_tool_bridge.rs and checked against
+// lumen-protocol/fixtures/pibridge_reply_budget.v2.json by both test suites.
+export const MAX_BRIDGE_READ_BYTES = 1_048_576;
+export const MAX_BRIDGE_METADATA_BYTES = 16 * 1024;
+export const MAX_BRIDGE_REPLY_BYTES = 6 * MAX_BRIDGE_READ_BYTES + MAX_BRIDGE_METADATA_BYTES;
 
 export interface HostDialogs {
     input(title: string, placeholder: string,
@@ -29,7 +34,11 @@ function hash(value: unknown): value is string {
 }
 
 export function decodeReply(raw: string, toolCallId: string, maxBytes: number) {
-    if (new TextEncoder().encode(raw).byteLength > 2 * 1024 * 1024) {
+    // JSON can escape each decoded UTF-8 byte as six bytes (e.g. U+0001).
+    // 6 * 1,048,576 + 16,384 = 6,307,840 wire bytes. The metadata bound
+    // includes the envelope and empty output string, leaving 16 KiB of margin
+    // beyond the worst-case escaped payload. Keep the decoded bound below too.
+    if (new TextEncoder().encode(raw).byteLength > MAX_BRIDGE_REPLY_BYTES) {
         throw new Error("Host response exceeded size limit");
     }
     const reply = record(JSON.parse(raw));
@@ -38,6 +47,13 @@ export function decodeReply(raw: string, toolCallId: string, maxBytes: number) {
         throw new Error("Host response version, correlation, or digest mismatch");
     }
     const outcome = record(reply.outcome);
+    const metadata = { ...reply, outcome: { ...outcome } };
+    if (outcome.status === "completed" || outcome.status === "uncertain") {
+        metadata.outcome.result = { ...record(outcome.result), output_tail: "" };
+    }
+    if (new TextEncoder().encode(JSON.stringify(metadata)).byteLength > MAX_BRIDGE_METADATA_BYTES) {
+        throw new Error("Host response metadata exceeded size limit");
+    }
     if (outcome.status !== "completed") {
         const fields: Record<string, string[]> = {
             denied: ["status", "reason"],
@@ -72,7 +88,7 @@ export function decodeReply(raw: string, toolCallId: string, maxBytes: number) {
         throw new Error("Missing durable audit reference");
     }
     if (result.exit_code !== 0 || typeof result.output_tail !== "string" ||
-        new TextEncoder().encode(result.output_tail).byteLength > maxBytes) {
+        new TextEncoder().encode(result.output_tail).byteLength > Math.min(maxBytes, MAX_BRIDGE_READ_BYTES)) {
         throw new Error("Invalid or oversized read result");
     }
     return {
@@ -92,7 +108,7 @@ export async function requestRead(
         typeof params.path !== "string" || !params.path.startsWith("/") ||
         params.path.includes("\0") || new TextEncoder().encode(params.path).byteLength > 4096 ||
         Object.keys(params).some(k => k !== "path" && k !== "max_bytes") ||
-        typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1_048_576) {
+        typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_BRIDGE_READ_BYTES) {
         throw new Error("Invalid read arguments");
     }
     cancellation.throwIfAborted();
