@@ -2644,6 +2644,15 @@ impl AuthorityKernelClient {
 }
 
 impl KernelClient for AuthorityKernelClient {
+    fn authoritative_action_digest(
+        &self,
+        envelope: &ActionEnvelope,
+    ) -> Result<String, KernelError> {
+        to_frozen_envelope(envelope)?
+            .digest()
+            .map_err(|e| KernelError::Unavailable(format!("digest failed: {e}")))
+    }
+
     fn decide<'a>(&'a self, envelope: &'a ActionEnvelope) -> KernelFuture<'a, PolicyDecision> {
         let kernel = Arc::clone(&self.kernel);
         let envelope = envelope.clone();

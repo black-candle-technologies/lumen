@@ -28,8 +28,9 @@ use lumen_core::lease::{LeaseLimits, OneShotGrant as CoreOneShotGrant, RootLease
 use lumen_db::Database;
 use lumen_server::{
     AuthorityDb, AuthorityKernelClient, AuthorityKernelConfig, Catalog, CatalogError, EffectClass,
-    KernelClient, KernelError, MockSandboxRunner, OneShotGrant, PendingApprovalView, PiToolRequest,
-    ProjectionKind, SessionIdentityAuthority, ToolDef, ToolOutcome, ToolPipeline, now_ms,
+    KernelClient, KernelError, MockKernelClient, MockSandboxRunner, MockVerdict, OneShotGrant,
+    PendingApprovalView, PiToolRequest, ProjectionKind, SessionIdentityAuthority, ToolDef,
+    ToolOutcome, ToolPipeline, now_ms,
 };
 
 fn read_file_catalog() -> Result<Catalog, CatalogError> {
@@ -1105,6 +1106,69 @@ async fn lease_store_failure_is_unavailable_not_silent_deny() {
     );
 }
 
+#[tokio::test]
+async fn bridge_mock_completed_digest_matches_execution_audits() {
+    assert_mock_bridge_digest_binding(false).await;
+}
+
+#[tokio::test]
+async fn bridge_mock_uncertain_digest_matches_staged_audit() {
+    assert_mock_bridge_digest_binding(true).await;
+}
+
+async fn assert_mock_bridge_digest_binding(fail_completion_audit: bool) {
+    use lumen_server::pi_tool_bridge::PiToolBridge;
+    let kernel = Arc::new(MockKernelClient::new().with_verdict(MockVerdict::Allow));
+    if fail_completion_audit {
+        // Keep the staging event durable and fail all completion retries.
+        kernel.fail_audit_after_appends(1);
+    }
+    let sandbox = Arc::new(MockSandboxRunner::new());
+    let pipeline = ToolPipeline::new(
+        Arc::new(read_file_catalog().unwrap()),
+        kernel.clone(),
+        sandbox.clone(),
+    );
+    let bridge = PiToolBridge::new("ed25519:subject".into(), vec![]);
+    let request = serde_json::to_vec(&serde_json::json!({
+        "version":2,"tool_call_id":"mock-digest-bound","tool":"bct.read_file",
+        "arguments":{"path":"/tmp/bridge-read.txt","max_bytes":65536}
+    }))
+    .unwrap();
+    let reply = bridge.dispatch(&pipeline, &request).await.unwrap();
+    let audit_ref = match &reply.outcome {
+        ToolOutcome::Completed {
+            audit_ref, result, ..
+        } if !fail_completion_audit => {
+            assert_eq!(result["output_tail"], "mock-ok");
+            audit_ref
+        }
+        ToolOutcome::Uncertain {
+            action_digest,
+            staged_audit_ref,
+            result,
+            ..
+        } if fail_completion_audit => {
+            assert_eq!(result["output_tail"], "mock-ok");
+            assert_eq!(action_digest, &reply.action_digest);
+            staged_audit_ref
+        }
+        other => panic!("unexpected bridge outcome: {other:?}"),
+    };
+    let log = kernel.audit_log();
+    assert_eq!(log.len(), if fail_completion_audit { 1 } else { 2 });
+    assert_eq!(log[0].0.kind, "tool_staged");
+    assert_eq!(log.last().unwrap().1, *audit_ref);
+    if !fail_completion_audit {
+        assert_eq!(log[1].0.kind, "tool_committed");
+    }
+    for (event, _) in &log {
+        assert_eq!(event.action_digest.as_ref(), Some(&reply.action_digest));
+    }
+    assert_eq!(sandbox.staged_count(), 1);
+    assert_eq!(sandbox.committed_count(), 1);
+}
+
 // PiBridge v2 codec + REAL kernel, with an explicit sandbox double. This is
 // seam evidence, not a Firecracker/real-Pi phase-gate claim.
 #[tokio::test]
@@ -1154,6 +1218,116 @@ async fn bridge_out_of_scope_and_missing_lease_do_not_execute() {
     assert!(matches!(reply.outcome, ToolOutcome::PendingApproval { .. }));
     assert_eq!(f.sandbox.staged_count(), 0);
     f.kernel.verify_kernel_audit().await.unwrap();
+}
+
+#[tokio::test]
+async fn bridge_completed_reference_is_bound_to_the_authoritative_action() {
+    use lumen_server::pi_tool_bridge::PiToolBridge;
+    let database_dir = tempfile::tempdir().unwrap();
+    let database_path = database_dir.path().join("authority.sqlite3");
+    let f = fixture_with_db(HashMap::new(), Some(database_path.clone())).await;
+    let (subject, lease) = leased_subject(&f).await;
+    let bridge = PiToolBridge::new(subject, vec![lease]);
+    let request = serde_json::to_vec(&serde_json::json!({
+        "version":2,"tool_call_id":"completed-bound","tool":"bct.read_file",
+        "arguments":{"path":f.leased_file,"max_bytes":65536}
+    }))
+    .unwrap();
+    let reply = bridge.dispatch(&f.pipeline, &request).await.unwrap();
+    let ToolOutcome::Completed { audit_ref, .. } = &reply.outcome else {
+        panic!("expected Completed, got {:?}", reply.outcome);
+    };
+    let database = Database::connect(&database_path).await.unwrap();
+    assert_bridge_audit_binding(&database, audit_ref, "tool_committed", &reply.action_digest).await;
+    let (staged_digest,): (String,) = sqlx::query_as(
+        "SELECT action_digest FROM kernel_audit_events WHERE json_extract(detail, '$.host_kind')='tool_staged'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(staged_digest, reply.action_digest);
+    assert_eq!(f.sandbox.staged_count(), 1);
+    assert_eq!(f.sandbox.committed_count(), 1);
+    f.kernel.verify_kernel_audit().await.unwrap();
+    database.close().await;
+}
+
+#[tokio::test]
+async fn bridge_uncertain_reference_is_bound_to_the_authoritative_action() {
+    use lumen_server::pi_tool_bridge::PiToolBridge;
+    let database_dir = tempfile::tempdir().unwrap();
+    let database_path = database_dir.path().join("authority.sqlite3");
+    let f = fixture_with_db(HashMap::new(), Some(database_path.clone())).await;
+    let (subject, lease) = leased_subject(&f).await;
+    let database = Database::connect(&database_path).await.unwrap();
+    // Keep policy and staging events durable, but fail every completion
+    // append (including retries) in the real authority client's store.
+    sqlx::query(
+        "CREATE TRIGGER fail_tool_completion BEFORE INSERT ON kernel_audit_events
+         WHEN NEW.kind='tool_executed'
+         BEGIN SELECT RAISE(FAIL, 'forced completion audit failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let bridge = PiToolBridge::new(subject, vec![lease]);
+    let request = serde_json::to_vec(&serde_json::json!({
+        "version":2,"tool_call_id":"uncertain-bound","tool":"bct.read_file",
+        "arguments":{"path":f.leased_file,"max_bytes":65536}
+    }))
+    .unwrap();
+    let reply = bridge.dispatch(&f.pipeline, &request).await.unwrap();
+    let ToolOutcome::Uncertain {
+        action_digest,
+        staged_audit_ref,
+        ..
+    } = &reply.outcome
+    else {
+        panic!("expected Uncertain, got {:?}", reply.outcome);
+    };
+    assert_eq!(action_digest, &reply.action_digest);
+    assert_bridge_audit_binding(
+        &database,
+        staged_audit_ref,
+        "tool_staged",
+        &reply.action_digest,
+    )
+    .await;
+    let (completions,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM kernel_audit_events WHERE kind='tool_executed'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(completions, 0);
+    assert_eq!(f.sandbox.staged_count(), 1);
+    assert_eq!(f.sandbox.committed_count(), 1);
+    f.kernel.verify_kernel_audit().await.unwrap();
+    database.close().await;
+}
+
+async fn assert_bridge_audit_binding(
+    database: &Database,
+    audit_ref: &lumen_server::AuditRef,
+    host_kind: &str,
+    action_digest: &str,
+) {
+    let (audited_digest, hash, detail): (String, String, String) = sqlx::query_as(
+        "SELECT action_digest, hash, detail FROM kernel_audit_events WHERE event_id=?",
+    )
+    .bind(&audit_ref.event_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(audited_digest, action_digest);
+    assert_eq!(hash, audit_ref.chain_hash);
+    let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(detail["host_kind"], host_kind);
+    let (policy_digest,): (String,) =
+        sqlx::query_as("SELECT action_digest FROM kernel_audit_events WHERE kind='policy_allowed'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(policy_digest, action_digest);
 }
 
 #[tokio::test]

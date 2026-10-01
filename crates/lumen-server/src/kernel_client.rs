@@ -434,6 +434,19 @@ pub type KernelFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, KernelError
 /// Implementations must be fail-closed: on any error the caller treats the
 /// effect as neither authorized nor committed.
 pub trait KernelClient: Send + Sync {
+    /// The authoritative action identity used in this kernel's durable
+    /// policy and execution audits. Implementations that convert envelopes
+    /// must override this to hash the same representation as their authority.
+    /// The default supports kernels that use the host envelope directly.
+    /// This may differ from the compatibility digest in `PolicyDecision`,
+    /// which is checked separately by `PolicyDecision::bind`.
+    fn authoritative_action_digest(
+        &self,
+        envelope: &ActionEnvelope,
+    ) -> Result<String, KernelError> {
+        Ok(envelope.digest()?)
+    }
+
     /// Ask the kernel to decide on an action envelope.
     fn decide<'a>(&'a self, envelope: &'a ActionEnvelope) -> KernelFuture<'a, PolicyDecision>;
 

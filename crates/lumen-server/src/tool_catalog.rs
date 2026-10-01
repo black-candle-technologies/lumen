@@ -860,6 +860,10 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
             .await
     }
 
+    pub(crate) fn kernel(&self) -> &K {
+        self.kernel.as_ref()
+    }
+
     /// Build the canonical envelope for one Pi tool request without
     /// executing it. The host is the envelope authority: resources and
     /// effects come from the host projection, never from Pi.

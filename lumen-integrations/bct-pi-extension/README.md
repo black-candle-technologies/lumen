@@ -18,6 +18,16 @@ cancellation, timeout, and uncertain completion fail once without local fallback
 The host and kernel repeat all validation; replacing the extension must confer no
 authority. OS confinement, not the extension's tool filters, is the boundary.
 
+The shared [PiBridge v2 reply budget](../../crates/lumen-protocol/fixtures/pibridge_reply_budget.v2.json)
+permits 1,048,576 decoded UTF-8 output bytes. JSON escaping needs at most six wire
+bytes per decoded byte (for example, U+0001 becomes `\u0001`). Both codecs reserve
+and enforce 16,384 bytes for the compact JSON envelope with an empty `output_tail`,
+including correlation, digests, usage, and audit metadata. The inner reply wire
+limit is therefore `6 × 1,048,576 + 16,384 = 6,307,840` UTF-8 bytes. This metadata
+allowance provides ample margin over an ordinary completed envelope; both the
+wire limit and the requested decoded output limit remain enforced. Both test
+suites check their constants against the shared budget fixture.
+
 The host codec is in `crates/lumen-server/src/pi_tool_bridge.rs`. Both reference
 supervisors currently reject production launches. Wiring the codec into a confined
 real Pi session and reviewing the new immutable extension manifest are still
