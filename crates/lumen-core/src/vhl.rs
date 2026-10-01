@@ -532,7 +532,7 @@ impl ApprovalView {
         )
         .map_err(|e| VhlError::Encoding(e.to_string()))?;
         let tool = format!("{}@{}", action.tool_name.as_str(), action.tool_version);
-        let paths: Vec<String> = action.paths.iter().map(|p| p.canonical_form()).collect();
+        let paths: Vec<String> = action.paths.iter().map(|p| p.absolute_path()).collect();
         // Per-path rights travel with the paths, in the same order. The two
         // vectors must stay parallel — a mismatch is a construction bug and
         // fails closed here rather than widening authority later.

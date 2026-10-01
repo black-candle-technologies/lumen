@@ -1,0 +1,99 @@
+{
+  "source_commit": "546c1236977ba4a53579e140ada974d6a000892c",
+  "source_tree": "85f632f4cd23fd23036f016f1a5f10336d11b387",
+  "host": "lane-vps",
+  "kernel": "7.0.0-31-generic",
+  "architecture": "x86_64",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "python": "3.14.4",
+  "source_files_matched": 458,
+  "source_manifest_sha256": "230b7469dc562a1ca19719b5110f7172aa74459c88efd2c2479ad91b1adcb14c",
+  "checks": [
+    {
+      "name": "committed-audit-suite",
+      "command": [
+        "/home/ubuntu/.cargo/bin/cargo",
+        "test",
+        "-p",
+        "lumen-core",
+        "-p",
+        "lumen-db",
+        "-p",
+        "lumen-protocol",
+        "-p",
+        "lumen-server",
+        "--lib",
+        "--tests"
+      ],
+      "exit_code": 0,
+      "seconds": 91.71,
+      "log_sha256": "17eb81d07a288c2f6a21b026a3543eb3737fb40be88b08b0eee2a844bbd4388a",
+      "passed": 605,
+      "ignored": 0,
+      "suites": 36,
+      "warnings": 0
+    },
+    {
+      "name": "committed-audit-clippy",
+      "command": [
+        "/home/ubuntu/.cargo/bin/cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 27.11,
+      "log_sha256": "b2f4a53bbceb8420de24ee8c9e0b21e1e9656d16335b418634d86db48bb412ff",
+      "passed": 0,
+      "ignored": 0,
+      "suites": 0,
+      "warnings": 0
+    },
+    {
+      "name": "committed-audit-fixtures",
+      "command": [
+        "python3",
+        "scripts/rebuild/verify_authority_fixtures.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.1,
+      "log_sha256": "d26560f775827ec3952c0e12a380885bddfa3714f070f585e4d8f840f9fabbcb",
+      "passed": 0,
+      "ignored": 0,
+      "suites": 0,
+      "warnings": 0
+    }
+  ],
+  "environment": {
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0"
+  },
+  "scratch_logs": "/home/ubuntu/lumen-phase1.1UuKBV",
+  "phase_gate": "not_passed",
+  "production_admission": false,
+  "artifact_signed": false,
+  "evidence_scope": "Isolated unprivileged source checkout; scratch SQLite migration/rollback, numeric regression and existing integration suites.",
+  "fixtures_and_migrations": {
+    "crates/lumen-db/migrations/0031_audit_numeric_integrity.sql": "575f24a1e8d3aaa9d76affde4ac3ac22707441c9288c1842242b5ccb58bf9fee",
+    "crates/lumen-db/tests/audit_numeric.rs": "f5847a0260d53457677882ab47f2e8d3f9e9795eb7582148aaaee5a53c15a02f"
+  },
+  "ci": {
+    "pull_request_run": "https://github.com/black-candle-technologies/lumen/actions/runs/36224051964",
+    "push_run": "https://github.com/black-candle-technologies/lumen/actions/runs/36224049605",
+    "status": "pending"
+  },
+  "limitations": [
+    "Producer/consumer review pending; no phase acceptance",
+    "The inherited restart suites still expect authorization after ephemeral-key loss; their passing is not evidence that the requested session-lifetime invariant holds",
+    "Append verifies only the existing tip; startup full-history/anchor validation remains open",
+    "Audit wire decoding and signature-role distinctions remain open",
+    "Other Phase 1 chain/budget/fault/revocation-latency obligations remain open",
+    "Scratch migration rollback is not an operator staging restore rehearsal",
+    "No strict Firecracker execution, merge, release, tag or deployment performed"
+  ]
+}

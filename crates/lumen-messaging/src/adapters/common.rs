@@ -177,6 +177,7 @@ impl ProviderReceipt {
 
 /// The adapter contract every messaging adapter implements.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait MessagingAdapter: Send + Sync {
     fn descriptor(&self) -> &AdapterDescriptor;
 

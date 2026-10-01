@@ -16,7 +16,9 @@ pub(crate) async fn connect(path: &Path) -> Result<Database, RepositoryError> {
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
+        // Authority holds must survive power loss after acknowledgment.
+        // WAL NORMAL can lose committed transactions on an OS/power failure.
+        .synchronous(SqliteSynchronous::Full)
         .busy_timeout(Duration::from_secs(5));
     connect_with(options, 5).await
 }

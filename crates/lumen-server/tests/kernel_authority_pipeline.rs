@@ -333,6 +333,13 @@ async fn pipeline_pending_approval_is_durable_with_zero_execution() {
         "durable approval request must be pollable, got {pending:?}"
     );
     let drained = f.kernel.drain_approval_requests().await;
+    let authoritative: lumen_server::CoreActionDigest = drained[0].action_digest.clone();
+    assert_eq!(authoritative, pending[0].action_digest);
+    assert_eq!(
+        serde_json::to_value(&drained[0]).unwrap()["action_digest"],
+        authoritative.as_str()
+    );
+
     assert!(
         drained.iter().any(|r| r.request_id == approval_request_id),
         "outbox mirror must carry the same request id"
@@ -474,7 +481,7 @@ async fn one_shot_mint_is_atomic_and_single_use() {
     // Build and sign the grant as the human.
     let mut core_grant = CoreOneShotGrant {
         approval_id: approval_id.clone(),
-        action_digest: view.action_digest.clone(),
+        action_digest: view.action_digest.clone().into_kernel_hex(),
         session_subject: subject.clone(),
         signer_key_id: vhl_key_id.to_string(),
         nonce: format!("grant-{}", uuid::Uuid::new_v4()),
@@ -485,7 +492,9 @@ async fn one_shot_mint_is_atomic_and_single_use() {
     core_grant.sign(&vhl_signing);
     let grant = OneShotGrant {
         approval_id: core_grant.approval_id.clone(),
-        action_digest: core_grant.action_digest.clone(),
+        action_digest: lumen_server::CoreActionDigest::from_kernel_hex(
+            core_grant.action_digest.clone(),
+        ),
         session_subject: core_grant.session_subject.clone(),
         signer_key_id: core_grant.signer_key_id.clone(),
         nonce: core_grant.nonce.clone(),
@@ -591,7 +600,7 @@ async fn one_shot_durable_failure_rolls_back_cleanly() {
     // Build and sign the grant.
     let mut core_grant = CoreOneShotGrant {
         approval_id: approval_id.clone(),
-        action_digest: view.action_digest.clone(),
+        action_digest: view.action_digest.clone().into_kernel_hex(),
         session_subject: subject.clone(),
         signer_key_id: vhl_key_id.to_string(),
         nonce: format!("grant-{}", uuid::Uuid::new_v4()),
@@ -602,7 +611,9 @@ async fn one_shot_durable_failure_rolls_back_cleanly() {
     core_grant.sign(&vhl_signing);
     let grant = OneShotGrant {
         approval_id: core_grant.approval_id.clone(),
-        action_digest: core_grant.action_digest.clone(),
+        action_digest: lumen_server::CoreActionDigest::from_kernel_hex(
+            core_grant.action_digest.clone(),
+        ),
         session_subject: core_grant.session_subject.clone(),
         signer_key_id: core_grant.signer_key_id.clone(),
         nonce: core_grant.nonce.clone(),
@@ -665,7 +676,7 @@ async fn one_shot_durable_failure_rolls_back_cleanly() {
 /// guarantee is that the store reflects the mint (no lost state), not
 /// that the lease remains valid across an issuer rotation.
 #[tokio::test]
-async fn one_shot_mint_survives_kernel_restart() {
+async fn retained_one_shot_cannot_execute_after_restart() {
     let vhl_signing = SigningKey::from_bytes(&[7u8; 32]);
     let vhl_key_id = "test-human-1";
     let mut vhl_keys = HashMap::new();
@@ -724,7 +735,7 @@ async fn one_shot_mint_survives_kernel_restart() {
 
         let mut core_grant = CoreOneShotGrant {
             approval_id: approval_id.clone(),
-            action_digest: view.action_digest.clone(),
+            action_digest: view.action_digest.clone().into_kernel_hex(),
             session_subject: subject.clone(),
             signer_key_id: vhl_key_id.to_string(),
             nonce: format!("grant-{}", uuid::Uuid::new_v4()),
@@ -735,7 +746,9 @@ async fn one_shot_mint_survives_kernel_restart() {
         core_grant.sign(&vhl_signing);
         let grant = OneShotGrant {
             approval_id: core_grant.approval_id.clone(),
-            action_digest: core_grant.action_digest.clone(),
+            action_digest: lumen_server::CoreActionDigest::from_kernel_hex(
+                core_grant.action_digest.clone(),
+            ),
             session_subject: core_grant.session_subject.clone(),
             signer_key_id: core_grant.signer_key_id.clone(),
             nonce: core_grant.nonce.clone(),
@@ -772,40 +785,25 @@ async fn one_shot_mint_survives_kernel_restart() {
     drop(conn);
     drop(db);
 
-    // The one-shot authorizes exactly once after the restart: the retired
-    // issuer generation still verifies, the session is hydrated from
-    // `kernel_sessions`, and the action digest matches the retained
-    // verbatim envelope. (It is NOT denied as an "old-issuer" lease —
-    // retired generations verify by design since lease persistence
-    // landed.)
+    // Public lease/signature retention never restores a live session.
     let mut presented = envelope.clone();
     presented.lease_chain = vec![lease_id.clone()];
-    let outcome = f2.pipeline.execute_envelope(&presented, &subject).await;
-    assert!(
-        matches!(outcome, ToolOutcome::Completed { .. }),
-        "one-shot authorizes once after restart, got {outcome:?}"
-    );
-
-    // And only once: the second presentation of the verbatim envelope is
-    // denied. The action nonce was consumed by the first authorization,
-    // so this is a replay denial; the durable one-shot consumption record
-    // (checked directly against the store below) is the backstop that
-    // survives even if the in-memory nonce set is lost.
-    let outcome = f2.pipeline.execute_envelope(&presented, &subject).await;
-    match outcome {
-        ToolOutcome::Denied { reason } => assert!(
-            reason.contains("replay"),
-            "expected the replay denial, got: {reason}"
-        ),
-        other => panic!("replayed one-shot must be denied, got {other:?}"),
+    for _ in 0..2 {
+        let outcome = f2.pipeline.execute_envelope(&presented, &subject).await;
+        assert!(
+            matches!(outcome, ToolOutcome::Denied { .. }),
+            "old one-shot must deny: {outcome:?}"
+        );
     }
+    assert_eq!(f2.sandbox.staged_count(), 0);
+    assert_eq!(f2.sandbox.committed_count(), 0);
 
     // The grant nonce is still burned: replay is rejected even though the
     // in-memory nonce set was lost in the crash (the durable nonce gate
     // holds).
     let replay_grant = OneShotGrant {
         approval_id: approval_id.clone(),
-        action_digest: "bogus".to_string(),
+        action_digest: lumen_server::CoreActionDigest::from_kernel_hex("bogus".to_string()),
         session_subject: subject.clone(),
         signer_key_id: vhl_key_id.to_string(),
         nonce: grant_nonce,
@@ -994,7 +992,7 @@ async fn one_shot_audit_failure_is_minted_but_not_returned() {
 
     let mut core_grant = CoreOneShotGrant {
         approval_id: approval_id.clone(),
-        action_digest: view.action_digest.clone(),
+        action_digest: view.action_digest.clone().into_kernel_hex(),
         session_subject: subject.clone(),
         signer_key_id: vhl_key_id.to_string(),
         nonce: format!("grant-{}", uuid::Uuid::new_v4()),
@@ -1005,7 +1003,9 @@ async fn one_shot_audit_failure_is_minted_but_not_returned() {
     core_grant.sign(&vhl_signing);
     let grant = OneShotGrant {
         approval_id: core_grant.approval_id.clone(),
-        action_digest: core_grant.action_digest.clone(),
+        action_digest: lumen_server::CoreActionDigest::from_kernel_hex(
+            core_grant.action_digest.clone(),
+        ),
         session_subject: core_grant.session_subject.clone(),
         signer_key_id: core_grant.signer_key_id.clone(),
         nonce: core_grant.nonce.clone(),
@@ -1190,7 +1190,7 @@ async fn bridge_read_intent_uses_host_authority_and_rejects_concurrent_replay() 
         panic!("expected one completion and one replay denial")
     };
     assert!(matches!(reply.outcome, ToolOutcome::Completed { .. }));
-    assert_eq!(reply.action_digest.len(), 64);
+    assert_eq!(reply.action_digest.as_str().len(), 64);
     assert_eq!(f.sandbox.staged_count(), 1);
     f.kernel.verify_kernel_audit().await.unwrap();
 }
@@ -1238,14 +1238,20 @@ async fn bridge_completed_reference_is_bound_to_the_authoritative_action() {
         panic!("expected Completed, got {:?}", reply.outcome);
     };
     let database = Database::connect(&database_path).await.unwrap();
-    assert_bridge_audit_binding(&database, audit_ref, "tool_committed", &reply.action_digest).await;
+    assert_bridge_audit_binding(
+        &database,
+        audit_ref,
+        "tool_committed",
+        reply.action_digest.as_str(),
+    )
+    .await;
     let (staged_digest,): (String,) = sqlx::query_as(
         "SELECT action_digest FROM kernel_audit_events WHERE json_extract(detail, '$.host_kind')='tool_staged'",
     )
     .fetch_one(database.pool())
     .await
     .unwrap();
-    assert_eq!(staged_digest, reply.action_digest);
+    assert_eq!(staged_digest, reply.action_digest.as_str());
     assert_eq!(f.sandbox.staged_count(), 1);
     assert_eq!(f.sandbox.committed_count(), 1);
     f.kernel.verify_kernel_audit().await.unwrap();
@@ -1290,7 +1296,7 @@ async fn bridge_uncertain_reference_is_bound_to_the_authoritative_action() {
         &database,
         staged_audit_ref,
         "tool_staged",
-        &reply.action_digest,
+        reply.action_digest.as_str(),
     )
     .await;
     let (completions,): (i64,) =
@@ -1351,7 +1357,7 @@ async fn bridge_reply_digest_identifies_the_durable_kernel_decision() {
             .fetch_one(database.pool())
             .await
             .unwrap();
-    assert_eq!(reply.action_digest, audited_digest);
+    assert_eq!(reply.action_digest.as_str(), audited_digest);
     assert_eq!(f.sandbox.staged_count(), 0);
     f.kernel.verify_kernel_audit().await.unwrap();
     database.close().await;

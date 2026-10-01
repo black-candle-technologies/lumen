@@ -1,5 +1,12 @@
 //! Lumen protocol: the frozen Phase-0 wire contracts, re-exported.
 //!
+//! ADR-0011 proposes strict ActionEnvelope v2, PolicyDecision v3 and kernel
+//! transport v2. Superseded action/decision/transport fixtures remain raw
+//! historical evidence and are rejected by live decoders. The legacy
+//! authority-bearing PiBridge tool request is retired; the host owns the
+//! intent-only PiBridge v2. The table below records the historical restack,
+//! not permission to admit the old authority versions.
+//!
 //! # Why this crate is a re-export facade
 //!
 //! The authoritative wire contracts are frozen in

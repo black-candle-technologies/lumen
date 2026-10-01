@@ -45,7 +45,7 @@ separate authorizations. No phase is accepted on historical test results alone.
 | Phase | Required gate | Current acceptance |
 |---|---|---|
 | 0 — Mediation | Pinned real Pi requests a real tool; kernel verdict + audit; hostile direct paths fail observably | **Not passed**; [current work and bypass inventory](phase-0.md) |
-| 1 — Authority | Signed narrowing leases; transitive revocation/replay; atomic reserved budgets; property/concurrency tests; independently verified audit | Reference only; revalidation required |
+| 1 — Authority | Signed narrowing leases; transitive revocation/replay; atomic reserved budgets; property/concurrency tests; independently verified audit | **Not passed**; [authority reset and current gaps](phase-1.md) |
 | 2 — Sandbox | Signed reproducible guest; jailer/seccomp/cgroup v2; default-deny egress; atomic validated writeback; quota/restart/fault evidence with zero orphans | Reference only; real KVM evidence required |
 | 3 — Host | Bounded lifecycle/streams; strict tools; host credential gateway; real kernel + real sandbox slice; fault reconciliation | Reference only; fake-child/mock-sandbox tests are not the slice |
 | 4 — Human authority | Ephemeral Ed25519 identity; exact-digest one-use approval through Courier; mutation/replay/expiry/shutdown fail closed | Reference only |

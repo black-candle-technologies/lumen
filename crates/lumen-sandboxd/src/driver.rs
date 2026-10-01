@@ -44,12 +44,14 @@ use crate::storage;
 
 /// Byte stream to the guest agent (vsock in production, duplex in tests).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait AgentIo: Send {
     async fn next_msg(&mut self) -> Result<Option<AgentMsg>, SandboxdError>;
     async fn send_msg(&mut self, msg: &HostMsg) -> Result<(), SandboxdError>;
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl<T> AgentIo for T
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
@@ -69,6 +71,7 @@ where
 
 /// Supervised jailer/VMM process.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait JailerHandle: Send {
     /// SIGKILL the Firecracker VMM (best effort, idempotent). The destroy
     /// path's `cgroup.kill` is the hammer; this is the first attempt.
@@ -83,6 +86,7 @@ pub trait JailerHandle: Send {
 /// All host effects behind one trait. The driver never touches KVM,
 /// netns, or the jailer directly.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait VmBackend: Send + Sync {
     async fn setup_network(
         &self,
@@ -118,6 +122,7 @@ pub struct NetnsCtx {
 
 /// Handle to the per-run netns services.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait NetnsHandle: Send {
     async fn shutdown(&mut self) -> Result<(), SandboxdError>;
 }
@@ -1926,6 +1931,7 @@ struct NetnsTask {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl NetnsHandle for NetnsTask {
     async fn shutdown(&mut self) -> Result<(), SandboxdError> {
         let _ = self.shutdown_tx.send(());
@@ -2042,6 +2048,7 @@ fn ensure_cgroup_parent(parent: &Path) -> std::io::Result<()> {
 pub struct FirecrackerBackend;
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl VmBackend for FirecrackerBackend {
     async fn setup_network(
         &self,
@@ -2519,6 +2526,7 @@ fn read_firecracker_pid(fc_pid_file: &Path) -> Option<u32> {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl JailerHandle for ChildJailerHandle {
     async fn terminate(&mut self) -> Result<(), SandboxdError> {
         if let Some(pid) = read_firecracker_pid(&self.fc_pid_file) {
@@ -2562,6 +2570,7 @@ pub struct MockScript {
 struct MockNetnsHandle;
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl NetnsHandle for MockNetnsHandle {
     async fn shutdown(&mut self) -> Result<(), SandboxdError> {
         Ok(())
@@ -2571,6 +2580,7 @@ impl NetnsHandle for MockNetnsHandle {
 struct MockJailerHandle;
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl JailerHandle for MockJailerHandle {
     async fn terminate(&mut self) -> Result<(), SandboxdError> {
         Ok(())
@@ -2581,6 +2591,7 @@ impl JailerHandle for MockJailerHandle {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl VmBackend for MockBackend {
     async fn setup_network(
         &self,

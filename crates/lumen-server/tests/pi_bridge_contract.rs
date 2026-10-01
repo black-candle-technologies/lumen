@@ -78,7 +78,7 @@ fn completed(output: String) -> PiToolReply {
     PiToolReply {
         version: 2,
         tool_call_id: "c".repeat(128),
-        action_digest: "a".repeat(64),
+        action_digest: lumen_server::CoreActionDigest::from_kernel_hex("a".repeat(64)),
         outcome: ToolOutcome::Completed {
             result: json!({"exit_code": 0, "output_tail": output}),
             usage: ResourceUsage {

@@ -450,7 +450,7 @@ fn widen_covers_parent(pair: &ScopePair, widen: Widen) -> bool {
             .parent
             .paths
             .iter()
-            .any(|g| g.root.canonical_form() == "/data2"),
+            .any(|g| g.root.absolute_path() == "/data2"),
         // ParentPath only widens when the parent directory isn't already
         // covered by the parent's own grants (e.g. parent grants `/d/a` and
         // `/d`: pushing `/d` read is a no-op, not a widening).

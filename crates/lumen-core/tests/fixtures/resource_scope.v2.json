@@ -1,0 +1,122 @@
+{
+  "version": 2,
+  "scope": {
+    "tools": {
+      "bct.read_file": "=1.0.0"
+    },
+    "paths": [
+      {
+        "root": {
+          "components": [
+            "workspace",
+            "file~fold"
+          ],
+          "case_folded": false
+        },
+        "rights": {
+          "read": true,
+          "write": false
+        }
+      }
+    ],
+    "destinations": [
+      {
+        "scheme": "https",
+        "host": {
+          "DnsName": "example.com"
+        },
+        "ports": {
+          "ranges": [
+            [
+              443,
+              443
+            ]
+          ],
+          "any": false
+        },
+        "methods": [
+          "GET"
+        ]
+      }
+    ],
+    "secrets": [
+      "vault:docs"
+    ],
+    "accounts": [
+      {
+        "provider": "a:b",
+        "account_id": "c"
+      }
+    ],
+    "models": {
+      "p": [
+        "local"
+      ]
+    },
+    "effects": [
+      "read",
+      "network"
+    ]
+  },
+  "canonical": {
+    "tools": {
+      "bct.read_file": "=1.0.0"
+    },
+    "paths": [
+      {
+        "root": {
+          "components": [
+            "workspace",
+            "file~fold"
+          ],
+          "case_folded": false
+        },
+        "rights": {
+          "read": true,
+          "write": false
+        }
+      }
+    ],
+    "destinations": [
+      {
+        "scheme": "https",
+        "host": {
+          "DnsName": "example.com"
+        },
+        "ports": {
+          "ranges": [
+            [
+              443,
+              443
+            ]
+          ],
+          "any": false
+        },
+        "methods": [
+          "GET"
+        ]
+      }
+    ],
+    "secrets": [
+      "vault:docs"
+    ],
+    "accounts": [
+      {
+        "provider": "a:b",
+        "account_id": "c"
+      }
+    ],
+    "models": {
+      "p": [
+        "local"
+      ]
+    },
+    "effects": [
+      "network",
+      "read"
+    ],
+    "contract": "lumen.resource-scope",
+    "version": 2
+  },
+  "digest": "1896e06ae045fa4382593910b1a5a2fc557349a13c294e5a061ef4fb989234f3"
+}

@@ -87,6 +87,7 @@ impl Default for SignalAdapter {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl MessagingAdapter for SignalAdapter {
     fn descriptor(&self) -> &AdapterDescriptor {
         &self.descriptor

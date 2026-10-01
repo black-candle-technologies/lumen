@@ -1,0 +1,35 @@
+{
+  "source_commit": "876218890d6262da285631d926e5abedd08a98d8",
+  "source_file": "crates/lumen-core/src/pi_boundary.rs",
+  "source_sha256": "72dffcfebf5a47d4d0bb690e9b05dace5614eff18b025edec7efcd609e275f4d",
+  "result": {
+    "": {
+      "accepted": true,
+      "same_digest": true
+    },
+    "/expected_effects": {
+      "accepted": true,
+      "same_digest": true
+    },
+    "/inputs/0": {
+      "accepted": true,
+      "same_digest": true
+    },
+    "/resources": {
+      "accepted": true,
+      "same_digest": true
+    },
+    "/resources/paths/0": {
+      "accepted": true,
+      "same_digest": true
+    },
+    "/tool": {
+      "accepted": true,
+      "same_digest": true
+    }
+  },
+  "scope": "Decoder and digest probe only; no external effect or end-to-end exploit demonstrated.",
+  "fixture": "crates/lumen-core/tests/fixtures/action_envelope.v1.json",
+  "operation": "For each JSON pointer, add future_authority:true to the fixture object. Decode with lumen_core::pi_boundary::ActionEnvelope, then compare the digest to the unmodified decoded fixture.",
+  "authority_admission": "Production Pi disabled; decoder observation only."
+}

@@ -1450,7 +1450,7 @@ async fn lease_chain_fails_closed_past_hop_limit() {
         .bind("test-subject")
         .bind("test-issuer")
         .bind(0_i64)
-        .bind(1_i64)
+        .bind(i64::from(lumen_core::lease::LEASE_PROTOCOL_VERSION))
         .bind("c".repeat(64))
         .bind(&scope_json)
         .bind(&limits_json)

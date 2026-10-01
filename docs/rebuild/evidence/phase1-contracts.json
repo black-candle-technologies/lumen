@@ -1,0 +1,94 @@
+{
+  "host": "lane-vps",
+  "kernel": "7.0.0-31-generic",
+  "architecture": "x86_64",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "python": "3.14.4",
+  "source_files_matched": 434,
+  "source_manifest_sha256": "98cdce6b487c4db75eb7f75301e56cf1e2b95a48873b31ae4974bbc1bfbfb69b",
+  "logs": {
+    "authority-contract-8762188.log": {
+      "sha256": "299bfda5d4225eb9f90e8ecf217ec3102dd65f6a9b78912af616dc66d7667032",
+      "suites": 31,
+      "passed": 577,
+      "failed": 0,
+      "ignored": 0,
+      "warnings": 0
+    },
+    "authority-regressions-final.log": {
+      "sha256": "9ef04c24a3cd3af47f5acf074dcef37088d01698badb46627868019663d5fb28",
+      "suites": 2,
+      "passed": 14,
+      "failed": 0,
+      "ignored": 0,
+      "warnings": 0
+    },
+    "authority-clippy-final.log": {
+      "sha256": "f47be5d16b2b89f60d148d70af788e719d6493f58b5f29c2e899e1c503390252",
+      "suites": 0,
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "warnings": 1
+    },
+    "authority-fixture-verifier.log": {
+      "sha256": "fac00f4e932b439e5c03333d261f34ee5b80aa6122587f4b078e18d535274956",
+      "suites": 0,
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "warnings": 0
+    }
+  },
+  "source_commit": "876218890d6262da285631d926e5abedd08a98d8",
+  "source_tree": "b11d338efe80f10cb38b176db67085f410659993",
+  "phase_gate": "not_passed",
+  "production_admission": false,
+  "artifact_signed": false,
+  "evidence_scope": "Unprivileged isolated source checkout on lane-vps, not strict Firecracker execution or release evidence.",
+  "commands": [
+    {
+      "command": "cargo test -p lumen-core -p lumen-db -p lumen-server --lib --tests",
+      "log": "authority-contract-8762188.log",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p lumen-core -p lumen-db --test canonical_contract",
+      "log": "authority-regressions-final.log",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --workspace --exclude lumen-desktop --all-targets -- -D warnings",
+      "log": "authority-clippy-final.log",
+      "exit_code": 0,
+      "cargo_warning": "excluded package lumen-desktop not found in workspace; no Rust/Clippy diagnostics"
+    },
+    {
+      "command": "python3 scripts/rebuild/verify_authority_fixtures.py",
+      "log": "authority-fixture-verifier.log",
+      "exit_code": 0
+    }
+  ],
+  "environment": {
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0"
+  },
+  "scratch_logs": "/home/ubuntu/lumen-phase1.1UuKBV",
+  "fixtures_and_migration": {
+    "crates/lumen-core/tests/fixtures/resource_scope.v2.json": "295907834774bd4aa48e8d1c341097f8185efc2a6f176acd227a956b442b4cb3",
+    "crates/lumen-core/tests/fixtures/lease.v3.json": "a662056c7882e17b9dc37e7155d9e9bd59979a7c40aee6acbedefa9e3acb7e46",
+    "crates/lumen-core/tests/fixtures/lease.legacy-v2.json": "5ff265d7baa3819dc6d702a5f7718f0e39c3d26a239c0c28eb0844190c175e85",
+    "crates/lumen-db/migrations/0029_canonical_scope_contract.sql": "fcfcdd4a7d07810f7f53673aa96af9965213f91c387281456c46c2078668e053"
+  },
+  "limitations": [
+    "Owner sign-offs pending; no gate acceptance",
+    "Migration rollback tested on scratch SQLite; staging restore not rehearsed",
+    "Historical records preserved, not upgraded or re-signed",
+    "Other action/decision authority decoders require versioned revalidation",
+    "Mount/inode pinning and execution races remain open",
+    "Full chain, budget fault, restart authority and revocation-latency gates remain open",
+    "No release, tag, merge or deployment performed"
+  ]
+}

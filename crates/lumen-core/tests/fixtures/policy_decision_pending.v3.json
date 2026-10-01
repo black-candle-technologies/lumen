@@ -1,0 +1,6 @@
+{
+  "approval_id": "apr-0123456789abcdef",
+  "decision": "pending_approval",
+  "reason": "path '/tmp/shared/notes.txt' is outside the lease; human approval required",
+  "version": 3
+}
