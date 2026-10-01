@@ -37,6 +37,7 @@ pub enum StoreError {
 
 /// Persistent lease documents.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait LeaseStore: Send + Sync {
     async fn insert_lease(&self, doc: &LeaseDocument) -> Result<(), StoreError>;
     async fn get_lease(&self, id: &str) -> Result<Option<LeaseDocument>, StoreError>;
