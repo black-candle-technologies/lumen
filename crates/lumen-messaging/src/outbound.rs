@@ -880,6 +880,7 @@ mod tests {
     }
 
     #[async_trait]
+    #[allow(clippy::double_must_use)]
     impl MessagingAdapter for FakeAdapter {
         fn descriptor(&self) -> &AdapterDescriptor {
             &self.descriptor

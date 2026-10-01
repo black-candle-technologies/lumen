@@ -754,6 +754,7 @@ mod tests {
     }
 
     #[async_trait]
+    #[allow(clippy::double_must_use)]
     impl BudgetStore for RaceLoserStore {
         async fn update_execution(
             &self,

@@ -678,6 +678,7 @@ fn url_encode(value: &str) -> String {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl MessagingAdapter for DiscordAdapter {
     fn descriptor(&self) -> &AdapterDescriptor {
         &self.descriptor

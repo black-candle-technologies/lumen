@@ -168,6 +168,7 @@ pub struct MemoryStores {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl LeaseStore for MemoryStores {
     async fn insert_lease(&self, doc: &LeaseDocument) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().expect("store mutex poisoned");
@@ -190,6 +191,7 @@ impl LeaseStore for MemoryStores {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl RevocationStore for MemoryStores {
     async fn record_revocation(
         &self,
@@ -226,6 +228,7 @@ impl RevocationStore for MemoryStores {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl OneShotStore for MemoryStores {
     async fn consume_one_shot(&self, lease_id: &str, _at_ms: i64) -> Result<bool, StoreError> {
         Ok(self
@@ -247,6 +250,7 @@ impl OneShotStore for MemoryStores {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl NonceStoreBackend for MemoryStores {
     async fn record_nonce(
         &self,
@@ -275,6 +279,7 @@ impl NonceStoreBackend for MemoryStores {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl BudgetStore for MemoryStores {
     async fn insert_reservation(&self, reservation: &Reservation) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().expect("store mutex poisoned");

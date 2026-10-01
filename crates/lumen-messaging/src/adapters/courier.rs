@@ -1313,6 +1313,7 @@ impl CourierAdapter {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 impl MessagingAdapter for CourierAdapter {
     fn descriptor(&self) -> &AdapterDescriptor {
         &self.descriptor
