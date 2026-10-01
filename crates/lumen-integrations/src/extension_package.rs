@@ -475,7 +475,7 @@ fn normalize_path(path: &Path) -> Result<String, PackageStageError> {
         let std::path::Component::Normal(segment) = component else {
             return Err(invalid());
         };
-        let segment = segment.to_str().ok_or_else(&invalid)?;
+        let segment = segment.to_str().ok_or_else(invalid)?;
         if !segment.is_ascii()
             || segment.contains('\\')
             || segment.bytes().any(|byte| byte.is_ascii_control())
