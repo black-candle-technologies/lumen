@@ -349,7 +349,7 @@ async fn restart_root_session_cannot_authorize_or_execute() {
             .build_envelope(
                 &read_request(&env.leased_file),
                 &subject,
-                &[lease.lease_id.clone()],
+                std::slice::from_ref(&lease.lease_id),
             )
             .unwrap();
         // Completed requires a bound Allow and a sandbox commit in this live boot.
@@ -726,7 +726,7 @@ async fn pre_migration_lease_without_session_row_is_legacy_not_tamper() {
         .handle(
             &read_request(&env.leased_file),
             legacy_subject,
-            &[core_doc.lease_id.clone()],
+            std::slice::from_ref(&core_doc.lease_id),
         )
         .await;
     match outcome {
@@ -2245,7 +2245,7 @@ async fn completed_pipeline_usage_is_not_refunded_on_restart() {
         .build_envelope(
             &read_request(&env.leased_file),
             &subject,
-            &[lease.lease_id.clone()],
+            std::slice::from_ref(&lease.lease_id),
         )
         .unwrap();
     let outcome = h.pipeline.execute_envelope(&envelope, &subject).await;
@@ -2368,7 +2368,7 @@ async fn completion_accounting_failure_blocks_recovery_without_partial_debit() {
         .build_envelope(
             &read_request(&env.leased_file),
             &subject,
-            &[lease.lease_id.clone()],
+            std::slice::from_ref(&lease.lease_id),
         )
         .unwrap();
     let outcome = h.pipeline.execute_envelope(&envelope, &subject).await;
