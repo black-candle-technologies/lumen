@@ -1003,6 +1003,9 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
             }
         }
 
+        // Execution events and reconciliation must use the authority's
+        // identity, just like its policy audit and the PiBridge reply.
+        // The host decision's compatibility digest is bound separately.
         let digest = match self.kernel.authoritative_action_digest(envelope) {
             Ok(digest) => digest,
             Err(e) => {
