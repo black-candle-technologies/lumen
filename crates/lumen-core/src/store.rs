@@ -69,6 +69,7 @@ pub trait LeaseStore: Send + Sync {
 /// Revocation records. Revoking a parent transitively invalidates descendants
 /// at validation time; no cascade writes are needed.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait RevocationStore: Send + Sync {
     async fn record_revocation(
         &self,
@@ -83,6 +84,7 @@ pub trait RevocationStore: Send + Sync {
 
 /// Durable one-shot consumption (replay protection across restarts).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait OneShotStore: Send + Sync {
     /// Returns `true` if newly consumed, `false` if this is a replay.
     async fn consume_one_shot(&self, lease_id: &str, at_ms: i64) -> Result<bool, StoreError>;
@@ -91,6 +93,7 @@ pub trait OneShotStore: Send + Sync {
 
 /// Durable nonce record (envelope replay protection across restarts).
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait NonceStoreBackend: Send + Sync {
     /// Returns `true` if the nonce was newly recorded, `false` on replay.
     async fn record_nonce(
@@ -104,6 +107,7 @@ pub trait NonceStoreBackend: Send + Sync {
 
 /// Durable budget reservations and debits.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait BudgetStore: Send + Sync {
     async fn insert_reservation(&self, reservation: &Reservation) -> Result<(), StoreError>;
     async fn get_reservation(&self, id: &str) -> Result<Option<Reservation>, StoreError>;
