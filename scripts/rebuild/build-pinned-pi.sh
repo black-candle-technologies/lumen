@@ -20,8 +20,10 @@ cleanup() { XDG_RUNTIME_DIR="$pi_user_runtime" systemctl --user stop "$pi_unit-d
 trap cleanup EXIT INT TERM
 
 verify_source_contents() {
-    # Read the pinned tree and actual bytes without consulting index flags or
-    # Git clean filters. Hash in-process to avoid a Git process per source file.
+    # Hash regular files with Git's clean filters from the pinned commit's
+    # .gitattributes: legitimate checkout line endings can differ from blob bytes.
+    # Explicit paths bypass index flags, so assume-unchanged/skip-worktree cannot
+    # hide edits. Batch them in one Git process; hash symlink targets in-process.
     /usr/bin/python3 - "$pi_output/repo" "$pi_commit" <<'PY'
 import hashlib
 import os
@@ -32,6 +34,7 @@ import sys
 repo, commit = sys.argv[1:]
 tree = subprocess.check_output(
     ["git", "-C", repo, "ls-tree", "-rz", "--full-tree", commit])
+regular_files = []
 for entry in tree.split(b"\0"):
     if not entry:
         continue
@@ -49,11 +52,8 @@ for entry in tree.split(b"\0"):
             actual = hashlib.sha1(
                 b"blob " + str(len(contents)).encode() + b"\0" + contents).hexdigest()
         elif mode in (b"100644", b"100755") and stat.S_ISREG(file_stat.st_mode):
-            digest = hashlib.sha1(b"blob " + str(file_stat.st_size).encode() + b"\0")
-            with open(path, "rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            actual = digest.hexdigest()
+            regular_files.append((name, expected))
+            continue
         else:
             raise ValueError("worktree file type differs from pinned mode " + mode.decode())
     except (OSError, ValueError) as error:
@@ -61,6 +61,24 @@ for entry in tree.split(b"\0"):
     if actual != expected.decode():
         sys.exit(f"Pinned Pi source {label} diverged: content hash mismatch "
                  f"(expected {expected.decode()}, found {actual})")
+
+# hash-object --stdin-paths has no -z option. Git C-quoted, line-delimited
+# paths preserve arbitrary filename bytes, including embedded newlines.
+paths = b"".join(
+    b'"' + name.replace(b"\\", b"\\\\").replace(b'"', b'\\"').replace(b"\n", b"\\n") + b'"\n'
+    for name, _ in regular_files)
+try:
+    hashes = subprocess.check_output(
+        ["git", "-C", repo, f"--attr-source={commit}", "hash-object", "--stdin-paths"],
+        input=paths).splitlines()
+except (OSError, subprocess.CalledProcessError) as error:
+    sys.exit(f"Pinned Pi source diverged: content hash check failed: {error}")
+if len(hashes) != len(regular_files):
+    sys.exit("Pinned Pi source diverged: content hash check returned an unexpected count")
+for (name, expected), actual in zip(regular_files, hashes):
+    if actual != expected:
+        sys.exit(f"Pinned Pi source {os.fsdecode(name)!r} diverged: content hash mismatch "
+                 f"(expected {expected.decode()}, found {actual.decode()})")
 PY
 }
 
