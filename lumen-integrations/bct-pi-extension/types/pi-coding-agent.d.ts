@@ -15,7 +15,10 @@ export interface ToolResult {
 }
 
 export interface ToolCallContext {
-	signal: AbortSignal;
+    ui: {
+        input(title: string, placeholder: string,
+              options: { signal: AbortSignal; timeout: number }): Promise<string | undefined>;
+    };
 }
 
 export interface DefinedTool {
@@ -26,8 +29,8 @@ export interface DefinedTool {
 	execute: (
 		toolCallId: string,
 		params: Record<string, unknown>,
-		signal: AbortSignal,
-		onUpdate: (partial: unknown) => void,
+		signal: AbortSignal | undefined,
+		onUpdate: ((partial: unknown) => void) | undefined,
 		ctx: ToolCallContext,
 	) => Promise<ToolResult>;
 }

@@ -1,5 +1,10 @@
 # Lumen
 
+> Lumen is being rebuilt around an untrusted Pi RPC subprocess and a separate
+> authority kernel. The [security-program baseline](docs/rebuild/README.md) governs
+> current work. The product description below is historical reference. Phase 0
+> has not passed its new gate; unconfined Pi launches are disabled in this branch.
+
 Lumen is a local-first AI agent runtime for user-owned infrastructure. It is meant to run close to the user's data, models, tools, projects, and automation logic instead of becoming a large hosted SaaS dashboard.
 
 The core idea is simple: users own the infrastructure, Lumen coordinates it.

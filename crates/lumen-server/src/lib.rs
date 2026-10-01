@@ -8,7 +8,9 @@ mod kernel_client;
 mod kernel_convert;
 mod model_gateway;
 mod orchestration;
+mod pi_launch;
 pub mod pi_supervisor;
+pub mod pi_tool_bridge;
 mod routes;
 mod sandbox_driver;
 mod session;
@@ -79,3 +81,14 @@ pub use state::{
     SkillReview, SkillReviewQuery, StagedPluginReview, WorkflowCaptureDraftReview,
     WorkspaceModelPolicyReview,
 };
+
+// Fake-child protocol/lifecycle checks are unit tests, not confinement evidence.
+#[cfg(test)]
+#[path = "test_support/host_phase3.rs"]
+mod host_phase3_fixture_tests;
+#[cfg(test)]
+#[path = "test_support/pi_supervisor_boundary.rs"]
+mod pi_protocol_fixture_tests;
+#[cfg(test)]
+#[path = "test_support/session_terminate_real_kernel.rs"]
+mod session_termination_fixture_tests;

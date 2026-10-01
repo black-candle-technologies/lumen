@@ -16,15 +16,15 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use lumen_core::budget::{Budget, BudgetDimension};
-use lumen_core::canonical::{CanonicalPath, PathGrant, PathRights, RealFsResolver, ResourceScope};
-use lumen_core::lease::{LeaseLimits, RootLeaseParams};
-use lumen_server::{
+use crate::{
     ACTION_ENVELOPE_VERSION, ActionEnvelope, AuthdClient, AuthorityKernelClient,
     AuthorityKernelConfig, Decision, EffectClass, KernelClient, LeaseDocument, MemorySessionStore,
     MockAuthdClient, ResourceSet, SessionIdentityAuthority, SessionStatus, SessionSupervisor,
     SupervisorConfig, ToolRef, deadline_rfc3339, default_catalog, now_ms, sha256_hex,
 };
+use lumen_core::budget::{Budget, BudgetDimension};
+use lumen_core::canonical::{CanonicalPath, PathGrant, PathRights, RealFsResolver, ResourceScope};
+use lumen_core::lease::{LeaseLimits, RootLeaseParams};
 use uuid::Uuid;
 
 fn fixture_script() -> PathBuf {
@@ -140,7 +140,7 @@ async fn terminate_destroys_vault_identities_and_revokes_descendant_leases() {
 
     let authd = MockAuthdClient::new().with_token("user-token", "acct-7");
     let owner = authd.authenticate("user-token").await.unwrap();
-    let handle = supervisor.spawn_session(&owner).await.unwrap();
+    let handle = supervisor.spawn_session_fixture(&owner).await.unwrap();
     let subject = handle.binding().await.unwrap().session_subject.clone();
 
     // The supervisor mints a REAL vault identity: `ed25519:` subject.

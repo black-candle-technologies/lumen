@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-26T02:57:01.417220+00:00",
+  "classification": "development verification; not phase acceptance or signed release evidence",
+  "phase_0_gate": "not_passed",
+  "source_commit": "99e598f8c51082b1e2def110ee0812c4d23d3734",
+  "tested_source_archive_sha256": "3273e38e6355ef3a7c9ba6d1bb738c431f715952f1496937f536ab7e5447d346",
+  "host": {
+    "name": "lane-vps",
+    "os": "Linux x86_64",
+    "rust": "cargo 1.98.1",
+    "node": "22.22.1",
+    "scratch": "/home/ubuntu/lumen-phase0.Fq24kV",
+    "deployment_modified": false
+  },
+  "checks": [
+    {
+      "command": "cargo test -p lumen-server --lib --tests",
+      "result": "passed",
+      "tests": 187,
+      "failed": 0,
+      "ignored": 0,
+      "log": "rust-tests-final.log",
+      "log_sha256": "6b2ff3020e0fdce5cbca5fcee08aff5e2c3f2357b9ddec91ec1f65b36b37e026"
+    },
+    {
+      "command": "cargo clippy -p lumen-server --all-targets -- -D warnings",
+      "result": "passed",
+      "log": "clippy-final.log",
+      "log_sha256": "5484778c285c3fc239d5fd91220dbce47dbbde12224899ff5b38b21be679fd00"
+    },
+    {
+      "command": "npm run typecheck && npm test",
+      "directory": "lumen-integrations/bct-pi-extension",
+      "result": "passed",
+      "bridge_tests": 6,
+      "legacy_read_limit_assertions": "passed",
+      "log": "typescript-final.log",
+      "log_sha256": "8ab10d6911a0f9beaf7ec9ace567f93f71165fb13b850f3f99a6b6cd0a4fc1d0"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "host": "local",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "host": "local",
+      "result": "passed"
+    }
+  ],
+  "upstream_api_inspection": {
+    "repository": "https://github.com/earendil-works/pi",
+    "commit": "b45597504eeaba1f11a9920a1d1048c361ed4b8e",
+    "files": {
+      "packages/coding-agent/src/core/extensions/types.ts": "27bfc378f0f2525567daad6ac41e206288559a4e2d0590db2ed08a59c6e1124e",
+      "packages/coding-agent/src/modes/rpc/rpc-mode.ts": "7d4bf1e4291a5320a1ce27504c488622c9a7307ce9e7c2d973f9d95f18a8b2bc"
+    }
+  },
+  "evidence_limits": [
+    "No real Pi process launched.",
+    "No Firecracker VM or signed guest image tested.",
+    "Kernel bridge tests use the real SQLite authority kernel and a sandbox double.",
+    "Fake subprocess lifecycle tests are unit tests using private cfg(test) fixture entry points.",
+    "Production launch rejection tests link the normal library.",
+    "No producer/consumer owner sign-off, independent security review, staging rollback, or release approval.",
+    "The old running service was not changed.",
+    "The local macOS Rust build fails on pre-existing Linux-only sandboxd APIs."
+  ]
+}

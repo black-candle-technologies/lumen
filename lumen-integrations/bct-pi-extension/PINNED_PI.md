@@ -1,5 +1,11 @@
 # Pinned Pi source (phase-0 spike)
 
+> Historical build record, not current launch admission. These candidate hashes
+> need independent reproduction for the boundary reset. The new PiBridge v2
+> extension has different bytes and requires a new reviewed immutable manifest.
+> Do not launch it with the unconfined command below; see
+> [Phase 0](../../docs/rebuild/phase-0.md).
+
 - Repository: https://github.com/earendil-works/pi
 - Commit: `b45597504eeaba1f11a9920a1d1048c361ed4b8e`
 - Commit date: 2026-09-23 23:21:15 +0200

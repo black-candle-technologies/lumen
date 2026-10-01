@@ -804,6 +804,8 @@ impl SessionSupervisor {
     ) -> Result<Arc<tokio::sync::Mutex<Child>>, SupervisorError> {
         let mut cmd = Command::new(&inner.config.pi_binary);
         cmd.args(&inner.config.pi_args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
             .env("LUMEN_SESSION_ID", id.to_string())
             .env("LUMEN_SESSION_SUBJECT", session_subject);
         // Kernel channel contract (phase-0 names): the socket the BCT
@@ -874,6 +876,25 @@ impl SessionSupervisor {
     /// Pi has reported its session reference: a failed spawn leaves no
     /// stale `Running` reference behind.
     pub async fn spawn_session(
+        &self,
+        owner: &AccountIdentity,
+    ) -> Result<SessionHandle, SupervisorError> {
+        crate::pi_launch::require_confinement()
+            .map_err(|reason| SupervisorError::SpawnFailed(reason.to_string()))?;
+        self.spawn_session_inner(owner).await
+    }
+
+    /// Tests of lifecycle mechanics use a fake child, never real Pi. This
+    /// method and its call sites do not exist in non-test library builds.
+    #[cfg(test)]
+    pub(crate) async fn spawn_session_fixture(
+        &self,
+        owner: &AccountIdentity,
+    ) -> Result<SessionHandle, SupervisorError> {
+        self.spawn_session_inner(owner).await
+    }
+
+    async fn spawn_session_inner(
         &self,
         owner: &AccountIdentity,
     ) -> Result<SessionHandle, SupervisorError> {
@@ -2156,7 +2177,10 @@ mod tests {
     #[tokio::test]
     async fn spawn_prompt_pause_resume_terminate() {
         let (supervisor, _kernel) = supervisor(test_config());
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         assert_eq!(handle.status().await.unwrap(), SessionStatus::Running);
 
         let mut events = handle.subscribe().await.unwrap();
@@ -2200,7 +2224,7 @@ mod tests {
         let mut config = test_config();
         config.pi_digest = "0".repeat(64);
         let (supervisor, _) = supervisor(config);
-        match supervisor.spawn_session(&owner().await).await {
+        match supervisor.spawn_session_fixture(&owner().await).await {
             Err(SupervisorError::PinMismatch(_)) => {}
             other => panic!("expected PinMismatch, got {:?}", other.map(|_| ())),
         }
@@ -2211,7 +2235,7 @@ mod tests {
         let mut config = test_config();
         config.pi_digest = String::new();
         let (supervisor, _) = supervisor(config);
-        match supervisor.spawn_session(&owner().await).await {
+        match supervisor.spawn_session_fixture(&owner().await).await {
             Err(SupervisorError::PinMismatch(_)) => {}
             other => panic!("expected PinMismatch, got {:?}", other.map(|_| ())),
         }
@@ -2220,7 +2244,10 @@ mod tests {
     #[tokio::test]
     async fn untrusted_tool_fails_session_closed() {
         let (supervisor, _) = supervisor(test_config_with_mode(Some("evil")));
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         let reason = wait_for_interrupted(&handle, Duration::from_secs(5)).await;
         assert!(
             reason.contains("untrusted tool executed: bash"),
@@ -2233,7 +2260,10 @@ mod tests {
     #[tokio::test]
     async fn malformed_stream_fails_closed_after_threshold() {
         let (supervisor, _) = supervisor(test_config_with_mode(Some("garbage")));
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         let reason = wait_for_interrupted(&handle, Duration::from_secs(5)).await;
         assert!(reason.contains("malformed"), "unexpected reason: {reason}");
     }
@@ -2241,7 +2271,10 @@ mod tests {
     #[tokio::test]
     async fn output_flood_fails_closed_without_truncation() {
         let (supervisor, _) = supervisor(test_config_with_mode(Some("flood")));
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         let reason = wait_for_interrupted(&handle, Duration::from_secs(5)).await;
         assert!(
             reason.contains("output flood"),
@@ -2261,7 +2294,10 @@ mod tests {
             Arc::new(default_catalog()),
             store.clone(),
         );
-        supervisor.spawn_session(&owner().await).await.unwrap_err();
+        supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap_err();
         assert_eq!(store.saves(), 0);
         assert!(store.list_by_owner("acct-test").unwrap().is_empty());
         assert!(supervisor.list_sessions().is_empty());
@@ -2270,7 +2306,10 @@ mod tests {
     #[tokio::test]
     async fn unexpected_child_exit_interrupts_without_retry() {
         let (supervisor, _) = supervisor(test_config_with_mode(Some("exit-slow")));
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         let reason = wait_for_interrupted(&handle, Duration::from_secs(5)).await;
         assert!(
             reason.contains("child exited"),
@@ -2288,7 +2327,10 @@ mod tests {
             Arc::new(default_catalog()),
             store.clone(),
         );
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         let session_ref = store.get(&handle.id()).unwrap().unwrap();
         assert_eq!(session_ref.owner_account_id, "acct-test");
         assert_eq!(session_ref.status, SessionStatus::Running);
@@ -2320,7 +2362,10 @@ mod tests {
             Arc::new(default_catalog()),
             store.clone(),
         );
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         let old_binding = handle.binding().await.unwrap();
         let old_pi_ref = handle.pi_session_id().await.unwrap();
         let old_fingerprint = store
@@ -2373,7 +2418,10 @@ mod tests {
     #[tokio::test]
     async fn restart_aborts_when_revocation_fails() {
         let (supervisor, kernel) = supervisor(test_config());
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         let subject = handle.binding().await.unwrap().session_subject;
         assert!(handle.pi_session_id().await.unwrap().is_some());
 
@@ -2403,7 +2451,10 @@ mod tests {
     #[tokio::test]
     async fn terminate_retries_after_revoke_failure() {
         let (supervisor, kernel) = supervisor(test_config());
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
 
         // First attempt: lease revocation fails. Termination must surface
         // the failure, not claim success.
@@ -2442,7 +2493,10 @@ mod tests {
     #[tokio::test]
     async fn restart_of_terminated_session_is_rejected() {
         let (supervisor, _kernel) = supervisor(test_config());
-        let handle = supervisor.spawn_session(&owner().await).await.unwrap();
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
         handle.terminate().await.unwrap();
         assert!(matches!(
             handle.restart().await,
@@ -2460,7 +2514,10 @@ mod tests {
         let kernel = Arc::new(MockKernelClient::new());
         let supervisor =
             SessionSupervisor::new(config, kernel, Arc::new(default_catalog()), store.clone());
-        let err = supervisor.spawn_session(&owner().await).await.unwrap_err();
+        let err = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, SupervisorError::RpcTimeout(_)),
             "unexpected error: {err:?}"

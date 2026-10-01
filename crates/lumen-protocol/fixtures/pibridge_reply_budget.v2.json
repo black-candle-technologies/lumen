@@ -1,0 +1,6 @@
+{
+  "max_decoded_bytes": 1048576,
+  "max_json_escape_bytes_per_decoded_byte": 6,
+  "max_metadata_bytes": 16384,
+  "max_wire_bytes": 6307840
+}

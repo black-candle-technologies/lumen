@@ -845,6 +845,10 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
         }
     }
 
+    pub(crate) fn kernel(&self) -> &K {
+        self.kernel.as_ref()
+    }
+
     /// Build the canonical envelope for one Pi tool request without
     /// executing it. The host is the envelope authority: resources and
     /// effects come from the host projection, never from Pi.
@@ -984,7 +988,10 @@ impl<K: KernelClient + ?Sized, S: SandboxRunner + ?Sized> ToolPipeline<K, S> {
             }
         }
 
-        let digest = match envelope.digest() {
+        // Execution events and reconciliation must use the authority's
+        // identity, just like its policy audit and the PiBridge reply.
+        // The host decision's compatibility digest is bound separately.
+        let digest = match self.kernel.authoritative_action_digest(envelope) {
             Ok(digest) => digest,
             Err(e) => {
                 return ToolOutcome::Fault {
