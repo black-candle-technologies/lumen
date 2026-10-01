@@ -68,9 +68,13 @@ class BuildPinnedPiTests(unittest.TestCase):
         self.upstream.mkdir()
         self.git(self.upstream, "init", "-q")
         (self.upstream / "source.js").write_text("original\n")
+        (self.upstream / ".gitattributes").write_text(
+            "* text=auto eol=lf\n*.bat text eol=crlf\n")
+        (self.upstream / "pi-test.bat").write_bytes(b"@echo off\necho fixture\n")
         lock = b'{"lockfileVersion": 3}\n'
         (self.upstream / "package-lock.json").write_bytes(lock)
-        self.git(self.upstream, "add", "source.js", "package-lock.json")
+        self.git(self.upstream, "add", "source.js", "package-lock.json",
+                 ".gitattributes", "pi-test.bat")
         self.git(self.upstream, "-c", "user.name=Fixture", "-c",
                  "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
         self.commit = self.git(self.upstream, "rev-parse", "HEAD").strip()
@@ -194,6 +198,22 @@ class BuildPinnedPiTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.executions(), ["hydrate", "deps", "build"])
         self.assertEqual(self.git(self.repo, "rev-parse", "HEAD").strip(), self.commit)
+        self.assertIn("Candidate build complete", result.stdout)
+
+    def test_clean_fresh_build_accepts_crlf_checkout(self):
+        result = self.run_build(resume=False)
+        contents = (self.repo / "pi-test.bat").read_bytes()
+        self.assertEqual(contents, b"@echo off\r\necho fixture\r\n")
+        blob = subprocess.check_output(
+            ["git", "-C", str(self.repo), "show", f"{self.commit}:pi-test.bat"])
+        self.assertEqual(blob, b"@echo off\necho fixture\n")
+        expected = self.git(self.repo, "rev-parse", f"{self.commit}:pi-test.bat").strip()
+        raw_hash = hashlib.sha1(
+            b"blob " + str(len(contents)).encode() + b"\0" + contents).hexdigest()
+        self.assertNotEqual(raw_hash, expected)
+        self.assertEqual(self.git(self.repo, "hash-object", "pi-test.bat").strip(), expected)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.executions(), ["hydrate", "deps", "build"])
         self.assertIn("Candidate build complete", result.stdout)
 
 
