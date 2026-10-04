@@ -402,9 +402,9 @@ pub struct PluginRevocationSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginActionRequest {
     pub run_id: RunId,
-    /// The pending approval the operator must decide (control-plane API;
-    /// the web approvals UI is not built yet — see docs/WEB_UI_FOLLOWUP.md)
-    /// before the action executes. `None` when no approval was created.
+    /// The pending approval the operator can review at /approvals or decide
+    /// through the control-plane API. Only a successful Grant authorizes the
+    /// action. `None` when no approval was created.
     pub approval_id: Option<String>,
 }
 
@@ -653,7 +653,7 @@ impl CommandOutput {
                     .as_ref()
                     .map(|id| format!("approval {id} is PENDING"))
                     .unwrap_or_else(|| "no approval was created".into()),
-                request.approval_id.as_ref().map(|_| "\nDecide it via the control-plane API (the web approvals UI is not built yet — see docs/WEB_UI_FOLLOWUP.md); the action executes after approval.").unwrap_or("")
+                request.approval_id.as_ref().map(|_| "\nReview it in the web approvals page (/approvals) and choose Grant or Reject, or decide it through the control-plane API. The action executes only after a successful Grant.").unwrap_or("")
             ),
             Self::ApprovalsListed(approvals) => {
                 let mut out = String::new();
@@ -1287,9 +1287,9 @@ async fn execute_plugin_command(
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
             // The request is approval-bound: the run parks awaiting the
-            // operator's decision. The CLI must not drain-and-cancel it —
+            // operator's decision. The CLI must not drain-and-cancel it;
             // the approval stays pending for the operator to decide via the
-            // control-plane API (the web approvals UI is not built yet).
+            // web /approvals page or the control-plane API.
             let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
             CommandOutput::PluginActionRequested(PluginActionRequest {
                 run_id,
@@ -1344,9 +1344,9 @@ async fn execute_plugin_command(
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
             // The request is approval-bound: the run parks awaiting the
-            // operator's decision. The CLI must not drain-and-cancel it —
+            // operator's decision. The CLI must not drain-and-cancel it;
             // the approval stays pending for the operator to decide via the
-            // control-plane API (the web approvals UI is not built yet).
+            // web /approvals page or the control-plane API.
             let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
             CommandOutput::PluginActionRequested(PluginActionRequest {
                 run_id,
@@ -1559,8 +1559,8 @@ async fn extension_action_proposal(
 /// Find the pending approval request for a run, if any.
 ///
 /// Approval-bound CLI requests park the run awaiting the operator's
-/// decision; this resolves the approval the operator must decide via the
-/// control-plane API (the web approvals UI is not built yet).
+/// decision. The operator can review it at /approvals and choose Grant or Reject,
+/// or decide it through the control-plane API.
 async fn pending_approval_for_run(
     database: &Database,
     config: &Config,
@@ -2041,6 +2041,30 @@ mod runtime_ownership_tests {
         assert!(acquire_runtime_ownership(&database).is_err());
         drop(first);
         acquire_runtime_ownership(&database).expect("owner after release");
+    }
+}
+
+#[cfg(test)]
+mod approval_rendering_tests {
+    use super::*;
+    #[test]
+    fn pending_plugin_action_points_to_live_approvals_ui() {
+        let rendered = CommandOutput::PluginActionRequested(PluginActionRequest {
+            run_id: RunId::new(),
+            approval_id: Some("approval-test".into()),
+        })
+        .render();
+        for required in [
+            "/approvals",
+            "Grant",
+            "Reject",
+            "control-plane API",
+            "only after a successful Grant",
+        ] {
+            assert!(rendered.contains(required));
+        }
+        assert!(!rendered.contains("WEB_UI_FOLLOWUP"));
+        assert!(!rendered.contains("not built"));
     }
 }
 
