@@ -322,6 +322,10 @@ impl Database {
             let oid = parse_orchestration(item.try_get::<String, _>("orchestration_id")?)?;
             sqlx::query("UPDATE worker_attempts SET state='unknown',completed_at=?,diagnostic='worker lease expired after dispatch' WHERE attempt_id=?").bind(stamp).bind(id.to_string()).execute(&mut *tx).await?;
             append_task_terminal(&mut tx, &item, WorkerAttemptState::Unknown, now).await?;
+            // Expired execution remains charged conservatively. Only active
+            // concurrency is returned so other durable Ready nodes can run.
+            sqlx::query("UPDATE routing_budget_reservations SET state='settled',actual_calls=reserved_calls,actual_input_tokens=reserved_input_tokens,actual_output_tokens=reserved_output_tokens,actual_remote_cost_micros=reserved_remote_cost_micros,usage_complete=0,settled_at=? WHERE orchestration_id=? AND graph_revision=? AND task_node_id=? AND state='active'")
+                .bind(stamp).bind(oid.to_string()).bind(item.try_get::<i64, _>("graph_revision")?).bind(item.try_get::<String, _>("task_node_id")?).execute(&mut *tx).await?;
             touched.insert(oid);
         }
         tx.commit().await?;

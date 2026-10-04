@@ -211,4 +211,28 @@ async fn concurrent_reservations_cannot_double_spend() {
         duplicate,
         Err(lumen_db::RepositoryError::RoutingTaskConflict)
     ));
+    db.settle_active_routing_for_task(graph.orchestration_id(), 1, winner, TimestampMillis::new(7))
+        .await
+        .unwrap();
+    let spent = db
+        .budget_snapshot(graph.orchestration_id(), TimestampMillis::new(7))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spent.remaining_concurrency, 1);
+    assert_eq!(spent.remaining_calls, 0);
+    assert_eq!(spent.remaining_input, 0);
+    assert_eq!(spent.remaining_output, 0);
+    let other = nodes.iter().find(|node| node.id() != winner).unwrap().id();
+    assert!(matches!(
+        db.persist_route_and_reserve(
+            graph.orchestration_id(),
+            1,
+            other,
+            &plan(),
+            TimestampMillis::new(7)
+        )
+        .await,
+        Err(lumen_db::RepositoryError::RoutingBudgetConflict)
+    ));
 }

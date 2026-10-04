@@ -251,6 +251,34 @@ impl Database {
         .transpose()
     }
 
+    pub(crate) async fn record_recovered_unknown_failure(
+        &self,
+        attempt_id: WorkerAttemptId,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let run = sqlx::query_scalar::<_, String>(
+            "SELECT run_id FROM worker_attempts WHERE attempt_id=? AND state='unknown'",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(RepositoryError::InvalidArtifactState)?;
+        let states = sqlx::query_scalar::<_, String>("SELECT execution_attempts.state FROM execution_attempts JOIN actions ON actions.id=execution_attempts.action_id WHERE actions.run_id=?")
+            .bind(run).fetch_all(&mut *tx).await?;
+        let risk = if states.is_empty() {
+            EffectRisk::NoEffect
+        } else if states.iter().all(|state| state == "succeeded") {
+            EffectRisk::KnownEffect
+        } else {
+            EffectRisk::UnknownEffect
+        };
+        sqlx::query("INSERT INTO worker_attempt_failures(attempt_id,failure_class,effect_risk,diagnostic,created_at) VALUES(?,?,?,?,?) ON CONFLICT(attempt_id) DO NOTHING")
+            .bind(attempt_id.to_string()).bind(FailureClass::UnknownFailure.as_str()).bind(risk.as_str()).bind("worker recovered after lease loss").bind(timestamp_to_i64(now)?).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn reconcile_unknown_retry(
         &self,
         attempt: WorkerAttemptId,

@@ -2,7 +2,7 @@ use crate::{Database, RepositoryError, timestamp_to_i64};
 use lumen_core::{
     action::CanonicalValue,
     approval::TimestampMillis,
-    artifact::{ArtifactValidationState, FailureClass, WorkerFailure},
+    artifact::ArtifactValidationState,
     context::{
         ContextSource, ContextSourceId, SourceProvenance, SourceProvenanceKind, most_restrictive,
     },
@@ -285,16 +285,8 @@ impl Database {
             if a.state() == WorkerAttemptState::Unknown
                 && self.worker_failure(a.attempt_id()).await?.is_none()
             {
-                let risk = self.effect_risk_for_run(a.run_id()).await?;
-                let f = WorkerFailure::new(
-                    a.attempt_id(),
-                    FailureClass::UnknownFailure,
-                    risk,
-                    Some("worker recovered after lease loss".into()),
-                    now,
-                )
-                .map_err(|_| RepositoryError::InvalidTrustGateState)?;
-                self.record_worker_failure(&f).await?;
+                self.record_recovered_unknown_failure(a.attempt_id(), now)
+                    .await?;
             }
         }
         Ok(())

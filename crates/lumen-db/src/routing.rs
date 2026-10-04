@@ -327,7 +327,15 @@ async fn used(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     id: OrchestrationId,
 ) -> Result<(u64, u64, u64, u64, u32), RepositoryError> {
-    let row = sqlx::query("SELECT COALESCE(SUM(reserved_calls),0) calls,COALESCE(SUM(reserved_input_tokens),0) input,COALESCE(SUM(reserved_output_tokens),0) output,COALESCE(SUM(reserved_remote_cost_micros),0) cost,COUNT(*) active FROM routing_budget_reservations WHERE orchestration_id=? AND state='active'").bind(id.to_string()).fetch_one(&mut **tx).await?;
+    let row = sqlx::query(
+        "SELECT
+           COALESCE(SUM(CASE WHEN state='active' THEN reserved_calls ELSE COALESCE(actual_calls,reserved_calls) END),0) calls,
+           COALESCE(SUM(CASE WHEN state='active' THEN reserved_input_tokens ELSE COALESCE(actual_input_tokens,reserved_input_tokens) END),0) input,
+           COALESCE(SUM(CASE WHEN state='active' THEN reserved_output_tokens ELSE COALESCE(actual_output_tokens,reserved_output_tokens) END),0) output,
+           COALESCE(SUM(CASE WHEN state='active' THEN reserved_remote_cost_micros ELSE COALESCE(actual_remote_cost_micros,reserved_remote_cost_micros) END),0) cost,
+           COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0) active
+         FROM routing_budget_reservations WHERE orchestration_id=? AND state<>'released'",
+    ).bind(id.to_string()).fetch_one(&mut **tx).await?;
     Ok((
         u64v(&row, "calls")?,
         u64v(&row, "input")?,
