@@ -21,6 +21,47 @@ HTTPS and certificate verification are required for remote providers. Userinfo,
 query strings, fragments and loopback remote endpoints are rejected. Paths are
 joined relatively, preserving the prefix. Redirects and environment proxies are disabled.
 
+## Headless Linux keyring prerequisite
+
+Provider credential storage and resolution on Linux require a Secret Service
+implementation and a working D-Bus session for the OS user running Lumen. Stock
+headless servers may have neither. On Debian/Ubuntu, install:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes gnome-keyring dbus-user-session
+```
+
+The `gnome-keyring` package supplies `gnome-keyring-daemon`. Verify that the user
+has a session bus and an available, unlocked secrets component:
+
+```sh
+test -n "$DBUS_SESSION_BUS_ADDRESS"
+pgrep -x gnome-keyring-daemon
+```
+
+For an explicit headless session, start both before the credential command:
+
+```sh
+dbus-run-session -- sh -lc '
+  eval "$(gnome-keyring-daemon --start --components=secrets)"
+  test -n "$DBUS_SESSION_BUS_ADDRESS"
+  exec "$@"
+' sh lumen --config /etc/lumen/lumen.toml provider credential create --metadata credential.json --stdin
+```
+
+Supply credential input through stdin as described below. An existing keyring
+may also need to be unlocked through its normal login or keyring workflow.
+The long-running `lumen serve` process needs access to the same user's Secret
+Service and D-Bus session, including an unlocked keyring. Creating a credential
+in a desktop session does not make it resolvable in a service environment with
+no session-bus access. The same `dbus-run-session` wrapper can run `lumen serve`
+when the secrets service and keyring are available in that session.
+
+Lumen fails closed when the keyring is unavailable. Fix the Secret Service and
+D-Bus environment; credentials have no environment-variable, plaintext-file or
+SQLite fallback.
+
 ## Create a credential reference
 
 Create a metadata-only `credential.json`:
@@ -74,6 +115,11 @@ zero; every successful registration advances each head by one.
   "expected": { "provider": 0, "profile": 0, "egress": 0, "workspace_policy": 0 },
   "allowed_data_classes": ["public"],
   "workspace_allowed_data_classes": ["public"],
+  "model_data_policy": {
+    "allowed_data_classes": ["public"],
+    "allowed_compartments": [],
+    "allow_uncompartmented": true
+  },
   "profile": {
     "id": "primary-text",
     "model": "YOUR-VENDOR-MODEL-ID",
@@ -88,7 +134,9 @@ zero; every successful registration advances each head by one.
 
 Advertise only capabilities the selected model supports. Add `workspace` or
 `sensitive` classes only when you intend to permit that disclosure, in both
-policies. `secret` is forbidden. The profile initially uses `remote_untrusted`.
+egress policies and the model-data policy. Explicitly select permitted compartments
+and whether uncompartmented data is allowed. An empty model-data class set and
+`secret` are forbidden. The profile initially uses `remote_untrusted`.
 A credential authenticates a request; it grants no egress permission.
 
 ```sh
@@ -101,7 +149,9 @@ lumen --config lumen.toml provider credential list
 Registration validates ownership and the ready reference's exact workspace,
 provider ID, protocol and canonical endpoint. One transaction compares all four
 expected heads and writes provider config, profile, egress mirror, workspace policy
-and audit event. A stale head is an explicit conflict; failure rolls back all writes.
+model-data policy and audit event. The model-data policy has its own revision stream
+and binds to this exact profile revision and trust zone. A stale head is an explicit
+conflict; failure rolls back all writes.
 Profile IDs cannot be reassigned to another provider. Provider and profile revision
 numbers can differ, for example when adding another profile to an existing provider.
 
@@ -149,7 +199,7 @@ fall back to another permitted provider or the legacy endpoint. Workers keep the
 assignment's exact provider/profile and existing projection/data-policy gates;
 the shared lazy resolver rechecks remote egress before key use. Worker generation
 settings and usage recording are forwarded. A registry profile alone does not
-create worker routing metadata, capacity, health observations or data policies;
+create worker routing metadata, capacity or health observations;
 those remain part of the existing orchestration setup and default-deny admission.
 
 ## Rotation, disablement and revocation
