@@ -89,4 +89,4 @@ Linux process actions require the complete bubblewrap profile. macOS uses a narr
 
 ## License
 
-No license has been added yet.
+MIT. See [LICENSE](LICENSE).

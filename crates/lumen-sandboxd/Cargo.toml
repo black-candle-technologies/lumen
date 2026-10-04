@@ -3,7 +3,7 @@ name = "lumen-sandboxd"
 version.workspace = true
 edition.workspace = true
 description = "Strict-profile Firecracker sandbox broker: one disposable microVM per action"
-license = "Apache-2.0"
+license = "MIT"
 
 [[bin]]
 name = "lumen-sandboxd"
