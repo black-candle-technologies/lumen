@@ -218,6 +218,56 @@ async fn model_data_policy_revision_is_independent_and_invalid_grants_roll_back(
     }
 }
 #[tokio::test]
+async fn disabled_registration_preserves_explicit_policy_without_model_access() {
+    let (db, w, p) = fixture().await;
+    let mut r = bundle(w, p.clone(), "profile", [0; 4]);
+    r.provider = ProviderConfig::remote(
+        p.id().clone(),
+        1,
+        p.kind(),
+        p.endpoint(),
+        false,
+        p.credential_secret_ref().unwrap(),
+    )
+    .unwrap();
+    r.profile = ModelProfile::new(
+        r.profile.id().clone(),
+        1,
+        p.id().clone(),
+        1,
+        "model",
+        false,
+        r.profile.capabilities().clone(),
+        32768,
+        r.profile.trust_zone(),
+        1,
+        0,
+    )
+    .unwrap();
+    r.egress = ModelProviderRevision::new(
+        p.id().clone(),
+        1,
+        ModelEndpointClass::Remote,
+        DestinationScope::parse(p.endpoint()).unwrap(),
+        "model",
+        false,
+        0,
+        p.credential_secret_ref(),
+        [DataClass::Public],
+        at(),
+    )
+    .unwrap();
+    db.register_provider_bundle(&r, &actor(), at())
+        .await
+        .unwrap();
+    let policy = db
+        .latest_model_data_policy(w, r.profile.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(policy.validate_profile(&r.profile).is_err());
+}
+#[tokio::test]
 async fn every_bundle_insert_and_audit_failure_roll_back_all_heads() {
     for table in [
         "model_provider_runtime_revisions",
