@@ -1,4 +1,5 @@
-use super::http;
+use super::{ProviderCredential, ProviderHttpOptions, http};
+use lumen_core::egress::EndpointClass;
 use lumen_core::{
     model::{ActionProposal, ModelInput, ModelMessage, ModelOutput, ModelRole, ModelToolCall},
     provider::{
@@ -10,34 +11,44 @@ use lumen_core::{
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
-pub struct LocalOpenAiCompatibleAdapter {
+pub struct OpenAiCompatibleAdapter {
     config: ProviderConfig,
-    key: Option<String>,
+    key: Option<ProviderCredential>,
     client: Client,
+    options: ProviderHttpOptions,
 }
-impl LocalOpenAiCompatibleAdapter {
-    pub fn new(config: ProviderConfig, key: Option<String>) -> Result<Self, ProviderError> {
+impl OpenAiCompatibleAdapter {
+    pub fn new_with_options(
+        config: ProviderConfig,
+        key: Option<ProviderCredential>,
+        options: ProviderHttpOptions,
+    ) -> Result<Self, ProviderError> {
         if config.kind() != ProviderKind::OpenAiCompatible
-            || config.local_runtime().is_none()
-            || key
-                .as_ref()
-                .is_some_and(|key| key.is_empty() || key.chars().any(char::is_control))
+            || match config.endpoint_class() {
+                EndpointClass::Local => config.local_runtime().is_none(),
+                EndpointClass::Remote => config.local_runtime().is_some() || key.is_none(),
+            }
         {
             return Err(ProviderError::configuration(
-                "invalid local OpenAI-compatible provider",
+                "invalid compatible provider shape",
             ));
         }
+        let options = options.validate()?;
         Ok(Self {
             config,
             key,
-            client: http::client()?,
+            client: http::client_with(options)?,
+            options,
         })
     }
-    pub fn runtime(&self) -> LocalRuntimeKind {
-        self.config
-            .local_runtime()
-            .expect("validated local runtime")
+    /// Trusted host transport injection, primarily for hermetic TLS tests.
+    /// The host must retain TLS verification, no redirects, and no proxy.
+    #[doc(hidden)]
+    pub fn with_http_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
     }
     async fn send(
         &self,
@@ -57,8 +68,16 @@ impl LocalOpenAiCompatibleAdapter {
             .config
             .endpoint()
             .join("chat/completions")
-            .map_err(|error| ProviderError::configuration(error.to_string()))?;
+            .map_err(|_| ProviderError::configuration("invalid provider request path"))?;
         let mut body = json!({"model":profile.model_name(),"messages":messages(input.messages()),"tools":tools(input.tools()),"parallel_tool_calls":false,"stream":false});
+        if input.tools().is_empty() {
+            body.as_object_mut()
+                .expect("request object")
+                .remove("tools");
+            body.as_object_mut()
+                .expect("request object")
+                .remove("parallel_tool_calls");
+        }
         if let Some(generation) = input.generation() {
             body["max_tokens"] = json!(generation.max_output_tokens());
             if let Some(effort) = generation.provider_effort() {
@@ -68,24 +87,25 @@ impl LocalOpenAiCompatibleAdapter {
         parse(
             profile,
             input.tools(),
-            http::json(
-                self.auth(self.client.post(url))
+            http::json_with(
+                self.auth(self.client.post(url))?
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|error| ProviderError::transport(error.to_string()))?,
+                    .map_err(|_| ProviderError::transport("provider request failed"))?,
+                self.options.max_response_bytes,
             )
             .await?,
         )
     }
-    fn auth(&self, request: RequestBuilder) -> RequestBuilder {
+    fn auth(&self, request: RequestBuilder) -> Result<RequestBuilder, ProviderError> {
         match &self.key {
-            Some(key) => request.bearer_auth(key),
-            None => request,
+            Some(key) => Ok(request.header(reqwest::header::AUTHORIZATION, key.bearer_header()?)),
+            None => Ok(request),
         }
     }
 }
-impl ProviderAdapter for LocalOpenAiCompatibleAdapter {
+impl ProviderAdapter for OpenAiCompatibleAdapter {
     fn config(&self) -> &ProviderConfig {
         &self.config
     }
@@ -97,7 +117,7 @@ impl ProviderAdapter for LocalOpenAiCompatibleAdapter {
     ) -> ProviderFuture<'a> {
         Box::pin(async move {
             validate_binding(&self.config, profile)?;
-            tokio::select! { biased; _ = cancel.cancelled() => Err(ProviderError::cancelled()), response = self.send(profile, input) => response }
+            tokio::select! { biased; _ = cancel.cancelled() => Err(ProviderError::cancelled()), response = tokio::time::timeout(self.options.timeout,self.send(profile, input)) => response.map_err(|_|ProviderError::transport("provider request timed out"))? }
         })
     }
 }
@@ -192,6 +212,43 @@ fn parse(
         },
     )
 }
+/// Compatibility wrapper retaining the local-only constructor and runtime accessor.
+pub struct LocalOpenAiCompatibleAdapter(OpenAiCompatibleAdapter);
+impl LocalOpenAiCompatibleAdapter {
+    pub fn new(config: ProviderConfig, key: Option<String>) -> Result<Self, ProviderError> {
+        if config.endpoint_class() != EndpointClass::Local || config.local_runtime().is_none() {
+            return Err(ProviderError::configuration("local provider required"));
+        }
+        let key = key
+            .map(|value| ProviderCredential::from_keyring(Zeroizing::new(value.into_bytes())))
+            .transpose()?;
+        Ok(Self(OpenAiCompatibleAdapter::new_with_options(
+            config,
+            key,
+            ProviderHttpOptions::default(),
+        )?))
+    }
+    pub fn runtime(&self) -> LocalRuntimeKind {
+        self.0
+            .config
+            .local_runtime()
+            .expect("validated local runtime")
+    }
+}
+impl ProviderAdapter for LocalOpenAiCompatibleAdapter {
+    fn config(&self) -> &ProviderConfig {
+        self.0.config()
+    }
+    fn generate<'a>(
+        &'a self,
+        profile: &'a ModelProfile,
+        input: ModelInput,
+        cancel: CancellationToken,
+    ) -> ProviderFuture<'a> {
+        self.0.generate(profile, input, cancel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+zeroize = "1"
 lumen-core = { path = "../lumen-core" }
 lumen-db = { path = "../lumen-db" }
 lumen-integrations = { path = "../lumen-integrations" }

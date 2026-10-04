@@ -11,6 +11,11 @@ pub mod lease;
 mod lifecycle;
 mod migrations;
 mod model_registry;
+mod provider_configuration;
+pub use provider_configuration::{
+    ProviderCredentialReference, ProviderRegistration, RegisteredModelSnapshot,
+    RegistrationReceipt, next_provider_revision,
+};
 mod orchestration;
 mod repositories;
 mod routing;
@@ -139,6 +144,14 @@ pub enum RepositoryError {
     InvalidEgressPolicy,
     #[error("model registry state conflicts with repository constraints")]
     InvalidModelRegistry,
+    #[error("provider revision conflict; inspect current heads before retrying")]
+    ProviderRevisionConflict,
+    #[error("provider scope denied")]
+    ProviderScopeDenied,
+    #[error("provider credential unavailable")]
+    ProviderCredentialUnavailable,
+    #[error("provider selection unavailable")]
+    ProviderSelectionUnavailable,
     #[error("secure context state conflicts with repository constraints")]
     InvalidContextState,
     #[error("orchestration state conflicts with repository constraints")]

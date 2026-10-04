@@ -10,6 +10,7 @@ native-secrets = ["dep:keyring"]
 wasm-host = ["dep:wasmtime"]
 
 [dependencies]
+zeroize = "1"
 cap-std = "4"
 cap-fs-ext = "4"
 eventsource-stream = "0.2"
@@ -42,3 +43,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_S
 tempfile = "3"
 wat = "1"
 wiremock = "0.6"
+
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

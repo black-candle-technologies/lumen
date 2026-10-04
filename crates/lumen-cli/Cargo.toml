@@ -8,6 +8,7 @@ name = "lumen"
 path = "src/main.rs"
 
 [dependencies]
+zeroize = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 lumen-core = { path = "../lumen-core" }
@@ -37,3 +38,7 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 wat = "1"
+
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

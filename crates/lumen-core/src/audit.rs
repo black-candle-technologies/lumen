@@ -47,6 +47,9 @@ pub enum AuditEventKind {
     SchedulerJobFailed,
     SchedulerPollFailed,
     ModelEgress,
+    ProviderConfigured,
+    ProviderCredentialCreated,
+    ProviderCredentialRevoked,
     PluginStaged,
     ActionProposed,
     ActionNormalized,
@@ -77,6 +80,9 @@ impl AuditEventKind {
             Self::RunReconciliationRequired => "run_reconciliation_required",
             Self::SchedulerJobFailed => "scheduler_job_failed",
             Self::SchedulerPollFailed => "scheduler_poll_failed",
+            Self::ProviderConfigured => "provider_configured",
+            Self::ProviderCredentialCreated => "provider_credential_created",
+            Self::ProviderCredentialRevoked => "provider_credential_revoked",
             Self::ModelEgress => "model_egress",
             Self::PluginStaged => "plugin_staged",
             Self::ActionProposed => "action_proposed",
@@ -112,6 +118,9 @@ impl FromStr for AuditEventKind {
             "run_reconciliation_required" => Ok(Self::RunReconciliationRequired),
             "scheduler_job_failed" => Ok(Self::SchedulerJobFailed),
             "scheduler_poll_failed" => Ok(Self::SchedulerPollFailed),
+            "provider_configured" => Ok(Self::ProviderConfigured),
+            "provider_credential_created" => Ok(Self::ProviderCredentialCreated),
+            "provider_credential_revoked" => Ok(Self::ProviderCredentialRevoked),
             "model_egress" => Ok(Self::ModelEgress),
             "plugin_staged" => Ok(Self::PluginStaged),
             "action_proposed" => Ok(Self::ActionProposed),
@@ -354,4 +363,21 @@ pub enum AuditValueError {
     InvalidUuid,
     #[error("invalid audit payload")]
     InvalidPayload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_event_wire_names_round_trip() {
+        for kind in [
+            AuditEventKind::ProviderConfigured,
+            AuditEventKind::ProviderCredentialCreated,
+            AuditEventKind::ProviderCredentialRevoked,
+        ] {
+            assert_eq!(kind.as_str().parse::<AuditEventKind>().unwrap(), kind);
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
+    }
 }

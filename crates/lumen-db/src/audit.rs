@@ -19,41 +19,10 @@ impl Database {
         &self,
         event: AuditEvent,
     ) -> Result<AuditRecord, RepositoryError> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let previous: Option<(i64, String)> = sqlx::query_as(
-            "SELECT sequence, event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1",
-        )
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let (sequence, previous_hash) = match previous {
-            Some((sequence, hash)) => (
-                sequence + 1,
-                AuditHash::parse(hash).map_err(audit_value_error)?,
-            ),
-            None => (1, AuditHash::genesis()),
-        };
-        let record = AuditRecord::chain(sequence, event, previous_hash);
-
-        sqlx::query(
-            "INSERT INTO audit_events (
-                sequence, event_id, timestamp, event_type, outcome, workspace_id,
-                payload_json, previous_hash, event_hash
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(record.sequence())
-        .bind(record.event().id().to_string())
-        .bind(timestamp_to_i64(record.event().timestamp())?)
-        .bind(record.event().kind().as_str())
-        .bind(record.event().outcome().as_str())
-        .bind(record.event().workspace_id().map(|id| id.to_string()))
-        .bind(serde_json::to_string(record.event().payload())?)
-        .bind(record.previous_hash().as_str())
-        .bind(record.hash().as_str())
-        .execute(&mut *transaction)
-        .await?;
-
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let result = append_audit_event_in(&mut transaction, event).await?;
         transaction.commit().await?;
-        Ok(record)
+        Ok(result)
     }
 
     pub async fn verify_audit_chain(&self) -> Result<(), AuditIntegrityError> {
@@ -196,4 +165,45 @@ fn audit_value_error(error: AuditValueError) -> RepositoryError {
 
 fn storage_error(error: sqlx::Error) -> AuditIntegrityError {
     AuditIntegrityError::Storage(error.to_string())
+}
+
+pub(crate) async fn append_audit_event_in(
+    connection: &mut sqlx::SqliteConnection,
+    event: AuditEvent,
+) -> Result<AuditRecord, RepositoryError> {
+    let previous: Option<(i64, String)> = sqlx::query_as(
+        "SELECT sequence, event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
+    let (sequence, previous_hash) = match previous {
+        Some((sequence, hash)) => (
+            sequence
+                .checked_add(1)
+                .ok_or(RepositoryError::InvalidModelRegistry)?,
+            AuditHash::parse(hash).map_err(audit_value_error)?,
+        ),
+        None => (1, AuditHash::genesis()),
+    };
+    let record = AuditRecord::chain(sequence, event, previous_hash);
+
+    sqlx::query(
+        "INSERT INTO audit_events (
+                sequence, event_id, timestamp, event_type, outcome, workspace_id,
+                payload_json, previous_hash, event_hash
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(record.sequence())
+    .bind(record.event().id().to_string())
+    .bind(timestamp_to_i64(record.event().timestamp())?)
+    .bind(record.event().kind().as_str())
+    .bind(record.event().outcome().as_str())
+    .bind(record.event().workspace_id().map(|id| id.to_string()))
+    .bind(serde_json::to_string(record.event().payload())?)
+    .bind(record.previous_hash().as_str())
+    .bind(record.hash().as_str())
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(record)
 }

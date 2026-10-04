@@ -39,6 +39,32 @@ async fn connect_with(
         .max_connections(max_connections)
         .connect_with(options)
         .await?;
-    MIGRATOR.run(&pool).await?;
+    let result: Result<(), RepositoryError> = async {
+        let mut connection = pool.acquire().await?;
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *connection)
+            .await?;
+        let migrated = MIGRATOR.run(&mut *connection).await;
+        let restored = sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&mut *connection)
+            .await;
+        migrated?;
+        restored?;
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *connection)
+            .await?;
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&mut *connection)
+            .await?;
+        if enabled != 1 || violations != 0 {
+            return Err(RepositoryError::InvalidModelRegistry);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        pool.close().await;
+        return Err(error);
+    }
     Ok(Database::from_pool(pool))
 }
