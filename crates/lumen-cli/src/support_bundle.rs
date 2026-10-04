@@ -21,7 +21,7 @@ use lumen_db::Database;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{config::Config, health};
+use crate::{config::Config, health, redaction::SecretRedactor};
 
 #[derive(Debug, Error)]
 pub enum SupportBundleError {
@@ -57,6 +57,23 @@ pub async fn export_bundle(
     out: &Path,
     audit_only: bool,
 ) -> Result<SupportBundleReport, SupportBundleError> {
+    let redactor = SecretRedactor::new(
+        std::env::var(&config.authentication.token_environment)
+            .ok()
+            .into_iter()
+            .collect(),
+    );
+    export_bundle_with_redactor(config, database, config_path, out, audit_only, &redactor).await
+}
+/// Callers with an active runtime can supply the same observer without another keyring read.
+pub(crate) async fn export_bundle_with_redactor(
+    config: &Config,
+    database: &Database,
+    config_path: &Path,
+    out: &Path,
+    audit_only: bool,
+    redactor: &SecretRedactor,
+) -> Result<SupportBundleReport, SupportBundleError> {
     if out.exists() {
         return Err(SupportBundleError::OutputExists(out.display().to_string()));
     }
@@ -64,7 +81,16 @@ pub async fn export_bundle(
     // If the scan fails we delete everything: no partial bundle survives.
     let staging = out.with_extension(format!("staging-{}", Uuid::new_v4().simple()));
     create_staging_dir(&staging)?;
-    let result = build_and_scan(config, database, config_path, &staging, out, audit_only).await;
+    let result = build_and_scan(
+        config,
+        database,
+        config_path,
+        &staging,
+        out,
+        audit_only,
+        redactor,
+    )
+    .await;
     match result {
         Ok(report) => {
             fs::rename(&staging, out)?;
@@ -103,6 +129,7 @@ async fn build_and_scan(
     staging: &Path,
     out: &Path,
     audit_only: bool,
+    redactor: &SecretRedactor,
 ) -> Result<SupportBundleReport, SupportBundleError> {
     let mut redactions = 0usize;
     let workspace_id = config.workspace_id();
@@ -245,7 +272,7 @@ async fn build_and_scan(
     }
 
     // The scan gates the export. Any hit deletes the whole staging tree.
-    let scan = scan_for_secrets(staging, config)?;
+    let scan = scan_for_secrets(staging, redactor)?;
     if !scan.hits.is_empty() {
         let locations = scan
             .hits
@@ -414,11 +441,13 @@ struct SecretScan {
 /// configured bearer-token value, and high-entropy strings that are not
 /// plausible content digests (64 lowercase hex chars are expected throughout
 /// the bundle and are excluded).
-fn scan_for_secrets(dir: &Path, config: &Config) -> Result<SecretScan, SupportBundleError> {
+fn scan_for_secrets(
+    dir: &Path,
+    redactor: &SecretRedactor,
+) -> Result<SecretScan, SupportBundleError> {
     let mut hits = Vec::new();
     let mut bytes = 0u64;
-    let bearer_value = std::env::var(&config.authentication.token_environment).ok();
-    scan_dir(dir, dir, &mut hits, &mut bytes, bearer_value.as_deref())?;
+    scan_dir(dir, dir, &mut hits, &mut bytes, redactor)?;
     Ok(SecretScan { hits, bytes })
 }
 
@@ -427,7 +456,7 @@ fn scan_dir(
     dir: &Path,
     hits: &mut Vec<SecretHit>,
     bytes: &mut u64,
-    bearer_value: Option<&str>,
+    redactor: &SecretRedactor,
 ) -> Result<(), SupportBundleError> {
     let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|e| e.file_name());
@@ -435,7 +464,7 @@ fn scan_dir(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            scan_dir(root, &path, hits, bytes, bearer_value)?;
+            scan_dir(root, &path, hits, bytes, redactor)?;
         } else if file_type.is_file() {
             let rel = path
                 .strip_prefix(root)
@@ -444,13 +473,27 @@ fn scan_dir(
             let content = fs::read(&path)?;
             *bytes += content.len() as u64;
             let text = String::from_utf8_lossy(&content);
-            scan_text(&rel, &text, hits, bearer_value);
+            scan_text_with_redactor(&rel, &text, hits, redactor);
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn scan_text(file: &str, text: &str, hits: &mut Vec<SecretHit>, bearer_value: Option<&str>) {
+    scan_text_with_redactor(
+        file,
+        text,
+        hits,
+        &SecretRedactor::new(bearer_value.map(str::to_owned).into_iter().collect()),
+    );
+}
+fn scan_text_with_redactor(
+    file: &str,
+    text: &str,
+    hits: &mut Vec<SecretHit>,
+    redactor: &SecretRedactor,
+) {
     let mut push = |pattern: &'static str| {
         // Avoid duplicate hits for the same file+pattern.
         if !hits.iter().any(|h| h.file == file && h.pattern == pattern) {
@@ -485,10 +528,7 @@ fn scan_text(file: &str, text: &str, hits: &mut Vec<SecretHit>, bearer_value: Op
             }
         }
     }
-    if let Some(value) = bearer_value
-        && !value.is_empty()
-        && text.contains(value)
-    {
+    if redactor.contains_secret(text) {
         push("bearer-token-value");
     }
     if has_high_entropy_token(text) {

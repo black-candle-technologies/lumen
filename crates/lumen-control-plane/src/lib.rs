@@ -1,3 +1,4 @@
+pub mod provider_runtime;
 use lumen_core::{
     approval::TimestampMillis,
     artifact::RetryMode,
@@ -12,19 +13,12 @@ use lumen_core::{
         AuthorityRequest, OperatorAuthorityPort, OperatorOperation, OrchestrationControlPolicy,
     },
     orchestration::{OrchestrationId, TaskGraph, TaskGraphProposal, TaskNode, TaskNodeState},
-    provider::{ModelProfile, ProviderAdapter, ProviderConfig, ProviderKind},
+    provider::ModelProfile,
     routing::{OrchestrationBudget, RoutingPolicy},
     trust_gate::evaluate_exact_projection,
     worker::{OwnedProjectedModel, WorkerAssignment, WorkerCapabilityGrant, WorkerRunBudget},
 };
 use lumen_db::{ControlEvent, Database, RepositoryError};
-use lumen_integrations::{
-    providers::{
-        anthropic::AnthropicAdapter, openai::OpenAiAdapter,
-        openai_compatible::LocalOpenAiCompatibleAdapter,
-    },
-    secrets::SecretStore,
-};
 use lumen_server::{
     ControlAction, ControlOrchestrationCommand, CreateOrchestrationCommand, OrchestrationEvent,
     OrchestrationFuture, OrchestrationService, ServiceError,
@@ -102,59 +96,11 @@ impl PlannerPort for JsonModelPlanner {
 }
 pub struct DatabaseWorkerMaterializer {
     db: Database,
-    secrets: Arc<dyn SecretStore>,
+    factory: Arc<provider_runtime::DatabaseProviderFactory>,
 }
 impl DatabaseWorkerMaterializer {
-    pub fn new(db: Database, secrets: Arc<dyn SecretStore>) -> Self {
-        Self { db, secrets }
-    }
-    async fn adapter(
-        &self,
-        a: &WorkerAssignment,
-        p: &ProviderConfig,
-    ) -> Result<Arc<dyn ProviderAdapter>, WorkerRuntimeError> {
-        let key = if let Some(id) = p.credential_secret_ref() {
-            let r = self
-                .db
-                .get_secret_reference(a.workspace_id(), id)
-                .await?
-                .ok_or(WorkerRuntimeError::Stale)?;
-            Some(
-                String::from_utf8(
-                    self.secrets
-                        .resolve(r.keychain_account())
-                        .await
-                        .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-                )
-                .map_err(|_| WorkerRuntimeError::Configuration("credential encoding".into()))?,
-            )
-        } else {
-            None
-        };
-        Ok(match p.kind() {
-            ProviderKind::OpenAi => Arc::new(
-                OpenAiAdapter::new(
-                    p.clone(),
-                    key.ok_or_else(|| {
-                        WorkerRuntimeError::Configuration("OpenAI credential missing".into())
-                    })?,
-                )
-                .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-            ),
-            ProviderKind::Anthropic => Arc::new(
-                AnthropicAdapter::new(
-                    p.clone(),
-                    key.ok_or_else(|| {
-                        WorkerRuntimeError::Configuration("Anthropic credential missing".into())
-                    })?,
-                )
-                .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-            ),
-            ProviderKind::OpenAiCompatible => Arc::new(
-                LocalOpenAiCompatibleAdapter::new(p.clone(), key)
-                    .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-            ),
-        })
+    pub fn new(db: Database, factory: Arc<provider_runtime::DatabaseProviderFactory>) -> Self {
+        Self { db, factory }
     }
 }
 impl WorkerMaterializer for DatabaseWorkerMaterializer {
@@ -197,13 +143,18 @@ impl WorkerMaterializer for DatabaseWorkerMaterializer {
                 return Err(WorkerRuntimeError::Stale);
             }
             let model = OwnedProjectedModel::new(
-                self.adapter(a, &p).await?,
+                self.factory.lazy_with_execution(
+                    a.workspace_id(),
+                    p.clone(),
+                    lumen_integrations::providers::ProviderHttpOptions::default(),
+                    g,
+                    sink,
+                ),
                 m.clone(),
                 policy,
                 projection,
                 cancel,
             )?;
-            let _ = (g, sink); // Routing metadata is enforced before materialization.
             Ok(MaterializedWorker {
                 model: Arc::new(model),
                 profile_id: m.id().clone(),

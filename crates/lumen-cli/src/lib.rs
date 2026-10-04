@@ -1,7 +1,10 @@
 pub mod config;
+pub mod provider;
+use provider::{ProviderCommand, ProviderCredentialCommand, ProviderSummary};
 mod extension_runtime;
 mod health;
 mod plugin_admission;
+mod redaction;
 mod runtime;
 mod support_bundle;
 
@@ -63,6 +66,10 @@ pub struct Cli {
 pub enum Command {
     Migrate,
     Serve,
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
@@ -284,6 +291,12 @@ pub enum SecretCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
     Migrated,
+    ProviderRegistered(ProviderSummary),
+    Providers(Vec<ProviderSummary>),
+    ProviderShown(ProviderSummary),
+    ProviderCredentials(Vec<lumen_db::ProviderCredentialReference>),
+    ProviderCredentialCreated(lumen_db::ProviderCredentialReference),
+    ProviderCredentialRevoked(SecretRefId),
     AuditVerified,
     AuditListed(Vec<AuditEventSummary>),
     ServerStopped,
@@ -477,6 +490,25 @@ impl CommandOutput {
                     out.push_str("no audit events\n");
                 }
                 out
+            }
+            Self::ProviderRegistered(value) | Self::ProviderShown(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe provider metadata")
+            ),
+            Self::Providers(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe provider metadata")
+            ),
+            Self::ProviderCredentials(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe credential metadata")
+            ),
+            Self::ProviderCredentialCreated(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe credential metadata")
+            ),
+            Self::ProviderCredentialRevoked(value) => {
+                format!("provider credential {value} revoked\n")
             }
             Self::ServerStopped => "server stopped\n".into(),
             Self::SandboxReport(report) => {
@@ -684,6 +716,31 @@ impl CommandOutput {
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
+    if let Command::Provider { command } = &cli.command {
+        let input = if matches!(
+            command,
+            ProviderCommand::Credential {
+                command: ProviderCredentialCommand::Create { .. }
+            }
+        ) {
+            Some(
+                tokio::task::spawn_blocking(provider::read_input)
+                    .await
+                    .map_err(|_| CliError::Runtime("provider input unavailable".into()))??,
+            )
+        } else {
+            None
+        };
+        let store = if provider::needs_store(command) {
+            Some(Arc::new(OsKeyringSecretStore::new("dev.lumen.runtime")?) as Arc<dyn SecretStore>)
+        } else {
+            None
+        };
+        let config = Config::load(&cli.config)?;
+        prepare_directories(&config)?;
+        let _owner = acquire_runtime_ownership(&config.database.path)?;
+        return provider::execute(&config, command.clone(), store, input).await;
+    }
     if matches!(
         &cli.command,
         Command::Sandbox {
@@ -716,8 +773,14 @@ pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
 pub async fn execute_with_secret_store(
     cli: Cli,
     secret_store: Arc<dyn SecretStore>,
-    secret_input: Option<Vec<u8>>,
+    mut secret_input: Option<Vec<u8>>,
 ) -> Result<CommandOutput, CliError> {
+    // Keep injected provider bytes zeroizing even if config loading/locking fails.
+    let provider_input = if matches!(&cli.command, Command::Provider { .. }) {
+        secret_input.take().map(zeroize::Zeroizing::new)
+    } else {
+        None
+    };
     if matches!(
         &cli.command,
         Command::Sandbox {
@@ -730,7 +793,15 @@ pub async fn execute_with_secret_store(
     }
     let config = Config::load(&cli.config)?;
     prepare_directories(&config)?;
+    let _offline_owner = if matches!(&cli.command, Command::Serve) {
+        None
+    } else {
+        Some(acquire_runtime_ownership(&config.database.path)?)
+    };
     match cli.command {
+        Command::Provider { command } => {
+            provider::execute(&config, command, Some(secret_store), provider_input).await
+        }
         Command::Migrate => {
             let database = Database::connect(&config.database.path).await?;
             database.close().await;
@@ -1741,7 +1812,7 @@ async fn serve(
             database.clone(),
             Arc::new(DatabaseWorkerMaterializer::new(
                 database.clone(),
-                Arc::clone(&secret_store),
+                service.provider_factory(),
             )),
             service.worker_kernel_ports(),
             WorkerSchedulerConfig::new(global, provider_limits, Duration::from_secs(30))

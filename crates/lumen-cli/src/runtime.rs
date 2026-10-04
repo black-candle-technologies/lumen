@@ -1,8 +1,10 @@
+use lumen_control_plane::provider_runtime::{DatabaseProviderFactory, RegisteredModelPort};
+use lumen_integrations::providers::ProviderHttpOptions;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{
-        Arc, Mutex as StdMutex, RwLock,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -19,7 +21,7 @@ use lumen_core::{
         JobId, JobOrigin, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion,
     },
     capability::{Capability, CapabilityName, CapabilitySet, EffectiveCapabilities, ResourceScope},
-    egress::{DataClass, DestinationScope, ProviderId, select_model_provider},
+    egress::{DataClass, ProviderId},
     executor::{AuthorizedAction, ExecutionOutcome, ExecutorFuture, ExecutorPort},
     extension::{PluginComponentId, PluginId, PluginVersion},
     model::{ActionProposal, ModelError, ModelFuture, ModelInput, ModelPort, ModelTool},
@@ -76,11 +78,9 @@ use crate::extension_runtime::{
     action_proposal, admin_capabilities, invocation_capability, is_extension_action,
     prepare_invocation,
 };
-use crate::{
-    CliError,
-    config::{Config, RemoteDataClass},
-};
+use crate::{CliError, config::Config};
 
+use crate::redaction::SecretRedactor;
 mod admission;
 use admission::AdmissionGate;
 
@@ -99,9 +99,9 @@ async fn read_bounded_skill_source(
 
 #[derive(Clone)]
 pub(crate) struct LocalRuntimeService {
-    model: Arc<dyn ModelPort>,
-    model_probe: Arc<OpenAiCompatibleClient>,
-    enforce_model_egress_policy: bool,
+    model: ConfiguredModel,
+    model_probe: Option<Arc<OpenAiCompatibleClient>>,
+    provider_factory: Arc<DatabaseProviderFactory>,
     normalizer: Arc<dyn ActionNormalizer>,
     executor: Arc<dyn ExecutorPort>,
     approvals: Arc<ApprovalRegistry>,
@@ -173,9 +173,10 @@ struct PluginInvocationCommand {
 impl LocalRuntimeService {
     pub(crate) fn planner_model(
         &self,
-        _workspace: lumen_core::identity::WorkspaceId,
+        workspace: lumen_core::identity::WorkspaceId,
     ) -> Arc<dyn ModelPort> {
-        Arc::clone(&self.model)
+        self.model
+            .for_context(workspace, None, CancellationToken::new())
     }
     pub(crate) const fn worker_owner_id(&self) -> uuid::Uuid {
         self.owner_instance_id
@@ -521,27 +522,43 @@ impl LocalRuntimeService {
         let workspace = std::fs::canonicalize(&config.workspace.path)?;
         std::fs::create_dir_all(&config.runtime.data_directory)?;
         let data_root = std::fs::canonicalize(&config.runtime.data_directory)?;
-        bootstrap_configured_remote_model_provider(config, &database).await?;
-        let endpoint_policy = if config.model.allow_remote {
-            EndpointPolicy::AllowRemote
+        let redactor = Arc::new(SecretRedactor::new(secrets));
+        let provider_factory = Arc::new(DatabaseProviderFactory::new(
+            database.clone(),
+            Arc::clone(&secret_store),
+            redactor.clone(),
+        ));
+        let (model, model_probe) = if let Some(selection) = &config.model.registry_profile {
+            let snapshot=database.registered_model_snapshot(config.workspace_id(),&selection.id,selection.revision).await
+                .map_err(|_|CliError::Runtime(format!("configured profile {} revision {} unavailable; inspect provider show and select current profile",selection.id.as_str(),selection.revision)))?;
+            if !config.model.allow_remote
+                && snapshot.provider.endpoint_class() == lumen_core::egress::EndpointClass::Remote
+            {
+                return Err(CliError::Runtime("remote model use is disabled".into()));
+            }
+            (
+                ConfiguredModel::Registry {
+                    database: database.clone(),
+                    selection: selection.clone(),
+                    factory: provider_factory.clone(),
+                    options: ProviderHttpOptions {
+                        timeout: Duration::from_secs(config.model.timeout_seconds),
+                        max_response_bytes: config.model.max_response_bytes,
+                    },
+                    allow_remote: config.model.allow_remote,
+                },
+                None,
+            )
         } else {
-            EndpointPolicy::LoopbackOnly
+            let model_config=OpenAiCompatibleConfig::new(&config.model.endpoint,&config.model.model,EndpointPolicy::LoopbackOnly)
+                .map_err(|_|CliError::Runtime("legacy remote model configuration requires provider credential create, provider register and model.registry_profile selection".into()))?
+                .with_streaming(config.model.streaming).with_timeout(Duration::from_secs(config.model.timeout_seconds)).with_max_response_bytes(config.model.max_response_bytes).with_ollama_gpu_policy(config.model.gpu_policy).map_err(|error|CliError::Runtime(error.to_string()))?;
+            let local = Arc::new(
+                OpenAiCompatibleClient::new(model_config)
+                    .map_err(|error| CliError::Runtime(error.to_string()))?,
+            );
+            (ConfiguredModel::LegacyLocal(local.clone()), Some(local))
         };
-        let model_config = OpenAiCompatibleConfig::new(
-            &config.model.endpoint,
-            &config.model.model,
-            endpoint_policy,
-        )
-        .map_err(|error| CliError::Runtime(error.to_string()))?
-        .with_streaming(config.model.streaming)
-        .with_timeout(Duration::from_secs(config.model.timeout_seconds))
-        .with_max_response_bytes(config.model.max_response_bytes)
-        .with_ollama_gpu_policy(config.model.gpu_policy)
-        .map_err(|error| CliError::Runtime(error.to_string()))?;
-        let model = Arc::new(
-            OpenAiCompatibleClient::new(model_config)
-                .map_err(|error| CliError::Runtime(error.to_string()))?,
-        );
         let allowed_programs: Vec<_> = config.process.allowed_programs.iter().cloned().collect();
         let secret_references = database
             .list_secret_references(config.workspace_id())
@@ -578,7 +595,6 @@ impl LocalRuntimeService {
             database.clone(),
             Duration::from_secs(config.runtime.approval_ttl_seconds),
         ));
-        let redactor = Arc::new(SecretRedactor::new(secrets));
         let secret_resolver = Arc::new(RuntimeSecretResolver {
             database: database.clone(),
             store: secret_store,
@@ -650,9 +666,9 @@ impl LocalRuntimeService {
         let ambient_capabilities = CapabilitySet::new(grants);
         let (shutdown_report, _) = watch::channel(None);
         let service = Self {
-            model: model.clone(),
-            model_probe: model,
-            enforce_model_egress_policy: config.model.allow_remote,
+            model,
+            model_probe,
+            provider_factory,
             normalizer: Arc::new(normalizer),
             executor: Arc::new(executor),
             approvals,
@@ -1748,26 +1764,15 @@ impl LocalRuntimeService {
             .get(&run_id)
             .cloned()
             .unwrap_or_else(CancellationToken::new);
-        let selected_model = stored
-            .model_override
-            .clone()
-            .unwrap_or_else(|| Arc::clone(&self.model));
-        let checked_model = if stored.model_override.is_none() && self.enforce_model_egress_policy {
-            Some(EgressCheckedModel {
-                inner: Arc::clone(&selected_model),
-                database: self.database.clone(),
-                audit: DatabaseAudit(self.database.clone()),
-                workspace_id: stored.workspace_id,
-                run_id,
-            })
-        } else {
-            None
-        };
-        let model_inner = checked_model
-            .as_ref()
-            .map_or(selected_model.as_ref(), |model| model as &dyn ModelPort);
+        let selected_model = stored.model_override.clone().unwrap_or_else(|| {
+            self.model.for_context(
+                stored.workspace_id,
+                Some(run_id),
+                cancellation.child_token(),
+            )
+        });
         let model = CancellableModel {
-            inner: model_inner,
+            inner: selected_model.as_ref(),
             cancellation: cancellation.clone(),
         };
         let clock = SystemClock;
@@ -2243,86 +2248,33 @@ impl LocalRuntimeService {
     }
 }
 
-async fn bootstrap_configured_remote_model_provider(
-    config: &Config,
-    database: &Database,
-) -> Result<(), CliError> {
-    let Some(provider) = &config.model.remote_provider else {
-        return Ok(());
-    };
-    let provider_id =
-        ProviderId::parse(&provider.id).map_err(|error| CliError::Runtime(error.to_string()))?;
-    let provider_exists = database
-        .latest_model_provider_revision(provider_id.clone())
-        .await?
-        .is_some();
-    let workspace_policy_exists = database
-        .latest_workspace_model_egress_revision(config.workspace_id(), provider_id.clone())
-        .await?
-        .is_some();
-    let allowed_data_classes = provider
-        .allowed_data_classes
-        .iter()
-        .copied()
-        .map(remote_data_class)
-        .collect::<Vec<_>>();
-    let created_at = now();
-    if !provider_exists {
-        let provider_revision = ModelProviderRevision::new(
-            provider_id.clone(),
-            1,
-            ModelEndpointClass::Remote,
-            DestinationScope::parse(&config.model.endpoint)
-                .map_err(|error| CliError::Runtime(error.to_string()))?,
-            config.model.model.clone(),
-            true,
-            0,
-            None,
-            allowed_data_classes.clone(),
-            created_at,
-        )
-        .map_err(CliError::Repository)?;
-        database
-            .append_model_provider_revision(&provider_revision)
-            .await?;
-    }
-    if !workspace_policy_exists {
-        let workspace_revision = WorkspaceModelEgressRevision::new(
-            config.workspace_id(),
-            provider_id,
-            1,
-            allowed_data_classes,
-            created_at,
-        )
-        .map_err(CliError::Repository)?;
-        database
-            .append_workspace_model_egress_revision(&workspace_revision)
-            .await?;
-    }
-    Ok(())
-}
-
-const fn remote_data_class(value: RemoteDataClass) -> DataClass {
-    match value {
-        RemoteDataClass::Public => DataClass::Public,
-        RemoteDataClass::Workspace => DataClass::Workspace,
-        RemoteDataClass::Sensitive => DataClass::Sensitive,
-        RemoteDataClass::Secret => DataClass::Secret,
-    }
-}
-
 impl RuntimeService for LocalRuntimeService {
     fn model_readiness(
         &self,
-        _workspace_id: lumen_core::identity::WorkspaceId,
+        workspace_id: lumen_core::identity::WorkspaceId,
     ) -> ServiceFuture<'_, String> {
         Box::pin(async move {
-            if self.model_probe.identity().endpoint_class()
-                == lumen_integrations::openai_compatible::EndpointClass::Remote
-            {
-                return Ok("remote_not_probed".into());
-            }
-            Ok(match self.model_probe.probe_local_model().await {
+            let Some(probe) = &self.model_probe else {
+                if let ConfiguredModel::Registry {
+                    database,
+                    selection,
+                    ..
+                } = &self.model
+                {
+                    return Ok(if database
+                        .registered_model_snapshot(workspace_id, &selection.id, selection.revision)
+                        .await
+                        .is_ok()
+                    {
+                        "remote_not_probed"
+                    } else {
+                        "unavailable"
+                    }
+                    .into());
+                }
+                return Ok("unavailable".into());
+            };
+            Ok(match probe.probe_local_model().await {
                 Ok(true) => "listed",
                 Ok(false) => "not_listed",
                 Err(_) => "unavailable",
@@ -4625,6 +4577,17 @@ fn sql_service_error(error: sqlx::Error) -> ServiceError {
     ServiceError::Internal(error.to_string())
 }
 
+impl ModelPort for CancellableModel<'_> {
+    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => Err(ModelError::new("model request cancelled")),
+                result = self.inner.generate(input) => result,
+            }
+        })
+    }
+}
 struct CancellableModel<'a> {
     inner: &'a dyn ModelPort,
     cancellation: CancellationToken,
@@ -4765,77 +4728,6 @@ impl ExecutorPort for RedactingExecutor {
     }
 }
 
-struct SecretRedactor {
-    secrets: RwLock<Vec<String>>,
-}
-
-impl SecretRedactor {
-    fn new(secrets: Vec<String>) -> Self {
-        let redactor = Self {
-            secrets: RwLock::new(Vec::new()),
-        };
-        for secret in secrets {
-            redactor.register(&secret);
-        }
-        redactor
-    }
-
-    fn register(&self, secret: &str) {
-        if secret.is_empty() {
-            return;
-        }
-        let mut secrets = self.secrets.write().expect("secret redactor lock");
-        secrets.push(secret.to_owned());
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
-    }
-
-    fn redact_value(&self, value: &mut CanonicalValue) {
-        match value {
-            CanonicalValue::String(value) => self.redact_string(value),
-            CanonicalValue::Array(values) => {
-                for value in values {
-                    self.redact_value(value);
-                }
-            }
-            CanonicalValue::Object(values) => {
-                for value in values.values_mut() {
-                    self.redact_value(value);
-                }
-            }
-            CanonicalValue::Null | CanonicalValue::Bool(_) | CanonicalValue::Integer(_) => {}
-        }
-    }
-
-    fn redact_string(&self, value: &mut String) {
-        for secret in self.secrets.read().expect("secret redactor lock").iter() {
-            if value.contains(secret) {
-                *value = value.replace(secret, "[REDACTED]");
-            }
-        }
-    }
-
-    fn contains_secret(&self, value: &str) -> bool {
-        self.secrets
-            .read()
-            .expect("secret redactor lock")
-            .iter()
-            .any(|secret| value.contains(secret))
-    }
-}
-
-impl ModelPort for CancellableModel<'_> {
-    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
-        Box::pin(async move {
-            tokio::select! {
-                biased;
-                () = self.cancellation.cancelled() => Err(ModelError::new("model request cancelled")),
-                result = self.inner.generate(input) => result,
-            }
-        })
-    }
-}
-
 struct StoredRun {
     workspace_id: lumen_core::identity::WorkspaceId,
     state: RunState,
@@ -4897,103 +4789,6 @@ struct StoredRunRequest {
     capabilities_override: Option<EffectiveCapabilities>,
     job_origin: Option<JobOrigin>,
     scheduled_handoff: Option<(OccurrenceKey, uuid::Uuid)>,
-}
-
-struct EgressCheckedModel {
-    inner: Arc<dyn ModelPort>,
-    database: Database,
-    audit: DatabaseAudit,
-    workspace_id: lumen_core::identity::WorkspaceId,
-    run_id: RunId,
-}
-
-impl ModelPort for EgressCheckedModel {
-    fn generate(&self, input: ModelInput) -> ModelFuture<'_> {
-        Box::pin(async move {
-            let data_class = input.data_class();
-            let routes = self
-                .database
-                .model_provider_routes(self.workspace_id)
-                .await
-                .map_err(|error| ModelError::new(format!("model egress policy failed: {error}")))?;
-            let decision = match select_model_provider(data_class, routes) {
-                Ok(decision) => decision,
-                Err(error) => {
-                    self.audit_model_egress_denied(data_class, error.to_string())
-                        .await?;
-                    return Err(ModelError::new(error.to_string()));
-                }
-            };
-            self.audit_model_egress_success(data_class, &decision)
-                .await?;
-            self.inner.generate(input).await
-        })
-    }
-}
-
-impl EgressCheckedModel {
-    async fn audit_model_egress_success(
-        &self,
-        data_class: DataClass,
-        decision: &lumen_core::egress::RoutingDecision,
-    ) -> Result<(), ModelError> {
-        self.audit
-            .record(AuditEvent::new(
-                AuditEventId::new(),
-                now(),
-                AuditEventKind::ModelEgress,
-                AuditOutcome::Success,
-                Some(self.workspace_id),
-                CanonicalValue::object([
-                    ("run_id", CanonicalValue::from(self.run_id.to_string())),
-                    ("data_class", CanonicalValue::from(data_class.as_str())),
-                    (
-                        "egress_occurred",
-                        CanonicalValue::from(decision.egress_occurred()),
-                    ),
-                    (
-                        "endpoint_class",
-                        CanonicalValue::from(endpoint_class_name(decision.endpoint_class())),
-                    ),
-                    (
-                        "provider_id",
-                        CanonicalValue::from(decision.provider().as_str().to_owned()),
-                    ),
-                ]),
-            ))
-            .await
-            .map_err(|error| ModelError::new(format!("model egress audit failed: {error}")))
-    }
-
-    async fn audit_model_egress_denied(
-        &self,
-        data_class: DataClass,
-        failure: String,
-    ) -> Result<(), ModelError> {
-        self.audit
-            .record(AuditEvent::new(
-                AuditEventId::new(),
-                now(),
-                AuditEventKind::ModelEgress,
-                AuditOutcome::Denied,
-                Some(self.workspace_id),
-                CanonicalValue::object([
-                    ("run_id", CanonicalValue::from(self.run_id.to_string())),
-                    ("data_class", CanonicalValue::from(data_class.as_str())),
-                    ("egress_occurred", CanonicalValue::from(false)),
-                    ("failure", CanonicalValue::from(failure)),
-                ]),
-            ))
-            .await
-            .map_err(|error| ModelError::new(format!("model egress audit failed: {error}")))
-    }
-}
-
-const fn endpoint_class_name(endpoint_class: lumen_core::egress::EndpointClass) -> &'static str {
-    match endpoint_class {
-        lumen_core::egress::EndpointClass::Local => "local",
-        lumen_core::egress::EndpointClass::Remote => "remote",
-    }
 }
 
 struct RoutingNormalizer {
@@ -5665,6 +5460,54 @@ fn scheduled_lease_expiry(timestamp: TimestampMillis) -> TimestampMillis {
 #[cfg(test)]
 mod security_tests;
 
+#[derive(Clone)]
+enum ConfiguredModel {
+    LegacyLocal(Arc<OpenAiCompatibleClient>),
+    Registry {
+        database: Database,
+        selection: crate::config::RegistryProfileSelection,
+        factory: Arc<DatabaseProviderFactory>,
+        options: ProviderHttpOptions,
+        allow_remote: bool,
+    },
+}
+impl ConfiguredModel {
+    fn for_context(
+        &self,
+        workspace: lumen_core::identity::WorkspaceId,
+        run_id: Option<RunId>,
+        cancel: CancellationToken,
+    ) -> Arc<dyn ModelPort> {
+        match self {
+            Self::LegacyLocal(model) => model.clone(),
+            Self::Registry {
+                database,
+                selection,
+                factory,
+                options,
+                allow_remote,
+            } => Arc::new(RegisteredModelPort {
+                database: database.clone(),
+                factory: factory.clone(),
+                workspace,
+                profile_id: selection.id.clone(),
+                profile_revision: selection.revision,
+                allow_remote: *allow_remote,
+                options: *options,
+                cancel,
+                run_id,
+                usage_sink: None,
+            }),
+        }
+    }
+}
+
+impl LocalRuntimeService {
+    pub(crate) fn provider_factory(&self) -> Arc<DatabaseProviderFactory> {
+        self.provider_factory.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
@@ -5794,3 +5637,6 @@ subject = "operator"
             .expect("audit chain verifies");
     }
 }
+
+#[cfg(test)]
+mod provider_tests;
