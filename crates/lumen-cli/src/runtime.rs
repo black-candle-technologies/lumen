@@ -1580,15 +1580,32 @@ impl LocalRuntimeService {
         self.scheduler_cancellation.cancel();
         self.admission.close_tracker();
         let cooperative = deadline - SHUTDOWN_SETTLEMENT_BUDGET;
-        let mut waiting_tasks = self.request_shutdown_cancellation().await;
-        let forced = tokio::time::timeout_at(cooperative, async {
-            for task in &mut waiting_tasks {
-                let _ = task.await;
+        let worker_scheduler = self.worker_scheduler.lock().await.clone();
+        let worker_shutdown = async {
+            match worker_scheduler {
+                Some(scheduler) => {
+                    scheduler
+                        .shutdown(
+                            cooperative.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await
+                }
+                None => true,
             }
-            self.admission.wait().await;
+        };
+        let mut waiting_tasks = self.request_shutdown_cancellation().await;
+        let drained = tokio::time::timeout_at(cooperative, async {
+            let local_shutdown = async {
+                for task in &mut waiting_tasks {
+                    let _ = task.await;
+                }
+                self.admission.wait().await;
+            };
+            let ((), workers_clean) = tokio::join!(local_shutdown, worker_shutdown);
+            workers_clean
         })
-        .await
-        .is_err();
+        .await;
+        let forced = !matches!(drained, Ok(true));
         if forced {
             for task in &waiting_tasks {
                 if !task.is_finished() {
@@ -1597,7 +1614,8 @@ impl LocalRuntimeService {
             }
             let _ = self.admission.abort_tracked();
         }
-        let workers_still_running = self.admission.active_count()
+        let workers_still_running = usize::from(!matches!(drained, Ok(true)))
+            + self.admission.active_count()
             + waiting_tasks
                 .iter()
                 .filter(|task| !task.is_finished())

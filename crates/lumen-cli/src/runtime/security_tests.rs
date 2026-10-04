@@ -8120,6 +8120,7 @@ async fn server_shutdown_closes_active_sse_and_releases_listener() {
             app,
             events,
             service,
+            None,
             (
                 std::path::Path::new("test-lumen.toml"),
                 &workspace_id,

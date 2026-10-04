@@ -20,6 +20,15 @@ pub struct RoutingDispatchRecord {
 }
 
 impl Database {
+    /// Called under the process runtime-owner lock before polling starts.
+    pub async fn recover_unadmitted_routing(
+        &self,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("UPDATE routing_budget_reservations SET state='released',actual_calls=reserved_calls,actual_input_tokens=reserved_input_tokens,actual_output_tokens=reserved_output_tokens,actual_remote_cost_micros=reserved_remote_cost_micros,usage_complete=0,settled_at=? WHERE state='active' AND NOT EXISTS(SELECT 1 FROM worker_attempt_routing_bindings b WHERE b.reservation_id=routing_budget_reservations.reservation_id)")
+            .bind(timestamp_to_i64(now)?).execute(self.pool()).await?;
+        Ok(())
+    }
     pub async fn append_model_routing_metadata(
         &self,
         metadata: &ModelRoutingMetadata,
@@ -158,6 +167,19 @@ impl Database {
         now: TimestampMillis,
     ) -> Result<BudgetReservationId, RepositoryError> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let eligible: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM orchestration_task_state_revisions s
+             WHERE s.orchestration_id=? AND s.graph_revision=? AND s.task_node_id=?
+             AND s.state_revision=(SELECT MAX(state_revision) FROM orchestration_task_state_revisions WHERE orchestration_id=s.orchestration_id AND graph_revision=s.graph_revision AND task_node_id=s.task_node_id)
+             AND s.state='ready'
+             AND s.graph_revision=(SELECT MAX(revision) FROM orchestration_graph_revisions WHERE orchestration_id=s.orchestration_id)
+             AND NOT EXISTS(SELECT 1 FROM orchestration_cancellations WHERE orchestration_id=s.orchestration_id)
+             AND NOT EXISTS(SELECT 1 FROM orchestration_security_quarantine WHERE orchestration_id=s.orchestration_id)
+             AND NOT EXISTS(SELECT 1 FROM routing_budget_reservations WHERE orchestration_id=s.orchestration_id AND graph_revision=s.graph_revision AND task_node_id=s.task_node_id AND state='active')",
+        ).bind(id.to_string()).bind(pos(graph_revision)?).bind(task.to_string()).fetch_one(&mut *tx).await?;
+        if eligible != 1 {
+            return Err(RepositoryError::RoutingTaskConflict);
+        }
         let budget = load_budget(&mut tx, id)
             .await?
             .ok_or(RepositoryError::InvalidRoutingState)?;

@@ -29,6 +29,44 @@ impl WorkerScheduler {
         mode: RetryMode,
         now: TimestampMillis,
     ) -> Result<RetryDispatch, WorkerRuntimeError> {
+        let decision = self
+            .authorize_retry(
+                graph,
+                node,
+                prior_attempt_id,
+                requested_by.clone(),
+                &mut candidates,
+                mode,
+                now,
+            )
+            .await?;
+        let attempt_id = self
+            .route_and_dispatch(
+                graph,
+                node,
+                requested_by,
+                candidates,
+                reasoning,
+                policy,
+                now,
+            )
+            .await?;
+        Ok(RetryDispatch {
+            decision,
+            attempt_id,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorize_retry(
+        &self,
+        graph: &TaskGraph,
+        node: &TaskNode,
+        prior_attempt_id: WorkerAttemptId,
+        requested_by: PrincipalId,
+        candidates: &mut Vec<RoutedWorkerCandidate>,
+        mode: RetryMode,
+        now: TimestampMillis,
+    ) -> Result<RetryDecision, WorkerRuntimeError> {
         let prior = self
             .db
             .worker_attempt(prior_attempt_id)
@@ -66,20 +104,38 @@ impl WorkerScheduler {
                 "no candidate satisfies the retry mode".into(),
             ));
         }
-        let attempt_id = self
-            .route_and_dispatch(
-                graph,
-                node,
-                requested_by,
-                candidates,
-                reasoning,
-                policy,
-                now,
-            )
-            .await?;
-        Ok(RetryDispatch {
-            decision,
-            attempt_id,
-        })
+        Ok(decision)
+    }
+    pub async fn filter_retry_candidates(
+        &self,
+        graph: &TaskGraph,
+        node: &TaskNode,
+        candidates: &mut Vec<RoutedWorkerCandidate>,
+    ) -> Result<(), WorkerRuntimeError> {
+        if let Some((mode, prior)) = self
+            .db
+            .pending_worker_retry(graph.orchestration_id(), graph.revision(), node.id())
+            .await?
+        {
+            let prior = self
+                .db
+                .worker_attempt(prior)
+                .await?
+                .ok_or(WorkerRuntimeError::Stale)?;
+            let previous = prior.assignment();
+            candidates.retain(|candidate| match mode {
+                RetryMode::SameWorker => {
+                    candidate.provider.id() == previous.provider_id()
+                        && candidate.provider.revision() == previous.provider_revision()
+                        && candidate.profile.id() == previous.model_profile_id()
+                        && candidate.profile.revision() == previous.model_profile_revision()
+                }
+                RetryMode::Reassign => {
+                    candidate.profile.id() != previous.model_profile_id()
+                        || candidate.profile.revision() != previous.model_profile_revision()
+                }
+            });
+        }
+        Ok(())
     }
 }

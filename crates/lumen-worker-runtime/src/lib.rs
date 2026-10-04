@@ -22,6 +22,7 @@ use lumen_db::{Database, RepositoryError, WorkerAttemptRecord};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 pub struct MaterializedWorker {
@@ -98,6 +99,9 @@ pub struct WorkerScheduler {
     profiles: Mutex<BTreeMap<(String, u64), Arc<Semaphore>>>,
     active: Mutex<BTreeMap<WorkerAttemptId, Active>>,
     cancellations: Mutex<BTreeMap<OrchestrationId, CancellationToken>>,
+    admission: Mutex<bool>,
+    admission_stop: CancellationToken,
+    tasks: TaskTracker,
 }
 impl WorkerScheduler {
     pub fn new(
@@ -123,6 +127,9 @@ impl WorkerScheduler {
             profiles: Mutex::new(BTreeMap::new()),
             active: Mutex::new(BTreeMap::new()),
             cancellations: Mutex::new(BTreeMap::new()),
+            admission: Mutex::new(true),
+            admission_stop: CancellationToken::new(),
+            tasks: TaskTracker::new(),
         })
     }
     pub async fn dispatch_ready(
@@ -141,6 +148,10 @@ impl WorkerScheduler {
         assignment: WorkerAssignment,
         now: lumen_core::approval::TimestampMillis,
     ) -> Result<WorkerAttemptId, WorkerRuntimeError> {
+        let admission = self.admission.lock().await;
+        if !*admission || self.admission_stop.is_cancelled() {
+            return Err(WorkerRuntimeError::Cancelled);
+        }
         if self
             .db
             .orchestration_cancelled(assignment.orchestration_id())
@@ -160,8 +171,84 @@ impl WorkerScheduler {
                 now,
             )
             .await?;
-        self.start(record, now).await?;
+        // Admission completes before model execution. Durable routing capacity is
+        // already committed, so a subsequent poll sees this worker's reservation.
+        let scheduler = Arc::clone(self);
+        self.token(assignment.orchestration_id()).await;
+        self.tasks.spawn(async move {
+            scheduler.run_reserved(record, now).await;
+        });
         Ok(id)
+    }
+    async fn run_reserved(
+        self: &Arc<Self>,
+        record: WorkerAttemptRecord,
+        now: lumen_core::approval::TimestampMillis,
+    ) {
+        if self.start(record.clone(), now).await.is_err() {
+            // Errors can contain provider material. Emit only a fixed diagnostic.
+            eprintln!(
+                "event=worker_dispatch_failed attempt_id={} diagnostic=worker_start_failed",
+                record.attempt_id()
+            );
+            if self.fail_dispatch(&record).await.is_err() {
+                eprintln!(
+                    "event=worker_dispatch_reconciliation_required attempt_id={}",
+                    record.attempt_id()
+                );
+            }
+        }
+    }
+    async fn fail_dispatch(&self, record: &WorkerAttemptRecord) -> Result<(), WorkerRuntimeError> {
+        let now = self.ports.clock.now();
+        let risk = self
+            .record_persistence_failure(record, "worker start failed".into(), now)
+            .await?;
+        self.db
+            .terminalize_worker_attempt(
+                record.attempt_id(),
+                Some(self.owner),
+                if risk == lumen_core::artifact::EffectRisk::UnknownEffect {
+                    WorkerAttemptState::Unknown
+                } else {
+                    WorkerAttemptState::Failed
+                },
+                Some("worker start failed"),
+                now,
+            )
+            .await?;
+        self.db
+            .release_active_routing_for_task(
+                record.assignment().orchestration_id(),
+                record.assignment().graph_revision(),
+                record.assignment().task_node_id(),
+                now,
+            )
+            .await?;
+        Ok(())
+    }
+    pub fn stop_accepting(&self) {
+        self.admission_stop.cancel();
+    }
+    pub async fn shutdown(self: &Arc<Self>, timeout: Duration) -> bool {
+        self.stop_accepting();
+        *self.admission.lock().await = false;
+        for token in self.cancellations.lock().await.values() {
+            token.cancel();
+        }
+        let waiting = self.active.lock().await.keys().copied().collect::<Vec<_>>();
+        for id in waiting {
+            let scheduler = Arc::clone(self);
+            self.tasks.spawn(async move {
+                if scheduler.advance(id).await.is_err() {
+                    eprintln!("event=worker_shutdown_reconciliation_required attempt_id={id}");
+                }
+            });
+        }
+        self.tasks.close();
+        tokio::time::timeout(timeout, self.tasks.wait())
+            .await
+            .is_ok()
     }
     async fn start(
         self: &Arc<Self>,
@@ -175,6 +262,11 @@ impl WorkerScheduler {
                 .db
                 .orchestration_cancelled(assignment.orchestration_id())
                 .await?
+            || self
+                .db
+                .orchestration_quarantine(assignment.orchestration_id())
+                .await?
+                .is_some()
         {
             let _ = self.record_pre_dispatch_cancel(&record, now).await?;
             self.db
@@ -183,6 +275,14 @@ impl WorkerScheduler {
                     Some(self.owner),
                     WorkerAttemptState::Cancelled,
                     Some("cancelled before dispatch"),
+                    now,
+                )
+                .await?;
+            self.db
+                .release_active_routing_for_task(
+                    assignment.orchestration_id(),
+                    assignment.graph_revision(),
+                    assignment.task_node_id(),
                     now,
                 )
                 .await?;
@@ -251,10 +351,18 @@ impl WorkerScheduler {
         id: WorkerAttemptId,
         now: lumen_core::approval::TimestampMillis,
     ) -> Result<(), WorkerRuntimeError> {
+        let admission = self.admission.lock().await;
+        if !*admission || self.admission_stop.is_cancelled() {
+            return Err(WorkerRuntimeError::Cancelled);
+        }
         self.db
             .resume_worker_attempt_from_approval(id, self.owner, add(now, self.config.lease), now)
             .await?;
-        self.advance(id).await
+        let scheduler = Arc::clone(self);
+        let task = self.tasks.spawn(async move { scheduler.advance(id).await });
+        drop(admission);
+        task.await
+            .map_err(|_| WorkerRuntimeError::Internal("worker resume join failed".into()))?
     }
     async fn advance(self: &Arc<Self>, id: WorkerAttemptId) -> Result<(), WorkerRuntimeError> {
         let mut active = self
@@ -285,6 +393,14 @@ impl WorkerScheduler {
                         Some(self.owner),
                         WorkerAttemptState::Cancelled,
                         Some("cancelled before dispatch"),
+                        now,
+                    )
+                    .await?;
+                self.db
+                    .release_active_routing_for_task(
+                        active.record.assignment().orchestration_id(),
+                        active.record.assignment().graph_revision(),
+                        active.record.assignment().task_node_id(),
                         now,
                     )
                     .await?;
@@ -443,6 +559,7 @@ impl WorkerScheduler {
         self: &Arc<Self>,
         now: lumen_core::approval::TimestampMillis,
     ) -> Result<Vec<WorkerAttemptId>, WorkerRuntimeError> {
+        self.db.recover_unadmitted_routing(now).await?;
         let (reserved, touched) = self.db.recover_expired_worker_attempts(now).await?;
         for orchestration in touched {
             self.db.reconcile_task_readiness(orchestration, now).await?;
@@ -459,7 +576,11 @@ impl WorkerScheduler {
                     .worker_attempt(id)
                     .await?
                     .ok_or(WorkerRuntimeError::Stale)?;
-                self.start(record, now).await?;
+                let scheduler = Arc::clone(self);
+                self.token(record.assignment().orchestration_id()).await;
+                self.tasks.spawn(async move {
+                    scheduler.run_reserved(record, now).await;
+                });
                 out.push(id);
             }
         }
@@ -553,6 +674,8 @@ fn add(
 pub enum WorkerRuntimeError {
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Route(#[from] lumen_core::routing::RoutingError),
     #[error(transparent)]
     Worker(#[from] lumen_core::worker::WorkerError),
     #[error("stale worker assignment")]

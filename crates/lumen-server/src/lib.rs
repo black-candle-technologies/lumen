@@ -17,6 +17,10 @@ mod session;
 mod sse;
 mod state;
 mod tool_catalog;
+mod worker_dispatch;
+pub use worker_dispatch::{
+    DispatchTick, WorkerDispatchDriver, WorkerDispatchFuture, WorkerDispatchLoop,
+};
 
 pub use authd::{
     AccountId, AccountIdentity, AuthError, AuthFuture, AuthdClient, MockAuthdClient, SessionBinding,

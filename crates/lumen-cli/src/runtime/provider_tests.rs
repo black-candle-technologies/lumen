@@ -17,6 +17,65 @@ use std::sync::atomic::AtomicUsize;
 mod tls;
 
 const KEY: &str = "sentinel-provider-key";
+#[path = "dispatch_tests.rs"]
+mod dispatch_regressions;
+#[tokio::test]
+async fn real_registration_persists_explicit_policy_and_catalog_visibility() {
+    let mut f = Fixture::new().await;
+    f.create("openai_compatible").await.unwrap();
+    f.register("openai_compatible", json!(["public"]))
+        .await
+        .unwrap();
+    let db = f.db().await;
+    let catalog = lumen_control_plane::DatabaseCandidateCatalog::new(
+        db.clone(),
+        Vec::new(),
+        lumen_core::worker::WorkerRunBudget::new(1, 1, 1000, 1024).unwrap(),
+    );
+    let (profiles, policies) = catalog.catalog(f.config.workspace_id()).await.unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(policies.len(), 1);
+    let p = &policies[0];
+    assert_eq!(p.workspace_id(), f.config.workspace_id());
+    assert_eq!(p.model_profile_id(), profiles[0].id());
+    assert_eq!(p.model_profile_revision(), profiles[0].revision());
+    assert_eq!(p.model_trust_zone(), profiles[0].trust_zone());
+    assert_eq!(p.allowed_data_classes(), &[DataClass::Public].into());
+    assert_eq!(
+        p.allowed_compartments(),
+        &[lumen_core::context::CompartmentId::parse("engineering").unwrap()].into()
+    );
+    assert!(p.allow_uncompartmented());
+    db.close().await;
+}
+
+#[tokio::test]
+async fn real_registration_policy_failure_leaves_no_bundle() {
+    let mut f = Fixture::new().await;
+    f.create("openai_compatible").await.unwrap();
+    let db = f.db().await;
+    sqlx::query("CREATE TRIGGER fail_policy BEFORE INSERT ON model_data_policy_revisions BEGIN SELECT RAISE(ABORT,'injected'); END").execute(db.pool()).await.unwrap();
+    db.close().await;
+    assert!(
+        f.register("openai_compatible", json!(["public"]))
+            .await
+            .is_err()
+    );
+    let db = f.db().await;
+    assert!(db.list_latest_model_profiles().await.unwrap().is_empty());
+    assert!(db.list_latest_provider_configs().await.unwrap().is_empty());
+    assert!(
+        db.latest_model_data_policy(
+            f.config.workspace_id(),
+            &ModelProfileId::parse("default-remote").unwrap()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    db.verify_audit_chain().await.unwrap();
+    db.close().await;
+}
 struct CountingStore {
     inner: InMemorySecretStore,
     reads: AtomicUsize,
@@ -156,7 +215,7 @@ subject="operator"
         classes: serde_json::Value,
     ) -> Result<CommandOutput, CliError> {
         let file = self.dir.path().join("provider.json");
-        std::fs::write(&file,json!({"provider_id":"primary","kind":kind,"endpoint":self.server.endpoint,"credential_secret_ref":self.credential.unwrap(),"enabled":true,"expected":{"provider":0,"profile":0,"egress":0,"workspace_policy":0},"allowed_data_classes":["public","workspace"],"workspace_allowed_data_classes":classes,"profile":{"id":"default-remote","model":"registered-model","enabled":true,"capabilities":["text","tool_calling"],"context_window_tokens":32768,"concurrency_limit":1,"priority":0}}).to_string()).unwrap();
+        std::fs::write(&file,json!({"provider_id":"primary","kind":kind,"endpoint":self.server.endpoint,"credential_secret_ref":self.credential.unwrap(),"enabled":true,"expected":{"provider":0,"profile":0,"egress":0,"workspace_policy":0},"allowed_data_classes":["public","workspace"],"workspace_allowed_data_classes":classes,"model_data_policy":{"allowed_data_classes":["public"],"allowed_compartments":["engineering"],"allow_uncompartmented":true},"profile":{"id":"default-remote","model":"registered-model","enabled":true,"capabilities":["text","tool_calling"],"context_window_tokens":32768,"concurrency_limit":1,"priority":0}}).to_string()).unwrap();
         self.command(ProviderCommand::Register { file }, None).await
     }
     async fn db(&self) -> Database {
@@ -673,8 +732,8 @@ async fn registered_tool_call_approval_tool_result_and_final_text() {
 async fn worker_projection_gate_precedes_shared_credential_resolution() {
     use lumen_core::{
         context::{
-            ContextSource, ContextSourceId, ModelDataPolicy, ProjectionId, ProjectionTaskKey,
-            SourceProvenance, SourceProvenanceKind, TaskProjection,
+            ContextSource, ContextSourceId, ProjectionId, ProjectionTaskKey, SourceProvenance,
+            SourceProvenanceKind, TaskProjection,
         },
         worker::{WorkerAssignment, WorkerRunBudget},
     };
@@ -693,18 +752,12 @@ async fn worker_projection_gate_precedes_shared_credential_resolution() {
         )
         .await
         .unwrap();
-    let policy = ModelDataPolicy::new(
-        f.config.workspace_id(),
-        snapshot.profile.id().clone(),
-        1,
-        snapshot.profile.trust_zone(),
-        1,
-        [DataClass::Public],
-        [],
-        true,
-        now(),
-    )
-    .unwrap();
+    let policy = service
+        .database
+        .latest_model_data_policy(f.config.workspace_id(), snapshot.profile.id())
+        .await
+        .unwrap()
+        .unwrap();
     let source = ContextSource::new(
         ContextSourceId::new(),
         f.config.workspace_id(),
@@ -725,11 +778,6 @@ async fn worker_projection_gate_precedes_shared_credential_resolution() {
         now(),
     )
     .unwrap();
-    service
-        .database
-        .append_model_data_policy(&policy)
-        .await
-        .unwrap();
     service
         .database
         .append_context_source(&source)

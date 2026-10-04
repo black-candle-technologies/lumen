@@ -21,6 +21,23 @@ use uuid::Uuid;
 use crate::{Database, RepositoryError, timestamp_to_i64};
 
 impl Database {
+    pub async fn pending_worker_retry(
+        &self,
+        id: OrchestrationId,
+        revision: u64,
+        task: TaskNodeId,
+    ) -> Result<Option<(RetryMode, WorkerAttemptId)>, RepositoryError> {
+        sqlx::query("SELECT mode,prior_attempt_id FROM worker_retry_decisions WHERE orchestration_id=? AND graph_revision=? AND task_node_id=? AND allowed=1 AND new_attempt_id IS NULL ORDER BY created_at DESC,rowid DESC LIMIT 1")
+            .bind(id.to_string()).bind(pos(revision)?).bind(task.to_string()).fetch_optional(self.pool()).await?
+            .map(|row| {
+                let mode = match row.try_get::<String, _>("mode")?.as_str() {
+                    "same_worker" => RetryMode::SameWorker,
+                    "reassign" => RetryMode::Reassign,
+                    _ => return Err(RepositoryError::InvalidArtifactState),
+                };
+                Ok((mode, WorkerAttemptId::from_uuid(Uuid::parse_str(&row.try_get::<String, _>("prior_attempt_id")?).map_err(|_| RepositoryError::InvalidArtifactState)?)))
+            }).transpose()
+    }
     pub async fn artifact_provenance_for_attempt(
         &self,
         attempt_id: WorkerAttemptId,
