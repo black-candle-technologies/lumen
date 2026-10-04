@@ -81,6 +81,7 @@ pub struct RegistrationDescriptor {
     pub expected: ExpectedHeads,
     pub allowed_data_classes: BTreeSet<DataClass>,
     pub workspace_allowed_data_classes: BTreeSet<DataClass>,
+    pub model_data_policy: lumen_db::ModelDataPolicyDescriptor,
     pub profile: ProfileDescriptor,
 }
 
@@ -250,6 +251,7 @@ pub(crate) async fn execute(
                 profile,
                 egress,
                 workspace_policy,
+                model_data_policy: d.model_data_policy,
                 expected_provider: d.expected.provider,
                 expected_profile: d.expected.profile,
                 expected_egress: d.expected.egress,

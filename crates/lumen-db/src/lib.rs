@@ -13,8 +13,8 @@ mod migrations;
 mod model_registry;
 mod provider_configuration;
 pub use provider_configuration::{
-    ProviderCredentialReference, ProviderRegistration, RegisteredModelSnapshot,
-    RegistrationReceipt, next_provider_revision,
+    ModelDataPolicyDescriptor, ProviderCredentialReference, ProviderRegistration,
+    RegisteredModelSnapshot, RegistrationReceipt, next_provider_revision,
 };
 mod orchestration;
 mod repositories;
@@ -162,6 +162,8 @@ pub enum RepositoryError {
     InvalidRoutingState,
     #[error("routing budget changed or no longer has sufficient capacity")]
     RoutingBudgetConflict,
+    #[error("routing task is no longer ready or already reserved")]
+    RoutingTaskConflict,
     #[error("artifact/retry state conflicts with repository constraints")]
     InvalidArtifactState,
     #[error("orchestration control state conflicts with repository constraints")]

@@ -11,7 +11,7 @@ use lumen_core::{
     identity::{PrincipalId, WorkspaceId},
     provider::{ModelProfileId, ModelTrustZone},
 };
-use sqlx::Row;
+use sqlx::{Row, Sqlite, Transaction};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 impl Database {
@@ -63,10 +63,8 @@ WHERE source_id = ?",
         policy: &ModelDataPolicy,
     ) -> Result<(), RepositoryError> {
         let mut tx = self.pool().begin().await?;
-        let stored_trust = sqlx::query_scalar::<_, String>(
-            "SELECT trust_zone
-FROM model_profile_revisions
-WHERE profile_id = ? AND revision = ? AND enabled = 1",
+        let enabled: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM model_profile_revisions WHERE profile_id=? AND revision=? AND enabled=1",
         )
         .bind(policy.model_profile_id().as_str())
         .bind(
@@ -74,50 +72,74 @@ WHERE profile_id = ? AND revision = ? AND enabled = 1",
                 .map_err(|_| RepositoryError::InvalidContextState)?,
         )
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(RepositoryError::InvalidContextState)?;
-        if ModelTrustZone::parse(&stored_trust) != Some(policy.model_trust_zone()) {
+        .await?;
+        if enabled.is_none() {
             return Err(RepositoryError::InvalidContextState);
         }
-        let latest = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(revision), 0)
+        insert_model_data_policy_tx(&mut tx, policy).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+pub(crate) async fn insert_model_data_policy_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    policy: &ModelDataPolicy,
+) -> Result<(), RepositoryError> {
+    let stored_trust = sqlx::query_scalar::<_, String>(
+        "SELECT trust_zone
+FROM model_profile_revisions
+WHERE profile_id = ? AND revision = ?",
+    )
+    .bind(policy.model_profile_id().as_str())
+    .bind(
+        i64::try_from(policy.model_profile_revision())
+            .map_err(|_| RepositoryError::InvalidContextState)?,
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(RepositoryError::InvalidContextState)?;
+    if ModelTrustZone::parse(&stored_trust) != Some(policy.model_trust_zone()) {
+        return Err(RepositoryError::InvalidContextState);
+    }
+    let latest = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(revision), 0)
 FROM model_data_policy_revisions
 WHERE workspace_id = ? AND profile_id = ?",
-        )
-        .bind(policy.workspace_id().to_string())
-        .bind(policy.model_profile_id().as_str())
-        .fetch_one(&mut *tx)
-        .await?;
-        let expected = u64::try_from(latest)
-            .ok()
-            .and_then(|value| value.checked_add(1));
-        if expected != Some(policy.revision()) {
-            return Err(RepositoryError::InvalidContextState);
-        }
-        sqlx::query(
-            "INSERT INTO model_data_policy_revisions (
+    )
+    .bind(policy.workspace_id().to_string())
+    .bind(policy.model_profile_id().as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    let expected = u64::try_from(latest)
+        .ok()
+        .and_then(|value| value.checked_add(1));
+    if expected != Some(policy.revision()) {
+        return Err(RepositoryError::InvalidContextState);
+    }
+    sqlx::query(
+        "INSERT INTO model_data_policy_revisions (
 workspace_id, profile_id, revision, profile_revision, trust_zone,
 allowed_data_classes_json, allowed_compartments_json,
 allow_uncompartmented, created_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(policy.workspace_id().to_string())
-        .bind(policy.model_profile_id().as_str())
-        .bind(i64::try_from(policy.revision()).map_err(|_| RepositoryError::InvalidContextState)?)
-        .bind(
-            i64::try_from(policy.model_profile_revision())
-                .map_err(|_| RepositoryError::InvalidContextState)?,
-        )
-        .bind(policy.model_trust_zone().as_str())
-        .bind(serde_json::to_string(policy.allowed_data_classes())?)
-        .bind(serde_json::to_string(policy.allowed_compartments())?)
-        .bind(policy.allow_uncompartmented())
-        .bind(timestamp_to_i64(policy.created_at())?)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
+    )
+    .bind(policy.workspace_id().to_string())
+    .bind(policy.model_profile_id().as_str())
+    .bind(i64::try_from(policy.revision()).map_err(|_| RepositoryError::InvalidContextState)?)
+    .bind(
+        i64::try_from(policy.model_profile_revision())
+            .map_err(|_| RepositoryError::InvalidContextState)?,
+    )
+    .bind(policy.model_trust_zone().as_str())
+    .bind(serde_json::to_string(policy.allowed_data_classes())?)
+    .bind(serde_json::to_string(policy.allowed_compartments())?)
+    .bind(policy.allow_uncompartmented())
+    .bind(timestamp_to_i64(policy.created_at())?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+impl Database {
     pub async fn model_data_policy_revision(
         &self,
         workspace_id: WorkspaceId,

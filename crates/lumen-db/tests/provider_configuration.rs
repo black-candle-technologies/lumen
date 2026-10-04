@@ -12,6 +12,7 @@ use lumen_db::{
     Database, ModelEndpointClass, ModelProviderRevision, ProviderRegistration, RepositoryError,
     WorkspaceModelEgressRevision,
 };
+use std::collections::BTreeSet;
 
 fn actor() -> PrincipalId {
     PrincipalId::new("local", "operator").unwrap()
@@ -77,6 +78,14 @@ fn bundle(
         profile,
         egress,
         workspace_policy,
+        model_data_policy: lumen_db::ModelDataPolicyDescriptor {
+            allowed_data_classes: [DataClass::Public, DataClass::Workspace].into(),
+            allowed_compartments: [
+                lumen_core::context::CompartmentId::parse("engineering").unwrap()
+            ]
+            .into(),
+            allow_uncompartmented: false,
+        },
         expected_provider: heads[0],
         expected_profile: heads[1],
         expected_egress: heads[2],
@@ -117,6 +126,23 @@ async fn atomic_registration_and_stale_heads_conflict() {
         .unwrap();
     assert_eq!(snapshot.provider, r.provider);
     assert_eq!(snapshot.profile, r.profile);
+    let policy = db
+        .latest_model_data_policy(w, r.profile.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.workspace_id(), w);
+    assert_eq!(policy.model_profile_revision(), r.profile.revision());
+    assert_eq!(policy.model_trust_zone(), r.profile.trust_zone());
+    assert_eq!(
+        policy.allowed_data_classes(),
+        &r.model_data_policy.allowed_data_classes
+    );
+    assert_eq!(
+        policy.allowed_compartments(),
+        &r.model_data_policy.allowed_compartments
+    );
+    assert!(!policy.allow_uncompartmented());
     assert!(
         db.registered_model_snapshot(WorkspaceId::new(), r.profile.id(), 1)
             .await
@@ -125,11 +151,79 @@ async fn atomic_registration_and_stale_heads_conflict() {
     db.verify_audit_chain().await.unwrap();
 }
 #[tokio::test]
+async fn model_data_policy_revision_is_independent_and_invalid_grants_roll_back() {
+    let (db, w, p) = fixture().await;
+    let r = bundle(w, p.clone(), "profile", [0; 4]);
+    db.register_provider_bundle(&r, &actor(), at())
+        .await
+        .unwrap();
+    let policy = lumen_core::context::ModelDataPolicy::new(
+        w,
+        r.profile.id().clone(),
+        1,
+        r.profile.trust_zone(),
+        2,
+        [DataClass::Public],
+        [],
+        true,
+        at(),
+    )
+    .unwrap();
+    db.append_model_data_policy(&policy).await.unwrap();
+    let mut r = bundle(
+        w,
+        provider("primary", 2, p.credential_secret_ref().unwrap()),
+        "profile",
+        [1; 4],
+    );
+    db.register_provider_bundle(&r, &actor(), at())
+        .await
+        .unwrap();
+    let policy = db
+        .latest_model_data_policy(w, r.profile.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.revision(), 3);
+    assert_eq!(policy.model_profile_revision(), 2);
+    r = bundle(
+        w,
+        provider("primary", 3, p.credential_secret_ref().unwrap()),
+        "profile",
+        [2; 4],
+    );
+    for classes in [BTreeSet::new(), BTreeSet::from([DataClass::Secret])] {
+        r.model_data_policy.allowed_data_classes = classes;
+        assert!(
+            db.register_provider_bundle(&r, &actor(), at())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.latest_model_profile(r.profile.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .revision(),
+            2
+        );
+        assert_eq!(
+            db.latest_model_data_policy(w, r.profile.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .revision(),
+            3
+        );
+    }
+}
+#[tokio::test]
 async fn every_bundle_insert_and_audit_failure_roll_back_all_heads() {
     for table in [
         "model_provider_runtime_revisions",
         "model_profiles",
         "model_profile_revisions",
+        "model_data_policy_revisions",
         "egress_model_provider_revisions",
         "egress_workspace_model_policies",
         "audit_events",
@@ -147,6 +241,7 @@ async fn every_bundle_insert_and_audit_failure_roll_back_all_heads() {
             "model_provider_runtime_revisions",
             "model_profiles",
             "model_profile_revisions",
+            "model_data_policy_revisions",
             "egress_model_provider_revisions",
             "egress_workspace_model_policies",
         ] {

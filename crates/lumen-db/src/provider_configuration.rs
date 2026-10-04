@@ -11,21 +11,31 @@ use crate::{
 use lumen_core::{
     approval::TimestampMillis,
     audit::{AuditEvent, AuditEventId, AuditEventKind, AuditOutcome},
+    context::{CompartmentId, ModelDataPolicy},
     egress::{DataClass, ProviderId},
     identity::{PrincipalId, WorkspaceId},
     provider::{ModelProfile, ModelProfileId, ProviderConfig, validate_binding},
     secret::SecretRefId,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
 use std::collections::BTreeSet;
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDataPolicyDescriptor {
+    pub allowed_data_classes: BTreeSet<DataClass>,
+    #[serde(default)]
+    pub allowed_compartments: BTreeSet<CompartmentId>,
+    pub allow_uncompartmented: bool,
+}
 pub struct ProviderRegistration {
     pub workspace: WorkspaceId,
     pub provider: ProviderConfig,
     pub profile: ModelProfile,
     pub egress: ModelProviderRevision,
     pub workspace_policy: WorkspaceModelEgressRevision,
+    pub model_data_policy: ModelDataPolicyDescriptor,
     pub expected_provider: u64,
     pub expected_profile: u64,
     pub expected_egress: u64,
@@ -129,6 +139,30 @@ impl Database {
 
         insert_provider_config_in(&mut tx, &r.provider, at).await?;
         insert_model_profile_in(&mut tx, &r.profile, at).await?;
+        let latest_policy: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(revision),0) FROM model_data_policy_revisions WHERE workspace_id=? AND profile_id=?",
+        )
+        .bind(r.workspace.to_string())
+        .bind(r.profile.id().as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        let policy_revision = u64::try_from(latest_policy)
+            .ok()
+            .and_then(|revision| revision.checked_add(1))
+            .ok_or(RepositoryError::InvalidContextState)?;
+        let policy = ModelDataPolicy::new(
+            r.workspace,
+            r.profile.id().clone(),
+            r.profile.revision(),
+            r.profile.trust_zone(),
+            policy_revision,
+            r.model_data_policy.allowed_data_classes.iter().copied(),
+            r.model_data_policy.allowed_compartments.iter().cloned(),
+            r.model_data_policy.allow_uncompartmented,
+            at,
+        )
+        .map_err(|_| RepositoryError::InvalidContextState)?;
+        crate::context::insert_model_data_policy_tx(&mut tx, &policy).await?;
         insert_model_egress_in(&mut tx, &r.egress).await?;
         insert_workspace_egress_in(&mut tx, &r.workspace_policy).await?;
         append_audit_event_in(&mut tx, registration_audit_event(r, actor, at)).await?;
