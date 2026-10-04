@@ -66,15 +66,23 @@ impl JsonModelPlanner {
         Self { model }
     }
 }
+fn task_graph_planner_prompt(prompt: &str) -> String {
+    format!(concat!(
+        "Return ONLY TaskGraphProposal JSON, no markdown/tools. ",
+        "The top-level object must be exactly {{\"nodes\":[...]}}. ",
+        "Each element of nodes must include ",
+        "key,description,expected_output,depends_on,requirements,limits,deadline_at. ",
+        "Return at most 256 nodes. Do not add any other top-level fields. ",
+        "Request: {prompt}"
+    ))
+}
 impl PlannerPort for JsonModelPlanner {
     fn plan<'a>(&'a self, prompt: &'a str, class: DataClass) -> PlannerFuture<'a> {
         Box::pin(async move {
             if prompt.is_empty() || prompt.len() > 65536 {
                 return Err(ControlPlaneError::Planner("invalid prompt".into()));
             }
-            let q = format!(
-                "Return ONLY TaskGraphProposal JSON, no markdown/tools. <=256 tasks; include key,description,expected_output,depends_on,requirements,limits,deadline_at. Request: {prompt}"
-            );
+            let q = task_graph_planner_prompt(prompt);
             match self
                 .model
                 .generate(
@@ -897,6 +905,16 @@ pub enum ControlPlaneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn planner_prompt_names_the_strict_graph_schema() {
+        let prompt = task_graph_planner_prompt("build a plan");
+        assert!(prompt.contains(r#"{"nodes":[...]}"#));
+        assert!(prompt.contains("at most 256 nodes"));
+        assert!(!prompt.contains("tasks"));
+        assert!(serde_json::from_str::<TaskGraphProposal>(r#"{"tasks":[]}"#).is_err());
+        assert!(serde_json::from_str::<TaskGraphProposal>(r#"{"nodes":[],"extra":0}"#).is_err());
+        assert!(serde_json::from_str::<TaskGraphProposal>(r#"{"nodes":[]}"#).is_ok());
+    }
     #[tokio::test]
     async fn bootstrap_authority_is_workspace_and_principal_exact() {
         let principal = PrincipalId::new("local", "owner").unwrap();
