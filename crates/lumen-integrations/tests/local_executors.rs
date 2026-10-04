@@ -578,11 +578,9 @@ async fn system_sandbox_reports_strength_and_enforces_it_when_available() {
     let workspace = tempdir().expect("temporary workspace");
     let output = sandbox
         .execute(SandboxRequest::new(
-            MonitoredCommand::new(test_program())
-                .args(["sandboxed"])
-                .current_dir(workspace.path()),
+            sandbox_probe_command().current_dir(workspace.path()),
             Duration::from_secs(2),
-            1024,
+            16 * 1024,
             CancellationToken::new(),
             resource_limits(),
         ))
@@ -590,7 +588,30 @@ async fn system_sandbox_reports_strength_and_enforces_it_when_available() {
         .expect("sandboxed command executes");
 
     assert_eq!(output.exit_code(), Some(0));
+    #[cfg(target_os = "linux")]
+    assert!(String::from_utf8_lossy(output.stdout()).contains("lumen-sandbox-probe-ok"));
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(output.stdout(), b"sandboxed\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_probe_marker() {
+    println!("lumen-sandbox-probe-ok");
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_probe_command() -> MonitoredCommand {
+    MonitoredCommand::new(std::env::current_exe().expect("integration-test executable")).args([
+        "--exact",
+        "sandbox_probe_marker",
+        "--nocapture",
+    ])
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_probe_command() -> MonitoredCommand {
+    MonitoredCommand::new(test_program()).args(["sandboxed"])
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
