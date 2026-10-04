@@ -349,6 +349,241 @@ async fn serve_assembly_recovers_ready_work_and_serializes_two_tasks() {
 }
 
 #[tokio::test]
+async fn provider_and_profile_saturation_leave_other_orchestrations_ready() {
+    let (f, service) = fixture().await;
+    let first = durable_graph(&f, &service.database, 1, false).await;
+    f.server.replies.lock().await.push_back(delayed_reply());
+    let (_, poller) = crate::start_orchestration_workers(&f.config, &service.database, &service)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_attempts(&service.database, &first, 1, WorkerAttemptState::Running).await;
+    let second = durable_graph(&f, &service.database, 1, false).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(
+        service
+            .database
+            .worker_attempts_for_orchestration(second.orchestration_id())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        service
+            .database
+            .latest_orchestration_snapshot(second.orchestration_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .states()
+            .all(|s| s.state() == TaskNodeState::Ready)
+    );
+    wait_attempts(&service.database, &first, 1, WorkerAttemptState::Completed).await;
+    wait_attempts(&service.database, &second, 1, WorkerAttemptState::Completed).await;
+    poller.request_stop();
+    poller.join().await;
+    assert!(service.shutdown().await.is_clean());
+}
+
+#[tokio::test]
+async fn background_start_failure_records_safe_diagnostic_and_releases_capacity() {
+    use lumen_worker_runtime::{
+        MaterializeFuture, WorkerMaterializer, WorkerRuntimeError, WorkerScheduler,
+        WorkerSchedulerConfig,
+    };
+    struct FailingMaterializer;
+    impl WorkerMaterializer for FailingMaterializer {
+        fn materialize<'a>(
+            &'a self,
+            _: &'a lumen_core::worker::WorkerAssignment,
+            _: Option<lumen_core::model::ModelGenerationConfig>,
+            _: Option<Arc<dyn lumen_core::provider::ProviderUsageSink>>,
+            _: CancellationToken,
+        ) -> MaterializeFuture<'a> {
+            Box::pin(async { Err(WorkerRuntimeError::Internal(KEY.into())) })
+        }
+    }
+    let (f, service) = fixture().await;
+    let g = durable_graph(&f, &service.database, 1, false).await;
+    let scheduler = WorkerScheduler::new(
+        service.database.clone(),
+        Arc::new(FailingMaterializer),
+        service.worker_kernel_ports(),
+        WorkerSchedulerConfig::new(
+            1,
+            BTreeMap::from([("primary".into(), 1)]),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+        service.worker_owner_id(),
+    );
+    let catalog = DatabaseCandidateCatalog::new(
+        service.database.clone(),
+        service.worker_grants().unwrap(),
+        WorkerRunBudget::new(1, 1, 10_000, 4096).unwrap(),
+    );
+    let n = g.nodes().next().unwrap();
+    let candidates = catalog
+        .candidates(&g, n, g.created_by(), now())
+        .await
+        .unwrap();
+    let assignment = scheduler
+        .prepare_routed_assignment(
+            &g,
+            n,
+            g.created_by().clone(),
+            candidates,
+            ReasoningProfile::Balanced,
+            RoutingPolicy::new(true, false),
+            now(),
+        )
+        .await
+        .unwrap();
+    let attempt = scheduler
+        .dispatch_prepared(assignment, now())
+        .await
+        .unwrap();
+    wait_attempts(&service.database, &g, 1, WorkerAttemptState::Failed).await;
+    assert!(scheduler.shutdown(Duration::from_secs(1)).await);
+    assert!(
+        service
+            .database
+            .active_routing_dispatch(g.orchestration_id(), 1, n.id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let failure = service
+        .database
+        .worker_failure(attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failure.failure_class,
+        lumen_core::artifact::FailureClass::DispatchFailure
+    );
+    assert_eq!(failure.diagnostic.as_deref(), Some("worker start failed"));
+    assert!(f.server.requests.lock().await.is_empty());
+    assert!(service.shutdown().await.is_clean());
+    f.no_leaks().await;
+}
+
+#[tokio::test]
+async fn recovery_settles_expired_execution_and_dispatches_remaining_ready_work() {
+    let (f, service) = fixture().await;
+    let g = durable_graph(&f, &service.database, 2, false).await;
+    let scheduler = lumen_worker_runtime::WorkerScheduler::new(
+        service.database.clone(),
+        Arc::new(lumen_control_plane::DatabaseWorkerMaterializer::new(
+            service.database.clone(),
+            service.provider_factory(),
+        )),
+        service.worker_kernel_ports(),
+        lumen_worker_runtime::WorkerSchedulerConfig::new(
+            1,
+            BTreeMap::from([("primary".into(), 1)]),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+        service.worker_owner_id(),
+    );
+    let catalog = DatabaseCandidateCatalog::new(
+        service.database.clone(),
+        service.worker_grants().unwrap(),
+        WorkerRunBudget::new(1, 1, 10_000, 4096).unwrap(),
+    );
+    let n = g.nodes().next().unwrap();
+    let t = now();
+    let candidates = catalog.candidates(&g, n, g.created_by(), t).await.unwrap();
+    let assignment = scheduler
+        .prepare_routed_assignment(
+            &g,
+            n,
+            g.created_by().clone(),
+            candidates,
+            ReasoningProfile::Balanced,
+            RoutingPolicy::new(true, false),
+            t,
+        )
+        .await
+        .unwrap();
+    let attempt = lumen_core::worker::WorkerAttemptId::new();
+    let expiry = TimestampMillis::new(t.as_u64() + 1);
+    service
+        .database
+        .reserve_worker_attempt(
+            &assignment,
+            attempt,
+            lumen_core::action::RunId::new(),
+            service.worker_owner_id(),
+            expiry,
+            t,
+        )
+        .await
+        .unwrap();
+    service
+        .database
+        .start_worker_attempt(attempt, service.worker_owner_id(), expiry, t)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let (_, poller) = crate::start_orchestration_workers(&f.config, &service.database, &service)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let attempts = service
+                .database
+                .worker_attempts_for_orchestration(g.orchestration_id())
+                .await
+                .unwrap();
+            if attempts.len() == 2
+                && attempts
+                    .iter()
+                    .any(|a| a.state() == WorkerAttemptState::Completed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        service
+            .database
+            .worker_attempt(attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        WorkerAttemptState::Unknown
+    );
+    assert!(
+        service
+            .database
+            .worker_failure(attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let budget = service
+        .database
+        .budget_snapshot(g.orchestration_id(), now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.remaining_concurrency, 1);
+    assert_eq!(budget.remaining_calls, 98);
+    poller.request_stop();
+    poller.join().await;
+    assert!(scheduler.shutdown(Duration::from_secs(1)).await);
+    assert!(service.shutdown().await.is_clean());
+}
+
+#[tokio::test]
 async fn serve_assembly_dispatches_after_one_create_api_request() {
     use http_body_util::BodyExt;
     use tower::ServiceExt;

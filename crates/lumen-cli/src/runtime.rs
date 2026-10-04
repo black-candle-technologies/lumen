@@ -1582,7 +1582,7 @@ impl LocalRuntimeService {
         let cooperative = deadline - SHUTDOWN_SETTLEMENT_BUDGET;
         let worker_scheduler = self.worker_scheduler.lock().await.clone();
         let worker_shutdown = async {
-            match worker_scheduler {
+            match worker_scheduler.as_ref() {
                 Some(scheduler) => {
                     scheduler
                         .shutdown(
@@ -1614,7 +1614,9 @@ impl LocalRuntimeService {
             }
             let _ = self.admission.abort_tracked();
         }
-        let workers_still_running = usize::from(!matches!(drained, Ok(true)))
+        let workers_still_running = worker_scheduler
+            .as_ref()
+            .map_or(0, |scheduler| scheduler.active_dispatch_count())
             + self.admission.active_count()
             + waiting_tasks
                 .iter()

@@ -135,6 +135,19 @@ impl WorkerScheduler {
         )
         .await
     }
+    pub(crate) async fn record_dispatch_failure(
+        &self,
+        record: &WorkerAttemptRecord,
+        now: TimestampMillis,
+    ) -> Result<EffectRisk, WorkerRuntimeError> {
+        self.record_failure(
+            record,
+            FailureClass::DispatchFailure,
+            Some("worker start failed".into()),
+            now,
+        )
+        .await
+    }
     pub(crate) async fn record_persistence_failure(
         &self,
         record: &WorkerAttemptRecord,

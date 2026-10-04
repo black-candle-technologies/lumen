@@ -1914,6 +1914,7 @@ async fn serve_listener_until_shutdown(
         std::process::id()
     );
     let stop_accepting = CancellationToken::new();
+    let mut runtime_stopped = false;
     let server_result = {
         let shutdown = stop_accepting.clone();
         let server = axum::serve(listener, app)
@@ -1934,6 +1935,7 @@ async fn serve_listener_until_shutdown(
                 }
                 events.close();
                 let report = service.shutdown().await;
+                runtime_stopped = true;
                 let drained = match tokio::time::timeout_at(deadline, &mut server).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -1953,13 +1955,12 @@ async fn serve_listener_until_shutdown(
         dispatch.join().await;
     }
     events.close();
-    let report = service.shutdown().await;
-    let server_result = if report.is_clean() {
-        server_result
-    } else {
+    let server_result = if !runtime_stopped && !service.shutdown().await.is_clean() {
         Err(std::io::Error::other(
             "runtime shutdown left unresolved work",
         ))
+    } else {
+        server_result
     };
     eprintln!(
         "event=server_stopped bind={bind} pid={} result={}",

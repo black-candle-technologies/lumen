@@ -201,9 +201,7 @@ impl WorkerScheduler {
     }
     async fn fail_dispatch(&self, record: &WorkerAttemptRecord) -> Result<(), WorkerRuntimeError> {
         let now = self.ports.clock.now();
-        let risk = self
-            .record_persistence_failure(record, "worker start failed".into(), now)
-            .await?;
+        let risk = self.record_dispatch_failure(record, now).await?;
         self.db
             .terminalize_worker_attempt(
                 record.attempt_id(),
@@ -229,6 +227,9 @@ impl WorkerScheduler {
     }
     pub fn stop_accepting(&self) {
         self.admission_stop.cancel();
+    }
+    pub fn active_dispatch_count(&self) -> usize {
+        self.tasks.len()
     }
     pub async fn shutdown(self: &Arc<Self>, timeout: Duration) -> bool {
         self.stop_accepting();
@@ -559,6 +560,10 @@ impl WorkerScheduler {
         self: &Arc<Self>,
         now: lumen_core::approval::TimestampMillis,
     ) -> Result<Vec<WorkerAttemptId>, WorkerRuntimeError> {
+        let admission = self.admission.lock().await;
+        if !*admission || self.admission_stop.is_cancelled() {
+            return Err(WorkerRuntimeError::Cancelled);
+        }
         self.db.recover_unadmitted_routing(now).await?;
         let (reserved, touched) = self.db.recover_expired_worker_attempts(now).await?;
         for orchestration in touched {

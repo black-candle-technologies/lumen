@@ -70,10 +70,10 @@ impl WorkerDispatchLoop {
     }
     pub async fn join(mut self) {
         self.request_stop();
-        if let Some(task) = self.task.take() {
-            if task.await.is_err() {
-                eprintln!("event=worker_dispatch_loop_failed diagnostic=join_failed");
-            }
+        if let Some(task) = self.task.take()
+            && task.await.is_err()
+        {
+            eprintln!("event=worker_dispatch_loop_failed diagnostic=join_failed");
         }
     }
 }
