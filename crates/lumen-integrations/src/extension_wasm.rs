@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering, fence},
     },
     time::Duration,
 };
@@ -120,12 +120,21 @@ impl WasmComponentHost {
                     () = cancellation.cancelled() => interruption.store(2, Ordering::Release),
                     () = tokio::time::sleep(deadline) => interruption.store(1, Ordering::Release),
                 }
+                // Publish the reason before Wasmtime's relaxed epoch increment.
+                fence(Ordering::Release);
                 engine.increment_epoch();
             })
         };
 
+        let worker_interruption = Arc::clone(&interruption);
         let worker = tokio::task::spawn_blocking(move || {
-            execute_component(&engine, &component, &encoded_request, limits)
+            execute_component(
+                &engine,
+                &component,
+                &encoded_request,
+                limits,
+                &worker_interruption,
+            )
         });
         let execution = worker.await;
         interruption_task.abort();
@@ -181,7 +190,7 @@ impl WasmComponentHost {
         let metadata = CompilationMetadata {
             artifact_digest: artifact_digest.clone(),
             target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
-            engine_version: "46",
+            engine_version: "49",
         };
         let compiled = Arc::new(CompiledComponent {
             engine,
@@ -199,6 +208,7 @@ fn execute_component(
     component: &Component,
     encoded_request: &str,
     limits: ExtensionInvocationLimits,
+    interruption: &AtomicU8,
 ) -> Result<String, ExecutionError> {
     let memory_size = usize::try_from(limits.max_memory_bytes()).unwrap_or(usize::MAX);
     let state = HostState {
@@ -218,6 +228,13 @@ fn execute_component(
         .map_err(ExecutionError::Guest)?;
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
+    // Pair with publication if Wasmtime observed the relaxed epoch increment.
+    fence(Ordering::Acquire);
+    // The one-shot epoch increment may have arrived before this relative deadline.
+    // Check after setting it so an earlier interruption cannot be lost.
+    if interruption.load(Ordering::Acquire) != 0 {
+        return Err(ExecutionError::Guest(Trap::Interrupt.into()));
+    }
 
     // An empty linker is the authority boundary: no WASI or host capability is linked.
     let linker = Linker::<HostState>::new(engine);

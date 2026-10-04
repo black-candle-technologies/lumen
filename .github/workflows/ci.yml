@@ -144,15 +144,8 @@ jobs:
       # lumen-acceptance is excluded: it is a 10m+ end-to-end suite that has
       # not been stabilized for CI yet. Do not re-add it until it is run and
       # green on its own.
-      #
-      # fuel_deadline_and_cancellation_interrupt_guest_code is skipped: it
-      # hangs intermittently (idle, zero CPU -- a never-firing wait inside the
-      # wasmtime epoch/deadline machinery) instead of failing, which would burn
-      # the whole job timeout. Observed 2026-09-24 on the phase-6 tree.
-      # Re-enable once root-caused; see crates/lumen-integrations/src/extension_wasm.rs.
       - run: >
-          cargo test --workspace --exclude lumen-acceptance --exclude lumen-desktop --
-          --skip fuel_deadline_and_cancellation_interrupt_guest_code
+          cargo test --workspace --exclude lumen-acceptance --exclude lumen-desktop
       # This bounded acceptance target exercises the versioned raw Unix
       # transport. It does not replace real Pi/Firecracker confinement evidence.
       - run: cargo test -p lumen-acceptance --test pi_bypass_inventory

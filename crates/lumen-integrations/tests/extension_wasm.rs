@@ -440,6 +440,52 @@ async fn fuel_deadline_and_cancellation_interrupt_guest_code() {
     assert_eq!(task.await.unwrap().unwrap_err(), WasmHostError::Cancelled);
 }
 
+#[test]
+fn interrupts_when_deadline_or_cancellation_precedes_worker_start() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            for cancel in [false, true] {
+                let request = request("queued-worker");
+                let response = InvocationResponse::new(
+                    request.request_id(),
+                    WireResponse::result(serde_json::Value::Null),
+                )
+                .unwrap();
+                let bytes = response_component(&response);
+                let host = WasmComponentHost::default();
+                let cancellation = CancellationToken::new();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || blocked.recv().unwrap());
+                let invocation = host.invoke(
+                    digest(&bytes),
+                    Arc::from(bytes),
+                    request,
+                    ExtensionInvocationLimits::new(10, 16 * 1024, 10_000_000, 2 * 1024 * 1024)
+                        .unwrap(),
+                    cancellation.clone(),
+                );
+                tokio::pin!(invocation);
+                assert!(futures_util::poll!(invocation.as_mut()).is_pending());
+                if cancel {
+                    cancellation.cancel();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                release.send(()).unwrap();
+                let expected = if cancel {
+                    WasmHostError::Cancelled
+                } else {
+                    WasmHostError::DeadlineExceeded
+                };
+                assert_eq!(invocation.await.unwrap_err(), expected);
+                blocker.await.unwrap();
+            }
+        });
+}
+
 #[tokio::test]
 async fn validates_digest_and_component_shape_without_execution() {
     let request = request("digest");
