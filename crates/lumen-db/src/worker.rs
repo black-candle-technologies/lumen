@@ -82,6 +82,15 @@ impl Database {
         if cancelled(&mut tx, assignment.orchestration_id()).await? {
             return Err(RepositoryError::InvalidWorkerState);
         }
+        let quarantine: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM orchestration_security_quarantine WHERE orchestration_id=?",
+        )
+        .bind(assignment.orchestration_id().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if quarantine.is_some() {
+            return Err(RepositoryError::InvalidWorkerState);
+        }
         validate_assignment(&mut tx, assignment).await?;
         crate::trust_gate::verify_trust_gate_binding_tx(&mut tx, assignment).await?;
         let row = sqlx::query("SELECT state_revision,state,attempt_count FROM orchestration_task_state_revisions WHERE orchestration_id=? AND graph_revision=? AND task_node_id=? ORDER BY state_revision DESC LIMIT 1")
@@ -313,6 +322,10 @@ impl Database {
             let oid = parse_orchestration(item.try_get::<String, _>("orchestration_id")?)?;
             sqlx::query("UPDATE worker_attempts SET state='unknown',completed_at=?,diagnostic='worker lease expired after dispatch' WHERE attempt_id=?").bind(stamp).bind(id.to_string()).execute(&mut *tx).await?;
             append_task_terminal(&mut tx, &item, WorkerAttemptState::Unknown, now).await?;
+            // Expired execution remains charged conservatively. Only active
+            // concurrency is returned so other durable Ready nodes can run.
+            sqlx::query("UPDATE routing_budget_reservations SET state='settled',actual_calls=reserved_calls,actual_input_tokens=reserved_input_tokens,actual_output_tokens=reserved_output_tokens,actual_remote_cost_micros=reserved_remote_cost_micros,usage_complete=0,settled_at=? WHERE orchestration_id=? AND graph_revision=? AND task_node_id=? AND state='active'")
+                .bind(stamp).bind(oid.to_string()).bind(item.try_get::<i64, _>("graph_revision")?).bind(item.try_get::<String, _>("task_node_id")?).execute(&mut *tx).await?;
             touched.insert(oid);
         }
         tx.commit().await?;

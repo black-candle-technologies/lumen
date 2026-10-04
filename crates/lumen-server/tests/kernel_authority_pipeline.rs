@@ -1014,17 +1014,14 @@ async fn one_shot_audit_failure_is_minted_but_not_returned() {
         signature: core_grant.signature.clone(),
     };
 
-    // Break the audit store.
+    // Fail audit appends without deleting referenced audit history. Startup now
+    // rejects foreign-key corruption; this test isolates the post-commit audit failure.
     let db = Database::connect(&db_path).await.expect("connect db");
     let mut conn = db.pool().acquire().await.expect("acquire");
-    sqlx::query("PRAGMA foreign_keys=OFF")
+    sqlx::query("CREATE TRIGGER fail_one_shot_audit BEFORE INSERT ON kernel_audit_events BEGIN SELECT RAISE(ABORT,'injected audit failure'); END")
         .execute(&mut *conn)
         .await
-        .expect("pragma");
-    sqlx::query("DROP TABLE kernel_audit_events")
-        .execute(&mut *conn)
-        .await
-        .expect("drop audit table");
+        .expect("fail audit appends");
     drop(conn);
     drop(db);
 

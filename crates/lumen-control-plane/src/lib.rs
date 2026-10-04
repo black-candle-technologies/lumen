@@ -1,3 +1,4 @@
+pub mod provider_runtime;
 use lumen_core::{
     approval::TimestampMillis,
     artifact::RetryMode,
@@ -12,30 +13,23 @@ use lumen_core::{
         AuthorityRequest, OperatorAuthorityPort, OperatorOperation, OrchestrationControlPolicy,
     },
     orchestration::{OrchestrationId, TaskGraph, TaskGraphProposal, TaskNode, TaskNodeState},
-    provider::{ModelProfile, ProviderAdapter, ProviderConfig, ProviderKind},
+    provider::ModelProfile,
     routing::{OrchestrationBudget, RoutingPolicy},
     trust_gate::evaluate_exact_projection,
     worker::{OwnedProjectedModel, WorkerAssignment, WorkerCapabilityGrant, WorkerRunBudget},
 };
 use lumen_db::{ControlEvent, Database, RepositoryError};
-use lumen_integrations::{
-    providers::{
-        anthropic::AnthropicAdapter, openai::OpenAiAdapter,
-        openai_compatible::LocalOpenAiCompatibleAdapter,
-    },
-    secrets::SecretStore,
-};
 use lumen_server::{
-    ControlAction, ControlOrchestrationCommand, CreateOrchestrationCommand, OrchestrationEvent,
-    OrchestrationFuture, OrchestrationService, ServiceError,
+    ControlAction, ControlOrchestrationCommand, CreateOrchestrationCommand, DispatchTick,
+    OrchestrationEvent, OrchestrationFuture, OrchestrationService, ServiceError,
+    WorkerDispatchDriver, WorkerDispatchFuture,
 };
 use lumen_worker_runtime::{
     MaterializeFuture, MaterializedWorker, RoutedWorkerCandidate, WorkerMaterializer,
     WorkerRuntimeError, WorkerScheduler,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use std::{future::Future, pin::Pin, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 #[derive(Clone)]
@@ -72,15 +66,26 @@ impl JsonModelPlanner {
         Self { model }
     }
 }
+fn task_graph_planner_prompt(prompt: &str) -> String {
+    format!(
+        concat!(
+            "Return ONLY TaskGraphProposal JSON, no markdown/tools. ",
+            "The top-level object must be exactly {{\"nodes\":[...]}}. ",
+            "Each element of nodes must include ",
+            "key,description,expected_output,depends_on,requirements,limits,deadline_at. ",
+            "Return at most 256 nodes. Do not add any other top-level fields. ",
+            "Request: {prompt}"
+        ),
+        prompt = prompt
+    )
+}
 impl PlannerPort for JsonModelPlanner {
     fn plan<'a>(&'a self, prompt: &'a str, class: DataClass) -> PlannerFuture<'a> {
         Box::pin(async move {
             if prompt.is_empty() || prompt.len() > 65536 {
                 return Err(ControlPlaneError::Planner("invalid prompt".into()));
             }
-            let q = format!(
-                "Return ONLY TaskGraphProposal JSON, no markdown/tools. <=256 tasks; include key,description,expected_output,depends_on,requirements,limits,deadline_at. Request: {prompt}"
-            );
+            let q = task_graph_planner_prompt(prompt);
             match self
                 .model
                 .generate(
@@ -102,59 +107,11 @@ impl PlannerPort for JsonModelPlanner {
 }
 pub struct DatabaseWorkerMaterializer {
     db: Database,
-    secrets: Arc<dyn SecretStore>,
+    factory: Arc<provider_runtime::DatabaseProviderFactory>,
 }
 impl DatabaseWorkerMaterializer {
-    pub fn new(db: Database, secrets: Arc<dyn SecretStore>) -> Self {
-        Self { db, secrets }
-    }
-    async fn adapter(
-        &self,
-        a: &WorkerAssignment,
-        p: &ProviderConfig,
-    ) -> Result<Arc<dyn ProviderAdapter>, WorkerRuntimeError> {
-        let key = if let Some(id) = p.credential_secret_ref() {
-            let r = self
-                .db
-                .get_secret_reference(a.workspace_id(), id)
-                .await?
-                .ok_or(WorkerRuntimeError::Stale)?;
-            Some(
-                String::from_utf8(
-                    self.secrets
-                        .resolve(r.keychain_account())
-                        .await
-                        .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-                )
-                .map_err(|_| WorkerRuntimeError::Configuration("credential encoding".into()))?,
-            )
-        } else {
-            None
-        };
-        Ok(match p.kind() {
-            ProviderKind::OpenAi => Arc::new(
-                OpenAiAdapter::new(
-                    p.clone(),
-                    key.ok_or_else(|| {
-                        WorkerRuntimeError::Configuration("OpenAI credential missing".into())
-                    })?,
-                )
-                .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-            ),
-            ProviderKind::Anthropic => Arc::new(
-                AnthropicAdapter::new(
-                    p.clone(),
-                    key.ok_or_else(|| {
-                        WorkerRuntimeError::Configuration("Anthropic credential missing".into())
-                    })?,
-                )
-                .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-            ),
-            ProviderKind::OpenAiCompatible => Arc::new(
-                LocalOpenAiCompatibleAdapter::new(p.clone(), key)
-                    .map_err(|e| WorkerRuntimeError::Configuration(e.to_string()))?,
-            ),
-        })
+    pub fn new(db: Database, factory: Arc<provider_runtime::DatabaseProviderFactory>) -> Self {
+        Self { db, factory }
     }
 }
 impl WorkerMaterializer for DatabaseWorkerMaterializer {
@@ -197,13 +154,18 @@ impl WorkerMaterializer for DatabaseWorkerMaterializer {
                 return Err(WorkerRuntimeError::Stale);
             }
             let model = OwnedProjectedModel::new(
-                self.adapter(a, &p).await?,
+                self.factory.lazy_with_execution(
+                    a.workspace_id(),
+                    p.clone(),
+                    lumen_integrations::providers::ProviderHttpOptions::default(),
+                    g,
+                    sink,
+                ),
                 m.clone(),
                 policy,
                 projection,
                 cancel,
             )?;
-            let _ = (g, sink); // Routing metadata is enforced before materialization.
             Ok(MaterializedWorker {
                 model: Arc::new(model),
                 profile_id: m.id().clone(),
@@ -316,7 +278,6 @@ pub struct OrchestrationControl {
     authority: Arc<dyn OperatorAuthorityPort>,
     catalog: DatabaseCandidateCatalog,
     workspace: WorkspaceId,
-    drivers: Arc<Mutex<BTreeSet<OrchestrationId>>>,
 }
 impl OrchestrationControl {
     pub fn new(
@@ -334,7 +295,6 @@ impl OrchestrationControl {
             authority,
             catalog,
             workspace,
-            drivers: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
     async fn auth(
@@ -376,111 +336,162 @@ impl OrchestrationControl {
         }
         Ok(s)
     }
-    fn kick(&self, id: OrchestrationId) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            let mut d = this.drivers.lock().await;
-            if !d.insert(id) {
-                return;
+    pub async fn dispatch_workspace_once(
+        &self,
+        now: TimestampMillis,
+        stop: &CancellationToken,
+    ) -> Result<DispatchTick, ControlPlaneError> {
+        let mut tick = DispatchTick::default();
+        for id in self
+            .db
+            .orchestration_ids_for_workspace(self.workspace)
+            .await?
+        {
+            if stop.is_cancelled() {
+                break;
             }
-            drop(d);
-            let _ = this.drive(id).await;
-            this.drivers.lock().await.remove(&id);
-        });
-    }
-    async fn drive(&self, id: OrchestrationId) -> Result<(), ControlPlaneError> {
-        loop {
-            if self.db.orchestration_quarantine(id).await?.is_some() {
-                return Ok(());
-            }
-            let now = clock();
-            self.db.reconcile_task_readiness(id, now).await?;
-            let Some(s) = self.db.latest_orchestration_snapshot(id).await? else {
-                return Ok(());
-            };
-            if self.db.orchestration_cancelled(id).await? {
-                return Ok(());
-            }
-            let states = s.states().map(|x| x.state()).collect::<Vec<_>>();
-            if states.iter().all(|x| {
-                matches!(
-                    x,
-                    TaskNodeState::Completed
-                        | TaskNodeState::Failed
-                        | TaskNodeState::Cancelled
-                        | TaskNodeState::Unknown
-                        | TaskNodeState::Blocked
-                )
-            }) {
-                return Ok(());
-            }
-            let control = self
-                .db
-                .latest_control_policy(id)
-                .await?
-                .ok_or_else(|| ControlPlaneError::Control("missing control policy".into()))?;
-            let ready = s
-                .states()
-                .filter(|x| x.state() == TaskNodeState::Ready)
-                .map(|x| x.task_node_id())
-                .collect::<Vec<_>>();
-            if ready.is_empty() {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
-            }
-            let mut jobs = tokio::task::JoinSet::new();
-            for tid in ready {
-                let n = s
-                    .graph()
-                    .node(tid)
-                    .cloned()
-                    .ok_or_else(|| ControlPlaneError::Control("task missing".into()))?;
-                let cs = self
-                    .catalog
-                    .candidates(s.graph(), &n, s.graph().created_by(), now)
-                    .await?;
-                if cs.is_empty() {
-                    let st = s
-                        .state(tid)
-                        .ok_or_else(|| ControlPlaneError::Control("task state missing".into()))?;
-                    self.db
-                        .transition_task_state(
-                            id,
-                            s.graph().revision(),
-                            tid,
-                            st.revision(),
-                            TaskNodeState::Blocked,
-                            now,
-                        )
-                        .await?;
-                    continue;
-                }
-                let scheduler = Arc::clone(&self.scheduler);
-                let g = s.graph().clone();
-                let actor = s.graph().created_by().clone();
-                jobs.spawn(async move {
-                    scheduler
-                        .route_and_dispatch(
-                            &g,
-                            &n,
-                            actor,
-                            cs,
-                            control.reasoning,
-                            RoutingPolicy::new(control.remote_allowed, control.prefer_local),
-                            now,
-                        )
-                        .await
-                });
-            }
-            while let Some(v) = jobs.join_next().await {
-                let _ = v
-                    .map_err(|e| ControlPlaneError::Control(e.to_string()))?
-                    .map_err(|e| ControlPlaneError::Control(e.to_string()))?;
+            match self.dispatch_orchestration_once(id, now, stop).await {
+                Ok(launched) => tick.launched += launched,
+                Err(_) => eprintln!(
+                    "event=worker_dispatch_orchestration_failed orchestration_id={id} diagnostic=dispatch_failed"
+                ),
             }
         }
+        Ok(tick)
+    }
+    async fn dispatch_orchestration_once(
+        &self,
+        id: OrchestrationId,
+        now: TimestampMillis,
+        stop: &CancellationToken,
+    ) -> Result<usize, ControlPlaneError> {
+        if self.db.orchestration_quarantine(id).await?.is_some()
+            || self.db.orchestration_cancelled(id).await?
+        {
+            return Ok(0);
+        }
+        self.db.reconcile_task_readiness(id, now).await?;
+        let Some(s) = self.db.latest_orchestration_snapshot(id).await? else {
+            return Ok(0);
+        };
+        let Some(budget) = self.db.budget_snapshot(id, now).await? else {
+            return Ok(0);
+        };
+        let control = self
+            .db
+            .latest_control_policy(id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::Control("missing control policy".into()))?;
+        let ready = s
+            .states()
+            .filter(|state| state.state() == TaskNodeState::Ready)
+            .collect::<Vec<_>>();
+        if budget.expired {
+            for state in ready {
+                if stop.is_cancelled() {
+                    break;
+                }
+                self.db
+                    .transition_task_state(
+                        id,
+                        s.graph().revision(),
+                        state.task_node_id(),
+                        state.revision(),
+                        TaskNodeState::Blocked,
+                        now,
+                    )
+                    .await?;
+            }
+            return Ok(0);
+        }
+        let mut launched = 0;
+        for state in ready
+            .into_iter()
+            .take(budget.remaining_concurrency as usize)
+        {
+            if stop.is_cancelled() {
+                break;
+            }
+            let n = s
+                .graph()
+                .node(state.task_node_id())
+                .ok_or_else(|| ControlPlaneError::Control("task missing".into()))?;
+            // Ready may still have a committed reservation while admission runs.
+            if self
+                .db
+                .active_routing_dispatch(id, s.graph().revision(), n.id())
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            let mut cs = self
+                .catalog
+                .candidates(s.graph(), n, s.graph().created_by(), now)
+                .await?;
+            self.scheduler
+                .filter_retry_candidates(s.graph(), n, &mut cs)
+                .await?;
+            if cs.is_empty() {
+                self.db
+                    .transition_task_state(
+                        id,
+                        s.graph().revision(),
+                        n.id(),
+                        state.revision(),
+                        TaskNodeState::Blocked,
+                        now,
+                    )
+                    .await?;
+                continue;
+            }
+            let assignment = match self
+                .scheduler
+                .prepare_routed_assignment(
+                    s.graph(),
+                    n,
+                    s.graph().created_by().clone(),
+                    cs,
+                    control.reasoning,
+                    RoutingPolicy::new(control.remote_allowed, control.prefer_local),
+                    now,
+                )
+                .await
+            {
+                Ok(assignment) => assignment,
+                Err(WorkerRuntimeError::Repository(
+                    RepositoryError::RoutingBudgetConflict | RepositoryError::RoutingTaskConflict,
+                )) => continue,
+                // Health and capacity may recover. Leave these tasks Ready.
+                Err(WorkerRuntimeError::Route(
+                    lumen_core::routing::RoutingError::NoEligibleModel,
+                )) => continue,
+                Err(_) => {
+                    eprintln!(
+                        "event=worker_route_prepare_failed orchestration_id={id} task_node_id={} diagnostic=route_failed",
+                        n.id()
+                    );
+                    continue;
+                }
+            };
+            if stop.is_cancelled() {
+                self.db
+                    .release_active_routing_for_task(id, s.graph().revision(), n.id(), now)
+                    .await?;
+                break;
+            }
+            match self.scheduler.dispatch_prepared(assignment, now).await {
+                Ok(_) => launched += 1,
+                Err(_) => eprintln!(
+                    "event=worker_dispatch_failed orchestration_id={id} task_node_id={} diagnostic=admission_failed",
+                    n.id()
+                ),
+            }
+        }
+        Ok(launched)
     }
     pub async fn recover(&self, now: TimestampMillis) -> Result<(), ControlPlaneError> {
-        let _ = self.scheduler.recover_once(now).await?;
+        // Verify durable bindings before allowing recovered reservations to run.
         for id in self
             .db
             .orchestration_ids_for_workspace(self.workspace)
@@ -491,23 +502,18 @@ impl OrchestrationControl {
                 .await?;
             let report = self.db.verify_orchestration_integrity(id, now).await?;
             self.db.record_recovery_integrity(&report).await?;
-            if !report.ok() {
-                continue;
-            }
-            if let Some(s) = self.db.latest_orchestration_snapshot(id).await?
-                && s.states().any(|x| {
-                    !matches!(
-                        x.state(),
-                        TaskNodeState::Completed
-                            | TaskNodeState::Failed
-                            | TaskNodeState::Cancelled
-                            | TaskNodeState::Unknown
-                            | TaskNodeState::Blocked
-                    )
-                })
-            {
-                self.kick(id)
-            }
+        }
+        self.scheduler.recover_once(now).await?;
+        for id in self
+            .db
+            .orchestration_ids_for_workspace(self.workspace)
+            .await?
+        {
+            self.db
+                .ensure_recovered_unknown_failure_metadata(id, now)
+                .await?;
+            let report = self.db.verify_orchestration_integrity(id, now).await?;
+            self.db.record_recovery_integrity(&report).await?;
         }
         Ok(())
     }
@@ -533,6 +539,22 @@ impl OrchestrationControl {
             );
         }
         Ok(v)
+    }
+}
+impl WorkerDispatchDriver for OrchestrationControl {
+    fn stop_dispatches(&self) {
+        self.scheduler.stop_accepting();
+    }
+    fn dispatch_tick<'a>(
+        &'a self,
+        now: TimestampMillis,
+        stop: &'a CancellationToken,
+    ) -> WorkerDispatchFuture<'a> {
+        Box::pin(async move {
+            self.dispatch_workspace_once(now, stop)
+                .await
+                .map_err(internal)
+        })
     }
 }
 impl OrchestrationService for OrchestrationControl {
@@ -633,7 +655,6 @@ impl OrchestrationService for OrchestrationControl {
                 )
                 .await
                 .map_err(map)?;
-            self.kick(id);
             self.view(c.workspace_id, id).await
         })
     }
@@ -726,32 +747,23 @@ impl OrchestrationService for OrchestrationControl {
                         .node(task_node_id)
                         .cloned()
                         .ok_or(ServiceError::NotFound)?;
-                    let p = self
-                        .db
-                        .latest_control_policy(c.orchestration_id)
-                        .await
-                        .map_err(map)?
-                        .ok_or(ServiceError::NotFound)?;
-                    let cs = self
+                    let mut candidates = self
                         .catalog
                         .candidates(snap.graph(), &n, &c.actor, clock())
                         .await
                         .map_err(internal)?;
                     self.scheduler
-                        .retry_task(
+                        .authorize_retry(
                             snap.graph(),
                             &n,
                             prior_attempt_id,
                             c.actor.clone(),
-                            cs,
-                            p.reasoning,
-                            RoutingPolicy::new(p.remote_allowed, p.prefer_local),
+                            &mut candidates,
                             mode,
                             clock(),
                         )
                         .await
                         .map_err(worker)?;
-                    self.kick(c.orchestration_id)
                 }
                 ControlAction::Pin {
                     task_node_id,
@@ -781,7 +793,6 @@ impl OrchestrationService for OrchestrationControl {
                         .append_task_graph(&g, &ps, &policies)
                         .await
                         .map_err(map)?;
-                    self.kick(c.orchestration_id)
                 }
                 ControlAction::Narrow {
                     remote_allowed,
@@ -946,6 +957,16 @@ pub enum ControlPlaneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn planner_prompt_names_the_strict_graph_schema() {
+        let prompt = task_graph_planner_prompt("build a plan");
+        assert!(prompt.contains(r#"{"nodes":[...]}"#));
+        assert!(prompt.contains("at most 256 nodes"));
+        assert!(!prompt.contains("tasks"));
+        assert!(serde_json::from_str::<TaskGraphProposal>(r#"{"tasks":[]}"#).is_err());
+        assert!(serde_json::from_str::<TaskGraphProposal>(r#"{"nodes":[],"extra":0}"#).is_err());
+        assert!(serde_json::from_str::<TaskGraphProposal>(r#"{"nodes":[]}"#).is_ok());
+    }
     #[tokio::test]
     async fn bootstrap_authority_is_workspace_and_principal_exact() {
         let principal = PrincipalId::new("local", "owner").unwrap();

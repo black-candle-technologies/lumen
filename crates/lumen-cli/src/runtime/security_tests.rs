@@ -19,12 +19,12 @@ use lumen_core::{
     approval::{ApprovalId, TimestampMillis},
     automation::{JobId, JobRevision, OccurrenceKey, ScheduleSpec, SkillId, SkillVersion},
     capability::{Capability, CapabilityName, CapabilitySet, ResourceScope},
-    egress::{DataClass, DestinationScope, EndpointClass, ProviderId, select_model_provider},
+    egress::{DataClass, DestinationScope, ProviderId},
     executor::{AuthorizedAction, ExecutorFuture, ExecutorPort},
     identity::{
         ChannelDestination, ComponentId, ExternalChannelIdentity, PrincipalId, WorkspaceId,
     },
-    model::{ActionProposal, ModelFuture, ModelInput, ModelOutput, ModelPort},
+    model::ActionProposal,
     policy::PolicyVersion,
     run::{ApprovalPort, Clock},
     secret::SecretRefId,
@@ -57,7 +57,7 @@ use wiremock::{
 };
 
 use super::{
-    ApprovalRegistry, EgressCheckedModel, LocalRuntimeService, PluginInvocationCommand,
+    ApprovalRegistry, LocalRuntimeService, PluginInvocationCommand,
     REVIEWED_SKILL_SOURCE_MAX_BYTES, RedactingExecutor, now, read_bounded_skill_source,
     recover_skill_publications, write_skill_stage,
 };
@@ -285,31 +285,8 @@ fn skill_id() -> SkillId {
     )
 }
 
-struct RecordingModel {
-    calls: AtomicUsize,
-}
-
-impl RecordingModel {
-    const fn new() -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-impl ModelPort for RecordingModel {
-    fn generate(&self, _input: ModelInput) -> ModelFuture<'_> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(ModelOutput::FinalText("allowed".into())) })
-    }
-}
-
 #[derive(Clone)]
-struct RecordingSandbox {
+pub(super) struct RecordingSandbox {
     calls: Arc<AtomicUsize>,
     environments: Arc<StdMutex<Vec<BTreeMap<String, String>>>>,
     output: Arc<StdMutex<SandboxOutput>>,
@@ -318,7 +295,7 @@ struct RecordingSandbox {
 }
 
 impl RecordingSandbox {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
             environments: Arc::new(StdMutex::new(Vec::new())),
@@ -1321,275 +1298,6 @@ async fn request_admin_action(
 }
 
 #[tokio::test]
-async fn explicit_remote_model_config_bootstraps_egress_policy() {
-    let directory = tempfile::tempdir().expect("temporary runtime");
-    let workspace = directory.path().join("workspace");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir(&workspace).expect("workspace directory");
-    std::fs::create_dir(&runtime).expect("runtime directory");
-    let config = Config::parse(&format!(
-        r#"
-[database]
-path = "ignored.sqlite3"
-
-[model]
-endpoint = "https://models.example.com/v1/"
-model = "remote-model"
-allow_remote = true
-streaming = false
-remote_provider = {{ id = "openai-compatible", allowed_data_classes = ["public"] }}
-
-[runtime]
-data_directory = {}
-
-[workspace]
-id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
-name = "Default"
-path = {}
-
-[bootstrap_admin]
-provider = "local"
-subject = "operator"
-"#,
-        path_toml(&runtime),
-        path_toml(&workspace)
-    ))
-    .expect("remote runtime config");
-    let database = Database::connect_in_memory().await.expect("database");
-    database
-        .bootstrap_workspace(
-            config.workspace_id(),
-            &config.workspace.name,
-            &config.bootstrap_principal(),
-            now(),
-        )
-        .await
-        .expect("workspace bootstrap");
-    let events = EventBroker::new(128);
-
-    let service = LocalRuntimeService::build_with_secret_store(
-        &config,
-        database.clone(),
-        events,
-        Arc::new(RecordingSandbox::new()),
-        vec![TOKEN.to_owned()],
-        Arc::new(InMemorySecretStore::new()),
-    )
-    .await
-    .expect("remote runtime builds with explicit policy");
-    service.shutdown().await;
-    let service = LocalRuntimeService::build_with_secret_store(
-        &config,
-        database.clone(),
-        EventBroker::new(128),
-        Arc::new(RecordingSandbox::new()),
-        vec![TOKEN.to_owned()],
-        Arc::new(InMemorySecretStore::new()),
-    )
-    .await
-    .expect("remote runtime bootstrap is idempotent");
-    service.shutdown().await;
-
-    let provider_id = ProviderId::parse("openai-compatible").expect("provider ID");
-    let provider = database
-        .latest_model_provider_revision(provider_id.clone())
-        .await
-        .expect("provider query")
-        .expect("provider persisted");
-    assert_eq!(provider.endpoint_class(), ModelEndpointClass::Remote);
-    assert!(provider.enabled());
-    assert!(provider.allows(DataClass::Public));
-    assert!(!provider.allows(DataClass::Workspace));
-
-    let workspace_policy = database
-        .latest_workspace_model_egress_revision(config.workspace_id(), provider_id.clone())
-        .await
-        .expect("workspace policy query")
-        .expect("workspace policy persisted");
-    assert!(workspace_policy.allows(DataClass::Public));
-
-    let routes = database
-        .model_provider_routes(config.workspace_id())
-        .await
-        .expect("routes load");
-    let decision = select_model_provider(DataClass::Public, routes).expect("public remote route");
-    assert_eq!(decision.provider(), &provider_id);
-    assert_eq!(decision.endpoint_class(), EndpointClass::Remote);
-    assert!(decision.egress_occurred());
-}
-
-#[tokio::test]
-async fn workspace_class_run_is_denied_before_public_only_remote_model_request() {
-    let directory = tempfile::tempdir().expect("temporary runtime");
-    let workspace = directory.path().join("workspace");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir(&workspace).expect("workspace directory");
-    std::fs::create_dir(&runtime).expect("runtime directory");
-    let config = Config::parse(&format!(
-        r#"
-[database]
-path = "ignored.sqlite3"
-
-[model]
-endpoint = "https://models.example.com/v1/"
-model = "remote-model"
-allow_remote = true
-streaming = false
-timeout_seconds = 1
-remote_provider = {{ id = "openai-compatible", allowed_data_classes = ["public"] }}
-
-[runtime]
-data_directory = {}
-
-[workspace]
-id = "26db5a31-94f0-4e92-a9c9-4cdf19d71c31"
-name = "Default"
-path = {}
-
-[bootstrap_admin]
-provider = "local"
-subject = "operator"
-"#,
-        path_toml(&runtime),
-        path_toml(&workspace)
-    ))
-    .expect("remote runtime config");
-    let database = Database::connect_in_memory().await.expect("database");
-    database
-        .bootstrap_workspace(
-            config.workspace_id(),
-            &config.workspace.name,
-            &config.bootstrap_principal(),
-            now(),
-        )
-        .await
-        .expect("workspace bootstrap");
-    let events = EventBroker::new(128);
-    let service = Arc::new(
-        LocalRuntimeService::build_with_secret_store(
-            &config,
-            database.clone(),
-            events.clone(),
-            Arc::new(RecordingSandbox::new()),
-            vec![TOKEN.to_owned()],
-            Arc::new(InMemorySecretStore::new()),
-        )
-        .await
-        .expect("runtime builds"),
-    );
-    let state = ApiState::new(
-        service.clone(),
-        events.clone(),
-        TOKEN,
-        config.bootstrap_principal(),
-        BTreeSet::from([config.workspace_id()]),
-        SandboxCapabilityReport::new(
-            "test",
-            "kernel_enforced",
-            ["filesystem_isolation", "network_isolation"],
-            None,
-        ),
-    )
-    .expect("API state");
-    let harness = Harness {
-        _directory: directory,
-        app: router(state),
-        events,
-        service,
-        database,
-        sandbox: RecordingSandbox::new(),
-        workspace_id: config.workspace_id(),
-    };
-
-    let run_id = harness.create_run("summarize workspace notes").await;
-    let stream = harness.sse_until(&run_id, "run.failed").await;
-
-    assert!(stream.contains("remote egress policy denied every remote provider"));
-    harness.service.shutdown().await;
-}
-
-#[tokio::test]
-async fn public_class_input_is_allowed_through_public_remote_model_policy() {
-    let database = Database::connect_in_memory().await.expect("database");
-    let workspace_id = WorkspaceId::from_uuid(
-        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
-    );
-    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
-    database
-        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
-        .await
-        .expect("workspace");
-    database
-        .append_model_provider_revision(
-            &ModelProviderRevision::new(
-                provider_id.clone(),
-                1,
-                ModelEndpointClass::Remote,
-                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
-                "remote-model",
-                true,
-                0,
-                None,
-                [DataClass::Public],
-                TimestampMillis::new(1_000),
-            )
-            .expect("provider revision"),
-        )
-        .await
-        .expect("provider stored");
-    database
-        .append_workspace_model_egress_revision(
-            &WorkspaceModelEgressRevision::new(
-                workspace_id,
-                provider_id,
-                1,
-                [DataClass::Public],
-                TimestampMillis::new(1_100),
-            )
-            .expect("workspace policy"),
-        )
-        .await
-        .expect("workspace policy stored");
-    let inner = Arc::new(RecordingModel::new());
-    let run_id = RunId::new();
-    let model = EgressCheckedModel {
-        inner: inner.clone(),
-        database: database.clone(),
-        audit: super::DatabaseAudit(database.clone()),
-        workspace_id,
-        run_id,
-    };
-
-    let output = model
-        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Public))
-        .await
-        .expect("public request allowed");
-
-    assert_eq!(output, ModelOutput::FinalText("allowed".into()));
-    assert_eq!(inner.call_count(), 1);
-    let records = database
-        .list_audit_records(workspace_id, 0, 10)
-        .await
-        .expect("audit records");
-    let event = records
-        .iter()
-        .map(|record| record.event())
-        .find(|event| event.kind() == AuditEventKind::ModelEgress)
-        .expect("model egress audit");
-    assert_eq!(event.outcome(), lumen_core::audit::AuditOutcome::Success);
-    assert_eq!(
-        event.payload(),
-        &CanonicalValue::object([
-            ("run_id", CanonicalValue::from(run_id.to_string())),
-            ("data_class", CanonicalValue::from("public")),
-            ("egress_occurred", CanonicalValue::from(true)),
-            ("endpoint_class", CanonicalValue::from("remote")),
-            ("provider_id", CanonicalValue::from("openai-compatible")),
-        ])
-    );
-}
-
-#[tokio::test]
 async fn enabled_network_destinations_are_loaded_as_runtime_capabilities() {
     let model = MockServer::start().await;
     let harness = Harness::new(&model, |_| {}).await;
@@ -2310,6 +2018,11 @@ subject = "operator"
     .fetch_one(database.pool())
     .await
     .expect("approval before restart");
+    // Terminal state can precede the scheduler's final audit write. Drain the runtime
+    // before taking the durable baseline so that restart is compared with settled history.
+    tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+        .await
+        .expect("first shutdown bounded");
     let lifecycle_before = database
         .get_run_lifecycle(workspace_id, run_id)
         .await
@@ -2367,9 +2080,6 @@ subject = "operator"
         effect_certainty: lifecycle_before.effect_certainty().as_str().to_owned(),
     };
 
-    tokio::time::timeout(Duration::from_secs(5), service.shutdown())
-        .await
-        .expect("first shutdown bounded");
     drop(service);
     drop(database);
 
@@ -5935,255 +5645,6 @@ async fn rejected_or_expired_capture_publication_never_creates_a_skill() {
     harness.service.shutdown().await;
 }
 
-#[tokio::test]
-async fn denied_model_egress_is_audited_before_inner_model_call() {
-    let database = Database::connect_in_memory().await.expect("database");
-    let workspace_id = WorkspaceId::from_uuid(
-        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
-    );
-    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
-    database
-        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
-        .await
-        .expect("workspace");
-    database
-        .append_model_provider_revision(
-            &ModelProviderRevision::new(
-                provider_id,
-                1,
-                ModelEndpointClass::Remote,
-                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
-                "remote-model",
-                true,
-                0,
-                None,
-                [DataClass::Public],
-                TimestampMillis::new(1_000),
-            )
-            .expect("provider revision"),
-        )
-        .await
-        .expect("provider stored");
-    let inner = Arc::new(RecordingModel::new());
-    let run_id = RunId::new();
-    let model = EgressCheckedModel {
-        inner: inner.clone(),
-        database: database.clone(),
-        audit: super::DatabaseAudit(database.clone()),
-        workspace_id,
-        run_id,
-    };
-
-    let error = model
-        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Workspace))
-        .await
-        .expect_err("workspace request denied");
-
-    assert_eq!(
-        error.message(),
-        "remote egress policy denied every remote provider"
-    );
-    assert_eq!(inner.call_count(), 0);
-    let records = database
-        .list_audit_records(workspace_id, 0, 10)
-        .await
-        .expect("audit records");
-    let event = records
-        .iter()
-        .map(|record| record.event())
-        .find(|event| event.kind() == AuditEventKind::ModelEgress)
-        .expect("model egress audit");
-    assert_eq!(event.outcome(), lumen_core::audit::AuditOutcome::Denied);
-    assert_eq!(
-        event.payload(),
-        &CanonicalValue::object([
-            ("run_id", CanonicalValue::from(run_id.to_string())),
-            ("data_class", CanonicalValue::from("workspace")),
-            ("egress_occurred", CanonicalValue::from(false)),
-            ("failure", CanonicalValue::from(error.message())),
-        ])
-    );
-}
-
-#[tokio::test]
-async fn disabled_remote_provider_is_denied_before_inner_model_call() {
-    let database = Database::connect_in_memory().await.expect("database");
-    let workspace_id = WorkspaceId::from_uuid(
-        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
-    );
-    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
-    database
-        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
-        .await
-        .expect("workspace");
-    database
-        .append_model_provider_revision(
-            &ModelProviderRevision::new(
-                provider_id.clone(),
-                1,
-                ModelEndpointClass::Remote,
-                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
-                "remote-model",
-                false,
-                0,
-                None,
-                [DataClass::Public],
-                TimestampMillis::new(1_000),
-            )
-            .expect("provider revision"),
-        )
-        .await
-        .expect("provider stored");
-    database
-        .append_workspace_model_egress_revision(
-            &WorkspaceModelEgressRevision::new(
-                workspace_id,
-                provider_id,
-                1,
-                [DataClass::Public],
-                TimestampMillis::new(1_100),
-            )
-            .expect("workspace policy"),
-        )
-        .await
-        .expect("workspace policy stored");
-    let inner = Arc::new(RecordingModel::new());
-    let run_id = RunId::new();
-    let model = EgressCheckedModel {
-        inner: inner.clone(),
-        database: database.clone(),
-        audit: super::DatabaseAudit(database.clone()),
-        workspace_id,
-        run_id,
-    };
-
-    let error = model
-        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Public))
-        .await
-        .expect_err("disabled provider denied");
-
-    assert_eq!(error.message(), "no eligible model provider is configured");
-    assert_eq!(inner.call_count(), 0);
-    assert_model_egress_denied_audit(
-        &database,
-        workspace_id,
-        run_id,
-        DataClass::Public,
-        error.message(),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn revoked_workspace_model_policy_is_denied_before_inner_model_call() {
-    let database = Database::connect_in_memory().await.expect("database");
-    let workspace_id = WorkspaceId::from_uuid(
-        uuid::Uuid::parse_str("26db5a31-94f0-4e92-a9c9-4cdf19d71c31").expect("workspace"),
-    );
-    let provider_id = ProviderId::parse("openai-compatible").expect("provider");
-    database
-        .insert_workspace(workspace_id, "Default", TimestampMillis::new(500))
-        .await
-        .expect("workspace");
-    database
-        .append_model_provider_revision(
-            &ModelProviderRevision::new(
-                provider_id.clone(),
-                1,
-                ModelEndpointClass::Remote,
-                DestinationScope::parse("https://models.example.com/v1/").unwrap(),
-                "remote-model",
-                true,
-                0,
-                None,
-                [DataClass::Public, DataClass::Workspace],
-                TimestampMillis::new(1_000),
-            )
-            .expect("provider revision"),
-        )
-        .await
-        .expect("provider stored");
-    for revision in [
-        WorkspaceModelEgressRevision::new(
-            workspace_id,
-            provider_id.clone(),
-            1,
-            [DataClass::Public, DataClass::Workspace],
-            TimestampMillis::new(1_100),
-        )
-        .expect("workspace policy"),
-        WorkspaceModelEgressRevision::new(
-            workspace_id,
-            provider_id,
-            2,
-            [DataClass::Public],
-            TimestampMillis::new(1_200),
-        )
-        .expect("workspace policy"),
-    ] {
-        database
-            .append_workspace_model_egress_revision(&revision)
-            .await
-            .expect("workspace policy stored");
-    }
-    let inner = Arc::new(RecordingModel::new());
-    let run_id = RunId::new();
-    let model = EgressCheckedModel {
-        inner: inner.clone(),
-        database: database.clone(),
-        audit: super::DatabaseAudit(database.clone()),
-        workspace_id,
-        run_id,
-    };
-
-    let error = model
-        .generate(ModelInput::new(Vec::new()).with_data_class(DataClass::Workspace))
-        .await
-        .expect_err("revoked workspace policy denied");
-
-    assert_eq!(
-        error.message(),
-        "remote egress policy denied every remote provider"
-    );
-    assert_eq!(inner.call_count(), 0);
-    assert_model_egress_denied_audit(
-        &database,
-        workspace_id,
-        run_id,
-        DataClass::Workspace,
-        error.message(),
-    )
-    .await;
-}
-
-async fn assert_model_egress_denied_audit(
-    database: &Database,
-    workspace_id: WorkspaceId,
-    run_id: RunId,
-    data_class: DataClass,
-    failure: &str,
-) {
-    let records = database
-        .list_audit_records(workspace_id, 0, 10)
-        .await
-        .expect("audit records");
-    let event = records
-        .iter()
-        .map(|record| record.event())
-        .find(|event| event.kind() == AuditEventKind::ModelEgress)
-        .expect("model egress audit");
-    assert_eq!(event.outcome(), lumen_core::audit::AuditOutcome::Denied);
-    assert_eq!(
-        event.payload(),
-        &CanonicalValue::object([
-            ("run_id", CanonicalValue::from(run_id.to_string())),
-            ("data_class", CanonicalValue::from(data_class.as_str())),
-            ("egress_occurred", CanonicalValue::from(false)),
-            ("failure", CanonicalValue::from(failure)),
-        ])
-    );
-}
-
 async fn install_and_enable_subprocess(harness: &Harness) -> StagedPluginPackage {
     let staged = stage_subprocess_fixture(harness).await;
     let plugin_id = staged.manifest().id().to_string();
@@ -8659,6 +8120,7 @@ async fn server_shutdown_closes_active_sse_and_releases_listener() {
             app,
             events,
             service,
+            None,
             (
                 std::path::Path::new("test-lumen.toml"),
                 &workspace_id,

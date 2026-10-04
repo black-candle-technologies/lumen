@@ -58,7 +58,7 @@ impl ProviderUsageSink for DatabaseUsageSink {
 
 impl WorkerScheduler {
     #[allow(clippy::too_many_arguments)]
-    pub async fn route_and_dispatch(
+    pub async fn prepare_routed_assignment(
         self: &Arc<Self>,
         graph: &TaskGraph,
         node: &TaskNode,
@@ -67,7 +67,7 @@ impl WorkerScheduler {
         reasoning: ReasoningProfile,
         policy: RoutingPolicy,
         now: TimestampMillis,
-    ) -> Result<lumen_core::worker::WorkerAttemptId, WorkerRuntimeError> {
+    ) -> Result<WorkerAssignment, WorkerRuntimeError> {
         self.db
             .reconcile_task_readiness(graph.orchestration_id(), now)
             .await?;
@@ -166,8 +166,7 @@ impl WorkerScheduler {
             policy,
             now,
         );
-        let plan = route(node, &request, &budget, routable)
-            .map_err(|error| WorkerRuntimeError::Routing(error.to_string()))?;
+        let plan = route(node, &request, &budget, routable)?;
         let selected = material
             .into_iter()
             .find(|candidate| {
@@ -177,15 +176,6 @@ impl WorkerScheduler {
                     && candidate.profile.revision() == plan.profile_revision()
             })
             .ok_or_else(|| WorkerRuntimeError::Routing("selected candidate disappeared".into()))?;
-        self.db
-            .persist_route_and_reserve(
-                graph.orchestration_id(),
-                graph.revision(),
-                node.id(),
-                &plan,
-                now,
-            )
-            .await?;
         let assignment = WorkerAssignment::new(
             graph,
             node,
@@ -197,21 +187,50 @@ impl WorkerScheduler {
             selected.grants,
             selected.worker_budget,
         )?;
-        match Arc::clone(self).reserve_and_start(assignment, now).await {
-            Ok(id) => Ok(id),
+        self.db
+            .persist_route_and_reserve(
+                graph.orchestration_id(),
+                graph.revision(),
+                node.id(),
+                &plan,
+                now,
+            )
+            .await?;
+        Ok(assignment)
+    }
+    pub async fn dispatch_prepared(
+        self: &Arc<Self>,
+        assignment: WorkerAssignment,
+        now: TimestampMillis,
+    ) -> Result<lumen_core::worker::WorkerAttemptId, WorkerRuntimeError> {
+        let orchestration = assignment.orchestration_id();
+        let revision = assignment.graph_revision();
+        let task = assignment.task_node_id();
+        match self.dispatch_ready(vec![assignment], now).await {
+            Ok(mut attempts) => attempts.pop().ok_or(WorkerRuntimeError::Stale),
             Err(error) => {
-                let _ = self
-                    .db
-                    .release_active_routing_for_task(
-                        graph.orchestration_id(),
-                        graph.revision(),
-                        node.id(),
-                        now,
-                    )
-                    .await;
+                self.db
+                    .release_active_routing_for_task(orchestration, revision, task, now)
+                    .await?;
                 Err(error)
             }
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_and_dispatch(
+        self: &Arc<Self>,
+        graph: &TaskGraph,
+        node: &TaskNode,
+        actor: PrincipalId,
+        candidates: Vec<RoutedWorkerCandidate>,
+        reasoning: ReasoningProfile,
+        policy: RoutingPolicy,
+        now: TimestampMillis,
+    ) -> Result<lumen_core::worker::WorkerAttemptId, WorkerRuntimeError> {
+        let assignment = self
+            .prepare_routed_assignment(graph, node, actor, candidates, reasoning, policy, now)
+            .await?;
+        self.dispatch_prepared(assignment, now).await
     }
 }
 fn now() -> Result<TimestampMillis, RepositoryError> {

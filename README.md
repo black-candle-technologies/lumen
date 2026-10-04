@@ -78,14 +78,15 @@ The reason is practical: runtime state needs to be queryable, auditable, mutable
 - [Architecture](docs/ARCHITECTURE.md)
 - [Plugin System](docs/PLUGIN_SYSTEM.md)
 - [Security Model](docs/SECURITY.md)
+- [Remote Provider Configuration](docs/REMOTE_PROVIDERS.md)
 - [Roadmap](docs/ROADMAP.md)
 
 ## Repository Status
 
 Milestones 1, 2, and 3 are implemented. The repository includes strict local configuration, SQLite state and audit chaining, a loopback OpenAI-compatible model client, capability and one-shot approval enforcement, bounded workspace file reads and writes, supervised process execution, OS-keychain secret references, cancellation and resource quotas, authenticated HTTP/SSE APIs, exact chat/approval/plugin/audit control surfaces, and a verified local extension runtime.
 
-Linux process actions require the complete bubblewrap profile. macOS uses a narrower reported `sandbox-exec` profile. The Tauri application is a command-free packaging shell with no filesystem, shell, process, or opener permissions. Local plugin packages can be staged, reviewed, approved for install, granted narrowly, enabled per workspace, and invoked through WASM components or supervised subprocesses with exact provenance and quarantine behavior. Remote providers, external channels, scheduled jobs, browser automation, public plugin marketplaces, automatic plugin updates, and learned skills remain intentionally unavailable until their roadmap milestones are implemented.
+Linux process actions require the complete bubblewrap profile. macOS uses a narrower reported `sandbox-exec` profile. The Tauri application is a command-free packaging shell with no filesystem, shell, process, or opener permissions. Local plugin packages can be staged, reviewed, approved for install, granted narrowly, enabled per workspace, and invoked through WASM components or supervised subprocesses with exact provenance and quarantine behavior. Registered remote OpenAI Responses, Anthropic Messages and OpenAI-compatible Chat providers use scoped OS credentials and explicit egress policies; see the operator guide above. See the roadmap for other integration milestones.
 
 ## License
 
-No license has been added yet.
+MIT. See [LICENSE](LICENSE).

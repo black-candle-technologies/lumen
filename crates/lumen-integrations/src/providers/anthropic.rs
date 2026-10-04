@@ -1,4 +1,4 @@
-use super::http;
+use super::{ProviderCredential, ProviderHttpOptions, http};
 use lumen_core::{
     model::{ActionProposal, ModelInput, ModelMessage, ModelOutput, ModelRole, ModelToolCall},
     provider::{
@@ -9,28 +9,46 @@ use lumen_core::{
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 pub struct AnthropicAdapter {
     config: ProviderConfig,
-    key: String,
+    key: ProviderCredential,
     client: Client,
+    options: ProviderHttpOptions,
 }
 impl AnthropicAdapter {
     pub fn new(config: ProviderConfig, key: impl Into<String>) -> Result<Self, ProviderError> {
-        let key = key.into();
-        if config.kind() != ProviderKind::Anthropic
-            || key.is_empty()
-            || key.chars().any(char::is_control)
-        {
+        Self::new_with_options(
+            config,
+            ProviderCredential::from_keyring(Zeroizing::new(key.into().into_bytes()))?,
+            ProviderHttpOptions::default(),
+        )
+    }
+    pub fn new_with_options(
+        config: ProviderConfig,
+        key: ProviderCredential,
+        options: ProviderHttpOptions,
+    ) -> Result<Self, ProviderError> {
+        if config.kind() != ProviderKind::Anthropic {
             return Err(ProviderError::configuration(
-                "invalid Anthropic provider or credential",
+                "incompatible provider protocol",
             ));
         }
+        let options = options.validate()?;
         Ok(Self {
             config,
             key,
-            client: http::client()?,
+            client: http::client_with(options)?,
+            options,
         })
+    }
+    /// Trusted host transport injection, primarily for hermetic TLS tests.
+    /// The host must retain TLS verification, no redirects, and no proxy.
+    #[doc(hidden)]
+    pub fn with_http_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
     }
     async fn send(
         &self,
@@ -50,7 +68,7 @@ impl AnthropicAdapter {
             .config
             .endpoint()
             .join("messages")
-            .map_err(|error| ProviderError::configuration(error.to_string()))?;
+            .map_err(|_| ProviderError::configuration("invalid provider request path"))?;
         let mut body = json!({"model":profile.model_name(),"max_tokens":8192,"messages":messages(input.messages()),"tools":tools(input.tools())});
         if let Some(generation) = input.generation() {
             body["max_tokens"] = json!(generation.max_output_tokens());
@@ -61,15 +79,16 @@ impl AnthropicAdapter {
         parse(
             profile,
             input.tools(),
-            http::json(
+            http::json_with(
                 self.client
                     .post(url)
-                    .header("x-api-key", &self.key)
+                    .header("x-api-key", self.key.api_key_header()?)
                     .header("anthropic-version", "2023-06-01")
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|error| ProviderError::transport(error.to_string()))?,
+                    .map_err(|_| ProviderError::transport("provider request failed"))?,
+                self.options.max_response_bytes,
             )
             .await?,
         )
@@ -87,7 +106,7 @@ impl ProviderAdapter for AnthropicAdapter {
     ) -> ProviderFuture<'a> {
         Box::pin(async move {
             validate_binding(&self.config, profile)?;
-            tokio::select! { biased; _ = cancel.cancelled() => Err(ProviderError::cancelled()), response = self.send(profile, input) => response }
+            tokio::select! { biased; _ = cancel.cancelled() => Err(ProviderError::cancelled()), response = tokio::time::timeout(self.options.timeout,self.send(profile, input)) => response.map_err(|_|ProviderError::transport("provider request timed out"))? }
         })
     }
 }

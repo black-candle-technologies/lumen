@@ -314,38 +314,8 @@ impl Database {
         &self,
         revision: &ModelProviderRevision,
     ) -> Result<(), RepositoryError> {
-        let created_at = timestamp_to_i64(revision.created_at)?;
-        let revision_number =
-            i64::try_from(revision.revision).map_err(|_| RepositoryError::InvalidEgressPolicy)?;
-        let allowed = serde_json::to_string(&revision.allowed_data_classes)?;
-        let priority = i64::from(revision.priority);
-        let mut transaction = self.pool().begin().await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO egress_model_providers (provider_id, created_at)
-             VALUES (?, ?)",
-        )
-        .bind(revision.provider_id.as_str())
-        .bind(created_at)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
-            "INSERT INTO egress_model_provider_revisions (
-                provider_id, revision, endpoint_class, endpoint_url, model, enabled,
-                priority, credential_secret_ref, allowed_data_classes_json, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(revision.provider_id.as_str())
-        .bind(revision_number)
-        .bind(revision.endpoint_class.as_str())
-        .bind(revision.endpoint.as_str())
-        .bind(&revision.model)
-        .bind(if revision.enabled { 1_i64 } else { 0_i64 })
-        .bind(priority)
-        .bind(revision.credential_secret_ref.map(|id| id.to_string()))
-        .bind(allowed)
-        .bind(created_at)
-        .execute(&mut *transaction)
-        .await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        insert_model_egress_in(&mut transaction, revision).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -530,21 +500,9 @@ impl Database {
         &self,
         revision: &WorkspaceModelEgressRevision,
     ) -> Result<(), RepositoryError> {
-        let created_at = timestamp_to_i64(revision.created_at)?;
-        let revision_number =
-            i64::try_from(revision.revision).map_err(|_| RepositoryError::InvalidEgressPolicy)?;
-        sqlx::query(
-            "INSERT INTO egress_workspace_model_policies (
-                workspace_id, provider_id, revision, allowed_data_classes_json, created_at
-             ) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(revision.workspace_id.to_string())
-        .bind(revision.provider_id.as_str())
-        .bind(revision_number)
-        .bind(serde_json::to_string(&revision.allowed_data_classes)?)
-        .bind(created_at)
-        .execute(self.pool())
-        .await?;
+        let mut transaction = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        insert_workspace_egress_in(&mut transaction, revision).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -944,4 +902,64 @@ impl Database {
             created_at,
         )
     }
+}
+
+pub(crate) async fn insert_model_egress_in(
+    connection: &mut sqlx::SqliteConnection,
+    revision: &ModelProviderRevision,
+) -> Result<(), RepositoryError> {
+    let created_at = timestamp_to_i64(revision.created_at)?;
+    let revision_number =
+        i64::try_from(revision.revision).map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+    let allowed = serde_json::to_string(&revision.allowed_data_classes)?;
+    let priority = i64::from(revision.priority);
+    sqlx::query(
+        "INSERT OR IGNORE INTO egress_model_providers (provider_id, created_at)
+             VALUES (?, ?)",
+    )
+    .bind(revision.provider_id.as_str())
+    .bind(created_at)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO egress_model_provider_revisions (
+                provider_id, revision, endpoint_class, endpoint_url, model, enabled,
+                priority, credential_secret_ref, allowed_data_classes_json, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(revision.provider_id.as_str())
+    .bind(revision_number)
+    .bind(revision.endpoint_class.as_str())
+    .bind(revision.endpoint.as_str())
+    .bind(&revision.model)
+    .bind(if revision.enabled { 1_i64 } else { 0_i64 })
+    .bind(priority)
+    .bind(revision.credential_secret_ref.map(|id| id.to_string()))
+    .bind(allowed)
+    .bind(created_at)
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn insert_workspace_egress_in(
+    connection: &mut sqlx::SqliteConnection,
+    revision: &WorkspaceModelEgressRevision,
+) -> Result<(), RepositoryError> {
+    let created_at = timestamp_to_i64(revision.created_at)?;
+    let revision_number =
+        i64::try_from(revision.revision).map_err(|_| RepositoryError::InvalidEgressPolicy)?;
+    sqlx::query(
+        "INSERT INTO egress_workspace_model_policies (
+                workspace_id, provider_id, revision, allowed_data_classes_json, created_at
+             ) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(revision.workspace_id.to_string())
+    .bind(revision.provider_id.as_str())
+    .bind(revision_number)
+    .bind(serde_json::to_string(&revision.allowed_data_classes)?)
+    .bind(created_at)
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
 }

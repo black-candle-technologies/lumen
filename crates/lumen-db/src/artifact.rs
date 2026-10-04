@@ -21,6 +21,23 @@ use uuid::Uuid;
 use crate::{Database, RepositoryError, timestamp_to_i64};
 
 impl Database {
+    pub async fn pending_worker_retry(
+        &self,
+        id: OrchestrationId,
+        revision: u64,
+        task: TaskNodeId,
+    ) -> Result<Option<(RetryMode, WorkerAttemptId)>, RepositoryError> {
+        sqlx::query("SELECT mode,prior_attempt_id FROM worker_retry_decisions WHERE orchestration_id=? AND graph_revision=? AND task_node_id=? AND allowed=1 AND new_attempt_id IS NULL ORDER BY created_at DESC,rowid DESC LIMIT 1")
+            .bind(id.to_string()).bind(pos(revision)?).bind(task.to_string()).fetch_optional(self.pool()).await?
+            .map(|row| {
+                let mode = match row.try_get::<String, _>("mode")?.as_str() {
+                    "same_worker" => RetryMode::SameWorker,
+                    "reassign" => RetryMode::Reassign,
+                    _ => return Err(RepositoryError::InvalidArtifactState),
+                };
+                Ok((mode, WorkerAttemptId::from_uuid(Uuid::parse_str(&row.try_get::<String, _>("prior_attempt_id")?).map_err(|_| RepositoryError::InvalidArtifactState)?)))
+            }).transpose()
+    }
     pub async fn artifact_provenance_for_attempt(
         &self,
         attempt_id: WorkerAttemptId,
@@ -232,6 +249,34 @@ impl Database {
             .map_err(|_| RepositoryError::InvalidArtifactState)
         })
         .transpose()
+    }
+
+    pub(crate) async fn record_recovered_unknown_failure(
+        &self,
+        attempt_id: WorkerAttemptId,
+        now: TimestampMillis,
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let run = sqlx::query_scalar::<_, String>(
+            "SELECT run_id FROM worker_attempts WHERE attempt_id=? AND state='unknown'",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(RepositoryError::InvalidArtifactState)?;
+        let states = sqlx::query_scalar::<_, String>("SELECT execution_attempts.state FROM execution_attempts JOIN actions ON actions.id=execution_attempts.action_id WHERE actions.run_id=?")
+            .bind(run).fetch_all(&mut *tx).await?;
+        let risk = if states.is_empty() {
+            EffectRisk::NoEffect
+        } else if states.iter().all(|state| state == "succeeded") {
+            EffectRisk::KnownEffect
+        } else {
+            EffectRisk::UnknownEffect
+        };
+        sqlx::query("INSERT INTO worker_attempt_failures(attempt_id,failure_class,effect_risk,diagnostic,created_at) VALUES(?,?,?,?,?) ON CONFLICT(attempt_id) DO NOTHING")
+            .bind(attempt_id.to_string()).bind(FailureClass::UnknownFailure.as_str()).bind(risk.as_str()).bind("worker recovered after lease loss").bind(timestamp_to_i64(now)?).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn reconcile_unknown_retry(

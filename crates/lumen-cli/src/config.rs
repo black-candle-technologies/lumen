@@ -99,30 +99,45 @@ impl Config {
         if !self.server.bind.ip().is_loopback() {
             return Err(ConfigError::NonLoopbackBind(self.server.bind.ip()));
         }
-        let endpoint_class = classify_model_endpoint(&self.model.endpoint)?;
-        if endpoint_class == ModelEndpointClass::Remote {
-            if !self.model.allow_remote {
-                return Err(ConfigError::RemoteModelDenied);
-            }
-            let provider = self
-                .model
-                .remote_provider
-                .as_ref()
-                .ok_or(ConfigError::RemoteModelPolicyRequired)?;
-            validate_remote_provider(provider)?;
-        }
-        if self.model.gpu_policy != OllamaGpuPolicy::Off {
-            let url =
-                Url::parse(&self.model.endpoint).map_err(|_| ConfigError::InvalidModelEndpoint)?;
-            if endpoint_class != ModelEndpointClass::Local
-                || url.scheme() != "http"
-                || !matches!(url.path(), "/v1" | "/v1/")
+        if let Some(selection) = &self.model.registry_profile {
+            if selection.revision == 0
+                || selection.revision > i64::MAX as u64
+                || !self.model.endpoint.is_empty()
+                || !self.model.model.is_empty()
+                || self.model.remote_provider.is_some()
+                || self.model.gpu_policy != OllamaGpuPolicy::Off
             {
-                return Err(ConfigError::InvalidOllamaGpuEndpoint);
+                return Err(ConfigError::InvalidRegistrySelection);
             }
-        }
-        if self.model.model.trim().is_empty() {
-            return Err(ConfigError::InvalidModel);
+            if self.model.streaming {
+                return Err(ConfigError::RegisteredStreamingUnsupported);
+            }
+        } else {
+            let endpoint_class = classify_model_endpoint(&self.model.endpoint)?;
+            if endpoint_class == ModelEndpointClass::Remote {
+                if !self.model.allow_remote {
+                    return Err(ConfigError::RemoteModelDenied);
+                }
+                let provider = self
+                    .model
+                    .remote_provider
+                    .as_ref()
+                    .ok_or(ConfigError::RemoteModelPolicyRequired)?;
+                validate_remote_provider(provider)?;
+            }
+            if self.model.gpu_policy != OllamaGpuPolicy::Off {
+                let url = Url::parse(&self.model.endpoint)
+                    .map_err(|_| ConfigError::InvalidModelEndpoint)?;
+                if endpoint_class != ModelEndpointClass::Local
+                    || url.scheme() != "http"
+                    || !matches!(url.path(), "/v1" | "/v1/")
+                {
+                    return Err(ConfigError::InvalidOllamaGpuEndpoint);
+                }
+            }
+            if self.model.model.trim().is_empty() {
+                return Err(ConfigError::InvalidModel);
+            }
         }
         Uuid::parse_str(&self.workspace.id).map_err(|_| ConfigError::InvalidWorkspaceId)?;
         if self.workspace.name.trim().is_empty() || self.workspace.path.as_os_str().is_empty() {
@@ -278,6 +293,7 @@ pub struct ModelConfig {
     pub model: String,
     pub allow_remote: bool,
     pub remote_provider: Option<RemoteModelProviderConfig>,
+    pub registry_profile: Option<RegistryProfileSelection>,
     pub streaming: bool,
     pub timeout_seconds: u64,
     pub max_response_bytes: usize,
@@ -291,6 +307,7 @@ impl Default for ModelConfig {
             model: String::new(),
             allow_remote: false,
             remote_provider: None,
+            registry_profile: None,
             streaming: true,
             timeout_seconds: 120,
             max_response_bytes: 4 * 1024 * 1024,
@@ -412,6 +429,12 @@ pub struct BootstrapAdminConfig {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ConfigError {
+    #[error(
+        "registry selection requires a positive revision and no legacy model/GPU configuration"
+    )]
+    InvalidRegistrySelection,
+    #[error("registered providers require streaming=false")]
+    RegisteredStreamingUnsupported,
     #[error("configuration could not be read from {0}: {1}")]
     Read(PathBuf, String),
     #[error("configuration is invalid: {0}")]
@@ -448,6 +471,12 @@ pub enum ConfigError {
     SandboxUnavailable(String),
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryProfileSelection {
+    pub id: lumen_core::provider::ModelProfileId,
+    pub revision: u64,
+}
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -537,6 +566,31 @@ subject = "operator"
 
             assert_eq!(config.runtime.data_directory, PathBuf::from(path));
             assert_eq!(config.workspace.path, PathBuf::from(path));
+        }
+    }
+
+    #[test]
+    fn registry_selection_is_offline_strict_and_explicit() {
+        let legacy = config_with_runtime("");
+        let selected = legacy.replace(
+            "endpoint = \"http://127.0.0.1:8080/v1/\"\nmodel = \"local-model\"",
+            "allow_remote = true\nstreaming = false\nregistry_profile = { id = \"remote\", revision = 3 }",
+        );
+        let config =
+            Config::parse(&selected).expect("offline selection without registry or keyring");
+        assert_eq!(config.model.registry_profile.unwrap().revision, 3);
+        for invalid in [
+            selected.replace("revision = 3", "revision = 0"),
+            selected.replace("streaming = false", "streaming = true"),
+            selected.replace("streaming = false", "streaming = false\nmodel = \"legacy\""),
+            selected.replace(
+                "streaming = false",
+                "streaming = false\nendpoint = \"http://127.0.0.1/v1/\"",
+            ),
+            selected.replace("revision = 3", "revision = 3, extra = true"),
+            selected.replace("id = \"remote\"", "id = \"bad id\""),
+        ] {
+            assert!(Config::parse(&invalid).is_err());
         }
     }
 }

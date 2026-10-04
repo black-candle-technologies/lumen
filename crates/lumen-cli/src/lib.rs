@@ -1,7 +1,10 @@
 pub mod config;
+pub mod provider;
+use provider::{ProviderCommand, ProviderCredentialCommand, ProviderSummary};
 mod extension_runtime;
 mod health;
 mod plugin_admission;
+mod redaction;
 mod runtime;
 mod support_bundle;
 
@@ -63,6 +66,10 @@ pub struct Cli {
 pub enum Command {
     Migrate,
     Serve,
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
@@ -284,6 +291,12 @@ pub enum SecretCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
     Migrated,
+    ProviderRegistered(ProviderSummary),
+    Providers(Vec<ProviderSummary>),
+    ProviderShown(ProviderSummary),
+    ProviderCredentials(Vec<lumen_db::ProviderCredentialReference>),
+    ProviderCredentialCreated(lumen_db::ProviderCredentialReference),
+    ProviderCredentialRevoked(SecretRefId),
     AuditVerified,
     AuditListed(Vec<AuditEventSummary>),
     ServerStopped,
@@ -389,9 +402,9 @@ pub struct PluginRevocationSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginActionRequest {
     pub run_id: RunId,
-    /// The pending approval the operator must decide (control-plane API;
-    /// the web approvals UI is not built yet — see docs/WEB_UI_FOLLOWUP.md)
-    /// before the action executes. `None` when no approval was created.
+    /// The pending approval the operator can review at /approvals or decide
+    /// through the control-plane API. Only a successful Grant authorizes the
+    /// action. `None` when no approval was created.
     pub approval_id: Option<String>,
 }
 
@@ -477,6 +490,25 @@ impl CommandOutput {
                     out.push_str("no audit events\n");
                 }
                 out
+            }
+            Self::ProviderRegistered(value) | Self::ProviderShown(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe provider metadata")
+            ),
+            Self::Providers(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe provider metadata")
+            ),
+            Self::ProviderCredentials(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe credential metadata")
+            ),
+            Self::ProviderCredentialCreated(value) => format!(
+                "{}\n",
+                serde_json::to_string_pretty(value).expect("safe credential metadata")
+            ),
+            Self::ProviderCredentialRevoked(value) => {
+                format!("provider credential {value} revoked\n")
             }
             Self::ServerStopped => "server stopped\n".into(),
             Self::SandboxReport(report) => {
@@ -621,7 +653,7 @@ impl CommandOutput {
                     .as_ref()
                     .map(|id| format!("approval {id} is PENDING"))
                     .unwrap_or_else(|| "no approval was created".into()),
-                request.approval_id.as_ref().map(|_| "\nDecide it via the control-plane API (the web approvals UI is not built yet — see docs/WEB_UI_FOLLOWUP.md); the action executes after approval.").unwrap_or("")
+                request.approval_id.as_ref().map(|_| "\nReview it in the web approvals page (/approvals) and choose Grant or Reject, or decide it through the control-plane API. The action executes only after a successful Grant.").unwrap_or("")
             ),
             Self::ApprovalsListed(approvals) => {
                 let mut out = String::new();
@@ -684,6 +716,31 @@ impl CommandOutput {
 }
 
 pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
+    if let Command::Provider { command } = &cli.command {
+        let input = if matches!(
+            command,
+            ProviderCommand::Credential {
+                command: ProviderCredentialCommand::Create { .. }
+            }
+        ) {
+            Some(
+                tokio::task::spawn_blocking(provider::read_input)
+                    .await
+                    .map_err(|_| CliError::Runtime("provider input unavailable".into()))??,
+            )
+        } else {
+            None
+        };
+        let store = if provider::needs_store(command) {
+            Some(Arc::new(OsKeyringSecretStore::new("dev.lumen.runtime")?) as Arc<dyn SecretStore>)
+        } else {
+            None
+        };
+        let config = Config::load(&cli.config)?;
+        prepare_directories(&config)?;
+        let _owner = acquire_runtime_ownership(&config.database.path)?;
+        return provider::execute(&config, command.clone(), store, input).await;
+    }
     if matches!(
         &cli.command,
         Command::Sandbox {
@@ -716,8 +773,14 @@ pub async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
 pub async fn execute_with_secret_store(
     cli: Cli,
     secret_store: Arc<dyn SecretStore>,
-    secret_input: Option<Vec<u8>>,
+    mut secret_input: Option<Vec<u8>>,
 ) -> Result<CommandOutput, CliError> {
+    // Keep injected provider bytes zeroizing even if config loading/locking fails.
+    let provider_input = if matches!(&cli.command, Command::Provider { .. }) {
+        secret_input.take().map(zeroize::Zeroizing::new)
+    } else {
+        None
+    };
     if matches!(
         &cli.command,
         Command::Sandbox {
@@ -730,7 +793,15 @@ pub async fn execute_with_secret_store(
     }
     let config = Config::load(&cli.config)?;
     prepare_directories(&config)?;
+    let _offline_owner = if matches!(&cli.command, Command::Serve) {
+        None
+    } else {
+        Some(acquire_runtime_ownership(&config.database.path)?)
+    };
     match cli.command {
+        Command::Provider { command } => {
+            provider::execute(&config, command, Some(secret_store), provider_input).await
+        }
         Command::Migrate => {
             let database = Database::connect(&config.database.path).await?;
             database.close().await;
@@ -1216,9 +1287,9 @@ async fn execute_plugin_command(
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
             // The request is approval-bound: the run parks awaiting the
-            // operator's decision. The CLI must not drain-and-cancel it —
+            // operator's decision. The CLI must not drain-and-cancel it;
             // the approval stays pending for the operator to decide via the
-            // control-plane API (the web approvals UI is not built yet).
+            // web /approvals page or the control-plane API.
             let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
             CommandOutput::PluginActionRequested(PluginActionRequest {
                 run_id,
@@ -1273,9 +1344,9 @@ async fn execute_plugin_command(
                 .await
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
             // The request is approval-bound: the run parks awaiting the
-            // operator's decision. The CLI must not drain-and-cancel it —
+            // operator's decision. The CLI must not drain-and-cancel it;
             // the approval stays pending for the operator to decide via the
-            // control-plane API (the web approvals UI is not built yet).
+            // web /approvals page or the control-plane API.
             let approval_id = wait_for_pending_approval(&database, config, run_id).await?;
             CommandOutput::PluginActionRequested(PluginActionRequest {
                 run_id,
@@ -1488,8 +1559,8 @@ async fn extension_action_proposal(
 /// Find the pending approval request for a run, if any.
 ///
 /// Approval-bound CLI requests park the run awaiting the operator's
-/// decision; this resolves the approval the operator must decide via the
-/// control-plane API (the web approvals UI is not built yet).
+/// decision. The operator can review it at /approvals and choose Grant or Reject,
+/// or decide it through the control-plane API.
 async fn pending_approval_for_run(
     database: &Database,
     config: &Config,
@@ -1631,6 +1702,70 @@ fn validate_secret_input(value: &[u8]) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn start_orchestration_workers(
+    config: &Config,
+    database: &Database,
+    service: &Arc<runtime::LocalRuntimeService>,
+) -> Result<Option<(Arc<OrchestrationControl>, lumen_server::WorkerDispatchLoop)>, CliError> {
+    let profiles = database.list_latest_model_profiles().await?;
+    let mut provider_limits = BTreeMap::<String, usize>::new();
+    for profile in &profiles {
+        *provider_limits
+            .entry(profile.provider_id().as_str().to_owned())
+            .or_default() += usize::try_from(profile.concurrency_limit()).unwrap_or(usize::MAX / 4);
+    }
+    if provider_limits.is_empty() {
+        return Ok(None);
+    }
+    let global = provider_limits
+        .values()
+        .copied()
+        .fold(0usize, usize::saturating_add)
+        .max(1);
+    let scheduler = WorkerScheduler::new(
+        database.clone(),
+        Arc::new(DatabaseWorkerMaterializer::new(
+            database.clone(),
+            service.provider_factory(),
+        )),
+        service.worker_kernel_ports(),
+        WorkerSchedulerConfig::new(global, provider_limits, Duration::from_secs(30))
+            .map_err(|error| CliError::Runtime(error.to_string()))?,
+        service.worker_owner_id(),
+    );
+    service
+        .attach_worker_scheduler(Arc::clone(&scheduler))
+        .await;
+    let budget = WorkerRunBudget::new(
+        config.runtime.max_model_turns,
+        config.runtime.max_actions,
+        config.runtime.max_wall_time_seconds.saturating_mul(1_000),
+        config.runtime.max_captured_result_bytes,
+    )
+    .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let control = Arc::new(OrchestrationControl::new(
+        database.clone(),
+        scheduler,
+        Arc::new(JsonModelPlanner::new(
+            service.planner_model(config.workspace_id()),
+        )),
+        Arc::new(BootstrapOperatorAuthority::new(
+            config.bootstrap_principal(),
+            config.workspace_id(),
+        )),
+        DatabaseCandidateCatalog::new(database.clone(), service.worker_grants()?, budget),
+        config.workspace_id(),
+    ));
+    control
+        .recover(runtime::now())
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let dispatch =
+        lumen_server::WorkerDispatchLoop::spawn(control.clone(), Duration::from_millis(250))
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
+    Ok(Some((control, dispatch)))
+}
+
 async fn serve(
     config: Config,
     secret_store: Arc<dyn SecretStore>,
@@ -1716,13 +1851,6 @@ async fn serve(
         )
         .await?,
     );
-    let profiles = database.list_latest_model_profiles().await?;
-    let mut provider_limits = BTreeMap::<String, usize>::new();
-    for profile in &profiles {
-        *provider_limits
-            .entry(profile.provider_id().as_str().to_owned())
-            .or_default() += usize::try_from(profile.concurrency_limit()).unwrap_or(usize::MAX / 4);
-    }
     let mut state = ApiState::new(
         service.clone(),
         events.clone(),
@@ -1731,50 +1859,11 @@ async fn serve(
         BTreeSet::from([config.workspace_id()]),
         api_sandbox_report(&sandbox_report),
     )?;
-    if !provider_limits.is_empty() {
-        let global = provider_limits
-            .values()
-            .copied()
-            .fold(0usize, usize::saturating_add)
-            .max(1);
-        let scheduler = WorkerScheduler::new(
-            database.clone(),
-            Arc::new(DatabaseWorkerMaterializer::new(
-                database.clone(),
-                Arc::clone(&secret_store),
-            )),
-            service.worker_kernel_ports(),
-            WorkerSchedulerConfig::new(global, provider_limits, Duration::from_secs(30))
-                .map_err(|error| CliError::Runtime(error.to_string()))?,
-            service.worker_owner_id(),
-        );
-        service
-            .attach_worker_scheduler(Arc::clone(&scheduler))
-            .await;
-        let budget = WorkerRunBudget::new(
-            config.runtime.max_model_turns,
-            config.runtime.max_actions,
-            config.runtime.max_wall_time_seconds.saturating_mul(1_000),
-            config.runtime.max_captured_result_bytes,
-        )
-        .map_err(|error| CliError::Runtime(error.to_string()))?;
-        let control = Arc::new(OrchestrationControl::new(
-            database.clone(),
-            scheduler,
-            Arc::new(JsonModelPlanner::new(
-                service.planner_model(config.workspace_id()),
-            )),
-            Arc::new(BootstrapOperatorAuthority::new(
-                config.bootstrap_principal(),
-                config.workspace_id(),
-            )),
-            DatabaseCandidateCatalog::new(database.clone(), service.worker_grants()?, budget),
-            config.workspace_id(),
-        ));
-        control
-            .recover(lumen_core::approval::TimestampMillis::new(0))
-            .await
-            .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut worker_dispatch = None;
+    if let Some((control, dispatch)) =
+        start_orchestration_workers(&config, &database, &service).await?
+    {
+        worker_dispatch = Some(dispatch);
         state = state.with_orchestration_service(control);
     }
     let server_result = serve_listener_until_shutdown(
@@ -1782,6 +1871,7 @@ async fn serve(
         router(state),
         events,
         service,
+        worker_dispatch,
         (
             config_path,
             &config.workspace_id().to_string(),
@@ -1811,6 +1901,7 @@ async fn serve_listener_until_shutdown(
     app: axum::Router,
     events: EventBroker,
     service: Arc<runtime::LocalRuntimeService>,
+    mut worker_dispatch: Option<lumen_server::WorkerDispatchLoop>,
     diagnostics: (&Path, &str, &SandboxReport),
     signal: impl Future<Output = ()>,
 ) -> Result<(), std::io::Error> {
@@ -1823,6 +1914,7 @@ async fn serve_listener_until_shutdown(
         std::process::id()
     );
     let stop_accepting = CancellationToken::new();
+    let mut runtime_stopped = false;
     let server_result = {
         let shutdown = stop_accepting.clone();
         let server = axum::serve(listener, app)
@@ -1837,8 +1929,13 @@ async fn serve_listener_until_shutdown(
                 eprintln!("event=server_stopping bind={bind} pid={}", std::process::id());
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
                 stop_accepting.cancel();
+                if let Some(dispatch) = worker_dispatch.take() {
+                    dispatch.request_stop();
+                    dispatch.join().await;
+                }
                 events.close();
                 let report = service.shutdown().await;
+                runtime_stopped = true;
                 let drained = match tokio::time::timeout_at(deadline, &mut server).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -1853,14 +1950,17 @@ async fn serve_listener_until_shutdown(
         }
     };
     stop_accepting.cancel();
+    if let Some(dispatch) = worker_dispatch.take() {
+        dispatch.request_stop();
+        dispatch.join().await;
+    }
     events.close();
-    let report = service.shutdown().await;
-    let server_result = if report.is_clean() {
-        server_result
-    } else {
+    let server_result = if !runtime_stopped && !service.shutdown().await.is_clean() {
         Err(std::io::Error::other(
             "runtime shutdown left unresolved work",
         ))
+    } else {
+        server_result
     };
     eprintln!(
         "event=server_stopped bind={bind} pid={} result={}",
@@ -1942,6 +2042,30 @@ mod runtime_ownership_tests {
         assert!(acquire_runtime_ownership(&database).is_err());
         drop(first);
         acquire_runtime_ownership(&database).expect("owner after release");
+    }
+}
+
+#[cfg(test)]
+mod approval_rendering_tests {
+    use super::*;
+    #[test]
+    fn pending_plugin_action_points_to_live_approvals_ui() {
+        let rendered = CommandOutput::PluginActionRequested(PluginActionRequest {
+            run_id: RunId::new(),
+            approval_id: Some("approval-test".into()),
+        })
+        .render();
+        for required in [
+            "/approvals",
+            "Grant",
+            "Reject",
+            "control-plane API",
+            "only after a successful Grant",
+        ] {
+            assert!(rendered.contains(required));
+        }
+        assert!(!rendered.contains("WEB_UI_FOLLOWUP"));
+        assert!(!rendered.contains("not built"));
     }
 }
 

@@ -33,6 +33,7 @@ impl SecretStore for OsKeyringSecretStore {
         let validated = validate_identifier("account", account, 512);
         let service = self.service.clone();
         let account = account.to_owned();
+        let value = zeroize::Zeroizing::new(value);
         Box::pin(async move {
             validated?;
             tokio::task::spawn_blocking(move || {
@@ -41,7 +42,9 @@ impl SecretStore for OsKeyringSecretStore {
                 entry.set_secret(&value).map_err(SecretStoreError::backend)
             })
             .await
-            .map_err(|error| SecretStoreError::Unavailable(error.to_string()))?
+            .map_err(|_| {
+                SecretStoreError::Unavailable("OS credential store operation failed".into())
+            })?
         })
     }
 
@@ -57,7 +60,9 @@ impl SecretStore for OsKeyringSecretStore {
                 entry.get_secret().map_err(SecretStoreError::backend)
             })
             .await
-            .map_err(|error| SecretStoreError::Unavailable(error.to_string()))?
+            .map_err(|_| {
+                SecretStoreError::Unavailable("OS credential store operation failed".into())
+            })?
         })
     }
 
@@ -73,7 +78,9 @@ impl SecretStore for OsKeyringSecretStore {
                 entry.delete_credential().map_err(SecretStoreError::backend)
             })
             .await
-            .map_err(|error| SecretStoreError::Unavailable(error.to_string()))?
+            .map_err(|_| {
+                SecretStoreError::Unavailable("OS credential store operation failed".into())
+            })?
         })
     }
 }
@@ -155,8 +162,11 @@ pub enum SecretStoreError {
 
 impl SecretStoreError {
     #[cfg(feature = "native-secrets")]
-    fn backend(error: impl std::fmt::Display) -> Self {
-        Self::Backend(error.to_string())
+    fn backend(error: keyring::Error) -> Self {
+        match error {
+            keyring::Error::NoEntry => Self::NotFound,
+            _ => Self::Backend("OS credential store operation failed".into()),
+        }
     }
 }
 

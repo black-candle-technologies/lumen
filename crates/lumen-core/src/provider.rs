@@ -175,8 +175,8 @@ impl ProviderConfig {
         enabled: bool,
         secret: SecretRefId,
     ) -> Result<Self, ProviderConfigError> {
-        if revision == 0 || !matches!(kind, ProviderKind::OpenAi | ProviderKind::Anthropic) {
-            return Err(ProviderConfigError::InvalidShape);
+        if revision == 0 {
+            return Err(ProviderConfigError::InvalidRevision);
         }
         let endpoint = normalize_endpoint(endpoint.as_ref())?;
         if endpoint.scheme() != "https" || is_loopback(&endpoint)? {
@@ -232,7 +232,7 @@ impl ProviderConfig {
     ) -> Result<Self, ProviderConfigError> {
         match (kind, class, runtime, secret) {
             (
-                ProviderKind::OpenAi | ProviderKind::Anthropic,
+                ProviderKind::OpenAi | ProviderKind::Anthropic | ProviderKind::OpenAiCompatible,
                 EndpointClass::Remote,
                 None,
                 Some(secret),
@@ -537,6 +537,9 @@ impl ProviderError {
     }
 }
 fn normalize_endpoint(value: &str) -> Result<Url, ProviderConfigError> {
+    if value.len() > 4096 {
+        return Err(ProviderConfigError::InvalidEndpoint);
+    }
     let mut url = Url::parse(value)?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
@@ -549,6 +552,9 @@ fn normalize_endpoint(value: &str) -> Result<Url, ProviderConfigError> {
     }
     if !url.path().ends_with('/') {
         url.set_path(&format!("{}/", url.path()));
+    }
+    if url.as_str().len() > 4096 {
+        return Err(ProviderConfigError::InvalidEndpoint);
     }
     Ok(url)
 }
@@ -589,6 +595,93 @@ pub enum ProviderConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_compatible_shape_and_stored_decoder_are_strict() {
+        let id = ProviderId::parse("remote").unwrap();
+        let secret = SecretRefId::new();
+        let p = ProviderConfig::remote(
+            id.clone(),
+            1,
+            ProviderKind::OpenAiCompatible,
+            "https://gateway.example/prefix/v1",
+            true,
+            secret,
+        )
+        .unwrap();
+        assert_eq!(p.endpoint().as_str(), "https://gateway.example/prefix/v1/");
+        assert_eq!(
+            ProviderConfig::from_stored_parts(
+                id.clone(),
+                1,
+                p.kind(),
+                EndpointClass::Remote,
+                p.endpoint(),
+                true,
+                None,
+                Some(secret)
+            )
+            .unwrap(),
+            p
+        );
+        for endpoint in [
+            "http://gateway.example/",
+            "https://127.0.0.1/",
+            "https://localhost/",
+            "https://[::1]/",
+            "https://user:password@gateway.example/",
+            "https://gateway.example/?key=value",
+            "https://gateway.example/#fragment",
+        ] {
+            assert!(
+                ProviderConfig::remote(
+                    id.clone(),
+                    1,
+                    ProviderKind::OpenAiCompatible,
+                    endpoint,
+                    true,
+                    secret
+                )
+                .is_err()
+            );
+            assert!(
+                ProviderConfig::from_stored_parts(
+                    id.clone(),
+                    1,
+                    ProviderKind::OpenAiCompatible,
+                    EndpointClass::Remote,
+                    endpoint,
+                    true,
+                    None,
+                    Some(secret)
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            ProviderConfig::remote(
+                id.clone(),
+                1,
+                ProviderKind::OpenAiCompatible,
+                format!("https://gateway.example/{}", "x".repeat(4096)),
+                true,
+                secret
+            )
+            .is_err()
+        );
+        assert!(
+            ProviderConfig::from_stored_parts(
+                id,
+                1,
+                p.kind(),
+                EndpointClass::Remote,
+                p.endpoint(),
+                true,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn validates_remote_local_and_profile() {
         let provider = ProviderConfig::remote(

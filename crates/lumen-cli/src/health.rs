@@ -192,6 +192,26 @@ pub async fn collect(config: &Config, database: &Database) -> Result<HealthRepor
     // Model endpoint: best-effort TCP reachability with a short timeout.
     // Failure here is a warning, not unhealthiness: the runtime can serve
     // cached/local flows without the model endpoint.
+    if let Some(selection) = &config.model.registry_profile {
+        let snapshot = database
+            .registered_model_snapshot(config.workspace_id(), &selection.id, selection.revision)
+            .await;
+        let valid = snapshot.as_ref().is_ok_and(|snapshot| {
+            config.model.allow_remote
+                || snapshot.provider.endpoint_class() == lumen_core::egress::EndpointClass::Local
+        });
+        checks.push(check(
+            "model-provider",
+            valid,
+            if valid {
+                "configured; credential reference ready; network not tested"
+            } else {
+                "selected provider metadata unavailable; inspect provider show"
+            }
+            .into(),
+        ));
+        return Ok(HealthReport::new(checks));
+    }
     let endpoint = config.model.endpoint.clone();
     let (host, port) = parse_host_port(&endpoint);
     let reachable = match (host, port) {

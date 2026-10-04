@@ -153,8 +153,17 @@ async fn concurrent_reservations_cannot_double_spend() {
         evaluations: Vec::<CandidateEvaluation>::new(),
     };
     let nodes = graph.nodes().collect::<Vec<_>>();
+    db.reconcile_task_readiness(graph.orchestration_id(), TimestampMillis::new(6))
+        .await
+        .unwrap();
     let first_plan = plan();
     let second_plan = plan();
+    let stale = db
+        .budget_snapshot(graph.orchestration_id(), TimestampMillis::new(6))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.remaining_concurrency, 1);
     let (first, second) = tokio::join!(
         db.persist_route_and_reserve(
             graph.orchestration_id(),
@@ -172,4 +181,58 @@ async fn concurrent_reservations_cannot_double_spend() {
         )
     );
     assert_ne!(first.is_ok(), second.is_ok());
+    assert!(matches!(
+        first.as_ref().err().or(second.as_ref().err()),
+        Some(lumen_db::RepositoryError::RoutingBudgetConflict)
+    ));
+    assert_eq!(
+        db.budget_snapshot(graph.orchestration_id(), TimestampMillis::new(6))
+            .await
+            .unwrap()
+            .unwrap()
+            .remaining_concurrency,
+        0
+    );
+    let winner = if first.is_ok() {
+        nodes[0].id()
+    } else {
+        nodes[1].id()
+    };
+    let duplicate = db
+        .persist_route_and_reserve(
+            graph.orchestration_id(),
+            1,
+            winner,
+            &plan(),
+            TimestampMillis::new(6),
+        )
+        .await;
+    assert!(matches!(
+        duplicate,
+        Err(lumen_db::RepositoryError::RoutingTaskConflict)
+    ));
+    db.settle_active_routing_for_task(graph.orchestration_id(), 1, winner, TimestampMillis::new(7))
+        .await
+        .unwrap();
+    let spent = db
+        .budget_snapshot(graph.orchestration_id(), TimestampMillis::new(7))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spent.remaining_concurrency, 1);
+    assert_eq!(spent.remaining_calls, 0);
+    assert_eq!(spent.remaining_input, 0);
+    assert_eq!(spent.remaining_output, 0);
+    let other = nodes.iter().find(|node| node.id() != winner).unwrap().id();
+    assert!(matches!(
+        db.persist_route_and_reserve(
+            graph.orchestration_id(),
+            1,
+            other,
+            &plan(),
+            TimestampMillis::new(7)
+        )
+        .await,
+        Err(lumen_db::RepositoryError::RoutingBudgetConflict)
+    ));
 }
