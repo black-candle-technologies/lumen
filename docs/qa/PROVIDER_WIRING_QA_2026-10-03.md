@@ -103,3 +103,28 @@ The first Anthropic attempt failed with `provider request failed`. Adapter reque
 ## Not yet covered
 
 Leases, sessions, sandbox behavior beyond the health probe, web UI, tool calls through workers (blocked on Finding 2), failure handling.
+
+## 8. Orchestration AI test (2026-10-03, 22:30 CDT) — PARTIAL
+
+First-ever orchestration created against real remote providers (ID `7e755564-be86-44c3-860c-d7acf17fa584`). The planner successfully called the model and produced a task graph. Two workarounds were required:
+
+1. **Planner prompt override:** the create prompt included an explicit schema override telling the model to return a top-level `nodes` array (Finding 3). The model complied and the proposal parsed.
+2. **Manual data policy insert:** `model_data_policy_revisions` rows were inserted directly into SQLite for `openai-text` rev 1 and `anthropic-text` rev 2 (workspace policy, `remote_untrusted`, `["public"]`, uncompartmented allowed). This is what `provider register` should have written (Finding 4). Documented here as a QA workaround, not a supported path.
+
+What worked: orchestration create, planner model call, graph digest, trust gate decisions, budget accounting. Task `haiku` reached `ready` state.
+
+What did not: task execution. Nothing in `lumen-server` calls `WorkerRuntime::dispatch_ready`; there is no background dispatch loop and no CLI worker driver. Ready tasks sit forever (Finding 5).
+
+## Findings (continued)
+
+### Finding 3: Planner prompt/schema mismatch (pre-existing, on master)
+
+`POST .../orchestrations` 409s on every call: `planner: unknown field 'tasks', expected 'nodes'`. `JsonModelPlanner` (`lumen-control-plane/src/lib.rs:76`) prompts the model with "Return ONLY TaskGraphProposal JSON... <=256 tasks" but `TaskGraphProposal` deserializes with `deny_unknown_fields` expecting `nodes`. The model returns `{"tasks": [...]}`, parsing fails. The prompt is identical on `161a7033`, so this predates the branch. Worked around in QA via an explicit schema override in the user prompt. Blocks orchestration-based model behavior and tool-call QA until fixed.
+
+### Finding 4: `provider register` never creates the per-profile ModelDataPolicy (new in #87)
+
+`validate_against_catalog` requires a `ModelDataPolicy` per profile from `latest_model_data_policy(workspace, profile_id)`, but `register_provider_bundle` only writes provider, profile, egress, and workspace-policy revisions. No CLI or API path creates the data policy (only tests do). Result: every orchestration fails with `no configured model/profile policy can satisfy task`, even with valid credentials and a parsed plan. The direct `model_egress` path is unaffected (it uses the egress revision), which is why live auth tests passed while orchestrations failed.
+
+### Finding 5: Worker dispatch is not wired to the server (new)
+
+`WorkerRuntime::dispatch_ready` exists but has no callers outside tests. `lumen-server` spawns background tasks for sessions, model gateway, and kernel channel, but none for worker dispatch. There is no `lumen worker` CLI command. Tasks validate and reach `ready`, then sit indefinitely. Orchestration execution is not yet possible in this tree.
