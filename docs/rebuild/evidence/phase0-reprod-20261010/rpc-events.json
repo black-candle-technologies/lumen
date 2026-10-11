@@ -1,0 +1,607 @@
+[
+  {
+    "id": "state",
+    "type": "response",
+    "command": "get_state",
+    "success": true,
+    "data": {
+      "model": {
+        "id": "one",
+        "name": "Deterministic Phase 0 probe",
+        "reasoning": false,
+        "input": [
+          "text"
+        ],
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 8192,
+        "maxTokens": 1024,
+        "api": "lumen-fixture-api",
+        "provider": "lumen-fixture",
+        "baseUrl": "https://invalid.invalid"
+      },
+      "thinkingLevel": "off",
+      "isStreaming": false,
+      "isCompacting": false,
+      "steeringMode": "one-at-a-time",
+      "followUpMode": "one-at-a-time",
+      "sessionId": "01a12991-a99c-770b-ac60-acb4fd24bdda",
+      "autoCompactionEnabled": true,
+      "messageCount": 0,
+      "pendingMessageCount": 0
+    }
+  },
+  {
+    "id": "retry",
+    "type": "response",
+    "command": "set_auto_retry",
+    "success": true
+  },
+  {
+    "id": "compact",
+    "type": "response",
+    "command": "set_auto_compaction",
+    "success": true
+  },
+  {
+    "id": "prompt",
+    "type": "response",
+    "command": "prompt",
+    "success": true
+  },
+  {
+    "type": "agent_start"
+  },
+  {
+    "type": "turn_start"
+  },
+  {
+    "type": "message_start",
+    "message": {
+      "role": "system",
+      "content": "",
+      "sections": {
+        "preamble": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.",
+        "tools": "<tools>\n(none)\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>",
+        "rules": "<rules>\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>",
+        "docs": "<docs>\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: /node_modules/@earendil-works/pi-coding-agent/README.md\n- Additional docs: /node_modules/@earendil-works/pi-coding-agent/docs\n- Examples: /node_modules/@earendil-works/pi-coding-agent/examples (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n</docs>",
+        "cwd": "<cwd>\n/state\n</cwd>"
+      },
+      "timestamp": 1791698774692,
+      "toolsAdded": [
+        {
+          "name": "bct.read_file",
+          "description": "Request a kernel decision.",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "max_bytes"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "max_bytes": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "message_end",
+    "message": {
+      "role": "system",
+      "content": "",
+      "sections": {
+        "preamble": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.",
+        "tools": "<tools>\n(none)\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>",
+        "rules": "<rules>\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>",
+        "docs": "<docs>\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: /node_modules/@earendil-works/pi-coding-agent/README.md\n- Additional docs: /node_modules/@earendil-works/pi-coding-agent/docs\n- Examples: /node_modules/@earendil-works/pi-coding-agent/examples (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n</docs>",
+        "cwd": "<cwd>\n/state\n</cwd>"
+      },
+      "timestamp": 1791698774692,
+      "toolsAdded": [
+        {
+          "name": "bct.read_file",
+          "description": "Request a kernel decision.",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "max_bytes"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "max_bytes": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "message_start",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"path\": \"/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt\"}"
+        }
+      ],
+      "timestamp": 1791698774690
+    }
+  },
+  {
+    "type": "message_end",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"path\": \"/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt\"}"
+        }
+      ],
+      "timestamp": 1791698774690
+    }
+  },
+  {
+    "type": "lumen_phase0_bypass_probe",
+    "activeTools": [
+      "bct.read_file"
+    ],
+    "filesystemDenied": true,
+    "shellDenied": true,
+    "syscalls": {
+      "socket_inet": 1,
+      "socket_inet6": 1,
+      "socket_unix": 1,
+      "fork": 1,
+      "clone_process": 1,
+      "execve": 1,
+      "execveat": 1,
+      "unshare": 1,
+      "ptrace": 1,
+      "io_uring": 1,
+      "bpf": 1,
+      "ioctl_inject": 1
+    },
+    "environment": [
+      "AI_AGENT",
+      "HOME",
+      "LANG",
+      "PATH",
+      "PI_CODING_AGENT",
+      "PI_CODING_AGENT_DIR",
+      "PWD",
+      "TMPDIR",
+      "UV_USE_IO_URING"
+    ]
+  },
+  {
+    "type": "message_start",
+    "message": {
+      "role": "assistant",
+      "api": "lumen-fixture-api",
+      "provider": "lumen-fixture",
+      "model": "one",
+      "timestamp": 0,
+      "stopReason": "toolUse",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "content": [
+        {
+          "type": "toolCall",
+          "id": "phase0-read-1",
+          "name": "bct.read_file",
+          "arguments": {
+            "path": "/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt",
+            "max_bytes": 65536
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "message_end",
+    "message": {
+      "role": "assistant",
+      "api": "lumen-fixture-api",
+      "provider": "lumen-fixture",
+      "model": "one",
+      "timestamp": 0,
+      "stopReason": "toolUse",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "content": [
+        {
+          "type": "toolCall",
+          "id": "phase0-read-1",
+          "name": "bct.read_file",
+          "arguments": {
+            "path": "/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt",
+            "max_bytes": 65536
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "tool_execution_start",
+    "toolCallId": "phase0-read-1",
+    "toolName": "bct.read_file",
+    "args": {
+      "path": "/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt",
+      "max_bytes": 65536
+    }
+  },
+  {
+    "type": "extension_ui_request",
+    "id": "1f81af62-f7d2-49ad-a7ad-73f62a1ef827",
+    "method": "input",
+    "title": "lumen.pi-bridge/2",
+    "placeholder": "{\"version\":2,\"tool_call_id\":\"phase0-read-1\",\"tool\":\"bct.read_file\",\"arguments\":{\"path\":\"/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt\",\"max_bytes\":65536}}",
+    "timeout": 60000
+  },
+  {
+    "type": "tool_execution_end",
+    "toolCallId": "phase0-read-1",
+    "toolName": "bct.read_file",
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Lumen denied: scope_exceeded: one-shot lease is not bound to the presented action"
+        }
+      ],
+      "details": {}
+    },
+    "isError": true
+  },
+  {
+    "type": "message_start",
+    "message": {
+      "role": "toolResult",
+      "toolCallId": "phase0-read-1",
+      "toolName": "bct.read_file",
+      "content": [
+        {
+          "type": "text",
+          "text": "Lumen denied: scope_exceeded: one-shot lease is not bound to the presented action"
+        }
+      ],
+      "details": {},
+      "isError": true,
+      "timestamp": 1791698775237
+    }
+  },
+  {
+    "type": "message_end",
+    "message": {
+      "role": "toolResult",
+      "toolCallId": "phase0-read-1",
+      "toolName": "bct.read_file",
+      "content": [
+        {
+          "type": "text",
+          "text": "Lumen denied: scope_exceeded: one-shot lease is not bound to the presented action"
+        }
+      ],
+      "details": {},
+      "isError": true,
+      "timestamp": 1791698775237
+    }
+  },
+  {
+    "type": "turn_end",
+    "message": {
+      "role": "assistant",
+      "api": "lumen-fixture-api",
+      "provider": "lumen-fixture",
+      "model": "one",
+      "timestamp": 0,
+      "stopReason": "toolUse",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "content": [
+        {
+          "type": "toolCall",
+          "id": "phase0-read-1",
+          "name": "bct.read_file",
+          "arguments": {
+            "path": "/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt",
+            "max_bytes": 65536
+          }
+        }
+      ]
+    },
+    "toolResults": [
+      {
+        "role": "toolResult",
+        "toolCallId": "phase0-read-1",
+        "toolName": "bct.read_file",
+        "content": [
+          {
+            "type": "text",
+            "text": "Lumen denied: scope_exceeded: one-shot lease is not bound to the presented action"
+          }
+        ],
+        "details": {},
+        "isError": true,
+        "timestamp": 1791698775237
+      }
+    ]
+  },
+  {
+    "type": "turn_start"
+  },
+  {
+    "type": "message_start",
+    "message": {
+      "role": "assistant",
+      "api": "lumen-fixture-api",
+      "provider": "lumen-fixture",
+      "model": "one",
+      "timestamp": 0,
+      "stopReason": "stop",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Mediation probe completed."
+        }
+      ]
+    }
+  },
+  {
+    "type": "message_end",
+    "message": {
+      "role": "assistant",
+      "api": "lumen-fixture-api",
+      "provider": "lumen-fixture",
+      "model": "one",
+      "timestamp": 0,
+      "stopReason": "stop",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Mediation probe completed."
+        }
+      ]
+    }
+  },
+  {
+    "type": "turn_end",
+    "message": {
+      "role": "assistant",
+      "api": "lumen-fixture-api",
+      "provider": "lumen-fixture",
+      "model": "one",
+      "timestamp": 0,
+      "stopReason": "stop",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Mediation probe completed."
+        }
+      ]
+    },
+    "toolResults": []
+  },
+  {
+    "type": "agent_end",
+    "messages": [
+      {
+        "role": "system",
+        "content": "",
+        "sections": {
+          "preamble": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.",
+          "tools": "<tools>\n(none)\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>",
+          "rules": "<rules>\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>",
+          "docs": "<docs>\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: /node_modules/@earendil-works/pi-coding-agent/README.md\n- Additional docs: /node_modules/@earendil-works/pi-coding-agent/docs\n- Examples: /node_modules/@earendil-works/pi-coding-agent/examples (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n</docs>",
+          "cwd": "<cwd>\n/state\n</cwd>"
+        },
+        "timestamp": 1791698774692,
+        "toolsAdded": [
+          {
+            "name": "bct.read_file",
+            "description": "Request a kernel decision.",
+            "parameters": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "max_bytes"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "max_bytes": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"path\": \"/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt\"}"
+          }
+        ],
+        "timestamp": 1791698774690
+      },
+      {
+        "role": "assistant",
+        "api": "lumen-fixture-api",
+        "provider": "lumen-fixture",
+        "model": "one",
+        "timestamp": 0,
+        "stopReason": "toolUse",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "phase0-read-1",
+            "name": "bct.read_file",
+            "arguments": {
+              "path": "/home/ubuntu/pinned-r/lumen-phase0/evidence/outside.txt",
+              "max_bytes": 65536
+            }
+          }
+        ]
+      },
+      {
+        "role": "toolResult",
+        "toolCallId": "phase0-read-1",
+        "toolName": "bct.read_file",
+        "content": [
+          {
+            "type": "text",
+            "text": "Lumen denied: scope_exceeded: one-shot lease is not bound to the presented action"
+          }
+        ],
+        "details": {},
+        "isError": true,
+        "timestamp": 1791698775237
+      },
+      {
+        "role": "assistant",
+        "api": "lumen-fixture-api",
+        "provider": "lumen-fixture",
+        "model": "one",
+        "timestamp": 0,
+        "stopReason": "stop",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Mediation probe completed."
+          }
+        ]
+      }
+    ],
+    "willRetry": false
+  }
+]

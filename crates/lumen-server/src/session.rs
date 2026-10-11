@@ -44,8 +44,16 @@ use crate::{
     authd::{AccountIdentity, SessionBinding},
     kernel_channel::{ChannelFuture, ChannelSession, ChannelSessionResolver},
     kernel_client::{KernelError, SupervisorKernel, now_ms, sha256_hex},
+    pi_tool_bridge::{
+        BridgeError, MAX_BRIDGE_READ_BYTES, MAX_BRIDGE_REQUEST_BYTES, PI_TOOL_BRIDGE_TITLE,
+        PiDialogRequest, SessionToolBridge, SessionToolBridgeFactory, encode_dialog_response,
+    },
     tool_catalog::Catalog,
 };
+
+/// Upper bound on machine-request dialogs dispatched concurrently for one
+/// session. Excess dialog volume is refused explicitly, never queued.
+const MAX_CONCURRENT_DIALOGS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -91,6 +99,11 @@ pub struct SupervisorConfig {
     /// listener the extension cannot mediate and every tool call fails
     /// closed inside the extension.
     pub channel_socket_path: Option<PathBuf>,
+    /// Factory for the PiBridge v2 tool bridge (one bridge instance per
+    /// fresh child generation, bound to the freshly minted kernel
+    /// identity). `None` means every bridge dialog is explicitly refused:
+    /// the reserved title alone grants nothing.
+    pub tool_bridge: Option<Arc<dyn SessionToolBridgeFactory>>,
 }
 
 impl SupervisorConfig {
@@ -132,6 +145,7 @@ impl Default for SupervisorConfig {
             event_buffer: 256,
             stderr_line_cap: 100,
             channel_socket_path: None,
+            tool_bridge: None,
         }
     }
 }
@@ -364,7 +378,17 @@ pub enum PiEvent {
         #[serde(default)]
         error: Option<String>,
     },
-    ExtensionUiRequest,
+    /// Pi's extension-dialog RPC (PiBridge v2 transport). Field-bound
+    /// strictness and the exact frame field set are re-checked from the raw
+    /// line in [`SessionSupervisor::handle_ui_request`]; a frame with
+    /// unexpected additionals is never dispatched.
+    ExtensionUiRequest {
+        id: String,
+        method: String,
+        title: String,
+        placeholder: String,
+        timeout: u64,
+    },
     ExtensionUiResponse,
 }
 
@@ -574,6 +598,15 @@ struct SessionInner {
     /// kernel channel; never leaves the host except via the
     /// `LUMEN_KERNEL_NONCE` environment of the Pi child it belongs to.
     channel_credential: Option<ChannelCredential>,
+    /// PiBridge v2 tool dispatcher for the CURRENT child generation,
+    /// created after the identity mint so claims never cross a restart,
+    /// and dropped at termination (also replaced at restart). `None`
+    /// when the coordinator did not provide a bridge factory — in that
+    /// case every dialog request for the reserved title is explicitly
+    /// refused and no machine request can reach authority.
+    tool_bridge: Option<Arc<dyn SessionToolBridge>>,
+    /// Bounds concurrent machine-request dispatches; excess is refused.
+    dialog_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// The kernel channel credential: 256 bits of entropy, hex-encoded.
@@ -927,6 +960,22 @@ impl SessionSupervisor {
         // mint failure leaves nothing behind.
         let channel_credential = self.inner.mint_channel_credential(&id)?;
 
+        // Generation tool bridge: created only after the vault identity
+        // exists, because the bridge's claims are bound to that subject.
+        // A bridge failure fails the spawn exactly as an identity failure
+        // would: no half-authority session is ever introduced.
+        let tool_bridge = self
+            .inner
+            .config
+            .tool_bridge
+            .as_ref()
+            .map(|factory| {
+                factory.create(&identity.subject).map_err(|e: BridgeError| {
+                    SupervisorError::SpawnFailed(format!("tool bridge creation failed: {e}"))
+                })
+            })
+            .transpose()?;
+
         let (cmd_tx, cmd_rx) = mpsc::channel::<Vec<u8>>(self.inner.config.outbound_queue_depth);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (event_tx, _) = broadcast::channel::<SupervisorEvent>(self.inner.config.event_buffer);
@@ -949,6 +998,8 @@ impl SessionSupervisor {
             event_tx,
             stderr_tail: VecDeque::new(),
             channel_credential,
+            tool_bridge,
+            dialog_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALOGS)),
         }));
         self.inner
             .sessions
@@ -1161,6 +1212,7 @@ impl SessionSupervisor {
                     sessions.get(id).cloned()
                 };
                 let Some(session) = session else { return };
+                let is_ui_request = matches!(&event, PiEvent::ExtensionUiRequest { .. });
                 let untrusted_tool = {
                     let mut guard = session.lock().await;
                     guard.last_activity = Instant::now();
@@ -1186,9 +1238,175 @@ impl SessionSupervisor {
                         .fault_session(id, FaultKind::UntrustedTool { tool })
                         .await;
                 }
+                // Machine-request dialogs are handled off the reader loop:
+                // a slow kernel/sandbox dispatch must not block stdout
+                // event processing or watchdog activity for the session.
+                if is_ui_request {
+                    Self::handle_ui_request(inner, id, generation, line).await;
+                }
             }
             Err(_) => Self::note_malformed(inner, id, generation).await,
         }
+    }
+
+    /// Strict frame re-validation and machine-request dispatch for one
+    /// `extension_ui_request` dialog.
+    ///
+    /// Explicit rejection, never silence, for every dialog the bridge
+    /// does not own: unknown titles/methods, malformed or oversized
+    /// intent, missing bridge factory, bridge errors, and dialog
+    /// concurrency over-limit. Replies always use the current
+    /// generation's child and only while it is Running — termination or
+    /// restart mid-dispatch suppresses the reply and the extension fails
+    /// closed on its own timeout. Nothing here touches the approval UI:
+    /// a `pending_approval` outcome is a machine reply field, never a
+    /// rendered human prompt.
+    async fn handle_ui_request(
+        inner: &Arc<SupervisorInner>,
+        id: &SessionId,
+        generation: u64,
+        line: &str,
+    ) {
+        if !Self::is_current_generation(inner, id, generation).await {
+            return;
+        }
+        // Re-check the exact frame field set from the raw line: serde's
+        // internally tagged enum decode ignores unknown fields, and the
+        // pinned dialog frame shape does not.
+        let mut value = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => value,
+            Err(_) => return Self::note_malformed(inner, id, generation).await,
+        };
+        if value
+            .as_object_mut()
+            .map(|map| map.remove("type").is_some())
+            != Some(true)
+        {
+            return Self::note_malformed(inner, id, generation).await;
+        }
+        let dialog = match PiDialogRequest::decode(&value) {
+            Ok(dialog) => dialog,
+            Err(_) => return Self::note_malformed(inner, id, generation).await,
+        };
+        if !Self::is_current_generation(inner, id, generation).await {
+            return;
+        }
+        if dialog.method != "input" || dialog.title != PI_TOOL_BRIDGE_TITLE {
+            return Self::send_dialog_reply(
+                inner,
+                id,
+                generation,
+                &dialog.id,
+                &PiDialogRequest::machine_rejection("unknown_dialog"),
+            )
+            .await;
+        }
+        if dialog.placeholder.len() > MAX_BRIDGE_REQUEST_BYTES {
+            // Oversized intent: refused without a bridge claim or dispatch.
+            return Self::send_dialog_reply(
+                inner,
+                id,
+                generation,
+                &dialog.id,
+                &PiDialogRequest::machine_rejection("invalid_bridge_request"),
+            )
+            .await;
+        }
+        let session = {
+            let sessions = inner.sessions.lock().unwrap();
+            sessions.get(id).cloned()
+        };
+        let Some(session) = session else { return };
+        let bridge = session.lock().await.tool_bridge.clone();
+        let Some(bridge) = bridge else {
+            return Self::send_dialog_reply(
+                inner,
+                id,
+                generation,
+                &dialog.id,
+                &PiDialogRequest::machine_rejection("bridge_unavailable"),
+            )
+            .await;
+        };
+        if !Self::is_current_generation(inner, id, generation).await {
+            return;
+        }
+        // Concurrency bound: excess machine requests are refused, not
+        // queued. The permit is moved into the dispatch task so the
+        // reader loop keeps consuming events meanwhile.
+        let permit = match tokio::time::timeout(
+            Duration::from_millis(250),
+            session.lock().await.dialog_slots.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                return Self::send_dialog_reply(
+                    inner,
+                    id,
+                    generation,
+                    &dialog.id,
+                    &PiDialogRequest::machine_rejection("bridge_busy"),
+                )
+                .await;
+            }
+        };
+
+        let intent = dialog.placeholder.into_bytes();
+        let dialog_id = dialog.id;
+        let inner = Arc::clone(inner);
+        let id = *id;
+        tokio::spawn(async move {
+            let _slot = permit;
+            let value = match bridge.dispatch(&intent).await {
+                Ok(reply) => match reply.encode(MAX_BRIDGE_READ_BYTES) {
+                    // The encoded v2 reply itself is the dialog value the
+                    // extension decodes; send it verbatim.
+                    Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| {
+                        PiDialogRequest::machine_rejection("invalid_bridge_request")
+                    }),
+                    Err(e) => PiDialogRequest::machine_rejection(match e {
+                        BridgeError::ReplyLimit | BridgeError::Limit => "bridge_limit",
+                        BridgeError::Replay => "bridge_replay",
+                        _ => "bridge_failed",
+                    }),
+                },
+                Err(e) => PiDialogRequest::machine_rejection(match e {
+                    BridgeError::Replay => "bridge_replay",
+                    BridgeError::Limit => "bridge_limit",
+                    _ => "bridge_failed",
+                }),
+            };
+            SessionSupervisor::send_dialog_reply(&inner, &id, generation, &dialog_id, &value).await;
+        });
+    }
+
+    /// Send one `extension_ui_response` frame to the CURRENT generation's
+    /// child, only while it is Running. Silence (no reply) is the
+    /// fail-closed path for termination/restart races; the extension's
+    /// bounded dialog timeout turns silence into a non-authority failure.
+    async fn send_dialog_reply(
+        inner: &Arc<SupervisorInner>,
+        id: &SessionId,
+        generation: u64,
+        dialog_id: &str,
+        value: &str,
+    ) {
+        if !Self::is_current_generation(inner, id, generation).await {
+            return;
+        }
+        let session = match inner.session(id).await {
+            Ok(session) => session,
+            Err(_) => return,
+        };
+        let mut guard = session.lock().await;
+        if !matches!(guard.status, SessionStatus::Running) {
+            return;
+        }
+        guard.last_activity = Instant::now();
+        let bytes = encode_dialog_response(dialog_id, value);
+        let _ = tokio::time::timeout(Duration::from_secs(5), guard.cmd_tx.send(bytes)).await;
     }
 
     async fn note_malformed(inner: &Arc<SupervisorInner>, id: &SessionId, generation: u64) {
@@ -1393,6 +1611,12 @@ impl SessionSupervisor {
                 }
                 TerminationState::Active => {
                     guard.termination = TerminationState::Terminating;
+                    // The generation tool bridge is unreachable from here on:
+                    // in-flight machine requests from the dying generation
+                    // never become reply authority, and no new dialog can
+                    // dispatch.
+                    guard.tool_bridge = None;
+                    guard.dialog_slots = Arc::new(tokio::sync::Semaphore::new(0));
                     guard.id
                 }
             }
@@ -1891,6 +2115,29 @@ impl SessionHandle {
             (guard.binding.clone(), fingerprint)
         };
 
+        // 4b. Recreate the generation tool bridge for the NEW subject. The
+        //     old bridge instance (old claims, old lease chain) is dropped
+        //     here and can never dispatch again: a restarted Pi process is
+        //     never served by the previous generation's machine channel.
+        let new_tool_bridge = match inner.config.tool_bridge.as_ref() {
+            Some(factory) => match factory.create(&binding.session_subject) {
+                Ok(bridge) => Some(bridge),
+                Err(e) => {
+                    let reason = format!("tool bridge recreation failed; restart aborted: {e}");
+                    inner
+                        .fault_session(
+                            &self.id,
+                            FaultKind::RestartFailed {
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await;
+                    return Err(SupervisorError::SpawnFailed(reason));
+                }
+            },
+            None => None,
+        };
+
         // 5. Rotate the kernel channel credential: the old child's
         //    credential dies with the old generation and is unregistered
         //    before the new child spawns, so it can never authenticate
@@ -1920,6 +2167,8 @@ impl SessionHandle {
             let session = inner.session(&self.id).await?;
             let mut guard = session.lock().await;
             guard.channel_credential = new_channel_credential;
+            guard.tool_bridge = new_tool_bridge;
+            guard.dialog_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALOGS));
             // Fresh exit notification for the new generation, installed
             // before start_child spawns the new monitor: the old
             // generation's monitor may have stored a `notify_one`
@@ -2582,5 +2831,454 @@ mod tests {
         let bytes = encode_command(&PiCommand::Abort);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["command"], "abort");
+    }
+
+    // -----------------------------------------------------------------------
+    // PiBridge v2 dialog wiring (bounded stdio, generation-scoped)
+    // -----------------------------------------------------------------------
+
+    use crate::kernel_client::{AuditRef, CoreActionDigest, EffectClass, MockVerdict};
+    use crate::pi_tool_bridge::{
+        BridgeFuture, PI_TOOL_BRIDGE_VERSION, PiToolReply, PipelineToolBridge,
+    };
+    use crate::tool_catalog::{
+        Catalog, CatalogError, MockSandboxRunner, ProjectionKind, ResourceUsage, ToolDef,
+        ToolOutcome, ToolPipeline,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn read_file_catalog() -> Result<Catalog, CatalogError> {
+        let mut catalog = Catalog::new();
+        catalog.register(ToolDef {
+            name: "bct.read_file".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Phase-0 bounded read (session-wiring test double).".to_string(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576}
+                }
+            }),
+            effects: vec![EffectClass::Read],
+            projection: ProjectionKind::FsRead,
+        })?;
+        Ok(catalog)
+    }
+
+    /// Factory the session supervisor calls once per fresh child
+    /// generation. Shared counters let tests prove that refusal paths
+    /// never reach a dispatch and that restarts churn the bridge.
+    struct BridgeFactoryProbe {
+        kernel: Arc<MockKernelClient>,
+        sandbox: Arc<MockSandboxRunner>,
+        creations: AtomicUsize,
+        dispatches: Arc<AtomicUsize>,
+    }
+
+    struct CountingBridge<B: SessionToolBridge + 'static> {
+        inner: B,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl<B: SessionToolBridge + 'static> SessionToolBridge for CountingBridge<B> {
+        fn dispatch<'a>(&'a self, intent: &'a [u8]) -> BridgeFuture<'a> {
+            self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.dispatch(intent)
+        }
+    }
+
+    impl SessionToolBridgeFactory for BridgeFactoryProbe {
+        fn create(&self, subject: &str) -> Result<Arc<dyn SessionToolBridge>, BridgeError> {
+            self.creations.fetch_add(1, AtomicOrdering::SeqCst);
+            let pipeline = Arc::new(ToolPipeline::new(
+                Arc::new(read_file_catalog().unwrap()),
+                Arc::clone(&self.kernel),
+                Arc::clone(&self.sandbox),
+            ));
+            Ok(Arc::new(CountingBridge {
+                inner: PipelineToolBridge::new(
+                    subject,
+                    vec!["00000000-0000-0000-0000-000000000001".to_string()],
+                    pipeline,
+                ),
+                counter: Arc::clone(&self.dispatches),
+            }))
+        }
+    }
+
+    fn bridge_test_kernel() -> Arc<MockKernelClient> {
+        Arc::new(MockKernelClient::new().with_verdict(MockVerdict::Allow))
+    }
+
+    fn dialog_frame_from(frame: serde_json::Value) -> String {
+        frame.to_string()
+    }
+
+    fn bridge_dialog_frame(intent: serde_json::Value) -> String {
+        dialog_frame_from(serde_json::json!({
+            "type": "extension_ui_request",
+            "id": "dialog-1",
+            "method": "input",
+            "title": PI_TOOL_BRIDGE_TITLE,
+            "placeholder": intent.to_string(),
+            "timeout": 60_000u64,
+        }))
+    }
+
+    fn bridge_config(
+        frame: &str,
+        record: std::path::PathBuf,
+        emit_cap: u32,
+        kernel: Arc<MockKernelClient>,
+        sandbox: Arc<MockSandboxRunner>,
+    ) -> (SupervisorConfig, Arc<AtomicUsize>) {
+        let script = fixture_script();
+        let digest = sha256_hex(&std::fs::read(&script).unwrap());
+        let mut config = test_config_with_mode(None);
+        config.pi_args = vec![
+            "bridge".to_string(),
+            record.to_string_lossy().into_owned(),
+            frame.to_string(),
+            emit_cap.to_string(),
+        ];
+        config.pi_digest = digest.clone();
+        config.extension_digest = digest;
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        config.tool_bridge = Some(Arc::new(BridgeFactoryProbe {
+            kernel,
+            sandbox,
+            creations: AtomicUsize::new(0),
+            dispatches: Arc::clone(&dispatches),
+        }));
+        (config, dispatches)
+    }
+
+    fn recorded_replies(record: &std::path::Path) -> Vec<(String, String)> {
+        let text = std::fs::read_to_string(record).unwrap_or_default();
+        text.lines()
+            .filter_map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).ok()?;
+                Some((
+                    value["id"].as_str()?.to_string(),
+                    value["value"].as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    async fn wait_for_replies(record: &std::path::Path, count: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if recorded_replies(record).len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "expected {count} recorded replies, got {} ({:?})",
+            recorded_replies(record).len(),
+            recorded_replies(record)
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_dialog_is_mediated_and_replied() {
+        let record_dir = tempfile::TempDir::new().unwrap();
+        let record = record_dir.path().join("replies.jsonl");
+        let kernel = bridge_test_kernel();
+        let sandbox = Arc::new(MockSandboxRunner::new());
+        let intent = serde_json::json!({
+            "version": 2, "tool_call_id": "call-dialog-1", "tool": "bct.read_file",
+            "arguments": {"path": "/tmp/bridge-read.txt", "max_bytes": 65536}
+        });
+        let (config, _dispatches) = bridge_config(
+            &bridge_dialog_frame(intent),
+            record.clone(),
+            1,
+            kernel.clone(),
+            sandbox.clone(),
+        );
+        let supervisor = SessionSupervisor::new(
+            config,
+            kernel.clone(),
+            Arc::new(default_catalog()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
+        wait_for_replies(&record, 1, Duration::from_secs(5)).await;
+        let replies = recorded_replies(&record);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, "dialog-1");
+        let value: serde_json::Value = serde_json::from_str(&replies[0].1).unwrap();
+        assert_eq!(value["version"], PI_TOOL_BRIDGE_VERSION);
+        assert_eq!(value["tool_call_id"], "call-dialog-1");
+        assert_eq!(value["outcome"]["status"], "completed");
+        assert_eq!(value["outcome"]["result"]["output_tail"], "mock-ok");
+        assert_eq!(value["action_digest"].as_str().unwrap().len(), 64);
+        assert_eq!(kernel.decisions_made(), 1);
+        assert_eq!(sandbox.committed_count(), 1);
+        handle.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_dialog_is_rejected_without_dispatch() {
+        let record_dir = tempfile::TempDir::new().unwrap();
+        let record = record_dir.path().join("replies.jsonl");
+        let kernel = bridge_test_kernel();
+        let sandbox = Arc::new(MockSandboxRunner::new());
+        let frame = dialog_frame_from(serde_json::json!({
+            "type": "extension_ui_request",
+            "id": "dialog-1",
+            "method": "input",
+            "title": "some-other-dialog",
+            "placeholder": "{\"x\":1}",
+            "timeout": 60_000u64,
+        }));
+        let (config, dispatches) =
+            bridge_config(&frame, record.clone(), 1, kernel.clone(), sandbox.clone());
+        let supervisor = SessionSupervisor::new(
+            config,
+            kernel.clone(),
+            Arc::new(default_catalog()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
+        wait_for_replies(&record, 1, Duration::from_secs(5)).await;
+        let replies = recorded_replies(&record);
+        let value: serde_json::Value = serde_json::from_str(&replies[0].1).unwrap();
+        assert_eq!(value["rejected"], "unknown_dialog");
+        // The unknown dialog never reached a bridge dispatch or the kernel.
+        assert_eq!(dispatches.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(kernel.decisions_made(), 0);
+        assert_eq!(sandbox.call_count(), 0);
+        handle.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_dialog_intent_is_refused_without_dispatch() {
+        let record_dir = tempfile::TempDir::new().unwrap();
+        let record = record_dir.path().join("replies.jsonl");
+        let kernel = bridge_test_kernel();
+        let sandbox = Arc::new(MockSandboxRunner::new());
+        let oversized = "x".repeat(MAX_BRIDGE_REQUEST_BYTES + 1);
+        let intent = serde_json::json!({
+            "version": 2, "tool_call_id": oversized, "tool": "bct.read_file",
+            "arguments": {"path": "/tmp/x", "max_bytes": 65536}
+        });
+        let (mut config, dispatches) = bridge_config(
+            &bridge_dialog_frame(intent),
+            record.clone(),
+            1,
+            kernel.clone(),
+            sandbox.clone(),
+        );
+        // The 16 KiB intent bound must be enforced by the dialog logic,
+        // not accidentally by the line-length guard: raise the line bound
+        // above the oversized frame so this session is not flood-faulted.
+        config.max_line_bytes = 256 * 1024;
+        let supervisor = SessionSupervisor::new(
+            config,
+            kernel.clone(),
+            Arc::new(default_catalog()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
+        wait_for_replies(&record, 1, Duration::from_secs(5)).await;
+        let replies = recorded_replies(&record);
+        let value: serde_json::Value = serde_json::from_str(&replies[0].1).unwrap();
+        assert_eq!(value["rejected"], "invalid_bridge_request");
+        assert_eq!(dispatches.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(kernel.decisions_made(), 0);
+        assert_eq!(sandbox.call_count(), 0);
+        handle.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dialog_replay_is_refused_by_generation_claim() {
+        let record_dir = tempfile::TempDir::new().unwrap();
+        let record = record_dir.path().join("replies.jsonl");
+        let kernel = bridge_test_kernel();
+        let sandbox = Arc::new(MockSandboxRunner::new());
+        let intent = serde_json::json!({
+            "version": 2, "tool_call_id": "call-replay", "tool": "bct.read_file",
+            "arguments": {"path": "/tmp/bridge-read.txt", "max_bytes": 65536}
+        });
+        // Emit the same frame, then re-emit after each reply (cap 3): the
+        // second identical intent must never mediate again.
+        let (config, _dispatches) = bridge_config(
+            &bridge_dialog_frame(intent),
+            record.clone(),
+            3,
+            kernel.clone(),
+            sandbox.clone(),
+        );
+        let supervisor = SessionSupervisor::new(
+            config,
+            kernel.clone(),
+            Arc::new(default_catalog()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
+        wait_for_replies(&record, 2, Duration::from_secs(5)).await;
+        // Cap 3 means three frames: one mediated, two refused replays.
+        wait_for_replies(&record, 3, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let replies = recorded_replies(&record);
+        assert_eq!(replies.len(), 3, "unexpected extra replies: {replies:?}");
+        let first: serde_json::Value = serde_json::from_str(&replies[0].1).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&replies[1].1).unwrap();
+        let third: serde_json::Value = serde_json::from_str(&replies[2].1).unwrap();
+        assert_eq!(first["outcome"]["status"], "completed");
+        assert_eq!(second["rejected"], "bridge_replay");
+        assert_eq!(third["rejected"], "bridge_replay");
+        assert_eq!(kernel.decisions_made(), 1);
+        handle.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_churns_bridge_and_fresh_claims() {
+        let record_dir = tempfile::TempDir::new().unwrap();
+        let record = record_dir.path().join("replies.jsonl");
+        let kernel = bridge_test_kernel();
+        let sandbox = Arc::new(MockSandboxRunner::new());
+        let intent = serde_json::json!({
+            "version": 2, "tool_call_id": "call-across-generations", "tool": "bct.read_file",
+            "arguments": {"path": "/tmp/bridge-read.txt", "max_bytes": 65536}
+        });
+        let (config, dispatches) = bridge_config(
+            &bridge_dialog_frame(intent),
+            record.clone(),
+            1,
+            kernel.clone(),
+            sandbox.clone(),
+        );
+        let supervisor = SessionSupervisor::new(
+            config,
+            kernel.clone(),
+            Arc::new(default_catalog()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
+        wait_for_replies(&record, 1, Duration::from_secs(5)).await;
+        handle.restart().await.unwrap();
+        // The new generation re-emits the same intent: a fresh claim set
+        // must serve it. A claim set shared across generations would
+        // classify this as a replay instead.
+        wait_for_replies(&record, 2, Duration::from_secs(5)).await;
+        let replies = recorded_replies(&record);
+        assert_eq!(replies.len(), 2);
+        let second: serde_json::Value = serde_json::from_str(&replies[1].1).unwrap();
+        assert_eq!(second["outcome"]["status"], "completed");
+        assert_eq!(kernel.decisions_made(), 2);
+        // The bridge factory created exactly one bridge per generation.
+        assert_eq!(dispatches.load(AtomicOrdering::SeqCst), 2);
+        handle.terminate().await.unwrap();
+    }
+
+    /// A bridge whose dispatch blocks until told to finish: models a slow
+    /// kernel/sandbox so the termination race can be observed.
+    struct GatedBridge {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    struct GatedSessionBridge {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl SessionToolBridge for GatedSessionBridge {
+        fn dispatch<'a>(&'a self, _intent: &'a [u8]) -> BridgeFuture<'a> {
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                release.notified().await;
+                Ok(PiToolReply {
+                    version: PI_TOOL_BRIDGE_VERSION,
+                    tool_call_id: "late-reply".to_string(),
+                    action_digest: CoreActionDigest::from_kernel_hex("0".repeat(64)),
+                    outcome: ToolOutcome::Completed {
+                        result: serde_json::json!({"exit_code": 0, "output_tail": "late"}),
+                        usage: ResourceUsage {
+                            cpu_ms: 0,
+                            memory_bytes_max: 0,
+                            egress_bytes: 0,
+                        },
+                        audit_ref: AuditRef {
+                            event_id: "evt-late".to_string(),
+                            chain_hash: "0".repeat(64),
+                        },
+                    },
+                })
+            })
+        }
+    }
+
+    impl SessionToolBridgeFactory for GatedBridge {
+        fn create(&self, _subject: &str) -> Result<Arc<dyn SessionToolBridge>, BridgeError> {
+            Ok(Arc::new(GatedSessionBridge {
+                release: Arc::clone(&self.release),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_mid_dialog_suppresses_reply() {
+        let record_dir = tempfile::TempDir::new().unwrap();
+        let record = record_dir.path().join("replies.jsonl");
+        let script = fixture_script();
+        let digest = sha256_hex(&std::fs::read(&script).unwrap());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut config = test_config_with_mode(None);
+        config.pi_args = vec![
+            "bridge".to_string(),
+            record.to_string_lossy().into_owned(),
+            bridge_dialog_frame(serde_json::json!({
+                "version": 2, "tool_call_id": "late", "tool": "bct.read_file",
+                "arguments": {"path": "/tmp/x", "max_bytes": 65536}
+            })),
+            "1".to_string(),
+        ];
+        config.pi_digest = digest.clone();
+        config.extension_digest = digest;
+        config.tool_bridge = Some(Arc::new(GatedBridge {
+            release: Arc::clone(&release),
+        }));
+        let supervisor = SessionSupervisor::new(
+            config,
+            Arc::new(MockKernelClient::new()),
+            Arc::new(default_catalog()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let handle = supervisor
+            .spawn_session_fixture(&owner().await)
+            .await
+            .unwrap();
+        // Terminate while the dialog dispatch is parked in the bridge.
+        handle.terminate().await.unwrap();
+        // A reply prepared after termination must never reach the dead
+        // generation's child.
+        release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            recorded_replies(&record).is_empty(),
+            "terminated generation must not be replied: {:?}",
+            recorded_replies(&record)
+        );
     }
 }

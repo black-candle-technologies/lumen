@@ -2100,7 +2100,15 @@ async fn authority_owner_subprocess() {
     if let Ok(ready_path) = std::env::var("LUMEN_TEST_OWNER_READY") {
         let owner = AuthorityKernelClient::open(config).await.unwrap();
         let subject = owner.start_session_identity(None).await.unwrap().subject;
-        std::fs::write(ready_path, subject).unwrap();
+        // The ready signal must be atomic: the parent SIGKILLs this process
+        // the instant it observes the file, and reading a file created but
+        // not yet filled yields an empty subject (observed as a flaky
+        // `kernel_session(None)` unwrap failure on a starved CI runner).
+        // Rename is atomic; the subject itself is committed durably by
+        // start_session_identity before the signal.
+        let staged = std::path::Path::new(&ready_path).with_extension("ready.tmp");
+        std::fs::write(&staged, &subject).unwrap();
+        std::fs::rename(&staged, &ready_path).unwrap();
         std::future::pending::<()>().await;
         drop(owner);
         return;
@@ -2203,7 +2211,11 @@ async fn crashed_owner_releases_lock_and_next_boot_invalidates_sessions() {
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(subject) = std::fs::read_to_string(&ready_path) {
-                break subject;
+                // Defense in depth against any non-atomic transport: the
+                // signal must carry a real subject, never a partial read.
+                if subject.starts_with("ed25519:") {
+                    break subject;
+                }
             }
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("owner subprocess exited early: {status}");

@@ -184,8 +184,24 @@ Remaining work includes other authority decoders and complete host/kernel
 representation reconciliation,
 mount/inode identity and resolution-to-execution races, complete lease-chain and
 nonce revalidation, budget reservation/spend/reconciliation under process faults,
-measured transitive revocation latency, deterministic redaction and independent
+deterministic redaction and independent
 audit verification tied to the final phase artifacts. Production authority
 admission, owner acceptance and operator staging drills remain open. Phase 2 must
 prove per-action Firecracker isolation and writeback; these resource tests do not
 substitute for that boundary.
+
+The measured transitive revocation latency item was closed on 2026-10-10: the
+test `transitive_revocation_latency_over_deep_chain`
+(`crates/lumen-db/tests/lease_persistence.rs`) drives
+`invalidate_kernel_sessions_and_revoke` over a depth-2000 descendant chain and
+asserts transitively-correct revocation, historical-row preservation, and a
+documented 5 s latency bound (measured 3.97 s on the lane x86-64 host under
+concurrent cargo load, 494 ms on the local arm64 developer machine; see
+[evidence/phase1-reprod-20261010](evidence/phase1-reprod-20261010/README.md)).
+The same 2026-10-10 re-run executed the four documented verification commands
+against HEAD (with the dated task changes applied): workspace Clippy exited 0,
+`cargo fmt --check` was clean, the independent authority-fixture verifier
+passed, and the full core/database/host test matrix plus the whole acceptance
+crate ran green in a sandboxed Linux environment (37 result-ok suites, no
+failures); the shared lane host itself hit its 93%-full disk during its own
+test-compile pass, so that environment's matrix run is deferred to CI.

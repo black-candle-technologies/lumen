@@ -2,9 +2,10 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use lumen_core::extension::{ExtensionInvocationLimits, ExtensionResponse, Sha256Digest};
@@ -109,26 +110,64 @@ impl WasmComponentHost {
         let engine = compiled.engine.clone();
         let component = compiled.component.clone();
         let interruption = Arc::new(AtomicU8::new(0));
-        let interruption_task = {
+        let interrupter_stopped = Arc::new(AtomicBool::new(false));
+        // The epoch interrupter is an OS thread, deliberately not a task on the
+        // caller's runtime: an epoch increment must not depend on that runtime's
+        // timer driver staying responsive. A stalled timer used to leave the guest
+        // running with no interrupt candidate (observed as an idle hang in CI).
+        // Detached by design: the thread exits within one poll tick (200µs)
+        // once `interrupter_stopped` is set, or immediately after firing its
+        // interruption; there is no result to await that a join would add.
+        let _interrupter_thread = {
             let engine = engine.clone();
             let interruption = Arc::clone(&interruption);
+            let stopped = Arc::clone(&interrupter_stopped);
             let cancellation = cancellation.clone();
             let deadline = Duration::from_millis(limits.deadline_millis());
-            tokio::spawn(async move {
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => interruption.store(2, Ordering::Release),
-                    () = tokio::time::sleep(deadline) => interruption.store(1, Ordering::Release),
+            thread::spawn(move || {
+                let started = Instant::now();
+                loop {
+                    if stopped.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if cancellation.is_cancelled() {
+                        interruption.store(2, Ordering::Release);
+                        engine.increment_epoch();
+                        return;
+                    }
+                    if started.elapsed() >= deadline {
+                        interruption.store(1, Ordering::Release);
+                        engine.increment_epoch();
+                        return;
+                    }
+                    thread::sleep(Duration::from_micros(200));
                 }
-                engine.increment_epoch();
             })
         };
 
         let worker = tokio::task::spawn_blocking(move || {
             execute_component(&engine, &component, &encoded_request, limits)
         });
-        let execution = worker.await;
-        interruption_task.abort();
+        // Watchdog: the epoch machinery must have fired by the deadline, so a
+        // completed guest cannot still be pending past deadline + slack. If the
+        // watchdog fires, the invocation machinery itself failed; surface a
+        // bounded error instead of hanging the caller forever.
+        let watchdog = Duration::from_millis(limits.deadline_millis()) + Duration::from_secs(2);
+        let execution = match tokio::time::timeout(watchdog, worker).await {
+            Ok(execution) => execution,
+            Err(_elapsed) => {
+                interrupter_stopped.store(true, Ordering::Relaxed);
+                let classified = match interruption.load(Ordering::Acquire) {
+                    1 => WasmHostError::DeadlineExceeded,
+                    2 => WasmHostError::Cancelled,
+                    _ => WasmHostError::Host(
+                        "WASM invocation watchdog fired before any interruption signal".into(),
+                    ),
+                };
+                return Err(classified);
+            }
+        };
+        interrupter_stopped.store(true, Ordering::Relaxed);
         let execution = execution.map_err(|error| {
             WasmHostError::Host(format!("WASM execution worker failed: {error}"))
         })?;

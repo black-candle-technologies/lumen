@@ -9,6 +9,7 @@ on:
     branches:
       - 'lumen-rebuild/**'
       - 'feat/issue-62-mixed-trust-gate'
+      - master
 
 permissions:
   contents: read
@@ -141,26 +142,39 @@ jobs:
       # namespaces work fine. /lib and /lib64 carry the dynamic loader
       # (symlinks into /usr on merged-/usr systems).
       - run: bwrap --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 --unshare-user /usr/bin/true && echo "bwrap userns probe OK"
-      # lumen-acceptance is excluded: it is a 10m+ end-to-end suite that has
-      # not been stabilized for CI yet. Do not re-add it until it is run and
-      # green on its own.
+      # lumen-acceptance is excluded: see its dedicated job below.
       #
-      # fuel_deadline_and_cancellation_interrupt_guest_code is skipped: it
-      # hangs intermittently (idle, zero CPU -- a never-firing wait inside the
-      # wasmtime epoch/deadline machinery) instead of failing, which would burn
-      # the whole job timeout. Observed 2026-09-24 on the phase-6 tree.
-      # Re-enable once root-caused; see crates/lumen-integrations/src/extension_wasm.rs.
+      # fuel_deadline_and_cancellation_interrupt_guest_code ran in CI here
+      # as of 2026-10-10. Its epoch interrupter is a dedicated OS thread (not
+      # a task on the caller's runtime) with a bounded invocation watchdog, so
+      # a stalled host timer can no longer leave the guest uninterruptible
+      # (the idle, zero-CPU hang observed 2026-09-24 on the phase-6 tree).
       - run: >
           cargo test --workspace --exclude lumen-acceptance --exclude lumen-desktop --
-          --skip fuel_deadline_and_cancellation_interrupt_guest_code
-      # This bounded acceptance target exercises the versioned raw Unix
-      # transport. It does not replace real Pi/Firecracker confinement evidence.
-      - run: cargo test -p lumen-acceptance --test pi_bypass_inventory
+      # lumen-acceptance gets its own job below (stabilized 2026-10-10: 19
+      # bounded tests, sub-second runtime; see the `acceptance` job).
       # The no-default-features configuration is materially different
       # (default features pull in model-client, native-secrets, and
       # wasm-host): the sandbox gate must keep covering it, or a
       # minimal-feature build can regress silently.
       - run: bash scripts/verify-linux-plugin-sandbox.sh
+
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # The full acceptance crate: the versioned raw Unix transport inventory
+      # (does not replace real Pi/Firecracker confinement evidence), the
+      # Phase-0 spike evidence re-verification, and the bin's compilation.
+      # Previously excluded wholesale from CI as an un-stabilized 10m+ suite;
+      # it is now 19 bounded tests that finish in under a second (verified
+      # 2026-10-10, repeated stress runs green). Run bounded here so a
+      # regression back to slow/hanging behavior fails the job, not the timeout.
+      - run: cargo test -p lumen-acceptance
 
   discord-feature-tests:
     runs-on: ubuntu-latest
