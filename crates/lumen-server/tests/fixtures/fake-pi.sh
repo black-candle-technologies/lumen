@@ -16,6 +16,9 @@
 #   exit-fast  exit 3 immediately (spawn must fail: no reference possible)
 #   exit-slow  answer get_state, then exit 3 (post-spawn death)
 #   no-state   never answer get_state (tests spawn failure on missing ref)
+#   bridge R F [C]  answer get_state; emit prebuilt dialog frame F; append
+#             every extension_ui_response to record file R; re-emit F
+#             after each response until C frames were emitted (default 1)
 set -u
 
 mode="${1:-}"
@@ -72,6 +75,38 @@ case "$mode" in
     answer_get_state_once
     sleep 1
     exit 3
+    ;;
+  bridge)
+    # Bridge dialog mode: args argv2=record-file argv3=frame argv4=emit-cap.
+    # After answering get_state, emit the prebuilt extension_ui_request
+    # frame. Every received extension_ui_response is appended (raw) to the
+    # record file; if the emit cap is set, the frame is re-emitted after
+    # each response so a replay can push the bridge's per-generation claim
+    # set. Restarting generates a fresh child that re-emits its own frame.
+    record="$2"; frame="$3"; cap="${4:-1}"
+    answer_get_state_once
+    emit "$frame"
+    emitted=1
+    while IFS= read -r line; do
+      case "$line" in
+        *'"extension_ui_response"'*)
+          printf '%s\n' "$line" >> "$record"
+          if [ "$emitted" -lt "$cap" ]; then
+            emit "$frame"
+            emitted=$((emitted + 1))
+          fi
+          ;;
+        *'"command":"prompt"'*)
+          emit '{"type":"message_end"}'
+          emit '{"type":"agent_settled"}'
+          ;;
+        *'"command":"get_state"'*)
+          n=$((n + 1))
+          id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+          emit "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"fake-pi-bridge-$n\"}}"
+          ;;
+      esac
+    done
     ;;
   no-state)
     # Answer everything except get_state; exit on stdin EOF.

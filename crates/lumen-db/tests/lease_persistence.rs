@@ -1121,3 +1121,82 @@ async fn recovery_rejects_settled_execution_without_accounting_receipt() {
         99
     );
 }
+
+/// Transitive revocation over a deep lease chain: measured latency probe
+/// for the phase-1 remaining-gate item. Builds a depth-N descendant chain
+/// under one active root session, then drives the atomic destroy-and-revoke
+/// transition and asserts (a) every descendant is revoked transitively,
+/// (b) the measured wall-clock latency stays within a documented bound. The
+/// bound is deliberately generous (deterministic pass on slow CI hardware
+/// with SQLite on spinner disks); the measured value is printed so lane
+/// evidence records can quote it.
+#[tokio::test]
+async fn transitive_revocation_latency_over_deep_chain() {
+    const DEPTH: usize = 2_000;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+    let db = test_db().await;
+    let ws = test_workspace(&db).await;
+    let fx = fixture();
+    let root = mint_root(&fx, "latency-root", "latency-root-nonce", 100, 10_000);
+    let public_key = hex::encode(
+        fx.sessions
+            .get(&root.subject)
+            .unwrap()
+            .verifying_key
+            .to_bytes(),
+    );
+    db.insert_kernel_session(&ws, &root.subject, None, &public_key, 100)
+        .await
+        .unwrap();
+    db.insert_kernel_lease_with_budget(&ws, &root, 100)
+        .await
+        .unwrap();
+    let child_key = SigningKey::from_bytes(&[0x77; 32]);
+    let mut parent = root.clone();
+    for depth in 0..DEPTH {
+        let mut child = root.clone();
+        child.lease_id = format!("latency-child-{depth}");
+        child.parent_id = Some(parent.lease_id.clone());
+        child.subject = "ed25519:latency-chain".into();
+        child.lease_nonce = format!("latency-child-nonce-{depth}");
+        child.sign(&child_key).unwrap();
+        db.insert_kernel_lease_with_budget(&ws, &child, 100)
+            .await
+            .unwrap();
+        parent = child;
+    }
+
+    let started = std::time::Instant::now();
+    let (subjects, leases) = db
+        .invalidate_kernel_sessions_and_revoke(&ws, 300)
+        .await
+        .unwrap();
+    let measured = started.elapsed();
+    // Every subject session (root only: the chain shares one subject row) is
+    // destroyed; every chain lease is transitively revoked.
+    assert_eq!(subjects.len(), 1);
+    assert_eq!(leases.len(), DEPTH + 1);
+    assert!(db.active_kernel_sessions(&ws).await.unwrap().is_empty());
+    assert!(db.is_kernel_revoked(&ws, &root.lease_id).await.unwrap());
+    assert!(
+        db.is_kernel_revoked(&ws, &format!("latency-child-{}", DEPTH - 1))
+            .await
+            .unwrap()
+    );
+    // Historical rows are preserved as evidence, not rewritten.
+    assert_eq!(
+        db.kernel_lease(&ws, &root.lease_id).await.unwrap(),
+        Some(root.clone())
+    );
+    assert!(
+        measured <= BOUND,
+        "transitive revocation of {DEPTH} descendants exceeded the documented \
+         bound: {measured:?} > {BOUND:?}"
+    );
+    eprintln!(
+        "latency: transitively revoked {} leases in {:?} (~{} us/lease)",
+        DEPTH + 1,
+        measured,
+        measured.as_micros() / u128::try_from(DEPTH + 1).unwrap()
+    );
+}

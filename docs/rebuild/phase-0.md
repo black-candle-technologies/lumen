@@ -70,6 +70,64 @@ These are process-crash observations, not machine-reboot, Firecracker, or kernel
 authority-reconciliation evidence. Signed artifact admission and owner acceptance
 remain pending. No product feature is enabled by this PR.
 
+A full independent re-run of the confinement pipeline (pinned Pi build,
+runtime packaging, real-Pi denied mediation, audit verification, and the 31
+native suite tests) was captured on an unprivileged x86-64 scratch host on
+2026-10-10; the reproduced digests match the immutable pinned values. The new
+record lies in [evidence/phase0-reprod-20261010](evidence/phase0-reprod-20261010/README.md)
+and overwrites no prior record. Owner review of the reproduced harness and
+digests is still required for gate acceptance.
+
+## Supervisor dialog wiring (coded 2026-10-10; admission still disabled)
+
+Bounded stdio v2 requests are now wired into host generations in the session
+supervisor, completing acceptance item 3 for the coded path:
+
+- **Strict frame decode.** `extension_ui_request` events are typed
+  (`crates/lumen-server/src/session.rs`), and the exact frame field set is
+  re-validated from the raw line (`PiDialogRequest::decode`); a frame with
+  unexpected fields fails into the counted malformed path. Dialog ids carry the
+  same 128-character bounded-alphabet requirement the denial probe enforces
+  against real pinned Pi.
+- **Generation-owned bridge.** One `SessionToolBridge` exists per live child
+  generation, created only after the kernel vault mints that generation's
+  identity (spawn fails closed on bridge-creation failure), recreated after the
+  restart identity rotation, dropped when the termination latch is taken. The
+  claim set therefore can never cross a restart, and a terminated generation
+  cannot dispatch.
+- **Explicit rejection, never silence, for every dialog the bridge does not
+  own:** unknown titles/methods (`unknown_dialog`), oversized intents
+  (`invalid_bridge_request`, >16 KiB, refused without consuming a claim or
+  pipeline dispatch), missing bridge factory (`bridge_unavailable`), bridge
+  errors (`bridge_replay`/`bridge_limit`/`bridge_failed`), and concurrency
+  over-limit (`bridge_busy`; 4 concurrent machine requests per session, refuse
+  not queue).
+- **Cancellation/termination binding.** Dispatches run off the reader loop as
+  spawned tasks that reply only through the current generation's child while it
+  is Running; a restart or terminate racing a dispatch suppresses the reply, and
+  the extension fails closed on its bounded dialog timeout.
+- **No human approval rendering.** `pending_approval` is a machine reply field
+  carrying `approval_request_id`; nothing in this path touches the approval UI
+  or the VHL flow.
+- **Mediation round trip.** Dispatch goes through `PiToolBridge`
+  (`pi_tool_bridge.rs`) → host-built envelope → real kernel seam decision →
+  sandbox stage/commit → durable audit; only completed outcomes with usage and
+  audit reference return the kernel action digest. The coordinator resolves the
+  lease chain for the fresh subject outside the supervisor; lease minting stays
+  kernel-owned.
+- **Test evidence (subprocess-backed, against the fake-Pi RPC fixture with mock
+  kernel and sandbox doubles — seam evidence, not confinement):** mediation
+  round trip with digest/correlation assertions, unknown-dialog and oversized
+  rejections proving zero decisions/dispatches, per-generation replay refusal,
+  restart claim-set churn (same intent mediated twice across generations), and
+  mid-dispatch termination reply suppression
+  (`session.rs` tests `bridge_dialog_*`, `restart_churns_bridge_and_fresh_claims`,
+  `termination_mid_dialog_suppresses_reply`).
+
+Production admission remains disabled (`pi_launch::require_confinement`); this
+wiring is unreachable until the confinement gate is accepted. Owner reviews and
+the real allow-path sandbox evidence are unchanged pending items.
+
 ## Proposed contract transition
 
 PiBridge v1 and `lumen-kernel/1` fixtures remain unchanged as historical contracts.
@@ -135,9 +193,17 @@ the full Phase-0 gate.
    sockets, credentials, network, and process-spawn authority. No fallback profile.
 2. Independently reproduce and verify the pinned Pi source/build, extension, and
    runtime dependency digests. The old `PINNED_PI.md` hashes are candidates only.
+   **Coded+executed 2026-10-10:** pinned source/build and runtime digests
+   reproduced on a scratch x86-64 host (see
+   [evidence/phase0-reprod-20261010](evidence/phase0-reprod-20261010/README.md));
+   independent owner verification remains pending.
 3. Wire bounded stdio v2 requests into a host generation whose identity/leases are
    kernel-owned; wire cancellation and termination to that generation. Explicitly
    reject unknown dialog requests. Never render machine requests as VHL prompts.
+   **Coded 2026-10-10** (see the supervisor dialog wiring section above); claims
+   and replies are bound per child generation; the real-kernel round trip is
+   proven with mock sandbox doubles, so the real allow-path sandbox evidence
+   (item 4) remains pending.
 4. Independently reproduce/review the committed real-Pi deterministic denial
    harness and malicious native probes. A real allow path requires the actual
    per-action sandbox and signed audit path, not a mock or local read.
